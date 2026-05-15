@@ -14,6 +14,11 @@ def _require_sb3():
     return PPO
 
 
+def _training_device(config: Any) -> str:
+    requested = str(config.get("training", {}).get("device", "auto")).strip().lower()
+    return "cuda" if requested == "gpu" else requested or "auto"
+
+
 def train_ppo(
     config: Any,
     env: SumoHighwayMergeEnv,
@@ -37,6 +42,7 @@ def train_ppo(
         ent_coef=float(config.rl.ent_coef),
         vf_coef=float(config.rl.vf_coef),
         tensorboard_log=str(tensorboard_dir) if tensorboard_dir else None,
+        device=_training_device(config),
         verbose=1,
     )
     model.learn(
@@ -50,9 +56,10 @@ def train_ppo(
         "model_path": str(output_path),
         "total_timesteps": int(config.rl.total_timesteps),
         "tensorboard": str(tensorboard_dir) if tensorboard_dir else None,
+        "device": str(model.device),
     }
 
 
-def load_ppo(path: str | Path):
+def load_ppo(path: str | Path, device: str = "auto"):
     PPO = _require_sb3()
-    return PPO.load(str(path))
+    return PPO.load(str(path), device=device)

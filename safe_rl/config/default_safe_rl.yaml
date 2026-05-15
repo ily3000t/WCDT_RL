@@ -5,6 +5,13 @@ run:
   tensorboard: true
   replay: true
 
+training:
+  device: "auto"
+  pin_memory: true
+  num_workers: 0
+  persistent_workers: true
+  cuda_tf32: true
+
 scenario:
   name: "highway_merge"
   root: "scenarios/highway_merge"
@@ -30,7 +37,7 @@ prediction:
   horizon_steps: 30
   num_modes: 10
   train_enabled: true
-  epochs: 3
+  epochs: 50
   batch_size: 16
   learning_rate: 0.0001
   max_pred_num: 8
@@ -63,7 +70,7 @@ risk_module:
   action_conditioned: true
   ranking_loss_enabled: true
   calibration_enabled: true
-  epochs: 10
+  epochs: 50
   batch_size: 64
   learning_rate: 0.0003
   latent_dim: 256
@@ -119,7 +126,7 @@ shield:
     progress: -0.05
 
 stage1:
-  episodes: 20
+  episodes: 500
   random_action_probability: 1.0
   output_name: "risk_probe_buffer.npz"
   audit_enabled: true
@@ -134,7 +141,7 @@ stage3:
   tensorboard_log_name: "ppo"
 
 stage4:
-  episodes: 10
+  episodes: 100
   mode: "shadow"
   replay_enabled: true
 

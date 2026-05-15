@@ -12,6 +12,7 @@ def run(cfg):
     stage_log("stage3", f"SUMO config={cfg.scenario.sumocfg}")
     stage_log("stage3", f"total_timesteps={cfg.rl.total_timesteps}")
     stage_log("stage3", f"forecast_features={bool(cfg.forecast_features.enabled or cfg.rl.use_wcdt_forecast_features)}")
+    stage_log("stage3", f"device={cfg.get('training', {}).get('device', 'auto')}")
     stage_log("stage3", f"model_output={stage_dir / str(cfg.stage3.model_name)}")
     env = make_env(cfg, seed=int(cfg.run.seed), shield_enabled=False)
     try:

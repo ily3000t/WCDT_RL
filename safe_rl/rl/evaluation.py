@@ -23,7 +23,10 @@ def evaluate_ppo(
     tensorboard: TensorboardLogger | None = None,
     tensorboard_step_offset: int = 0,
 ) -> dict:
-    model = load_ppo(model_path)
+    device = str(cfg.get("training", {}).get("device", "auto") or "auto")
+    if device.lower() == "gpu":
+        device = "cuda"
+    model = load_ppo(model_path, device=device)
     reports: list[dict] = []
     rewards: list[float] = []
     for episode_idx, seed in enumerate(progress_iter(seeds, desc=f"Eval {group_name or 'ppo'} seeds")):

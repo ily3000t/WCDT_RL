@@ -30,7 +30,7 @@ class MultiModalLoss(nn.Module):
         multimodal = traj.shape[2]
         future_step = traj.shape[3]
         output_dim = traj.shape[4]
-        predicted_future_extend = predicted_future_traj.unsqueeze(dim=-3)
+        predicted_future_extend = predicted_future_traj.unsqueeze(dim=-3).expand_as(traj)
         loss = self.huber_loss(traj, predicted_future_extend)
         loss = loss.view(batch, obs_num, multimodal, -1)
         loss = torch.mean(loss, dim=-1)
