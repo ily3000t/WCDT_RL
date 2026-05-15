@@ -4,6 +4,7 @@ import math
 import os
 import shutil
 import sys
+import time
 import uuid
 from pathlib import Path
 from typing import Any
@@ -36,6 +37,7 @@ class SumoHighwayMergeEnv(gym.Env):
         forecast_augmentor: ForecastFeatureAugmentor | None = None,
         shield: SafetyShield | None = None,
         record_trajectory_samples: bool = False,
+        sumo_step_delay_ms: float = 0.0,
     ):
         self.config = config
         self.seed_value = int(seed if seed is not None else config.run.seed)
@@ -49,6 +51,7 @@ class SumoHighwayMergeEnv(gym.Env):
         self.forecast_augmentor = forecast_augmentor
         self.shield = shield
         self.record_trajectory_samples = record_trajectory_samples
+        self.sumo_step_delay_ms = float(sumo_step_delay_ms)
 
         self.action_space = spaces.Discrete(len(ACTIONS))
         self._base_obs_dim = 8 + self.top_k * 8 + 4
@@ -200,6 +203,8 @@ class SumoHighwayMergeEnv(gym.Env):
 
     def _simulation_step(self) -> None:
         self._traci.simulationStep()
+        if self.sumo_step_delay_ms > 0:
+            time.sleep(self.sumo_step_delay_ms / 1000.0)
 
     def _collect_states(self) -> list[VehicleState]:
         states: list[VehicleState] = []

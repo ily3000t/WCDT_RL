@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import xml.etree.ElementTree as ET
 from pathlib import Path
 
 from safe_rl.risk.risk_module import HeuristicRiskEstimator
@@ -30,6 +31,24 @@ def test_scenario_validation_passes():
     assert report["passed"], report["errors"]
     ego = next(item for item in report["seed_positions"] if item["vehicle_id"] == "ego")
     assert ego["first_edge"] == "ramp_in"
+
+
+def test_ramp_connection_targets_adjacent_main_lane():
+    con_file = Path("scenarios/highway_merge/highway_merge.con.xml")
+    root = ET.parse(con_file).getroot()
+    ramp_connection = next(
+        connection
+        for connection in root.findall("connection")
+        if connection.attrib.get("from") == "ramp_in" and connection.attrib.get("to") == "main_out"
+    )
+    assert ramp_connection.attrib["toLane"] == "2"
+
+
+def test_merge_junction_uses_zipper_right_of_way():
+    node_file = Path("scenarios/highway_merge/highway_merge.nod.xml")
+    root = ET.parse(node_file).getroot()
+    merge_node = next(node for node in root.findall("node") if node.attrib.get("id") == "merge")
+    assert merge_node.attrib["type"] == "zipper"
 
 
 def test_shield_replaces_lane_oob_action():

@@ -16,7 +16,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--config", default=None, help="Optional YAML config overlay.")
     parser.add_argument("--gui", action="store_true", help="Use sumo-gui instead of sumo.")
     parser.add_argument("--sumo-binary", default=None, help="Explicit SUMO binary, e.g. sumo-gui.")
-    parser.add_argument("--delay-ms", type=float, default=0.0, help="Sleep between RL control steps for visual inspection.")
+    parser.add_argument("--delay-ms", type=float, default=0.0, help="Sleep after each SUMO simulation step for smooth GUI playback.")
+    parser.add_argument("--control-delay-ms", type=float, default=0.0, help="Additional sleep between recorded RL control actions.")
     parser.add_argument("--risk-checkpoint", default=None, help="Override risk checkpoint for shield-enabled replays.")
     return parser.parse_args()
 
@@ -43,7 +44,13 @@ def run() -> None:
     stage_log("replay", f"sumo_binary={cfg.scenario.sumo_binary} shield={shield_enabled}")
     stage_log("replay", f"actions={len(actions)}")
 
-    env = make_env(cfg, seed=seed, shield_enabled=shield_enabled, risk_checkpoint=risk_checkpoint)
+    env = make_env(
+        cfg,
+        seed=seed,
+        shield_enabled=shield_enabled,
+        risk_checkpoint=risk_checkpoint,
+        sumo_step_delay_ms=max(0.0, float(args.delay_ms)),
+    )
     try:
         obs, _info = env.reset(seed=seed)
         terminated = truncated = False
@@ -56,8 +63,8 @@ def run() -> None:
                 f"step={step} action={action} reward={float(reward):.3f} "
                 f"done={terminated or truncated} reason={info.get('done_reason', '')}",
             )
-            if args.delay_ms > 0:
-                time.sleep(args.delay_ms / 1000.0)
+            if args.control_delay_ms > 0:
+                time.sleep(args.control_delay_ms / 1000.0)
         stage_log("replay", f"episode_report={env.episode_report()}")
     finally:
         env.close()

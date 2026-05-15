@@ -59,6 +59,7 @@ def make_env(
     shield_enabled: bool | None = None,
     risk_checkpoint: str | None = None,
     record_trajectory_samples: bool = False,
+    sumo_step_delay_ms: float = 0.0,
 ) -> SumoHighwayMergeEnv:
     shield = None
     if shield_enabled if shield_enabled is not None else bool(cfg.shield.enabled):
@@ -70,6 +71,7 @@ def make_env(
         seed=seed,
         shield=shield,
         record_trajectory_samples=record_trajectory_samples,
+        sumo_step_delay_ms=sumo_step_delay_ms,
     )
 
 
