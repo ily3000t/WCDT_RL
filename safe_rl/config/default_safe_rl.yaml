@@ -1,0 +1,160 @@
+run:
+  output_root: "safe_rl_output/runs"
+  run_id: null
+  seed: 1
+  tensorboard: true
+  replay: true
+
+scenario:
+  name: "highway_merge"
+  root: "scenarios/highway_merge"
+  sumocfg: "scenarios/highway_merge/highway_merge.sumocfg"
+  net_file: "scenarios/highway_merge/highway_merge.net.xml"
+  route_file: "scenarios/highway_merge/highway_merge.rou.xml"
+  ego_id: "ego"
+  sumo_binary: "sumo"
+  step_length: 0.1
+  episode_seconds: 80.0
+  control_interval_steps: 5
+  top_k_neighbors: 5
+  history_steps: 11
+  forecast_horizon_steps: 30
+  success_edge: "main_out"
+  success_min_x: 250.0
+
+prediction:
+  enabled: true
+  model_type: "wcdt"
+  checkpoint: null
+  freeze: true
+  horizon_steps: 30
+  num_modes: 10
+  train_enabled: true
+  epochs: 3
+  batch_size: 16
+  learning_rate: 0.0001
+  max_pred_num: 8
+  max_other_num: 6
+  max_traffic_light: 8
+  max_lane_num: 32
+  max_point_num: 128
+
+forecast_features:
+  enabled: false
+  use_for_ppo_observation: false
+  source: "wcdt"
+  freeze_predictor: true
+  horizon_steps: 30
+  top_k_agents: 5
+  include_min_distance: true
+  include_ttc: true
+  include_drac: true
+  include_collision_probability: true
+  include_uncertainty: true
+  include_merge_gap: true
+  normalize: true
+  normalize_features: true
+  detach_gradient: true
+
+risk_module:
+  enabled: true
+  use_wcdt_latent: true
+  use_explicit_risk_features: true
+  action_conditioned: true
+  ranking_loss_enabled: true
+  calibration_enabled: true
+  epochs: 10
+  batch_size: 64
+  learning_rate: 0.0003
+  latent_dim: 256
+  hidden_dim: 128
+  explicit_feature_dim: 8
+  action_embedding_dim: 4
+  collision_horizon_steps: 30
+  collision_distance_threshold: 0.25
+  near_miss_distance_threshold: 0.75
+  ttc_threshold: 1.5
+  drac_threshold: 3.35
+  loss_weights:
+    prediction: 1.0
+    risk: 1.0
+    ranking: 0.5
+    calibration: 0.1
+
+rl:
+  backend: "sb3"
+  use_wcdt_forecast_features: false
+  total_timesteps: 20000
+  learning_rate: 0.0003
+  n_steps: 1024
+  batch_size: 64
+  gamma: 0.99
+  gae_lambda: 0.95
+  ent_coef: 0.0
+  vf_coef: 0.5
+  reward:
+    progress: 0.05
+    speed: 0.02
+    merge_success: 100.0
+    collision: -100.0
+    near_miss: -10.0
+    low_ttc: -3.0
+    high_drac: -2.0
+    hard_brake: -1.0
+    lane_oob: -5.0
+
+shield:
+  enabled: false
+  candidate_action_count: 9
+  coarse_to_fine: true
+  risk_threshold: 0.65
+  uncertainty_threshold: 0.40
+  replacement_margin: 0.05
+  prefer_closest_safe_action: true
+  fallback_action: "decelerate"
+  score_weights:
+    risk: 1.0
+    uncertainty: 0.2
+    action_distance: 0.1
+    progress: -0.05
+
+stage1:
+  episodes: 20
+  random_action_probability: 1.0
+  output_name: "risk_probe_buffer.npz"
+  audit_enabled: true
+  replay_enabled: true
+
+stage2:
+  input_stage1: null
+  input_stage4: null
+
+stage3:
+  model_name: "ppo_model.zip"
+  tensorboard_log_name: "ppo"
+
+stage4:
+  episodes: 10
+  mode: "shadow"
+  replay_enabled: true
+
+stage5:
+  paired_eval: true
+  same_seed: true
+  compare_shield_off_on: true
+  replay_enabled: true
+  episodes_per_group: 20
+  seeds: [1, 2, 3, 4, 5]
+  groups:
+    - name: "ppo"
+      forecast_features: false
+      shield: false
+    - name: "ppo_wcdt_features"
+      forecast_features: true
+      shield: false
+    - name: "ppo_shield"
+      forecast_features: false
+      shield: true
+    - name: "full_prediction_shield"
+      forecast_features: true
+      shield: true

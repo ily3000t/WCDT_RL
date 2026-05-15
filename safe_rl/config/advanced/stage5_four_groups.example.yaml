@@ -1,0 +1,18 @@
+stage5:
+  groups:
+    - name: "ppo"
+      forecast_features: false
+      shield: false
+      model_path: "safe_rl_output/runs/safe_rl_highway_merge_001/stage3/ppo_model.zip"
+    - name: "ppo_wcdt_features"
+      forecast_features: true
+      shield: false
+      model_path: "safe_rl_output/runs/safe_rl_highway_merge_forecast_001/stage3/ppo_model.zip"
+    - name: "ppo_shield"
+      forecast_features: false
+      shield: true
+      model_path: "safe_rl_output/runs/safe_rl_highway_merge_001/stage3/ppo_model.zip"
+    - name: "full_prediction_shield"
+      forecast_features: true
+      shield: true
+      model_path: "safe_rl_output/runs/safe_rl_highway_merge_forecast_001/stage3/ppo_model.zip"

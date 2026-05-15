@@ -1,0 +1,6 @@
+forecast_features:
+  enabled: true
+  use_for_ppo_observation: true
+
+rl:
+  use_wcdt_forecast_features: true
