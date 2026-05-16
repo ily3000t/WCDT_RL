@@ -166,6 +166,14 @@ prediction:
   checkpoint: "path/to/wcdt_checkpoint.pt"
 ```
 
+Stage4 采集完成后，如果要把 on-policy failure buffer 合并回 Risk Module 训练，使用：
+
+```powershell
+python -m safe_rl.pipeline.stage2_train_prediction_risk --run-id $RUN_ID --config safe_rl\config\advanced\stage2_with_stage4.yaml
+```
+
+该配置会读取同一 run 下的 `stage1/risk_probe_buffer.npz` 和 `stage4/on_policy_failure_buffer.npz`，Risk Module 使用两者拼接后的风险样本训练；WcDT predictor 仍优先使用 Stage1 的 trajectory windows。
+
 ### Stage3：PPO 强化学习训练
 
 训练 highway_merge ego agent。默认是不带 WcDT forecast features 的 PPO。
@@ -190,7 +198,7 @@ Stage3 使用 Stable-Baselines3 的 TensorBoard 记录 PPO reward、episode leng
 safe_rl/config/advanced/ppo_forecast_features.yaml
 ```
 
-然后使用单独 run id 训练：
+然后使用单独 run id 训练。注意：forecast-feature PPO 是 63 维 observation，不能复用 baseline 的 52 维 PPO；如果使用单独 run id，需要把该配置中的 `forecast_features.checkpoint` 指向 baseline run 的 `stage2/wcdt_predictor.pt`。
 
 ```powershell
 $FORECAST_RUN_ID = "safe_rl_highway_merge_forecast_001"
@@ -223,9 +231,11 @@ safe_rl_output/runs/<run_id>/stage4/tensorboard/
 python -m safe_rl.pipeline.stage4_collect_failures --run-id $RUN_ID --config safe_rl\config\advanced\stage4_intervention.yaml
 ```
 
+Stage4 report 会额外记录 action histogram、shadow would-replace rate、fallback rate、raw risk 分布和 replacement risk delta，用于判断 Shield 是否仍在过度干预。
+
 ### Stage5：Shield on/off 成对闭环安全评估
 
-使用相同 SUMO seed、相同 PPO checkpoint、相同初始交通状态，只改变 Shield 开关做 paired evaluation。
+默认命令只比较 baseline 52 维 PPO 的 `ppo` 和 `ppo_shield` 两组，使用相同 SUMO seed、相同 PPO checkpoint、相同初始交通状态，只改变 Shield 开关做 paired evaluation。
 
 ```powershell
 python -m safe_rl.pipeline.stage5_paired_eval --run-id $RUN_ID
@@ -247,6 +257,8 @@ safe_rl_output/runs/<run_id>/stage5/tensorboard/
 safe_rl/config/advanced/stage5_four_groups.example.yaml
 ```
 
+模板中的 forecast 组必须显式设置 63 维 forecast PPO 的 `model_path`，并设置 `forecast_checkpoint` 指向 Stage2 的 `wcdt_predictor.pt`。Stage5 会在评估前校验 PPO model 和环境 observation shape，不匹配会直接失败。
+
 命令：
 
 ```powershell
@@ -263,6 +275,7 @@ python -m safe_rl.pipeline.stage1_risk_probe --run-id $RUN_ID
 python -m safe_rl.pipeline.stage2_train_prediction_risk --run-id $RUN_ID
 python -m safe_rl.pipeline.stage3_train_ppo --run-id $RUN_ID
 python -m safe_rl.pipeline.stage4_collect_failures --run-id $RUN_ID
+python -m safe_rl.pipeline.stage2_train_prediction_risk --run-id $RUN_ID --config safe_rl\config\advanced\stage2_with_stage4.yaml
 python -m safe_rl.pipeline.stage5_paired_eval --run-id $RUN_ID
 ```
 
@@ -407,7 +420,7 @@ python -c "from safe_rl.utils.config import load_config; from safe_rl.sim.sumo_h
 - 离散动作空间共 9 个动作：`lateral_cmd {-1,0,+1} x accel_cmd {-1,0,+1}`。
 - PPO observation 默认包含 ego 状态、top-k 周车相对状态、merge 几何；启用 forecast features 后拼接低维预测风险特征。
 - Risk Module 同时使用显式物理风险特征和学习型 MLP 风险头。
-- Shield 默认阈值：`risk_threshold=0.65`，`uncertainty_threshold=0.40`；无安全候选时 fallback 为 keep-lane decelerate。
+- Shield V2 默认只在 raw action 风险高于 `activation_risk_threshold=0.90`、候选动作风险至少降低 `replacement_margin=0.15` 且 uncertainty 低于阈值时替换；`allow_fallback=false`，没有明显更安全候选动作时继续执行 raw action。
 
 ## 原始 WcDT 说明
 

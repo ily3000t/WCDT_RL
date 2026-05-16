@@ -1,6 +1,11 @@
 forecast_features:
   enabled: true
   use_for_ppo_observation: true
+  source: "wcdt"
+  # When this is trained under a separate forecast run id, set this to the
+  # baseline run's stage2/wcdt_predictor.pt.
+  checkpoint: null
+  allow_heuristic_fallback: false
 
 rl:
   use_wcdt_forecast_features: true

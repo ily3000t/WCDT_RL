@@ -17,13 +17,26 @@ class SafetyShield:
 
     def select_action(self, raw_action: CandidateAction, context: dict[str, Any]) -> tuple[CandidateAction, dict[str, Any]]:
         raw_prediction = self.ranker.risk_model.predict(raw_action, context)
-        if self._safe(raw_prediction):
+        activation_threshold = float(
+            self.config.shield.get("activation_risk_threshold", self.config.shield.risk_threshold)
+        )
+        if raw_prediction.risk_score < activation_threshold:
             return raw_action, self._record(raw_action, raw_action, raw_prediction, raw_prediction, "raw_safe", False)
+        if raw_prediction.risk_uncertainty >= float(self.config.shield.uncertainty_threshold):
+            return raw_action, self._record(raw_action, raw_action, raw_prediction, raw_prediction, "raw_tolerated", False)
 
         ranked = self.ranker.rank(raw_action, context)
+        margin = float(self.config.shield.get("replacement_margin", 0.15))
         for candidate, prediction, _score in ranked:
-            if self._safe(prediction):
+            if candidate.index == raw_action.index:
+                continue
+            improves_enough = prediction.risk_score <= raw_prediction.risk_score - margin
+            if improves_enough and self._safe(prediction):
                 return candidate, self._record(raw_action, candidate, raw_prediction, prediction, "replacement", False)
+
+        if not self._fallback_allowed(context):
+            reason = "fallback_disabled" if not bool(self.config.shield.get("allow_fallback", False)) else "raw_tolerated"
+            return raw_action, self._record(raw_action, raw_action, raw_prediction, raw_prediction, reason, False)
 
         fallback = self.fallback_policy.select()
         fallback_prediction = self.ranker.risk_model.predict(fallback, context)
@@ -33,6 +46,19 @@ class SafetyShield:
         return (
             prediction.risk_score < float(self.config.shield.risk_threshold)
             and prediction.risk_uncertainty < float(self.config.shield.uncertainty_threshold)
+        )
+
+    def _fallback_allowed(self, context: dict[str, Any]) -> bool:
+        if not bool(self.config.shield.get("allow_fallback", False)):
+            return False
+        metrics = context.get("current_metrics")
+        if metrics is None:
+            return False
+        min_ttc = float(getattr(metrics, "min_ttc", 1.0e6))
+        min_distance = float(getattr(metrics, "min_distance", 1.0e6))
+        return (
+            min_ttc < float(self.config.shield.get("fallback_min_ttc", 0.30))
+            or min_distance < float(self.config.shield.get("fallback_min_distance", 0.75))
         )
 
     def _record(

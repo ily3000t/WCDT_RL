@@ -16,6 +16,10 @@ def run(cfg):
     stage_log("stage3", f"model_output={stage_dir / str(cfg.stage3.model_name)}")
     env = make_env(cfg, seed=int(cfg.run.seed), shield_enabled=False)
     try:
+        observation_shape = list(env.observation_space.shape)
+        prediction_checkpoint = None
+        if env.forecast_augmentor is not None and env.forecast_augmentor.predictor is not None:
+            prediction_checkpoint = getattr(env.forecast_augmentor.predictor, "checkpoint_path", None)
         report = train_ppo(
             cfg,
             env,
@@ -26,6 +30,10 @@ def run(cfg):
         env.close()
     report["stage"] = "stage3"
     report["forecast_features_enabled"] = bool(cfg.forecast_features.enabled or cfg.rl.use_wcdt_forecast_features)
+    report["forecast_source"] = str(cfg.forecast_features.get("source", ""))
+    report["prediction_checkpoint"] = prediction_checkpoint
+    report["observation_dim"] = int(observation_shape[0]) if observation_shape else 0
+    report["observation_shape"] = observation_shape
     write_report(stage_dir / "stage3_training_report.json", report)
     stage_log("stage3", f"tensorboard={stage_dir / 'tensorboard'}")
     stage_log("stage3", f"report={stage_dir / 'stage3_training_report.json'}")

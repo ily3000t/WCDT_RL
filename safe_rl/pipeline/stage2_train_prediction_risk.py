@@ -71,6 +71,23 @@ def _stage1_path(cfg) -> Path:
     return latest_stage_file(cfg, "stage1", str(cfg.stage1.output_name))
 
 
+def _stage4_path(cfg) -> Path | None:
+    input_stage4 = cfg.stage2.get("input_stage4")
+    if not input_stage4:
+        return None
+    if str(input_stage4).lower() == "auto":
+        return latest_stage_file(cfg, "stage4", "on_policy_failure_buffer.npz")
+    return Path(input_stage4)
+
+
+def _merge_risk_buffers(stage1_data: Any, stage4_data: Any | None) -> dict[str, np.ndarray] | Any:
+    if stage4_data is None:
+        return stage1_data
+    risk_keys = ("risk_features", "actions", "overall_risk", "risk_types")
+    merged = {key: np.concatenate([stage1_data[key], stage4_data[key]], axis=0) for key in risk_keys}
+    return merged
+
+
 def _train_risk_module(
     cfg: Any,
     data: np.lib.npyio.NpzFile,
@@ -272,8 +289,11 @@ def run(cfg) -> Path:
     _configure_torch_backend(cfg, torch, device)
     stage_dir = prepare_run_dir(cfg, "stage2")
     input_path = _stage1_path(cfg)
+    input_stage4_path = _stage4_path(cfg)
     stage_log("stage2", f"run_id={cfg.run.run_id}")
     stage_log("stage2", f"input_stage1={input_path}")
+    if input_stage4_path is not None:
+        stage_log("stage2", f"input_stage4={input_stage4_path}")
     stage_log("stage2", f"output_dir={stage_dir}")
     if device.type == "cuda":
         stage_log("stage2", f"device={device} ({torch.cuda.get_device_name(device)})")
@@ -281,18 +301,25 @@ def run(cfg) -> Path:
         stage_log("stage2", f"device={device}")
     tb = TensorboardLogger(stage_dir / "tensorboard", enabled=bool(cfg.run.get("tensorboard", True)))
     data = np.load(input_path, allow_pickle=False)
+    stage4_data = np.load(input_stage4_path, allow_pickle=False) if input_stage4_path is not None else None
+    risk_data = _merge_risk_buffers(data, stage4_data)
     stage_log("stage2", f"transition_count={int(data['actions'].shape[0])}")
+    if stage4_data is not None:
+        stage_log("stage2", f"stage4_transition_count={int(stage4_data['actions'].shape[0])}")
+        stage_log("stage2", f"risk_transition_count={int(risk_data['actions'].shape[0])}")
     if "agent_history" in data:
         stage_log("stage2", f"trajectory_samples={int(data['agent_history'].shape[0])}")
     report = {
         "stage": "stage2",
         "run_id": cfg.run.run_id,
         "input_stage1": str(input_path),
+        "input_stage4": str(input_stage4_path) if input_stage4_path is not None else None,
         "transition_count": int(data["actions"].shape[0]),
+        "risk_transition_count": int(risk_data["actions"].shape[0]),
         "tensorboard": str(stage_dir / "tensorboard"),
         "device": str(device),
     }
-    report.update(_train_risk_module(cfg, data, stage_dir, tb, device))
+    report.update(_train_risk_module(cfg, risk_data, stage_dir, tb, device))
     if bool(cfg.prediction.train_enabled):
         report.update(_train_wcdt_predictor(cfg, data, stage_dir, tb, device))
     write_report(stage_dir / "stage2_training_report.json", report)

@@ -12,6 +12,16 @@ from safe_rl.utils.progress import TensorboardLogger, progress_iter, stage_log
 from safe_rl.utils.replay import write_replay_file
 
 
+def validate_model_env_observation_shape(model: Any, env: Any, model_path: str | Path) -> None:
+    model_shape = tuple(getattr(model.observation_space, "shape", ()) or ())
+    env_shape = tuple(getattr(env.observation_space, "shape", ()) or ())
+    if model_shape != env_shape:
+        raise ValueError(
+            f"PPO model observation shape {model_shape} does not match environment observation shape "
+            f"{env_shape}; model={model_path}"
+        )
+
+
 def evaluate_ppo(
     cfg: Any,
     model_path: str | Path,
@@ -27,6 +37,13 @@ def evaluate_ppo(
     if device.lower() == "gpu":
         device = "cuda"
     model = load_ppo(model_path, device=device)
+    shape_env = make_env(cfg, seed=int(seeds[0]) if seeds else int(cfg.run.seed), shield_enabled=shield_enabled, risk_checkpoint=risk_checkpoint)
+    try:
+        validate_model_env_observation_shape(model, shape_env, model_path)
+        model_observation_shape = tuple(model.observation_space.shape)
+        env_observation_shape = tuple(shape_env.observation_space.shape)
+    finally:
+        shape_env.close()
     reports: list[dict] = []
     rewards: list[float] = []
     for episode_idx, seed in enumerate(progress_iter(seeds, desc=f"Eval {group_name or 'ppo'} seeds")):
@@ -75,4 +92,9 @@ def evaluate_ppo(
     metrics["average_reward"] = float(np.mean(rewards)) if rewards else 0.0
     metrics["merge_success_rate"] = float(np.mean([float(item.get("merge_success", False)) for item in reports])) if reports else 0.0
     stage_log("stage5", f"group={group_name or 'ppo'} metrics={metrics}")
-    return {"episodes": reports, "metrics": metrics}
+    return {
+        "episodes": reports,
+        "metrics": metrics,
+        "model_observation_shape": list(model_observation_shape),
+        "env_observation_shape": list(env_observation_shape),
+    }

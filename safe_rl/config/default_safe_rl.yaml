@@ -50,6 +50,8 @@ forecast_features:
   enabled: false
   use_for_ppo_observation: false
   source: "wcdt"
+  checkpoint: null
+  allow_heuristic_fallback: false
   freeze_predictor: true
   horizon_steps: 30
   top_k_agents: 5
@@ -112,11 +114,15 @@ rl:
 
 shield:
   enabled: false
+  activation_risk_threshold: 0.90
   candidate_action_count: 9
   coarse_to_fine: true
   risk_threshold: 0.65
   uncertainty_threshold: 0.40
-  replacement_margin: 0.05
+  replacement_margin: 0.15
+  allow_fallback: false
+  fallback_min_ttc: 0.30
+  fallback_min_distance: 0.75
   prefer_closest_safe_action: true
   fallback_action: "decelerate"
   score_weights:
@@ -151,17 +157,11 @@ stage5:
   compare_shield_off_on: true
   replay_enabled: true
   episodes_per_group: 20
-  seeds: [1, 2, 3, 4, 5]
+  seeds: [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20]
   groups:
     - name: "ppo"
       forecast_features: false
       shield: false
-    - name: "ppo_wcdt_features"
-      forecast_features: true
-      shield: false
     - name: "ppo_shield"
       forecast_features: false
-      shield: true
-    - name: "full_prediction_shield"
-      forecast_features: true
       shield: true

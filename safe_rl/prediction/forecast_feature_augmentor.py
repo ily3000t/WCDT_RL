@@ -43,6 +43,8 @@ class ForecastFeatureAugmentor:
             try:
                 prediction = self.predictor.predict(context)
             except Exception:
+                if not bool(self.config.forecast_features.get("allow_heuristic_fallback", False)):
+                    raise
                 prediction = None
 
         if prediction is not None:

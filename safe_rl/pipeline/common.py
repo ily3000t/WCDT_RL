@@ -7,6 +7,8 @@ from typing import Any
 
 import numpy as np
 
+from safe_rl.prediction.forecast_feature_augmentor import ForecastFeatureAugmentor
+from safe_rl.prediction.wcdt_predictor import WcDTPredictor
 from safe_rl.risk.risk_module import RiskModuleWrapper
 from safe_rl.shield.safety_shield import SafetyShield
 from safe_rl.sim.sumo_highway_merge_env import SumoHighwayMergeEnv
@@ -53,6 +55,40 @@ def latest_stage_file(cfg: ConfigDict, stage: str, name: str) -> Path:
     return matches[0]
 
 
+def _resolve_repo_path(path: str | Path) -> Path:
+    path = Path(path)
+    return path if path.is_absolute() else REPO_ROOT / path
+
+
+def _forecast_checkpoint_path(cfg: ConfigDict) -> Path:
+    checkpoint = cfg.forecast_features.get("checkpoint")
+    if checkpoint:
+        path = _resolve_repo_path(checkpoint)
+        if path.exists():
+            return path
+        raise FileNotFoundError(f"forecast_features.checkpoint does not exist: {path}")
+    candidate = stage_file(cfg, "stage2", "wcdt_predictor.pt")
+    if candidate.exists():
+        return candidate
+    return latest_stage_file(cfg, "stage2", "wcdt_predictor.pt")
+
+
+def make_forecast_augmentor(cfg: ConfigDict) -> ForecastFeatureAugmentor | None:
+    forecast_enabled = bool(cfg.forecast_features.enabled or cfg.rl.use_wcdt_forecast_features)
+    if not forecast_enabled:
+        return None
+    source = str(cfg.forecast_features.get("source", "heuristic")).lower()
+    if source != "wcdt":
+        return ForecastFeatureAugmentor(cfg)
+    try:
+        checkpoint = _forecast_checkpoint_path(cfg)
+    except FileNotFoundError:
+        if bool(cfg.forecast_features.get("allow_heuristic_fallback", False)):
+            return ForecastFeatureAugmentor(cfg)
+        raise
+    return ForecastFeatureAugmentor(cfg, predictor=WcDTPredictor(cfg, checkpoint))
+
+
 def make_env(
     cfg: ConfigDict,
     seed: int,
@@ -66,9 +102,11 @@ def make_env(
         risk_model = RiskModuleWrapper(cfg, checkpoint=risk_checkpoint)
         shield = SafetyShield(cfg, risk_model)
         shield.enabled = True
+    forecast_augmentor = make_forecast_augmentor(cfg)
     return SumoHighwayMergeEnv(
         cfg,
         seed=seed,
+        forecast_augmentor=forecast_augmentor,
         shield=shield,
         record_trajectory_samples=record_trajectory_samples,
         sumo_step_delay_ms=sumo_step_delay_ms,

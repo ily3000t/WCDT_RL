@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from collections import Counter
 from pathlib import Path
 
 import numpy as np
@@ -21,6 +22,45 @@ def _model_path(cfg) -> Path:
 
 def _risk_path(cfg) -> Path:
     return latest_stage_file(cfg, "stage2", "risk_module.pt")
+
+
+def _array_summary(values: list[float]) -> dict:
+    if not values:
+        return {"count": 0}
+    arr = np.asarray(values, dtype=np.float32)
+    return {
+        "count": int(arr.shape[0]),
+        "min": float(np.min(arr)),
+        "mean": float(np.mean(arr)),
+        "p50": float(np.percentile(arr, 50)),
+        "p95": float(np.percentile(arr, 95)),
+        "max": float(np.max(arr)),
+    }
+
+
+def _shadow_summary(records: list[dict]) -> dict:
+    if not records:
+        return {
+            "count": 0,
+            "would_replace_rate": 0.0,
+            "fallback_rate": 0.0,
+        }
+    replacement_deltas = [
+        float(record["risk_before"]) - float(record["risk_after"])
+        for record in records
+        if bool(record.get("would_replace", False))
+    ]
+    return {
+        "count": len(records),
+        "would_replace_rate": float(np.mean([bool(record.get("would_replace", False)) for record in records])),
+        "fallback_rate": float(np.mean([bool(record.get("fallback", False)) for record in records])),
+        "reason_counts": dict(Counter(str(record.get("replacement_reason", "")) for record in records)),
+        "raw_action_counts": dict(Counter(str(record.get("raw_action_name", "")) for record in records)),
+        "final_action_counts": dict(Counter(str(record.get("final_action_name", "")) for record in records)),
+        "raw_risk": _array_summary([float(record["risk_before"]) for record in records]),
+        "final_risk": _array_summary([float(record["risk_after"]) for record in records]),
+        "replacement_risk_delta": _array_summary(replacement_deltas),
+    }
 
 
 def run(cfg) -> Path:
@@ -59,6 +99,7 @@ def run(cfg) -> Path:
         "episode_id": [],
     }
     reports: list[dict] = []
+    shadow_records: list[dict] = []
     events_path = stage_dir / "intervention_buffer.jsonl"
     replay_dir = stage_dir / "replay"
     if events_path.exists():
@@ -80,6 +121,7 @@ def run(cfg) -> Path:
                     raw_action = decode_action(action)
                     final_action, shadow_record = shadow_shield.select_action(raw_action, env.get_risk_context())
                     shadow_record["would_replace"] = final_action.index != raw_action.index
+                    shadow_records.append(shadow_record)
                 next_obs, reward, terminated, truncated, info = env.step(action)
                 episode_reward += float(reward)
                 risk_features = np.asarray(info.get("explicit_risk_features"), dtype=np.float32)
@@ -151,6 +193,9 @@ def run(cfg) -> Path:
 
     output = stage_dir / "on_policy_failure_buffer.npz"
     np.savez_compressed(output, **{key: np.asarray(value) for key, value in transitions.items()})
+    actions = np.asarray(transitions["actions"], dtype=np.int64)
+    risk_types = np.asarray(transitions["risk_types"], dtype=np.float32)
+    overall_risk = np.asarray(transitions["overall_risk"], dtype=np.float32)
     report = {
         "stage": "stage4",
         "mode": mode,
@@ -159,6 +204,19 @@ def run(cfg) -> Path:
         "replay_dir": str(replay_dir),
         "tensorboard": str(stage_dir / "tensorboard"),
         "transition_count": len(transitions["actions"]),
+        "action_histogram": {
+            str(index): int(count)
+            for index, count in enumerate(np.bincount(actions, minlength=9))
+        } if actions.size else {},
+        "overall_risk_rate": float(np.mean(overall_risk)) if overall_risk.size else 0.0,
+        "risk_type_rates": {
+            "collision": float(np.mean(risk_types[:, 0])) if risk_types.size else 0.0,
+            "near_miss": float(np.mean(risk_types[:, 1])) if risk_types.size else 0.0,
+            "low_ttc": float(np.mean(risk_types[:, 2])) if risk_types.size else 0.0,
+            "high_drac": float(np.mean(risk_types[:, 3])) if risk_types.size else 0.0,
+            "merge_conflict": float(np.mean(risk_types[:, 4])) if risk_types.size else 0.0,
+        },
+        "shadow_summary": _shadow_summary(shadow_records),
         "episodes": reports,
     }
     write_report(stage_dir / "stage4_report.json", report)
