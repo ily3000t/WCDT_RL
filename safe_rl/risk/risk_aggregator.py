@@ -12,6 +12,8 @@ def aggregate_episode_reports(reports: list[dict]) -> dict:
     ttc = np.asarray([float(report.get("ttc_p1", 1.0e6)) for report in reports], dtype=np.float32)
     drac = np.asarray([float(report.get("drac_p99", 0.0)) for report in reports], dtype=np.float32)
     interventions = np.asarray([float(report.get("intervention_count", 0)) for report in reports], dtype=np.float32)
+    shield_calls = np.asarray([float(report.get("shield_call_count", report.get("intervention_count", 0))) for report in reports], dtype=np.float32)
+    replacements = np.asarray([float(report.get("actual_replacement_count", 0)) for report in reports], dtype=np.float32)
     fallbacks = np.asarray([float(report.get("fallback_count", 0)) for report in reports], dtype=np.float32)
     return {
         "episodes": len(reports),
@@ -21,5 +23,9 @@ def aggregate_episode_reports(reports: list[dict]) -> dict:
         "ttc_p1": float(np.percentile(ttc, 1)),
         "drac_p99": float(np.percentile(drac, 99)),
         "intervention_rate": float(np.mean(interventions > 0)),
+        "shield_call_rate": float(np.mean(shield_calls > 0)),
+        "mean_shield_calls": float(np.mean(shield_calls)),
+        "actual_replacement_rate": float(np.mean(replacements > 0)),
+        "mean_actual_replacements": float(np.mean(replacements)),
         "fallback_rate": float(np.mean(fallbacks > 0)),
     }

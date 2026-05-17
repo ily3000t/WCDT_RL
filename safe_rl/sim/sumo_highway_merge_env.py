@@ -6,6 +6,7 @@ import shutil
 import sys
 import time
 import uuid
+from collections import Counter
 from pathlib import Path
 from typing import Any
 
@@ -407,6 +408,14 @@ class SumoHighwayMergeEnv(gym.Env):
         min_distances = [metric.min_distance for metric in self._episode_metrics]
         ttcs = [metric.min_ttc for metric in self._episode_metrics if metric.min_ttc < INF_TTC]
         dracs = [metric.max_drac for metric in self._episode_metrics]
+        replacement_count = sum(
+            1
+            for item in self._interventions
+            if int(item.get("final_action", item.get("raw_action", -1))) != int(item.get("raw_action", -1))
+        )
+        reason_counts = Counter(str(item.get("replacement_reason", "")) for item in self._interventions)
+        raw_actions = Counter(str(item.get("raw_action", "")) for item in self._interventions)
+        final_actions = Counter(str(item.get("final_action", "")) for item in self._interventions)
         return {
             "seed": self.seed_value,
             "steps": self._episode_step,
@@ -416,7 +425,13 @@ class SumoHighwayMergeEnv(gym.Env):
             "ttc_p1": float(np.percentile(ttcs, 1)) if ttcs else INF_TTC,
             "drac_p99": float(np.percentile(dracs, 99)) if dracs else 0.0,
             "intervention_count": len(self._interventions),
+            "shield_call_count": len(self._interventions),
+            "actual_replacement_count": replacement_count,
+            "actual_replacement_rate": float(replacement_count / len(self._interventions)) if self._interventions else 0.0,
             "fallback_count": sum(1 for item in self._interventions if item.get("fallback")),
+            "replacement_reason_counts": dict(reason_counts),
+            "raw_action_histogram": dict(raw_actions),
+            "final_action_histogram": dict(final_actions),
         }
 
     def trajectory_window_samples(self) -> tuple[np.ndarray, np.ndarray, np.ndarray]:

@@ -267,6 +267,26 @@ python -m safe_rl.pipeline.stage5_paired_eval --run-id $RUN_ID --config path\to\
 
 ## 一键顺序运行示例
 
+推荐直接使用全流程 runner。它会重建网络、做 SUMO smoke check、依次运行 Stage1/2/3/4、用 Stage4 buffer 重训 Risk Module、训练 forecast-feature PPO，并完成四组 Stage5 paired evaluation：
+
+```powershell
+python -m safe_rl.pipeline.run_full_pipeline --run-id safe_rl_highway_merge_hard_001
+```
+
+如需覆盖采样轮数和 PPO 训练步数：
+
+```powershell
+python -m safe_rl.pipeline.run_full_pipeline --run-id safe_rl_highway_merge_hard_001 --stage1-episodes 500 --ppo-timesteps 20000
+```
+
+生成的临时配置会写入：
+
+```text
+safe_rl_output/runs/<run_id>/generated_configs/
+```
+
+如果需要手动逐阶段运行，命令如下：
+
 ```powershell
 $RUN_ID = "safe_rl_highway_merge_001"
 
@@ -417,6 +437,7 @@ python -c "from safe_rl.utils.config import load_config; from safe_rl.sim.sumo_h
 ## 关键实现说明
 
 - `ego` 已改为匝道车辆，merge success 定义为进入 `main_out` 并超过配置中的 `success_min_x`。
+- 当前 `highway_merge.rou.xml` 已使用更高难度交通流：合流目标车道 lane 2 为 `1350 veh/h`，lane 1 为 `1150 veh/h`，lane 0 为 `900 veh/h`，匝道为 `650 veh/h`；地图长度和连接关系不变。
 - 离散动作空间共 9 个动作：`lateral_cmd {-1,0,+1} x accel_cmd {-1,0,+1}`。
 - PPO observation 默认包含 ego 状态、top-k 周车相对状态、merge 几何；启用 forecast features 后拼接低维预测风险特征。
 - Risk Module 同时使用显式物理风险特征和学习型 MLP 风险头。
