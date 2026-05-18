@@ -20,6 +20,8 @@ scenario:
   route_file: "scenarios/highway_merge/highway_merge.rou.xml"
   ego_id: "ego"
   sumo_binary: "sumo"
+  sumo_start_retries: 5
+  sumo_start_retry_delay: 0.25
   step_length: 0.1
   episode_seconds: 80.0
   control_interval_steps: 5

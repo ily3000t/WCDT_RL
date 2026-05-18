@@ -65,6 +65,7 @@ class SumoHighwayMergeEnv(gym.Env):
         )
 
         self.history = HistoryBuffer(self.history_steps, max_agents=self.top_k + 1)
+        self._traci_module = None
         self._traci = None
         self._conn_label = f"safe_rl_{uuid.uuid4().hex[:8]}"
         self._episode_step = 0
@@ -75,8 +76,8 @@ class SumoHighwayMergeEnv(gym.Env):
         self._trajectory_frames: list[dict[str, VehicleState]] = []
 
     def _import_traci(self):
-        if self._traci is not None:
-            return self._traci
+        if self._traci_module is not None:
+            return self._traci_module
         self._add_sumo_tools_path()
         try:
             import traci
@@ -85,7 +86,7 @@ class SumoHighwayMergeEnv(gym.Env):
                 "Running SumoHighwayMergeEnv requires SUMO Python tools. "
                 "Install/configure traci and sumolib, or activate the SAFE_RL environment."
             ) from exc
-        self._traci = traci
+        self._traci_module = traci
         return traci
 
     def _add_sumo_tools_path(self) -> None:
@@ -190,8 +191,37 @@ class SumoHighwayMergeEnv(gym.Env):
             "--collision.action",
             "warn",
         ]
-        traci.start(cmd, label=self._conn_label)
-        self._traci = traci.getConnection(self._conn_label)
+        retries = int(self.config.scenario.get("sumo_start_retries", 5))
+        delay = float(self.config.scenario.get("sumo_start_retry_delay", 0.25))
+        last_error: Exception | None = None
+        for attempt in range(max(1, retries)):
+            try:
+                self._conn_label = f"safe_rl_{uuid.uuid4().hex[:8]}"
+                traci.start(cmd, label=self._conn_label, numRetries=20)
+                self._traci = traci.getConnection(self._conn_label)
+                return
+            except Exception as exc:
+                last_error = exc
+                self._cleanup_failed_traci_start(traci)
+                time.sleep(delay * (attempt + 1))
+        raise RuntimeError(f"Failed to start SUMO after {retries} attempts: {last_error}") from last_error
+
+    def _cleanup_failed_traci_start(self, traci_module: Any) -> None:
+        try:
+            connection = traci_module.getConnection(self._conn_label)
+        except Exception:
+            connection = None
+        if connection is not None:
+            try:
+                connection.close(wait=False)
+            except Exception:
+                pass
+        try:
+            if hasattr(traci_module, "close"):
+                traci_module.close(False)
+        except Exception:
+            pass
+        self._traci = None
 
     def _close_sumo(self) -> None:
         if self._traci is None:

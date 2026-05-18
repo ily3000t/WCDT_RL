@@ -17,6 +17,7 @@ from safe_rl.shield.safety_shield import SafetyShield
 from safe_rl.sim.action_space import ACTIONS, decode_action
 from safe_rl.sim.metrics import compute_step_metrics
 from safe_rl.sim.scenario_validation import validate_scenario_geometry
+from safe_rl.sim.sumo_highway_merge_env import SumoHighwayMergeEnv
 from safe_rl.sim.types import StepMetrics, VehicleState
 from safe_rl.utils.config import load_config
 
@@ -225,3 +226,31 @@ def test_full_pipeline_generated_configs_use_forecast_model_and_checkpoint(tmp_p
     assert forecast["forecast_features"]["checkpoint"] == "safe_rl_output/runs/safe_rl_test_run/stage2/wcdt_predictor.pt"
     assert forecast["forecast_features"]["allow_heuristic_fallback"] is False
     assert forecast["rl"]["total_timesteps"] == 128
+
+
+def test_sumo_start_retries_after_transient_traci_failure(monkeypatch):
+    cfg = load_config()
+    cfg.scenario["sumo_start_retries"] = 2
+    cfg.scenario["sumo_start_retry_delay"] = 0.0
+    env = SumoHighwayMergeEnv(cfg, seed=1)
+
+    class _FakeTraci:
+        def __init__(self):
+            self.calls = 0
+
+        def start(self, _cmd, label, numRetries):
+            self.calls += 1
+            if self.calls == 1:
+                raise OSError("transient port collision")
+
+        def getConnection(self, _label):
+            return SimpleNamespace(close=lambda wait=True: None)
+
+        def close(self, wait=True):
+            return None
+
+    fake = _FakeTraci()
+    monkeypatch.setattr(env, "_import_traci", lambda: fake)
+    env._start_sumo()
+    assert fake.calls == 2
+    assert env._traci is not None
