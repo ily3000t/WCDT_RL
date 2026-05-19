@@ -9,8 +9,8 @@ import pytest
 import yaml
 
 from safe_rl.prediction.forecast_feature_augmentor import ForecastFeatureAugmentor
-from safe_rl.pipeline.run_full_pipeline import build_generated_configs
-from safe_rl.pipeline.stage5_paired_eval import _select_eval_seeds
+from safe_rl.pipeline.run_full_pipeline import build_generated_configs, resolve_forecast_sources
+from safe_rl.pipeline.stage5_paired_eval import _build_acceptance, _build_paired_delta, _select_eval_seeds
 from safe_rl.risk.merge_local import candidate_action_risk_samples, target_lane_neighbors
 from safe_rl.risk.risk_feature_extractor import extract_candidate_features
 from safe_rl.risk.risk_aggregator import aggregate_episode_reports
@@ -267,6 +267,13 @@ def test_stage5_metrics_distinguish_shield_calls_from_replacements():
     assert metrics["mean_actual_replacements"] == pytest.approx(1.0)
 
 
+def test_forecast_source_parser_rejects_conflicting_legacy_and_multi_args():
+    assert resolve_forecast_sources("constant_velocity,wcdt") == ["constant_velocity", "wcdt"]
+    assert resolve_forecast_sources(forecast_source="wcdt") == ["wcdt"]
+    with pytest.raises(ValueError, match="either"):
+        resolve_forecast_sources("wcdt", forecast_source="constant_velocity")
+
+
 def test_full_pipeline_generated_configs_use_forecast_model_and_checkpoint(tmp_path):
     configs = build_generated_configs(
         "safe_rl_test_run",
@@ -274,35 +281,138 @@ def test_full_pipeline_generated_configs_use_forecast_model_and_checkpoint(tmp_p
         stage1_episodes=2,
         ppo_timesteps=128,
     )
-    stage5 = yaml.safe_load(configs["stage5_four_groups"].read_text(encoding="utf-8"))
+    assert "forecast_cv_ppo" in configs
+    assert "forecast_wcdt_ppo" in configs
+    stage5 = yaml.safe_load(configs["stage5_multi_groups"].read_text(encoding="utf-8"))
     groups = {item["name"]: item for item in stage5["stage5"]["groups"]}
     assert stage5["stage5"]["episodes_per_group"] == 20
     assert len(stage5["stage5"]["seeds"]) == 20
     assert groups["ppo"]["model_path"] == "safe_rl_output/runs/safe_rl_test_run/stage3/ppo_model.zip"
+    assert groups["ppo_shield"]["model_path"] == "safe_rl_output/runs/safe_rl_test_run/stage3/ppo_model.zip"
     assert groups["ppo_cv_features"]["model_path"] == (
-        "safe_rl_output/runs/safe_rl_test_run_forecast/stage3/ppo_model.zip"
+        "safe_rl_output/runs/safe_rl_test_run_forecast_cv/stage3/ppo_model.zip"
     )
     assert groups["ppo_cv_features"]["forecast_source"] == "constant_velocity"
     assert "forecast_checkpoint" not in groups["ppo_cv_features"]
+    assert groups["cv_prediction_shield"]["model_path"] == (
+        "safe_rl_output/runs/safe_rl_test_run_forecast_cv/stage3/ppo_model.zip"
+    )
+    assert groups["ppo_wcdt_features"]["model_path"] == (
+        "safe_rl_output/runs/safe_rl_test_run_forecast_wcdt/stage3/ppo_model.zip"
+    )
+    assert groups["ppo_wcdt_features"]["forecast_checkpoint"] == (
+        "safe_rl_output/runs/safe_rl_test_run/stage2/wcdt_predictor.pt"
+    )
+    assert groups["wcdt_prediction_shield"]["forecast_checkpoint"] == (
+        "safe_rl_output/runs/safe_rl_test_run/stage2/wcdt_predictor.pt"
+    )
 
-    forecast = yaml.safe_load(configs["forecast_ppo"].read_text(encoding="utf-8"))
-    assert forecast["forecast_features"]["source"] == "constant_velocity"
-    assert forecast["forecast_features"]["checkpoint"] is None
-    assert forecast["forecast_features"]["allow_heuristic_fallback"] is False
-    assert forecast["rl"]["total_timesteps"] == 128
+    stage2_stage4 = yaml.safe_load(configs["stage2_with_stage4"].read_text(encoding="utf-8"))
+    assert stage2_stage4["prediction"]["train_enabled"] is False
+
+    forecast_cv = yaml.safe_load(configs["forecast_cv_ppo"].read_text(encoding="utf-8"))
+    assert forecast_cv["run"]["run_id"] == "safe_rl_test_run_forecast_cv"
+    assert forecast_cv["forecast_features"]["source"] == "constant_velocity"
+    assert forecast_cv["forecast_features"]["checkpoint"] is None
+    assert forecast_cv["forecast_features"]["allow_heuristic_fallback"] is False
+    assert forecast_cv["rl"]["total_timesteps"] == 128
+
+    forecast_wcdt = yaml.safe_load(configs["forecast_wcdt_ppo"].read_text(encoding="utf-8"))
+    assert forecast_wcdt["run"]["run_id"] == "safe_rl_test_run_forecast_wcdt"
+    assert forecast_wcdt["forecast_features"]["source"] == "wcdt"
+    assert forecast_wcdt["forecast_features"]["checkpoint"] == (
+        "safe_rl_output/runs/safe_rl_test_run/stage2/wcdt_predictor.pt"
+    )
+
+
+def test_full_pipeline_generated_configs_support_single_forecast_source(tmp_path):
+    cv_configs = build_generated_configs(
+        "safe_rl_test_run",
+        tmp_path / "cv",
+        forecast_sources=["constant_velocity"],
+    )
+    cv_stage5 = yaml.safe_load(cv_configs["stage5_multi_groups"].read_text(encoding="utf-8"))
+    cv_groups = {item["name"]: item for item in cv_stage5["stage5"]["groups"]}
+    assert "ppo_cv_features" in cv_groups
+    assert "ppo_wcdt_features" not in cv_groups
+    assert "forecast_cv_ppo" in cv_configs
+    assert "forecast_wcdt_ppo" not in cv_configs
 
     wcdt_configs = build_generated_configs(
         "safe_rl_test_run",
         tmp_path / "wcdt",
         stage1_episodes=2,
         ppo_timesteps=128,
-        forecast_source="wcdt",
+        forecast_sources=["wcdt"],
     )
-    wcdt_stage5 = yaml.safe_load(wcdt_configs["stage5_four_groups"].read_text(encoding="utf-8"))
+    wcdt_stage5 = yaml.safe_load(wcdt_configs["stage5_multi_groups"].read_text(encoding="utf-8"))
     wcdt_groups = {item["name"]: item for item in wcdt_stage5["stage5"]["groups"]}
+    assert "ppo_cv_features" not in wcdt_groups
+    assert "ppo_wcdt_features" in wcdt_groups
+    assert "forecast_cv_ppo" not in wcdt_configs
+    assert "forecast_wcdt_ppo" in wcdt_configs
     assert wcdt_groups["ppo_wcdt_features"]["forecast_checkpoint"] == (
         "safe_rl_output/runs/safe_rl_test_run/stage2/wcdt_predictor.pt"
     )
+
+
+def _fake_group(seed_rewards: list[tuple[int, float]], reward: float, near_miss: float = 0.0, min_distance: float = 5.0):
+    return {
+        "episodes": [
+            {
+                "seed": seed,
+                "episode_reward": episode_reward,
+                "min_distance": min_distance,
+                "ttc_p1": 2.0,
+                "drac_p99": 1.0,
+                "intervention_count": 0,
+                "actual_replacement_count": 0,
+                "fallback_count": 0,
+            }
+            for seed, episode_reward in seed_rewards
+        ],
+        "metrics": {
+            "average_reward": reward,
+            "near_miss_rate": near_miss,
+            "min_distance_p1": min_distance,
+            "fallback_rate": 0.0,
+        },
+    }
+
+
+def test_stage5_dynamic_paired_delta_and_acceptance_for_optional_forecast_groups():
+    reports = {
+        "ppo": _fake_group([(1, 100.0)], 100.0),
+        "ppo_shield": _fake_group([(1, 101.0)], 101.0),
+        "ppo_cv_features": _fake_group([(1, 99.0)], 99.0),
+        "cv_prediction_shield": _fake_group([(1, 100.0)], 100.0),
+        "ppo_wcdt_features": _fake_group([(1, 98.0)], 98.0),
+        "wcdt_prediction_shield": _fake_group([(1, 99.0)], 99.0),
+    }
+    paired = _build_paired_delta(reports)
+    assert set(paired) >= {
+        "ppo_vs_ppo_shield",
+        "ppo_cv_features_vs_cv_prediction_shield",
+        "ppo_wcdt_features_vs_wcdt_prediction_shield",
+        "ppo_vs_ppo_cv_features",
+        "ppo_cv_features_vs_ppo_wcdt_features",
+    }
+    acceptance = _build_acceptance(reports)
+    assert acceptance["ppo_shield"]["available"]
+    assert acceptance["cv_prediction_shield"]["available"]
+    assert acceptance["wcdt_prediction_shield"]["available"]
+    assert acceptance["forecast_cv_vs_baseline"]["available"]
+    assert acceptance["forecast_wcdt_vs_cv"]["available"]
+
+    single = {
+        "ppo": reports["ppo"],
+        "ppo_shield": reports["ppo_shield"],
+        "ppo_wcdt_features": reports["ppo_wcdt_features"],
+        "wcdt_prediction_shield": reports["wcdt_prediction_shield"],
+    }
+    single_acceptance = _build_acceptance(single)
+    assert "forecast_wcdt_vs_cv" not in single_acceptance
+    assert single_acceptance["wcdt_prediction_shield"]["available"]
 
 
 def test_sumo_start_retries_after_transient_traci_failure(monkeypatch):

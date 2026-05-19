@@ -257,13 +257,13 @@ safe_rl_output/runs/<run_id>/stage5/replay/<group>_seed_<seed>.json
 safe_rl_output/runs/<run_id>/stage5/tensorboard/
 ```
 
-如果要完整比较四组实验，建议分别训练 baseline PPO 和 forecast-feature PPO，然后复制并修改模板中的 `model_path`：
+如果要手动比较 baseline、CV forecast 和 WcDT forecast，建议分别训练 baseline PPO、CV forecast PPO、WcDT forecast PPO，然后复制并修改模板中的 `model_path`：
 
 ```text
 safe_rl/config/advanced/stage5_four_groups.example.yaml
 ```
 
-模板中的 forecast 组必须显式设置 63 维 forecast PPO 的 `model_path`。如果 `forecast_source: "wcdt"`，还要设置 `forecast_checkpoint` 指向 Stage2 的 `wcdt_predictor.pt`；如果 `forecast_source: "constant_velocity"`，不需要 checkpoint。Stage5 会在评估前校验 PPO model 和环境 observation shape，不匹配会直接失败。
+模板中的 forecast 组必须显式设置对应 63 维 forecast PPO 的 `model_path`。CV 与 WcDT 虽然 observation 都是 63 维，但 forecast feature 分布不同，应分别训练 PPO。`forecast_source: "wcdt"` 还要设置 `forecast_checkpoint` 指向 Stage2 的 `wcdt_predictor.pt`；`forecast_source: "constant_velocity"` 不需要 checkpoint。Stage5 会在评估前校验 PPO model 和环境 observation shape，不匹配会直接失败。
 
 命令：
 
@@ -273,28 +273,34 @@ python -m safe_rl.pipeline.stage5_paired_eval --run-id $RUN_ID --config path\to\
 
 ## 一键顺序运行示例
 
-推荐直接使用全流程 runner。它会重建网络、做 SUMO smoke check、依次运行 Stage1/2/3/4、用 Stage4 buffer 重训 Risk Module、训练 forecast-feature PPO，并完成四组 Stage5 paired evaluation：
+推荐直接使用全流程 runner。它会重建网络、做 SUMO smoke check、依次运行 Stage1/2/3/4、用 Stage4 buffer 重训 Risk Module，然后在同一份 Stage1/Stage4 数据、同一个 Risk Module、同一个 baseline PPO 上分别训练 CV forecast PPO 和 WcDT forecast PPO，并完成多组 Stage5 paired evaluation：
 
 ```powershell
-python -m safe_rl.pipeline.run_full_pipeline --run-id safe_rl_highway_merge_hard_001
+python -m safe_rl.pipeline.run_full_pipeline --run-id safe_rl_merge_local_001 --forecast-sources constant_velocity,wcdt
 ```
 
-runner 默认使用 `constant_velocity` forecast branch，用来先验证 forecast feature 设计本身是否有效。需要对照 WcDT 时显式指定：
+默认 `--forecast-sources` 就是 `constant_velocity,wcdt`。如果只想跑其中一个 forecast 分支：
 
 ```powershell
-python -m safe_rl.pipeline.run_full_pipeline --run-id safe_rl_highway_merge_wcdt_001 --forecast-source wcdt
+python -m safe_rl.pipeline.run_full_pipeline --run-id safe_rl_merge_local_cv_001 --forecast-sources constant_velocity
+python -m safe_rl.pipeline.run_full_pipeline --run-id safe_rl_merge_local_wcdt_001 --forecast-sources wcdt
 ```
+
+旧参数 `--forecast-source wcdt` 仍可用于单分支兼容，但不要和 `--forecast-sources` 同时使用。
 
 如需覆盖采样轮数和 PPO 训练步数：
 
 ```powershell
-python -m safe_rl.pipeline.run_full_pipeline --run-id safe_rl_highway_merge_hard_001 --stage1-episodes 500 --ppo-timesteps 20000
+python -m safe_rl.pipeline.run_full_pipeline --run-id safe_rl_merge_local_001 --stage1-episodes 500 --ppo-timesteps 20000 --forecast-sources constant_velocity,wcdt
 ```
 
 生成的临时配置会写入：
 
 ```text
 safe_rl_output/runs/<run_id>/generated_configs/
+safe_rl_output/runs/<run_id>/generated_configs/forecast_cv_ppo.yaml
+safe_rl_output/runs/<run_id>/generated_configs/forecast_wcdt_ppo.yaml
+safe_rl_output/runs/<run_id>/generated_configs/stage5_multi_groups.yaml
 ```
 
 如果需要手动逐阶段运行，命令如下：

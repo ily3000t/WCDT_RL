@@ -2,4 +2,4 @@ stage2:
   input_stage4: "auto"
 
 prediction:
-  train_enabled: true
+  train_enabled: false

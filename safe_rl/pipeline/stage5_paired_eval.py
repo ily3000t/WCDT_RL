@@ -106,9 +106,26 @@ def _shield_acceptance(baseline: dict | None, shielded: dict | None) -> dict:
     }
 
 
+def _forecast_acceptance(reference: dict | None, candidate: dict | None) -> dict:
+    if not reference or not candidate or "metrics" not in reference or "metrics" not in candidate:
+        return {"available": False, "forecast_regression": False}
+    ref = reference["metrics"]
+    item = candidate["metrics"]
+    checks = {
+        "reward_not_degraded": float(item["average_reward"]) >= float(ref["average_reward"]) - 5.0,
+        "near_miss_not_worse": float(item["near_miss_rate"]) <= float(ref["near_miss_rate"]),
+        "min_distance_not_degraded": float(item["min_distance_p1"]) >= float(ref["min_distance_p1"]) - 1.0,
+    }
+    return {
+        "available": True,
+        "checks": checks,
+        "forecast_regression": not all(checks.values()),
+    }
+
+
 def _forecast_baseline_group(group_reports: dict) -> str | None:
     for name in group_reports:
-        if name in ("ppo", "ppo_shield", "full_prediction_shield"):
+        if name in ("ppo", "ppo_shield", "full_prediction_shield") or str(name).endswith("shield"):
             continue
         report = group_reports.get(name) or {}
         if report.get("forecast_source") or int(report.get("env_observation_shape", [0])[0]) > 52:
@@ -117,6 +134,78 @@ def _forecast_baseline_group(group_reports: dict) -> str | None:
         if name not in ("ppo", "ppo_shield", "full_prediction_shield") and not str(name).endswith("shield"):
             return str(name)
     return None
+
+
+def _add_delta(target: dict, key: str, a_report: dict | None, b_report: dict | None) -> None:
+    delta = _paired_delta(a_report, b_report)
+    if delta is not None:
+        target[key] = delta
+
+
+def _build_paired_delta(group_reports: dict) -> dict:
+    paired_delta: dict = {}
+    _add_delta(paired_delta, "ppo_vs_ppo_shield", group_reports.get("ppo"), group_reports.get("ppo_shield"))
+    _add_delta(
+        paired_delta,
+        "ppo_cv_features_vs_cv_prediction_shield",
+        group_reports.get("ppo_cv_features"),
+        group_reports.get("cv_prediction_shield"),
+    )
+    _add_delta(
+        paired_delta,
+        "ppo_wcdt_features_vs_wcdt_prediction_shield",
+        group_reports.get("ppo_wcdt_features"),
+        group_reports.get("wcdt_prediction_shield"),
+    )
+    _add_delta(paired_delta, "ppo_vs_ppo_cv_features", group_reports.get("ppo"), group_reports.get("ppo_cv_features"))
+    _add_delta(
+        paired_delta,
+        "ppo_cv_features_vs_ppo_wcdt_features",
+        group_reports.get("ppo_cv_features"),
+        group_reports.get("ppo_wcdt_features"),
+    )
+    legacy_forecast = _forecast_baseline_group(group_reports)
+    if "full_prediction_shield" in group_reports and legacy_forecast:
+        _add_delta(
+            paired_delta,
+            f"{legacy_forecast}_vs_full_prediction_shield",
+            group_reports.get(legacy_forecast),
+            group_reports.get("full_prediction_shield"),
+        )
+    return paired_delta
+
+
+def _build_acceptance(group_reports: dict) -> dict:
+    acceptance: dict = {}
+    if "ppo_shield" in group_reports:
+        acceptance["ppo_shield"] = _shield_acceptance(group_reports.get("ppo"), group_reports.get("ppo_shield"))
+    if "cv_prediction_shield" in group_reports:
+        acceptance["cv_prediction_shield"] = _shield_acceptance(
+            group_reports.get("ppo_cv_features"),
+            group_reports.get("cv_prediction_shield"),
+        )
+    if "wcdt_prediction_shield" in group_reports:
+        acceptance["wcdt_prediction_shield"] = _shield_acceptance(
+            group_reports.get("ppo_wcdt_features"),
+            group_reports.get("wcdt_prediction_shield"),
+        )
+    if "ppo_cv_features" in group_reports:
+        acceptance["forecast_cv_vs_baseline"] = _forecast_acceptance(
+            group_reports.get("ppo"),
+            group_reports.get("ppo_cv_features"),
+        )
+    if "ppo_wcdt_features" in group_reports and "ppo_cv_features" in group_reports:
+        acceptance["forecast_wcdt_vs_cv"] = _forecast_acceptance(
+            group_reports.get("ppo_cv_features"),
+            group_reports.get("ppo_wcdt_features"),
+        )
+    legacy_forecast = _forecast_baseline_group(group_reports)
+    if "full_prediction_shield" in group_reports and legacy_forecast:
+        acceptance["full_prediction_shield"] = _shield_acceptance(
+            group_reports.get(legacy_forecast),
+            group_reports.get("full_prediction_shield"),
+        )
+    return acceptance
 
 
 def run(cfg) -> Path:
@@ -162,20 +251,8 @@ def run(cfg) -> Path:
     shield_off = {name: report for name, report in group_reports.items() if not name.endswith("shield")}
     shield_on = {name: report for name, report in group_reports.items() if name.endswith("shield") or name == "full_prediction_shield"}
     forecast_baseline = _forecast_baseline_group(group_reports)
-    paired_delta = {
-        "ppo_vs_ppo_shield": _paired_delta(group_reports.get("ppo"), group_reports.get("ppo_shield")),
-        f"{forecast_baseline or 'forecast_features'}_vs_full_prediction_shield": _paired_delta(
-            group_reports.get(forecast_baseline) if forecast_baseline else None,
-            group_reports.get("full_prediction_shield"),
-        ),
-    }
-    acceptance = {
-        "ppo_shield": _shield_acceptance(group_reports.get("ppo"), group_reports.get("ppo_shield")),
-        "full_prediction_shield": _shield_acceptance(
-            group_reports.get(forecast_baseline) if forecast_baseline else None,
-            group_reports.get("full_prediction_shield"),
-        ),
-    }
+    paired_delta = _build_paired_delta(group_reports)
+    acceptance = _build_acceptance(group_reports)
     write_report(stage_dir / "shield_off_metrics.json", shield_off)
     write_report(stage_dir / "shield_on_metrics.json", shield_on)
     report = {
