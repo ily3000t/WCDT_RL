@@ -303,9 +303,17 @@ def run(cfg) -> Path:
     data = np.load(input_path, allow_pickle=False)
     stage4_data = np.load(input_stage4_path, allow_pickle=False) if input_stage4_path is not None else None
     risk_data = _merge_risk_buffers(data, stage4_data)
-    stage_log("stage2", f"transition_count={int(data['actions'].shape[0])}")
+    executed_count = int(data["executed_actions"].shape[0]) if "executed_actions" in data else int(data["actions"].shape[0])
+    stage_log("stage2", f"executed_transition_count={executed_count}")
+    stage_log("stage2", f"risk_transition_count={int(data['actions'].shape[0])}")
     if stage4_data is not None:
-        stage_log("stage2", f"stage4_transition_count={int(stage4_data['actions'].shape[0])}")
+        stage4_executed = (
+            int(stage4_data["executed_actions"].shape[0])
+            if "executed_actions" in stage4_data
+            else int(stage4_data["actions"].shape[0])
+        )
+        stage_log("stage2", f"stage4_executed_transition_count={stage4_executed}")
+        stage_log("stage2", f"stage4_risk_transition_count={int(stage4_data['actions'].shape[0])}")
         stage_log("stage2", f"risk_transition_count={int(risk_data['actions'].shape[0])}")
     if "agent_history" in data:
         stage_log("stage2", f"trajectory_samples={int(data['agent_history'].shape[0])}")
@@ -314,7 +322,15 @@ def run(cfg) -> Path:
         "run_id": cfg.run.run_id,
         "input_stage1": str(input_path),
         "input_stage4": str(input_stage4_path) if input_stage4_path is not None else None,
-        "transition_count": int(data["actions"].shape[0]),
+        "transition_count": executed_count,
+        "stage1_risk_transition_count": int(data["actions"].shape[0]),
+        "stage4_transition_count": (
+            int(stage4_data["executed_actions"].shape[0])
+            if stage4_data is not None and "executed_actions" in stage4_data
+            else int(stage4_data["actions"].shape[0])
+            if stage4_data is not None
+            else 0
+        ),
         "risk_transition_count": int(risk_data["actions"].shape[0]),
         "tensorboard": str(stage_dir / "tensorboard"),
         "device": str(device),

@@ -10,6 +10,7 @@ stage5:
       forecast_features: true
       shield: false
       model_path: "safe_rl_output/runs/<forecast_run_id>/stage3/ppo_model.zip"
+      forecast_source: "wcdt"
       forecast_checkpoint: "safe_rl_output/runs/<baseline_run_id>/stage2/wcdt_predictor.pt"
     - name: "ppo_shield"
       forecast_features: false
@@ -19,4 +20,5 @@ stage5:
       forecast_features: true
       shield: true
       model_path: "safe_rl_output/runs/<forecast_run_id>/stage3/ppo_model.zip"
+      forecast_source: "wcdt"
       forecast_checkpoint: "safe_rl_output/runs/<baseline_run_id>/stage2/wcdt_predictor.pt"

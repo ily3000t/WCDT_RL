@@ -30,6 +30,10 @@ scenario:
   forecast_horizon_steps: 30
   success_edge: "main_out"
   success_min_x: 250.0
+  merge_x: 220.0
+  merge_target_lane: 2
+  merge_zone_distance: 80.0
+  merge_conflict_gap: 8.0
 
 prediction:
   enabled: true
@@ -135,6 +139,11 @@ shield:
 
 stage1:
   episodes: 500
+  action_sampling: "mixed"
+  sampling_probs:
+    random: 0.10
+    merge_heuristic: 0.60
+    risk_seek: 0.30
   random_action_probability: 1.0
   output_name: "risk_probe_buffer.npz"
   audit_enabled: true

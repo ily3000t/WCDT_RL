@@ -1,0 +1,9 @@
+forecast_features:
+  enabled: true
+  use_for_ppo_observation: true
+  source: "constant_velocity"
+  checkpoint: null
+  allow_heuristic_fallback: false
+
+rl:
+  use_wcdt_forecast_features: true

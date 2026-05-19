@@ -1,9 +1,32 @@
 from __future__ import annotations
 
+import json
+from pathlib import Path
+
+from safe_rl.prediction.forecast_feature_augmentor import ForecastFeatureAugmentor
 from safe_rl.pipeline.common import load_stage_config, make_env, parse_config_arg, write_report
 from safe_rl.rl.ppo import train_ppo
 from safe_rl.utils.config import prepare_run_dir
 from safe_rl.utils.progress import stage_log
+
+
+def _prediction_loss_summary(checkpoint: str | None) -> dict | None:
+    if not checkpoint:
+        return None
+    report_path = Path(checkpoint).parent / "stage2_training_report.json"
+    if not report_path.exists():
+        return None
+    with report_path.open("r", encoding="utf-8") as file:
+        report = json.load(file)
+    history = report.get("prediction_loss_history")
+    if not history:
+        return report.get("prediction_skip_reason") and {"prediction_skip_reason": report["prediction_skip_reason"]}
+    return {
+        "epochs": len(history),
+        "first": float(history[0]),
+        "last": float(history[-1]),
+        "min": float(min(history)),
+    }
 
 
 def run(cfg):
@@ -20,6 +43,7 @@ def run(cfg):
         prediction_checkpoint = None
         if env.forecast_augmentor is not None and env.forecast_augmentor.predictor is not None:
             prediction_checkpoint = getattr(env.forecast_augmentor.predictor, "checkpoint_path", None)
+            prediction_checkpoint = str(prediction_checkpoint) if prediction_checkpoint is not None else None
         report = train_ppo(
             cfg,
             env,
@@ -32,6 +56,12 @@ def run(cfg):
     report["forecast_features_enabled"] = bool(cfg.forecast_features.enabled or cfg.rl.use_wcdt_forecast_features)
     report["forecast_source"] = str(cfg.forecast_features.get("source", ""))
     report["prediction_checkpoint"] = prediction_checkpoint
+    report["prediction_loss_summary"] = _prediction_loss_summary(prediction_checkpoint)
+    report["forecast_feature_summary"] = {
+        "feature_dim": ForecastFeatureAugmentor.feature_dim(cfg),
+        "feature_names": list(ForecastFeatureAugmentor.FEATURE_NAMES),
+        "source": str(cfg.forecast_features.get("source", "")),
+    } if report["forecast_features_enabled"] else None
     report["observation_dim"] = int(observation_shape[0]) if observation_shape else 0
     report["observation_shape"] = observation_shape
     write_report(stage_dir / "stage3_training_report.json", report)

@@ -90,9 +90,9 @@ shield:
 
 ```text
 forecast_features=false, shield=false  -> 原始 PPO
-forecast_features=true,  shield=false  -> PPO + WcDT 预测特征
+forecast_features=true,  shield=false  -> PPO + forecast 预测特征（constant_velocity 或 WcDT）
 forecast_features=false, shield=true   -> PPO + Shield
-forecast_features=true,  shield=true   -> PPO + WcDT 预测特征 + Shield
+forecast_features=true,  shield=true   -> PPO + forecast 预测特征 + Shield
 ```
 
 ## 五阶段命令
@@ -140,7 +140,7 @@ Stage1 episodes:  50%|...
 [stage1] buffer=...
 ```
 
-Stage1 数据分布审计会统计 action 分布、risk label 分布、risk type rate、reward 分布、风险特征分位数、episode 长度和 trajectory sample 数量。
+Stage1 默认使用 mixed sampler：少量随机动作、主要 merge heuristic、部分 risk-seek 动作。风险 buffer 会对每个状态展开 9 个候选动作样本，风险标签重点关注 ego 从匝道汇入目标主路 lane 2 的 front/rear gap、ramp 局部 gap、merge-zone risk。审计会统计执行动作分布、候选动作风险分布、per-action risk rate、target-lane gap 分位数、risk type rate、reward 分布和 trajectory sample 数量。
 
 ### Stage2：WcDT-style Prediction + Risk Module 训练
 
@@ -191,6 +191,12 @@ safe_rl_output/runs/<run_id>/stage3/tensorboard/
 ```
 
 Stage3 使用 Stable-Baselines3 的 TensorBoard 记录 PPO reward、episode length、policy loss、value loss、entropy 等训练指标。
+
+如果要先训练不依赖 checkpoint 的 `PPO + constant-velocity forecast features`，使用覆盖配置：
+
+```text
+safe_rl/config/advanced/ppo_constant_velocity_features.yaml
+```
 
 如果要训练 `PPO + WcDT forecast features`，使用覆盖配置：
 
@@ -257,7 +263,7 @@ safe_rl_output/runs/<run_id>/stage5/tensorboard/
 safe_rl/config/advanced/stage5_four_groups.example.yaml
 ```
 
-模板中的 forecast 组必须显式设置 63 维 forecast PPO 的 `model_path`，并设置 `forecast_checkpoint` 指向 Stage2 的 `wcdt_predictor.pt`。Stage5 会在评估前校验 PPO model 和环境 observation shape，不匹配会直接失败。
+模板中的 forecast 组必须显式设置 63 维 forecast PPO 的 `model_path`。如果 `forecast_source: "wcdt"`，还要设置 `forecast_checkpoint` 指向 Stage2 的 `wcdt_predictor.pt`；如果 `forecast_source: "constant_velocity"`，不需要 checkpoint。Stage5 会在评估前校验 PPO model 和环境 observation shape，不匹配会直接失败。
 
 命令：
 
@@ -271,6 +277,12 @@ python -m safe_rl.pipeline.stage5_paired_eval --run-id $RUN_ID --config path\to\
 
 ```powershell
 python -m safe_rl.pipeline.run_full_pipeline --run-id safe_rl_highway_merge_hard_001
+```
+
+runner 默认使用 `constant_velocity` forecast branch，用来先验证 forecast feature 设计本身是否有效。需要对照 WcDT 时显式指定：
+
+```powershell
+python -m safe_rl.pipeline.run_full_pipeline --run-id safe_rl_highway_merge_wcdt_001 --forecast-source wcdt
 ```
 
 如需覆盖采样轮数和 PPO 训练步数：

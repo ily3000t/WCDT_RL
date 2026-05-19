@@ -13,6 +13,7 @@ from typing import Any
 import numpy as np
 
 from safe_rl.prediction.forecast_feature_augmentor import ForecastFeatureAugmentor
+from safe_rl.risk.merge_local import merge_local_stats, merge_x
 from safe_rl.shield.safety_shield import SafetyShield
 from safe_rl.sim.action_space import ACTIONS, decode_action
 from safe_rl.sim.gym_compat import gym, spaces
@@ -350,10 +351,9 @@ class SumoHighwayMergeEnv(gym.Env):
             )
         while len(neighbor_features) < self.top_k * 8:
             neighbor_features.append(0.0)
-        merge_x = 220.0
         merge_features = np.asarray(
             [
-                (merge_x - ego.x) / 300.0,
+                (merge_x(self.config) - ego.x) / 300.0,
                 (float(self.config.scenario.success_min_x) - ego.x) / 300.0,
                 self._front_gap(ego, latest) / 100.0,
                 self._rear_gap(ego, latest) / 100.0,
@@ -415,21 +415,56 @@ class SumoHighwayMergeEnv(gym.Env):
             "intervention": intervention,
         }
         if metrics is not None:
-            info.update(metrics.to_dict())
-            info["explicit_risk_features"] = explicit_risk_features(metrics)
+            latest = self.history.latest()
+            local = merge_local_stats(self._get_ego(), list(latest.values()), self.config)
+            local_metrics = StepMetrics(
+                min_distance=metrics.min_distance,
+                min_ttc=metrics.min_ttc,
+                max_drac=metrics.max_drac,
+                collision=metrics.collision,
+                near_miss=metrics.near_miss,
+                low_ttc=metrics.low_ttc,
+                high_drac=metrics.high_drac,
+                merge_gap=local.target_lane_gap,
+                lane_oob=metrics.lane_oob,
+                hard_brake=metrics.hard_brake,
+            )
+            info.update(local_metrics.to_dict())
+            info.update(
+                {
+                    "target_lane_id": local.target_lane_id,
+                    "target_front_gap": local.target_front_gap,
+                    "target_rear_gap": local.target_rear_gap,
+                    "target_lane_gap": local.target_lane_gap,
+                    "ramp_front_gap": local.ramp_front_gap,
+                    "ramp_rear_gap": local.ramp_rear_gap,
+                    "ramp_local_risk": local.ramp_local_risk,
+                    "merge_zone_risk": local.merge_zone_risk,
+                }
+            )
+            info["explicit_risk_features"] = explicit_risk_features(local_metrics)
         return info
 
     def get_risk_context(self) -> dict[str, Any]:
         latest = self.history.latest()
         ego = latest.get(self.ego_id)
         vehicles = list(latest.values())
+        local = merge_local_stats(ego, vehicles, self.config)
         return {
             "ego": ego,
             "vehicles": vehicles,
             "history": self.history,
             "config": self.config,
             "lane_count": self._lane_count(ego.edge_id) if ego is not None else 1,
-            "current_metrics": compute_step_metrics(ego, vehicles, collision=False) if ego is not None else None,
+            "current_metrics": compute_step_metrics(
+                ego,
+                vehicles,
+                collision=False,
+                near_miss_threshold=float(self.config.risk_module.near_miss_distance_threshold),
+                ttc_threshold=float(self.config.risk_module.ttc_threshold),
+                drac_threshold=float(self.config.risk_module.drac_threshold),
+            ) if ego is not None else None,
+            "merge_local": local,
         }
 
     def episode_report(self) -> dict[str, Any]:

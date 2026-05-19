@@ -4,6 +4,12 @@ from typing import Any
 
 import numpy as np
 
+from safe_rl.risk.merge_local import (
+    constant_velocity_rollout,
+    merge_local_stats,
+    merge_target_lane,
+    nearest_future_gap,
+)
 from safe_rl.sim.metrics import INF_TTC, bbox_gap, drac, merge_gap, relative_ttc
 
 
@@ -47,8 +53,11 @@ class ForecastFeatureAugmentor:
                     raise
                 prediction = None
 
-        if prediction is not None:
-            features = self._from_prediction(ego, prediction)
+        source = str(self.config.forecast_features.get("source", "heuristic")).lower()
+        if source == "constant_velocity":
+            features = self._constant_velocity_features(ego, vehicles)
+        elif prediction is not None:
+            features = self._from_prediction(ego, vehicles, prediction)
         else:
             features = self._heuristic_features(ego, vehicles)
 
@@ -84,10 +93,52 @@ class ForecastFeatureAugmentor:
             dtype=np.float32,
         )
 
-    def _from_prediction(self, ego, prediction: dict[str, Any]) -> np.ndarray:
+    def _constant_velocity_features(self, ego, vehicles) -> np.ndarray:
+        others = [vehicle for vehicle in vehicles if vehicle.vehicle_id != ego.vehicle_id]
+        if not others:
+            return np.asarray([50.0, INF_TTC, 0.0, 0.0, 0.0, 50.0, 0.0, 0.0, 0.0, 0.0, 0.0], dtype=np.float32)
+        horizon = int(self.config.forecast_features.get("horizon_steps", self.config.scenario.forecast_horizon_steps))
+        dt = float(self.config.scenario.step_length)
+        ego_rollout = constant_velocity_rollout(ego, horizon, dt)
+        other_rollouts = [constant_velocity_rollout(other, horizon, dt) for other in others]
+        min_distance, min_ttc, max_drac, nearest_dx, nearest_dy = nearest_future_gap(ego_rollout, other_rollouts, dt)
+        top_risks = []
+        for rollout in other_rollouts:
+            agent_min = min(bbox_gap(ego_rollout[idx], state) for idx, state in enumerate(rollout[: len(ego_rollout)]))
+            top_risks.append(1.0 / (1.0 + max(0.0, agent_min)))
+        top = np.sort(np.asarray(top_risks, dtype=np.float32))[::-1]
+        top = np.pad(top[:3], (0, max(0, 3 - len(top))), constant_values=0.0)
+        target_lane_gap = 50.0
+        for step_idx, ego_state in enumerate(ego_rollout):
+            step_vehicles = [
+                rollout[step_idx]
+                for rollout in other_rollouts
+                if step_idx < len(rollout) and int(rollout[step_idx].lane_index) == merge_target_lane(self.config)
+            ]
+            stats = merge_local_stats(ego_state, step_vehicles, self.config)
+            target_lane_gap = min(target_lane_gap, stats.target_lane_gap)
+        collision_probability = float(min_distance < float(self.config.risk_module.collision_distance_threshold))
+        return np.asarray(
+            [
+                float(min_distance),
+                float(min_ttc),
+                float(max_drac),
+                collision_probability,
+                0.0,
+                float(target_lane_gap),
+                float(nearest_dx),
+                float(nearest_dy),
+                float(top[0]),
+                float(top[1]),
+                float(top[2]),
+            ],
+            dtype=np.float32,
+        )
+
+    def _from_prediction(self, ego, vehicles, prediction: dict[str, Any]) -> np.ndarray:
         trajectories = prediction.get("future_trajectories")
         if trajectories is None:
-            return self._heuristic_features(ego, [])
+            return self._heuristic_features(ego, vehicles)
         if hasattr(trajectories, "detach"):
             trajectories = trajectories.detach().cpu().numpy()
         trajectories = np.asarray(trajectories)
@@ -96,7 +147,7 @@ class ForecastFeatureAugmentor:
         if trajectories.ndim == 4:
             trajectories = trajectories[:, 0]
         if trajectories.size == 0:
-            return self._heuristic_features(ego, [])
+            return self._heuristic_features(ego, vehicles)
 
         min_distance = 50.0
         min_ttc = INF_TTC
@@ -104,17 +155,28 @@ class ForecastFeatureAugmentor:
         nearest_dx = 0.0
         nearest_dy = 0.0
         top_risks: list[float] = []
+        dt = float(self.config.scenario.step_length)
+        horizon = int(min(trajectories.shape[-2], self.config.forecast_features.get("horizon_steps", trajectories.shape[-2])))
+        ego_rollout = constant_velocity_rollout(ego, horizon, dt)
         for traj in trajectories:
             agent_min = 50.0
-            for step in traj:
-                dx = float(step[0] - ego.x)
-                dy = float(step[1] - ego.y)
+            previous_distance = INF_TTC
+            for step_idx, step in enumerate(traj[:horizon]):
+                ego_future = ego_rollout[min(step_idx, len(ego_rollout) - 1)]
+                dx = float(step[0] - ego_future.x)
+                dy = float(step[1] - ego_future.y)
                 distance = max(0.0, float(np.hypot(dx, dy)) - 3.0)
                 if distance < min_distance:
                     min_distance = distance
                     nearest_dx = dx
                     nearest_dy = dy
                 agent_min = min(agent_min, distance)
+                if previous_distance < INF_TTC:
+                    closing = max(0.0, (previous_distance - distance) / max(dt, 1.0e-6))
+                    if closing > 1.0e-6:
+                        min_ttc = min(min_ttc, distance / closing)
+                        max_drac = max(max_drac, (closing * closing) / (2.0 * max(distance, 1.0e-6)))
+                previous_distance = distance
             top_risks.append(1.0 / (1.0 + agent_min))
         top = np.sort(np.asarray(top_risks, dtype=np.float32))[::-1]
         top = np.pad(top[:3], (0, max(0, 3 - len(top))), constant_values=0.0)
@@ -133,7 +195,7 @@ class ForecastFeatureAugmentor:
                 max_drac,
                 collision_probability,
                 float(uncertainty),
-                50.0,
+                min_distance,
                 nearest_dx,
                 nearest_dy,
                 float(top[0]),

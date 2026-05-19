@@ -6,11 +6,27 @@ import numpy as np
 
 from safe_rl.analysis.stage1_audit import audit_stage1_buffer
 from safe_rl.pipeline.common import json_ready, load_stage_config, make_env, parse_config_arg, write_report
+from safe_rl.risk.merge_local import candidate_action_risk_samples, merge_local_stats
 from safe_rl.risk.risk_aggregator import aggregate_episode_reports
+from safe_rl.risk.stage1_sampling import configured_sampling_probs, sampling_summary, select_stage1_action
 from safe_rl.utils.config import prepare_run_dir
 from safe_rl.utils.io import append_jsonl
 from safe_rl.utils.progress import TensorboardLogger, progress_iter, stage_log
 from safe_rl.utils.replay import write_replay_file
+
+
+def _array_summary(values: list[float]) -> dict:
+    if not values:
+        return {"count": 0}
+    arr = np.asarray(values, dtype=np.float32)
+    return {
+        "count": int(arr.shape[0]),
+        "p1": float(np.percentile(arr, 1)),
+        "p5": float(np.percentile(arr, 5)),
+        "mean": float(np.mean(arr)),
+        "p50": float(np.percentile(arr, 50)),
+        "p95": float(np.percentile(arr, 95)),
+    }
 
 
 def run(cfg) -> Path:
@@ -24,6 +40,7 @@ def run(cfg) -> Path:
     transitions: dict[str, list] = {
         "observations": [],
         "actions": [],
+        "executed_actions": [],
         "next_observations": [],
         "rewards": [],
         "dones": [],
@@ -31,6 +48,14 @@ def run(cfg) -> Path:
         "overall_risk": [],
         "risk_types": [],
         "episode_id": [],
+        "transition_episode_id": [],
+        "candidate_target_lane_gap": [],
+        "candidate_ramp_local_risk": [],
+        "candidate_merge_zone_risk": [],
+        "target_lane_gap": [],
+        "ramp_local_risk": [],
+        "merge_zone_risk": [],
+        "sampling_modes": [],
     }
     history_samples: list[np.ndarray] = []
     future_samples: list[np.ndarray] = []
@@ -51,34 +76,47 @@ def run(cfg) -> Path:
             episode_actions: list[int] = []
             episode_reward = 0.0
             while not (terminated or truncated):
-                action = int(rng.integers(0, env.action_space.n))
+                context = env.get_risk_context()
+                action, sampling_mode = select_stage1_action(cfg, rng, context)
+                candidate_samples = candidate_action_risk_samples(context)
+                candidate_by_action = {sample.action: sample for sample in candidate_samples}
+                local = merge_local_stats(context.get("ego"), list(context.get("vehicles") or []), cfg)
                 next_obs, reward, terminated, truncated, info = env.step(action)
                 episode_actions.append(action)
                 episode_reward += float(reward)
-                risk_features = np.asarray(info.get("explicit_risk_features"), dtype=np.float32)
-                if risk_features.size == 0:
-                    risk_features = np.zeros((int(cfg.risk_module.explicit_feature_dim),), dtype=np.float32)
-                risk_types = np.asarray(
+                transitions["observations"].append(obs)
+                transitions["executed_actions"].append(action)
+                transitions["next_observations"].append(next_obs)
+                transitions["rewards"].append(reward)
+                transitions["dones"].append(float(terminated or truncated))
+                transitions["transition_episode_id"].append(episode)
+                transitions["target_lane_gap"].append(local.target_lane_gap)
+                transitions["ramp_local_risk"].append(float(local.ramp_local_risk))
+                transitions["merge_zone_risk"].append(float(local.merge_zone_risk))
+                transitions["sampling_modes"].append(sampling_mode)
+                for sample in candidate_samples:
+                    transitions["actions"].append(sample.action)
+                    transitions["risk_features"].append(sample.features)
+                    transitions["overall_risk"].append(sample.overall_risk)
+                    transitions["risk_types"].append(sample.risk_types)
+                    transitions["episode_id"].append(episode)
+                    transitions["candidate_target_lane_gap"].append(sample.local_stats.target_lane_gap)
+                    transitions["candidate_ramp_local_risk"].append(float(sample.local_stats.ramp_local_risk))
+                    transitions["candidate_merge_zone_risk"].append(float(sample.local_stats.merge_zone_risk))
+                executed_sample = candidate_by_action.get(action)
+                executed_candidate_risk = float(executed_sample.overall_risk) if executed_sample is not None else 0.0
+                actual_risk_types = np.asarray(
                     [
                         float(info.get("collision", False)),
                         float(info.get("near_miss", False)),
                         float(info.get("low_ttc", False)),
                         float(info.get("high_drac", False)),
-                        float(info.get("merge_gap", 1.0e6) < 8.0),
+                        float(local.merge_zone_risk),
                     ],
                     dtype=np.float32,
                 )
-                overall = float(np.max(risk_types))
-                transitions["observations"].append(obs)
-                transitions["actions"].append(action)
-                transitions["next_observations"].append(next_obs)
-                transitions["rewards"].append(reward)
-                transitions["dones"].append(float(terminated or truncated))
-                transitions["risk_features"].append(risk_features)
-                transitions["overall_risk"].append(overall)
-                transitions["risk_types"].append(risk_types)
-                transitions["episode_id"].append(episode)
-                if overall > 0:
+                actual_overall = float(np.max(actual_risk_types))
+                if actual_overall > 0 or executed_candidate_risk > 0:
                     append_jsonl(
                         events_path,
                         json_ready(
@@ -86,12 +124,16 @@ def run(cfg) -> Path:
                                 "episode": episode,
                                 "step": info.get("step"),
                                 "action": action,
+                                "sampling_mode": sampling_mode,
+                                "executed_candidate_risk": executed_candidate_risk,
                                 "collision": info.get("collision"),
                                 "near_miss": info.get("near_miss"),
                                 "min_distance": info.get("min_distance"),
                                 "min_ttc": info.get("min_ttc"),
                                 "max_drac": info.get("max_drac"),
-                                "merge_gap": info.get("merge_gap"),
+                                "merge_gap": local.target_lane_gap,
+                                "target_front_gap": local.target_front_gap,
+                                "target_rear_gap": local.target_rear_gap,
                                 "done_reason": info.get("done_reason"),
                             }
                         ),
@@ -144,8 +186,40 @@ def run(cfg) -> Path:
         "replay_dir": str(replay_dir),
         "audit": str(stage_dir / "audit" / "stage1_data_audit.json") if audit_report else None,
         "tensorboard": str(stage_dir / "tensorboard"),
-        "transition_count": len(transitions["actions"]),
+        "transition_count": len(transitions["executed_actions"]),
+        "candidate_risk_sample_count": len(transitions["actions"]),
         "trajectory_sample_count": int(sum(item.shape[0] for item in history_samples)),
+        "action_sampling": {
+            "mode": str(cfg.stage1.get("action_sampling", "random")),
+            "configured_probs": configured_sampling_probs(cfg),
+            "actual": sampling_summary([str(item) for item in transitions["sampling_modes"]]),
+        },
+        "merge_local": {
+            "target_lane_gap": _array_summary([float(item) for item in transitions["target_lane_gap"]]),
+            "candidate_target_lane_gap": _array_summary(
+                [float(item) for item in transitions["candidate_target_lane_gap"]]
+            ),
+            "ramp_local_risk_rate": (
+                float(np.mean(np.asarray(transitions["ramp_local_risk"], dtype=np.float32)))
+                if transitions["ramp_local_risk"]
+                else 0.0
+            ),
+            "merge_zone_risk_rate": (
+                float(np.mean(np.asarray(transitions["merge_zone_risk"], dtype=np.float32)))
+                if transitions["merge_zone_risk"]
+                else 0.0
+            ),
+            "candidate_ramp_local_risk_rate": (
+                float(np.mean(np.asarray(transitions["candidate_ramp_local_risk"], dtype=np.float32)))
+                if transitions["candidate_ramp_local_risk"]
+                else 0.0
+            ),
+            "candidate_merge_zone_risk_rate": (
+                float(np.mean(np.asarray(transitions["candidate_merge_zone_risk"], dtype=np.float32)))
+                if transitions["candidate_merge_zone_risk"]
+                else 0.0
+            ),
+        },
         "metrics": aggregate_episode_reports(reports),
     }
     write_report(stage_dir / "stage1_report.json", report)

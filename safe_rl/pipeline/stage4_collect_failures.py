@@ -6,6 +6,7 @@ from pathlib import Path
 import numpy as np
 
 from safe_rl.pipeline.common import latest_stage_file, load_stage_config, make_env, parse_config_arg, write_report
+from safe_rl.risk.merge_local import candidate_action_risk_samples, merge_local_stats
 from safe_rl.risk.risk_module import RiskModuleWrapper
 from safe_rl.rl.ppo import load_ppo
 from safe_rl.shield.safety_shield import SafetyShield
@@ -90,6 +91,7 @@ def run(cfg) -> Path:
     transitions = {
         "observations": [],
         "actions": [],
+        "executed_actions": [],
         "next_observations": [],
         "rewards": [],
         "dones": [],
@@ -97,6 +99,13 @@ def run(cfg) -> Path:
         "overall_risk": [],
         "risk_types": [],
         "episode_id": [],
+        "transition_episode_id": [],
+        "candidate_target_lane_gap": [],
+        "candidate_ramp_local_risk": [],
+        "candidate_merge_zone_risk": [],
+        "target_lane_gap": [],
+        "ramp_local_risk": [],
+        "merge_zone_risk": [],
     }
     reports: list[dict] = []
     shadow_records: list[dict] = []
@@ -116,36 +125,50 @@ def run(cfg) -> Path:
                 action, _state = model.predict(obs, deterministic=True)
                 action = int(action)
                 episode_actions.append(action)
+                context = env.get_risk_context()
+                candidate_samples = candidate_action_risk_samples(context)
+                candidate_by_action = {sample.action: sample for sample in candidate_samples}
+                local = merge_local_stats(context.get("ego"), list(context.get("vehicles") or []), cfg)
                 shadow_record = None
                 if not intervention_env:
                     raw_action = decode_action(action)
-                    final_action, shadow_record = shadow_shield.select_action(raw_action, env.get_risk_context())
+                    final_action, shadow_record = shadow_shield.select_action(raw_action, context)
                     shadow_record["would_replace"] = final_action.index != raw_action.index
                     shadow_records.append(shadow_record)
                 next_obs, reward, terminated, truncated, info = env.step(action)
                 episode_reward += float(reward)
-                risk_features = np.asarray(info.get("explicit_risk_features"), dtype=np.float32)
-                risk_types = np.asarray(
+                actual_risk_types = np.asarray(
                     [
                         float(info.get("collision", False)),
                         float(info.get("near_miss", False)),
                         float(info.get("low_ttc", False)),
                         float(info.get("high_drac", False)),
-                        float(info.get("merge_gap", 1.0e6) < 8.0),
+                        float(local.merge_zone_risk),
                     ],
                     dtype=np.float32,
                 )
-                overall = float(np.max(risk_types))
+                actual_overall = float(np.max(actual_risk_types))
+                executed_sample = candidate_by_action.get(action)
+                executed_candidate_risk = float(executed_sample.overall_risk) if executed_sample is not None else 0.0
                 transitions["observations"].append(obs)
-                transitions["actions"].append(action)
+                transitions["executed_actions"].append(action)
                 transitions["next_observations"].append(next_obs)
                 transitions["rewards"].append(reward)
                 transitions["dones"].append(float(terminated or truncated))
-                transitions["risk_features"].append(risk_features)
-                transitions["overall_risk"].append(overall)
-                transitions["risk_types"].append(risk_types)
-                transitions["episode_id"].append(episode)
-                if overall > 0 or shadow_record or info.get("intervention"):
+                transitions["transition_episode_id"].append(episode)
+                transitions["target_lane_gap"].append(local.target_lane_gap)
+                transitions["ramp_local_risk"].append(float(local.ramp_local_risk))
+                transitions["merge_zone_risk"].append(float(local.merge_zone_risk))
+                for sample in candidate_samples:
+                    transitions["actions"].append(sample.action)
+                    transitions["risk_features"].append(sample.features)
+                    transitions["overall_risk"].append(sample.overall_risk)
+                    transitions["risk_types"].append(sample.risk_types)
+                    transitions["episode_id"].append(episode)
+                    transitions["candidate_target_lane_gap"].append(sample.local_stats.target_lane_gap)
+                    transitions["candidate_ramp_local_risk"].append(float(sample.local_stats.ramp_local_risk))
+                    transitions["candidate_merge_zone_risk"].append(float(sample.local_stats.merge_zone_risk))
+                if actual_overall > 0 or executed_candidate_risk > 0 or shadow_record or info.get("intervention"):
                     append_jsonl(
                         events_path,
                         {
@@ -153,6 +176,7 @@ def run(cfg) -> Path:
                             "step": info.get("step"),
                             "mode": mode,
                             "raw_action": action,
+                            "executed_candidate_risk": executed_candidate_risk,
                             "shadow": shadow_record,
                             "intervention": info.get("intervention"),
                             "outcome": {
@@ -161,6 +185,9 @@ def run(cfg) -> Path:
                                 "min_distance": info.get("min_distance"),
                                 "min_ttc": info.get("min_ttc"),
                                 "max_drac": info.get("max_drac"),
+                                "target_lane_gap": local.target_lane_gap,
+                                "target_front_gap": local.target_front_gap,
+                                "target_rear_gap": local.target_rear_gap,
                                 "done_reason": info.get("done_reason"),
                             },
                         },
@@ -194,6 +221,7 @@ def run(cfg) -> Path:
     output = stage_dir / "on_policy_failure_buffer.npz"
     np.savez_compressed(output, **{key: np.asarray(value) for key, value in transitions.items()})
     actions = np.asarray(transitions["actions"], dtype=np.int64)
+    executed_actions = np.asarray(transitions["executed_actions"], dtype=np.int64)
     risk_types = np.asarray(transitions["risk_types"], dtype=np.float32)
     overall_risk = np.asarray(transitions["overall_risk"], dtype=np.float32)
     report = {
@@ -203,8 +231,13 @@ def run(cfg) -> Path:
         "interventions": str(events_path),
         "replay_dir": str(replay_dir),
         "tensorboard": str(stage_dir / "tensorboard"),
-        "transition_count": len(transitions["actions"]),
+        "transition_count": len(transitions["executed_actions"]),
+        "candidate_risk_sample_count": len(transitions["actions"]),
         "action_histogram": {
+            str(index): int(count)
+            for index, count in enumerate(np.bincount(executed_actions, minlength=9))
+        } if executed_actions.size else {},
+        "candidate_action_histogram": {
             str(index): int(count)
             for index, count in enumerate(np.bincount(actions, minlength=9))
         } if actions.size else {},
@@ -215,6 +248,36 @@ def run(cfg) -> Path:
             "low_ttc": float(np.mean(risk_types[:, 2])) if risk_types.size else 0.0,
             "high_drac": float(np.mean(risk_types[:, 3])) if risk_types.size else 0.0,
             "merge_conflict": float(np.mean(risk_types[:, 4])) if risk_types.size else 0.0,
+        },
+        "candidate_action_risk_rate": {
+            str(index): float(np.mean(overall_risk[actions == index])) if np.any(actions == index) else 0.0
+            for index in range(9)
+        },
+        "merge_local": {
+            "target_lane_gap": _array_summary([float(item) for item in transitions["target_lane_gap"]]),
+            "candidate_target_lane_gap": _array_summary(
+                [float(item) for item in transitions["candidate_target_lane_gap"]]
+            ),
+            "ramp_local_risk_rate": (
+                float(np.mean(np.asarray(transitions["ramp_local_risk"], dtype=np.float32)))
+                if transitions["ramp_local_risk"]
+                else 0.0
+            ),
+            "merge_zone_risk_rate": (
+                float(np.mean(np.asarray(transitions["merge_zone_risk"], dtype=np.float32)))
+                if transitions["merge_zone_risk"]
+                else 0.0
+            ),
+            "candidate_ramp_local_risk_rate": (
+                float(np.mean(np.asarray(transitions["candidate_ramp_local_risk"], dtype=np.float32)))
+                if transitions["candidate_ramp_local_risk"]
+                else 0.0
+            ),
+            "candidate_merge_zone_risk_rate": (
+                float(np.mean(np.asarray(transitions["candidate_merge_zone_risk"], dtype=np.float32)))
+                if transitions["candidate_merge_zone_risk"]
+                else 0.0
+            ),
         },
         "shadow_summary": _shadow_summary(shadow_records),
         "episodes": reports,

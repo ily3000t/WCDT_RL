@@ -42,6 +42,10 @@ def audit_stage1_buffer(buffer_path: str | Path, output_dir: str | Path) -> dict
     risk_features = data["risk_features"].astype(np.float32)
 
     action_hist = {str(idx): int(np.sum(actions == idx)) for idx in range(9)}
+    per_action_risk_rate = {
+        str(idx): float(np.mean(risk[actions == idx])) if np.any(actions == idx) else 0.0
+        for idx in range(9)
+    }
     episode_transition_counts = {
         str(int(episode)): int(np.sum(episode_ids == episode)) for episode in sorted(set(episode_ids.tolist()))
     }
@@ -55,10 +59,13 @@ def audit_stage1_buffer(buffer_path: str | Path, output_dir: str | Path) -> dict
     }
     report = {
         "buffer": str(buffer_path),
-        "transition_count": int(actions.shape[0]),
+        "transition_count": int(data["executed_actions"].shape[0]) if "executed_actions" in data else int(actions.shape[0]),
+        "candidate_risk_sample_count": int(actions.shape[0]),
         "episode_count": int(len(set(episode_ids.tolist()))) if episode_ids.size else 0,
         "observation_shape": list(data["observations"].shape),
         "action_histogram": action_hist,
+        "candidate_action_histogram": action_hist,
+        "per_action_risk_rate": per_action_risk_rate,
         "episode_transition_counts": episode_transition_counts,
         "overall_risk_rate": float(np.mean(risk)) if risk.size else 0.0,
         "risk_type_rates": risk_type_rates,
@@ -66,6 +73,31 @@ def audit_stage1_buffer(buffer_path: str | Path, output_dir: str | Path) -> dict
         "risk_features": feature_stats,
         "trajectory_sample_count": int(data["agent_history"].shape[0]) if "agent_history" in data else 0,
     }
+    if "executed_actions" in data:
+        executed_actions = data["executed_actions"].astype(np.int64)
+        report["executed_action_histogram"] = {
+            str(idx): int(np.sum(executed_actions == idx)) for idx in range(9)
+        }
+    if "sampling_modes" in data:
+        modes = data["sampling_modes"].astype(str)
+        report["action_sampling"] = {
+            "counts": {mode: int(np.sum(modes == mode)) for mode in sorted(set(modes.tolist()))},
+            "proportions": {
+                mode: float(np.mean(modes == mode)) for mode in sorted(set(modes.tolist()))
+            },
+        }
+    if "target_lane_gap" in data:
+        report["target_lane_gap"] = _quantiles(data["target_lane_gap"].astype(np.float32))
+    if "candidate_target_lane_gap" in data:
+        report["candidate_target_lane_gap"] = _quantiles(data["candidate_target_lane_gap"].astype(np.float32))
+    if "ramp_local_risk" in data:
+        report["ramp_local_risk_rate"] = float(np.mean(data["ramp_local_risk"].astype(np.float32)))
+    if "merge_zone_risk" in data:
+        report["merge_zone_risk_rate"] = float(np.mean(data["merge_zone_risk"].astype(np.float32)))
+    if "candidate_ramp_local_risk" in data:
+        report["candidate_ramp_local_risk_rate"] = float(np.mean(data["candidate_ramp_local_risk"].astype(np.float32)))
+    if "candidate_merge_zone_risk" in data:
+        report["candidate_merge_zone_risk_rate"] = float(np.mean(data["candidate_merge_zone_risk"].astype(np.float32)))
 
     write_json(output_dir / "stage1_data_audit.json", report)
     with (output_dir / "stage1_action_histogram.csv").open("w", encoding="utf-8", newline="") as file:

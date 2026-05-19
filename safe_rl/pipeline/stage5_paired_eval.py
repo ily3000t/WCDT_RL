@@ -29,6 +29,8 @@ def _select_eval_seeds(cfg) -> list[int]:
 
 def _group_overrides(group) -> dict:
     forecast_overrides = {"enabled": bool(group.forecast_features)}
+    if group.get("forecast_source"):
+        forecast_overrides["source"] = str(group.forecast_source)
     if group.get("forecast_checkpoint"):
         forecast_overrides["checkpoint"] = str(group.forecast_checkpoint)
     return {
@@ -104,6 +106,19 @@ def _shield_acceptance(baseline: dict | None, shielded: dict | None) -> dict:
     }
 
 
+def _forecast_baseline_group(group_reports: dict) -> str | None:
+    for name in group_reports:
+        if name in ("ppo", "ppo_shield", "full_prediction_shield"):
+            continue
+        report = group_reports.get(name) or {}
+        if report.get("forecast_source") or int(report.get("env_observation_shape", [0])[0]) > 52:
+            return str(name)
+    for name in group_reports:
+        if name not in ("ppo", "ppo_shield", "full_prediction_shield") and not str(name).endswith("shield"):
+            return str(name)
+    return None
+
+
 def run(cfg) -> Path:
     stage_dir = prepare_run_dir(cfg, "stage5")
     seeds = _select_eval_seeds(cfg)
@@ -135,20 +150,29 @@ def run(cfg) -> Path:
             tensorboard=tb,
             tensorboard_step_offset=group_idx * max(1, len(seeds)),
         )
+        if bool(group.forecast_features):
+            group_reports[group.name]["forecast_source"] = str(
+                group.get("forecast_source", group_cfg.forecast_features.get("source", ""))
+            )
+            group_reports[group.name]["forecast_checkpoint"] = str(group_cfg.forecast_features.get("checkpoint", ""))
+        else:
+            group_reports[group.name]["forecast_source"] = ""
+            group_reports[group.name]["forecast_checkpoint"] = ""
 
     shield_off = {name: report for name, report in group_reports.items() if not name.endswith("shield")}
     shield_on = {name: report for name, report in group_reports.items() if name.endswith("shield") or name == "full_prediction_shield"}
+    forecast_baseline = _forecast_baseline_group(group_reports)
     paired_delta = {
         "ppo_vs_ppo_shield": _paired_delta(group_reports.get("ppo"), group_reports.get("ppo_shield")),
-        "ppo_wcdt_features_vs_full_prediction_shield": _paired_delta(
-            group_reports.get("ppo_wcdt_features"),
+        f"{forecast_baseline or 'forecast_features'}_vs_full_prediction_shield": _paired_delta(
+            group_reports.get(forecast_baseline) if forecast_baseline else None,
             group_reports.get("full_prediction_shield"),
         ),
     }
     acceptance = {
         "ppo_shield": _shield_acceptance(group_reports.get("ppo"), group_reports.get("ppo_shield")),
         "full_prediction_shield": _shield_acceptance(
-            group_reports.get("ppo_wcdt_features"),
+            group_reports.get(forecast_baseline) if forecast_baseline else None,
             group_reports.get("full_prediction_shield"),
         ),
     }
@@ -159,6 +183,7 @@ def run(cfg) -> Path:
         "paired_eval": bool(cfg.stage5.paired_eval),
         "seeds": seeds,
         "groups": group_reports,
+        "forecast_baseline_group": forecast_baseline,
         "paired_delta": paired_delta,
         "acceptance": acceptance,
     }

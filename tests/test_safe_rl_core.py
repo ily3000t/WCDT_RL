@@ -8,10 +8,14 @@ import numpy as np
 import pytest
 import yaml
 
+from safe_rl.prediction.forecast_feature_augmentor import ForecastFeatureAugmentor
 from safe_rl.pipeline.run_full_pipeline import build_generated_configs
 from safe_rl.pipeline.stage5_paired_eval import _select_eval_seeds
+from safe_rl.risk.merge_local import candidate_action_risk_samples, target_lane_neighbors
+from safe_rl.risk.risk_feature_extractor import extract_candidate_features
 from safe_rl.risk.risk_aggregator import aggregate_episode_reports
 from safe_rl.risk.risk_module import RiskPrediction
+from safe_rl.risk.stage1_sampling import configured_sampling_probs, sampling_summary, select_stage1_action
 from safe_rl.rl.evaluation import validate_model_env_observation_shape
 from safe_rl.shield.safety_shield import SafetyShield
 from safe_rl.sim.action_space import ACTIONS, decode_action
@@ -83,6 +87,66 @@ def test_route_file_uses_harder_traffic_distribution():
         if vehicle["route"] == "route_main" and vehicle["departLane"] == "2"
     ]
     assert len(target_lane_seeds) >= 3
+
+
+def test_stage1_mixed_sampler_configures_three_sources():
+    cfg = load_config()
+    probs = configured_sampling_probs(cfg)
+    assert cfg.stage1.action_sampling == "mixed"
+    assert probs["random"] == pytest.approx(0.10)
+    assert probs["merge_heuristic"] == pytest.approx(0.60)
+    assert probs["risk_seek"] == pytest.approx(0.30)
+    summary = sampling_summary(["random", "merge_heuristic", "merge_heuristic", "risk_seek"])
+    assert summary["counts"]["merge_heuristic"] == 2
+    assert summary["proportions"]["risk_seek"] == pytest.approx(0.25)
+
+
+def test_target_lane_front_rear_gap_uses_lane_2_only():
+    cfg = load_config()
+    ego = VehicleState("ego", 200.0, 0.0, 0.0, 20.0, 0, "ramp_0", 100.0, "ramp_in")
+    front = VehicleState("front", 215.0, 0.0, 0.0, 18.0, 2, "main_2", 215.0, "main_in")
+    rear = VehicleState("rear", 190.0, 0.0, 0.0, 22.0, 2, "main_2", 190.0, "main_in")
+    other_lane = VehicleState("other", 202.0, 0.0, 0.0, 18.0, 1, "main_1", 202.0, "main_in")
+    gaps = target_lane_neighbors(ego, [ego, front, rear, other_lane], cfg)
+    assert gaps["front_gap"] == pytest.approx(10.2)
+    assert gaps["rear_gap"] == pytest.approx(5.2)
+    assert gaps["front_rel_speed"] == pytest.approx(-2.0)
+    assert gaps["rear_rel_speed"] == pytest.approx(2.0)
+
+
+def test_candidate_action_buffer_generates_nine_samples_per_state():
+    cfg = load_config()
+    ego = VehicleState("ego", 205.0, 0.0, 0.0, 22.0, 0, "ramp_0", 120.0, "ramp_in")
+    vehicle = VehicleState("main", 212.0, 0.0, 0.0, 18.0, 2, "main_2", 212.0, "main_in")
+    context = {"ego": ego, "vehicles": [ego, vehicle], "lane_count": 1, "config": cfg}
+    samples = candidate_action_risk_samples(context)
+    assert len(samples) == 9
+    assert sorted(sample.action for sample in samples) == list(range(9))
+    assert all(sample.features.shape == (cfg.risk_module.explicit_feature_dim,) for sample in samples)
+
+
+def test_extract_candidate_features_reflects_candidate_action():
+    cfg = load_config()
+    ego = VehicleState("ego", 205.0, 0.0, 0.0, 22.0, 0, "ramp_0", 120.0, "ramp_in")
+    vehicle = VehicleState("main", 212.0, 0.0, 0.0, 18.0, 2, "main_2", 212.0, "main_in")
+    context = {"ego": ego, "vehicles": [ego, vehicle], "lane_count": 1, "config": cfg}
+    keep = extract_candidate_features(decode_action(4), context)
+    lateral_oob = extract_candidate_features(decode_action(0), context)
+    assert lateral_oob[5] == 1.0
+    assert keep[5] == 0.0
+    assert not np.allclose(keep, lateral_oob)
+
+
+def test_constant_velocity_forecast_runs_without_checkpoint():
+    cfg = load_config()
+    cfg.forecast_features["enabled"] = True
+    cfg.forecast_features["source"] = "constant_velocity"
+    cfg.forecast_features["checkpoint"] = None
+    ego = VehicleState("ego", 205.0, 0.0, 0.0, 22.0, 0, "ramp_0", 120.0, "ramp_in")
+    vehicle = VehicleState("main", 212.0, 0.0, 0.0, 18.0, 2, "main_2", 212.0, "main_in")
+    features = ForecastFeatureAugmentor(cfg).extract({"ego": ego, "vehicles": [ego, vehicle], "config": cfg})
+    assert features.shape == (ForecastFeatureAugmentor.feature_dim(cfg),)
+    assert np.all(np.isfinite(features))
 
 
 class _StaticRiskModel:
@@ -215,17 +279,30 @@ def test_full_pipeline_generated_configs_use_forecast_model_and_checkpoint(tmp_p
     assert stage5["stage5"]["episodes_per_group"] == 20
     assert len(stage5["stage5"]["seeds"]) == 20
     assert groups["ppo"]["model_path"] == "safe_rl_output/runs/safe_rl_test_run/stage3/ppo_model.zip"
-    assert groups["ppo_wcdt_features"]["model_path"] == (
+    assert groups["ppo_cv_features"]["model_path"] == (
         "safe_rl_output/runs/safe_rl_test_run_forecast/stage3/ppo_model.zip"
     )
-    assert groups["ppo_wcdt_features"]["forecast_checkpoint"] == (
-        "safe_rl_output/runs/safe_rl_test_run/stage2/wcdt_predictor.pt"
-    )
+    assert groups["ppo_cv_features"]["forecast_source"] == "constant_velocity"
+    assert "forecast_checkpoint" not in groups["ppo_cv_features"]
 
     forecast = yaml.safe_load(configs["forecast_ppo"].read_text(encoding="utf-8"))
-    assert forecast["forecast_features"]["checkpoint"] == "safe_rl_output/runs/safe_rl_test_run/stage2/wcdt_predictor.pt"
+    assert forecast["forecast_features"]["source"] == "constant_velocity"
+    assert forecast["forecast_features"]["checkpoint"] is None
     assert forecast["forecast_features"]["allow_heuristic_fallback"] is False
     assert forecast["rl"]["total_timesteps"] == 128
+
+    wcdt_configs = build_generated_configs(
+        "safe_rl_test_run",
+        tmp_path / "wcdt",
+        stage1_episodes=2,
+        ppo_timesteps=128,
+        forecast_source="wcdt",
+    )
+    wcdt_stage5 = yaml.safe_load(wcdt_configs["stage5_four_groups"].read_text(encoding="utf-8"))
+    wcdt_groups = {item["name"]: item for item in wcdt_stage5["stage5"]["groups"]}
+    assert wcdt_groups["ppo_wcdt_features"]["forecast_checkpoint"] == (
+        "safe_rl_output/runs/safe_rl_test_run/stage2/wcdt_predictor.pt"
+    )
 
 
 def test_sumo_start_retries_after_transient_traci_failure(monkeypatch):

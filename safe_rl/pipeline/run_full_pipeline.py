@@ -36,9 +36,14 @@ def build_generated_configs(
     generated_dir: str | Path,
     stage1_episodes: int | None = None,
     ppo_timesteps: int | None = None,
+    forecast_source: str = "constant_velocity",
 ) -> dict[str, Path]:
     generated_dir = Path(generated_dir)
     forecast_run_id = f"{run_id}_forecast"
+    forecast_source = str(forecast_source).lower()
+    if forecast_source not in ("constant_velocity", "wcdt"):
+        raise ValueError("forecast_source must be 'constant_velocity' or 'wcdt'")
+    forecast_group_name = "ppo_wcdt_features" if forecast_source == "wcdt" else "ppo_cv_features"
 
     main_payload: dict[str, Any] = {"run": {"run_id": run_id}}
     if stage1_episodes is not None:
@@ -51,8 +56,8 @@ def build_generated_configs(
         "forecast_features": {
             "enabled": True,
             "use_for_ppo_observation": True,
-            "source": "wcdt",
-            "checkpoint": _relative_run_path(run_id, "stage2", "wcdt_predictor.pt"),
+            "source": forecast_source,
+            "checkpoint": _relative_run_path(run_id, "stage2", "wcdt_predictor.pt") if forecast_source == "wcdt" else None,
             "allow_heuristic_fallback": False,
         },
         "rl": {"use_wcdt_forecast_features": True},
@@ -79,11 +84,11 @@ def build_generated_configs(
                     "model_path": _relative_run_path(run_id, "stage3", "ppo_model.zip"),
                 },
                 {
-                    "name": "ppo_wcdt_features",
+                    "name": forecast_group_name,
                     "forecast_features": True,
                     "shield": False,
                     "model_path": _relative_run_path(forecast_run_id, "stage3", "ppo_model.zip"),
-                    "forecast_checkpoint": _relative_run_path(run_id, "stage2", "wcdt_predictor.pt"),
+                    "forecast_source": forecast_source,
                 },
                 {
                     "name": "ppo_shield",
@@ -96,11 +101,14 @@ def build_generated_configs(
                     "forecast_features": True,
                     "shield": True,
                     "model_path": _relative_run_path(forecast_run_id, "stage3", "ppo_model.zip"),
-                    "forecast_checkpoint": _relative_run_path(run_id, "stage2", "wcdt_predictor.pt"),
+                    "forecast_source": forecast_source,
                 },
             ],
         },
     }
+    if forecast_source == "wcdt":
+        stage5_payload["stage5"]["groups"][1]["forecast_checkpoint"] = _relative_run_path(run_id, "stage2", "wcdt_predictor.pt")
+        stage5_payload["stage5"]["groups"][3]["forecast_checkpoint"] = _relative_run_path(run_id, "stage2", "wcdt_predictor.pt")
 
     return {
         "main": _write_yaml(generated_dir / "main_overrides.yaml", main_payload),
@@ -155,16 +163,22 @@ def _print_stage5_summary(run_id: str) -> None:
     print(json.dumps(metrics, ensure_ascii=False, indent=2))
 
 
-def run_full_pipeline(run_id: str, stage1_episodes: int | None = None, ppo_timesteps: int | None = None) -> Path:
+def run_full_pipeline(
+    run_id: str,
+    stage1_episodes: int | None = None,
+    ppo_timesteps: int | None = None,
+    forecast_source: str = "constant_velocity",
+) -> Path:
     bootstrap_cfg = load_config()
     bootstrap_cfg.run["run_id"] = run_id
     run_dir = prepare_run_dir(bootstrap_cfg)
     generated_dir = run_dir / "generated_configs"
-    configs = build_generated_configs(run_id, generated_dir, stage1_episodes, ppo_timesteps)
+    configs = build_generated_configs(run_id, generated_dir, stage1_episodes, ppo_timesteps, forecast_source=forecast_source)
     forecast_run_id = f"{run_id}_forecast"
 
     stage_log("full", f"run_id={run_id}")
     stage_log("full", f"forecast_run_id={forecast_run_id}")
+    stage_log("full", f"forecast_source={forecast_source}")
     stage_log("full", f"generated_configs={generated_dir}")
 
     _run_subprocess([sys.executable, str(REPO_ROOT / "scenarios" / "highway_merge" / "build_network.py")], "build network")
@@ -193,8 +207,19 @@ def main() -> None:
     parser.add_argument("--run-id", required=True, help="Baseline run id. Forecast run id is '<run-id>_forecast'.")
     parser.add_argument("--stage1-episodes", type=int, default=None, help="Optional override for Stage1 episodes.")
     parser.add_argument("--ppo-timesteps", type=int, default=None, help="Optional override for baseline and forecast PPO timesteps.")
+    parser.add_argument(
+        "--forecast-source",
+        choices=["constant_velocity", "wcdt"],
+        default="constant_velocity",
+        help="Forecast feature source for the forecast PPO branch.",
+    )
     args = parser.parse_args()
-    run_full_pipeline(args.run_id, stage1_episodes=args.stage1_episodes, ppo_timesteps=args.ppo_timesteps)
+    run_full_pipeline(
+        args.run_id,
+        stage1_episodes=args.stage1_episodes,
+        ppo_timesteps=args.ppo_timesteps,
+        forecast_source=args.forecast_source,
+    )
 
 
 if __name__ == "__main__":
