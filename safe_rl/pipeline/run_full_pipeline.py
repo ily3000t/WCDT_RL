@@ -10,6 +10,7 @@ from typing import Any
 import yaml
 
 from safe_rl.pipeline import (
+    forecast_diagnostics,
     stage1_risk_probe,
     stage2_train_prediction_risk,
     stage3_train_ppo,
@@ -270,6 +271,8 @@ def run_full_pipeline(
         stage3_train_ppo.run(_load_stage_cfg(configs[f"forecast_{_source_suffix(source)}_ppo"], forecast_run_id))
     stage_log("full", "Stage5 multi-group paired evaluation")
     stage5_paired_eval.run(_load_stage_cfg(configs["stage5_multi_groups"], run_id))
+    stage_log("full", "Forecast diagnostics")
+    forecast_diagnostics.run_forecast_diagnostics(_load_stage_cfg(configs["main"], run_id))
     _print_stage5_summary(run_id)
     return run_dir
 

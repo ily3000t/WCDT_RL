@@ -301,6 +301,7 @@ safe_rl_output/runs/<run_id>/generated_configs/
 safe_rl_output/runs/<run_id>/generated_configs/forecast_cv_ppo.yaml
 safe_rl_output/runs/<run_id>/generated_configs/forecast_wcdt_ppo.yaml
 safe_rl_output/runs/<run_id>/generated_configs/stage5_multi_groups.yaml
+safe_rl_output/runs/<run_id>/stage5/diagnostics/forecast_diagnostics.json
 ```
 
 如果需要手动逐阶段运行，命令如下：
@@ -386,6 +387,18 @@ Stage5 实验结果回放示例：
 
 ```powershell
 python -m safe_rl.tools.replay_episode --replay safe_rl_output\runs\$RUN_ID\stage5\replay\ppo_shield_seed_1.json --gui --delay-ms 200
+```
+
+Forecast diagnostics 会自动挑出 `ppo_cv_features` 中 min distance 最低的 seeds，并生成可直接运行的回放脚本：
+
+```text
+safe_rl_output/runs/<run_id>/stage5/diagnostics/replay_low_min_distance_ppo_cv_features.ps1
+```
+
+也可以对已有 run 手动补生成 forecast diagnostics：
+
+```powershell
+python -m safe_rl.pipeline.forecast_diagnostics --run-id $RUN_ID --max-samples 512 --low-seed-count 5
 ```
 
 如果机器上 `sumo-gui` 不在 `PATH` 中：

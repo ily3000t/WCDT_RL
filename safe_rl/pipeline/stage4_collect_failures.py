@@ -6,7 +6,7 @@ from pathlib import Path
 import numpy as np
 
 from safe_rl.pipeline.common import latest_stage_file, load_stage_config, make_env, parse_config_arg, write_report
-from safe_rl.risk.merge_local import candidate_action_risk_samples, merge_local_stats
+from safe_rl.risk.merge_local import candidate_action_risk_samples, candidate_sample_weight, merge_local_stats
 from safe_rl.risk.risk_module import RiskModuleWrapper
 from safe_rl.rl.ppo import load_ppo
 from safe_rl.shield.safety_shield import SafetyShield
@@ -51,16 +51,37 @@ def _shadow_summary(records: list[dict]) -> dict:
         for record in records
         if bool(record.get("would_replace", False))
     ]
+    legal_replacement_deltas = [
+        float(record["risk_before"]) - float(record["risk_after"])
+        for record in records
+        if bool(record.get("would_replace", False)) and bool(record.get("final_candidate_legal", True))
+    ]
     return {
         "count": len(records),
         "would_replace_rate": float(np.mean([bool(record.get("would_replace", False)) for record in records])),
+        "legal_candidate_would_replace_rate": float(
+            np.mean(
+                [
+                    bool(record.get("would_replace", False)) and bool(record.get("final_candidate_legal", True))
+                    for record in records
+                ]
+            )
+        ),
         "fallback_rate": float(np.mean([bool(record.get("fallback", False)) for record in records])),
+        "raw_illegal_rate": float(np.mean([not bool(record.get("raw_candidate_legal", True)) for record in records])),
+        "mean_legal_candidate_count": float(
+            np.mean([int(record.get("legal_candidate_count", 9)) for record in records])
+        ),
+        "mean_illegal_candidate_count": float(
+            np.mean([int(record.get("illegal_candidate_count", 0)) for record in records])
+        ),
         "reason_counts": dict(Counter(str(record.get("replacement_reason", "")) for record in records)),
         "raw_action_counts": dict(Counter(str(record.get("raw_action_name", "")) for record in records)),
         "final_action_counts": dict(Counter(str(record.get("final_action_name", "")) for record in records)),
         "raw_risk": _array_summary([float(record["risk_before"]) for record in records]),
         "final_risk": _array_summary([float(record["risk_after"]) for record in records]),
         "replacement_risk_delta": _array_summary(replacement_deltas),
+        "legal_replacement_risk_delta": _array_summary(legal_replacement_deltas),
     }
 
 
@@ -98,6 +119,10 @@ def run(cfg) -> Path:
         "risk_features": [],
         "overall_risk": [],
         "risk_types": [],
+        "lane_oob_risk": [],
+        "candidate_legal": [],
+        "traffic_risk": [],
+        "risk_sample_weight": [],
         "episode_id": [],
         "transition_episode_id": [],
         "candidate_target_lane_gap": [],
@@ -150,6 +175,10 @@ def run(cfg) -> Path:
                 actual_overall = float(np.max(actual_risk_types))
                 executed_sample = candidate_by_action.get(action)
                 executed_candidate_risk = float(executed_sample.overall_risk) if executed_sample is not None else 0.0
+                executed_candidate_legal = (
+                    bool(executed_sample.candidate_legal) if executed_sample is not None else True
+                )
+                executed_lane_oob_risk = float(executed_sample.lane_oob) if executed_sample is not None else 0.0
                 transitions["observations"].append(obs)
                 transitions["executed_actions"].append(action)
                 transitions["next_observations"].append(next_obs)
@@ -164,6 +193,10 @@ def run(cfg) -> Path:
                     transitions["risk_features"].append(sample.features)
                     transitions["overall_risk"].append(sample.overall_risk)
                     transitions["risk_types"].append(sample.risk_types)
+                    transitions["lane_oob_risk"].append(sample.lane_oob)
+                    transitions["candidate_legal"].append(float(sample.candidate_legal))
+                    transitions["traffic_risk"].append(sample.traffic_risk)
+                    transitions["risk_sample_weight"].append(candidate_sample_weight(sample))
                     transitions["episode_id"].append(episode)
                     transitions["candidate_target_lane_gap"].append(sample.local_stats.target_lane_gap)
                     transitions["candidate_ramp_local_risk"].append(float(sample.local_stats.ramp_local_risk))
@@ -177,6 +210,8 @@ def run(cfg) -> Path:
                             "mode": mode,
                             "raw_action": action,
                             "executed_candidate_risk": executed_candidate_risk,
+                            "executed_candidate_legal": executed_candidate_legal,
+                            "executed_lane_oob_risk": executed_lane_oob_risk,
                             "shadow": shadow_record,
                             "intervention": info.get("intervention"),
                             "outcome": {
@@ -224,6 +259,10 @@ def run(cfg) -> Path:
     executed_actions = np.asarray(transitions["executed_actions"], dtype=np.int64)
     risk_types = np.asarray(transitions["risk_types"], dtype=np.float32)
     overall_risk = np.asarray(transitions["overall_risk"], dtype=np.float32)
+    traffic_risk = np.asarray(transitions["traffic_risk"], dtype=np.float32)
+    lane_oob_risk = np.asarray(transitions["lane_oob_risk"], dtype=np.float32)
+    candidate_legal = np.asarray(transitions["candidate_legal"], dtype=np.float32) > 0.5
+    legal_risk = traffic_risk[candidate_legal]
     report = {
         "stage": "stage4",
         "mode": mode,
@@ -242,6 +281,30 @@ def run(cfg) -> Path:
             for index, count in enumerate(np.bincount(actions, minlength=9))
         } if actions.size else {},
         "overall_risk_rate": float(np.mean(overall_risk)) if overall_risk.size else 0.0,
+        "risk_labels": {
+            "overall_risk_semantics": "traffic_risk_only",
+            "overall_risk_rate": float(np.mean(overall_risk)) if overall_risk.size else 0.0,
+            "traffic_risk_rate": float(np.mean(traffic_risk)) if traffic_risk.size else 0.0,
+            "lane_oob_risk_rate": float(np.mean(lane_oob_risk)) if lane_oob_risk.size else 0.0,
+            "illegal_candidate_rate": float(np.mean(~candidate_legal)) if candidate_legal.size else 0.0,
+            "legal_candidate_risk_rate": float(np.mean(legal_risk)) if legal_risk.size else 0.0,
+            "traffic_risk_by_action": {
+                str(index): float(np.mean(traffic_risk[actions == index])) if np.any(actions == index) else 0.0
+                for index in range(9)
+            },
+            "lane_oob_by_action": {
+                str(index): float(np.mean(lane_oob_risk[actions == index])) if np.any(actions == index) else 0.0
+                for index in range(9)
+            },
+            "legal_candidate_action_risk_rate": {
+                str(index): (
+                    float(np.mean(traffic_risk[(actions == index) & candidate_legal]))
+                    if np.any((actions == index) & candidate_legal)
+                    else 0.0
+                )
+                for index in range(9)
+            },
+        },
         "risk_type_rates": {
             "collision": float(np.mean(risk_types[:, 0])) if risk_types.size else 0.0,
             "near_miss": float(np.mean(risk_types[:, 1])) if risk_types.size else 0.0,

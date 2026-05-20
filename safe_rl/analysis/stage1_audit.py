@@ -28,6 +28,32 @@ def _quantiles(values: np.ndarray) -> dict[str, float]:
     }
 
 
+def _risk_label_arrays(data: np.lib.npyio.NpzFile, risk_features: np.ndarray, risk_types: np.ndarray) -> dict[str, np.ndarray]:
+    risk = data["overall_risk"].astype(np.float32)
+    if "traffic_risk" in data:
+        traffic_risk = data["traffic_risk"].astype(np.float32)
+    elif risk_types.ndim == 2 and risk_types.shape[1] > 0:
+        traffic_risk = np.max(risk_types, axis=1).astype(np.float32)
+    else:
+        traffic_risk = risk
+    if "lane_oob_risk" in data:
+        lane_oob = data["lane_oob_risk"].astype(np.float32)
+    elif risk_features.ndim == 2 and risk_features.shape[1] > 5:
+        lane_oob = (risk_features[:, 5] > 0.5).astype(np.float32)
+    else:
+        lane_oob = np.zeros_like(traffic_risk, dtype=np.float32)
+    if "candidate_legal" in data:
+        candidate_legal = data["candidate_legal"].astype(np.float32) > 0.5
+    else:
+        candidate_legal = lane_oob <= 0.5
+    return {
+        "risk": risk,
+        "traffic_risk": traffic_risk,
+        "lane_oob": lane_oob,
+        "candidate_legal": candidate_legal,
+    }
+
+
 def audit_stage1_buffer(buffer_path: str | Path, output_dir: str | Path) -> dict[str, Any]:
     buffer_path = Path(buffer_path)
     output_dir = Path(output_dir)
@@ -36,14 +62,30 @@ def audit_stage1_buffer(buffer_path: str | Path, output_dir: str | Path) -> dict
 
     actions = data["actions"].astype(np.int64)
     rewards = data["rewards"].astype(np.float32)
-    risk = data["overall_risk"].astype(np.float32)
     risk_types = data["risk_types"].astype(np.float32)
     episode_ids = data["episode_id"].astype(np.int64)
     risk_features = data["risk_features"].astype(np.float32)
+    label_arrays = _risk_label_arrays(data, risk_features, risk_types)
+    risk = label_arrays["traffic_risk"]
+    lane_oob = label_arrays["lane_oob"]
+    candidate_legal = label_arrays["candidate_legal"].astype(bool)
+    legal_risk = risk[candidate_legal]
 
     action_hist = {str(idx): int(np.sum(actions == idx)) for idx in range(9)}
     per_action_risk_rate = {
         str(idx): float(np.mean(risk[actions == idx])) if np.any(actions == idx) else 0.0
+        for idx in range(9)
+    }
+    lane_oob_by_action = {
+        str(idx): float(np.mean(lane_oob[actions == idx])) if np.any(actions == idx) else 0.0
+        for idx in range(9)
+    }
+    legal_candidate_action_risk_rate = {
+        str(idx): (
+            float(np.mean(risk[(actions == idx) & candidate_legal]))
+            if np.any((actions == idx) & candidate_legal)
+            else 0.0
+        )
         for idx in range(9)
     }
     episode_transition_counts = {
@@ -66,8 +108,16 @@ def audit_stage1_buffer(buffer_path: str | Path, output_dir: str | Path) -> dict
         "action_histogram": action_hist,
         "candidate_action_histogram": action_hist,
         "per_action_risk_rate": per_action_risk_rate,
+        "traffic_risk_by_action": per_action_risk_rate,
+        "lane_oob_by_action": lane_oob_by_action,
+        "legal_candidate_action_risk_rate": legal_candidate_action_risk_rate,
         "episode_transition_counts": episode_transition_counts,
+        "overall_risk_semantics": "traffic_risk_only",
         "overall_risk_rate": float(np.mean(risk)) if risk.size else 0.0,
+        "traffic_risk_rate": float(np.mean(risk)) if risk.size else 0.0,
+        "lane_oob_risk_rate": float(np.mean(lane_oob)) if lane_oob.size else 0.0,
+        "illegal_candidate_rate": float(np.mean(~candidate_legal)) if candidate_legal.size else 0.0,
+        "legal_candidate_risk_rate": float(np.mean(legal_risk)) if legal_risk.size else 0.0,
         "risk_type_rates": risk_type_rates,
         "reward": _quantiles(rewards),
         "risk_features": feature_stats,

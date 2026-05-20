@@ -10,11 +10,13 @@ import yaml
 
 from safe_rl.prediction.forecast_feature_augmentor import ForecastFeatureAugmentor
 from safe_rl.pipeline.run_full_pipeline import build_generated_configs, resolve_forecast_sources
+from safe_rl.pipeline.stage2_train_prediction_risk import _configured_sample_weight, _risk_training_arrays
 from safe_rl.pipeline.stage5_paired_eval import _build_acceptance, _build_paired_delta, _select_eval_seeds
-from safe_rl.risk.merge_local import candidate_action_risk_samples, target_lane_neighbors
+from safe_rl.risk.candidate_risk_ranker import CandidateRiskRanker
+from safe_rl.risk.merge_local import candidate_action_risk_samples, is_candidate_legal, target_lane_neighbors
 from safe_rl.risk.risk_feature_extractor import extract_candidate_features
 from safe_rl.risk.risk_aggregator import aggregate_episode_reports
-from safe_rl.risk.risk_module import RiskPrediction
+from safe_rl.risk.risk_module import RiskPrediction, risk_loss
 from safe_rl.risk.stage1_sampling import configured_sampling_probs, sampling_summary, select_stage1_action
 from safe_rl.rl.evaluation import validate_model_env_observation_shape
 from safe_rl.shield.safety_shield import SafetyShield
@@ -123,6 +125,21 @@ def test_candidate_action_buffer_generates_nine_samples_per_state():
     assert len(samples) == 9
     assert sorted(sample.action for sample in samples) == list(range(9))
     assert all(sample.features.shape == (cfg.risk_module.explicit_feature_dim,) for sample in samples)
+    assert not samples[0].candidate_legal
+    assert samples[0].lane_oob == 1.0
+    assert samples[4].candidate_legal
+    assert samples[4].lane_oob == 0.0
+
+
+def test_lane_oob_is_split_from_overall_traffic_risk():
+    cfg = load_config()
+    ego = VehicleState("ego", 100.0, 0.0, 0.0, 12.0, 0, "ramp_0", 30.0, "ramp_in")
+    context = {"ego": ego, "vehicles": [ego], "lane_count": 1, "config": cfg}
+    sample = next(item for item in candidate_action_risk_samples(context) if item.action == 0)
+    assert not sample.candidate_legal
+    assert sample.lane_oob == 1.0
+    assert sample.traffic_risk == 0.0
+    assert sample.overall_risk == 0.0
 
 
 def test_extract_candidate_features_reflects_candidate_action():
@@ -189,6 +206,19 @@ def _shield_context():
     }
 
 
+def _shield_context_with_ramp_ego():
+    context = _shield_context()
+    context.update(
+        {
+            "ego": VehicleState("ego", 100.0, 0.0, 0.0, 12.0, 0, "ramp_0", 30.0, "ramp_in"),
+            "vehicles": [],
+            "lane_count": 1,
+            "config": load_config(),
+        }
+    )
+    return context
+
+
 def test_shield_keeps_raw_action_below_activation_threshold():
     cfg = _shield_cfg()
     shield = SafetyShield(cfg, _StaticRiskModel({4: 0.50}))
@@ -197,6 +227,8 @@ def test_shield_keeps_raw_action_below_activation_threshold():
     assert final.index == raw.index
     assert record["replacement_reason"] == "raw_safe"
     assert not record["fallback"]
+    assert record["raw_candidate_legal"]
+    assert record["legal_candidate_count"] == 9
 
 
 def test_shield_does_not_fallback_without_clear_safe_replacement():
@@ -217,6 +249,73 @@ def test_shield_replaces_only_when_candidate_improves_by_margin():
     assert final.index == 5
     assert record["replacement_reason"] == "replacement"
     assert record["risk_before"] - record["risk_after"] >= cfg.shield.replacement_margin
+
+
+def test_ranker_filters_illegal_candidates_on_ramp():
+    cfg = _shield_cfg()
+    context = _shield_context_with_ramp_ego()
+    context["config"] = cfg
+    ranker = CandidateRiskRanker(cfg, _StaticRiskModel({index: 0.1 for index in range(9)}))
+    ranked = ranker.rank(decode_action(4), context)
+    assert {action.index for action, _prediction, _score in ranked} == {3, 4, 5}
+    assert all(is_candidate_legal(action, context) for action, _prediction, _score in ranked)
+
+
+def test_stage2_infers_legacy_lane_oob_and_weights_from_features():
+    cfg = load_config()
+    data = {
+        "risk_features": np.asarray(
+            [
+                [0.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0],
+                [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0],
+            ],
+            dtype=np.float32,
+        ),
+        "actions": np.asarray([0, 4], dtype=np.int64),
+        "overall_risk": np.asarray([1.0, 1.0], dtype=np.float32),
+        "risk_types": np.asarray(
+            [
+                [0.0, 0.0, 0.0, 0.0, 0.0],
+                [0.0, 1.0, 0.0, 0.0, 0.0],
+            ],
+            dtype=np.float32,
+        ),
+    }
+    arrays = _risk_training_arrays(data)
+    weights = _configured_sample_weight(cfg, arrays)
+    assert arrays["lane_oob_risk"].tolist() == [1.0, 0.0]
+    assert arrays["candidate_legal"].tolist() == [0.0, 1.0]
+    assert arrays["traffic_risk"].tolist() == [0.0, 1.0]
+    assert weights[0] == pytest.approx(0.0)
+    assert weights[1] == pytest.approx(cfg.risk_module.positive_traffic_risk_weight)
+
+
+def test_risk_loss_ignores_zero_weight_samples():
+    torch = pytest.importorskip("torch")
+    output = {
+        "risk_score": torch.tensor([0.99, 0.90], dtype=torch.float32),
+        "risk_type_logits": torch.zeros((2, 5), dtype=torch.float32),
+        "risk_uncertainty": torch.zeros((2,), dtype=torch.float32),
+    }
+    labels_a = {
+        "risk_score": torch.tensor([0.0, 1.0], dtype=torch.float32),
+        "risk_types": torch.zeros((2, 5), dtype=torch.float32),
+        "sample_weight": torch.tensor([0.0, 1.0], dtype=torch.float32),
+    }
+    labels_b = {
+        "risk_score": torch.tensor([1.0, 1.0], dtype=torch.float32),
+        "risk_types": torch.tensor(
+            [
+                [1.0, 1.0, 1.0, 1.0, 1.0],
+                [0.0, 0.0, 0.0, 0.0, 0.0],
+            ],
+            dtype=torch.float32,
+        ),
+        "sample_weight": torch.tensor([0.0, 1.0], dtype=torch.float32),
+    }
+    assert risk_loss(output, labels_a, {"risk": 1.0, "calibration": 0.1}).item() == pytest.approx(
+        risk_loss(output, labels_b, {"risk": 1.0, "calibration": 0.1}).item()
+    )
 
 
 def test_stage5_rejects_insufficient_seeds():

@@ -138,10 +138,34 @@ class RiskModuleWrapper:
         )
 
 
+def _weighted_mean(values: Any, sample_weight: Any | None = None) -> Any:
+    if sample_weight is None:
+        return values.mean()
+    sample_weight = sample_weight.float()
+    if values.ndim > sample_weight.ndim:
+        sample_weight = sample_weight.view(sample_weight.shape[0], *([1] * (values.ndim - 1)))
+    weighted = values * sample_weight
+    denom = sample_weight.sum() * (values.numel() / max(values.shape[0], 1))
+    if float(denom.detach().cpu()) <= 1.0e-8:
+        return values.sum() * 0.0
+    return weighted.sum() / denom
+
+
 def risk_loss(output: dict[str, Any], labels: dict[str, Any], weights: dict[str, float]) -> Any:
     if torch is None or F is None:
         raise ImportError("risk_loss requires torch.")
-    risk = F.binary_cross_entropy(output["risk_score"], labels["risk_score"].float())
-    type_loss = F.binary_cross_entropy_with_logits(output["risk_type_logits"], labels["risk_types"].float())
-    calib = F.mse_loss(output["risk_uncertainty"], torch.abs(output["risk_score"].detach() - labels["risk_score"].float()))
+    sample_weight = labels.get("sample_weight")
+    target = labels["risk_score"].float()
+    risk = _weighted_mean(
+        F.binary_cross_entropy(output["risk_score"], target, reduction="none"),
+        sample_weight,
+    )
+    type_loss = _weighted_mean(
+        F.binary_cross_entropy_with_logits(output["risk_type_logits"], labels["risk_types"].float(), reduction="none"),
+        sample_weight,
+    )
+    calib = _weighted_mean(
+        torch.square(output["risk_uncertainty"] - torch.abs(output["risk_score"].detach() - target)),
+        sample_weight,
+    )
     return weights.get("risk", 1.0) * (risk + type_loss) + weights.get("calibration", 0.1) * calib

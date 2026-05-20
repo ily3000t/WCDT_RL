@@ -6,7 +6,7 @@ import numpy as np
 
 from safe_rl.analysis.stage1_audit import audit_stage1_buffer
 from safe_rl.pipeline.common import json_ready, load_stage_config, make_env, parse_config_arg, write_report
-from safe_rl.risk.merge_local import candidate_action_risk_samples, merge_local_stats
+from safe_rl.risk.merge_local import candidate_action_risk_samples, candidate_sample_weight, merge_local_stats
 from safe_rl.risk.risk_aggregator import aggregate_episode_reports
 from safe_rl.risk.stage1_sampling import configured_sampling_probs, sampling_summary, select_stage1_action
 from safe_rl.utils.config import prepare_run_dir
@@ -47,6 +47,10 @@ def run(cfg) -> Path:
         "risk_features": [],
         "overall_risk": [],
         "risk_types": [],
+        "lane_oob_risk": [],
+        "candidate_legal": [],
+        "traffic_risk": [],
+        "risk_sample_weight": [],
         "episode_id": [],
         "transition_episode_id": [],
         "candidate_target_lane_gap": [],
@@ -99,12 +103,20 @@ def run(cfg) -> Path:
                     transitions["risk_features"].append(sample.features)
                     transitions["overall_risk"].append(sample.overall_risk)
                     transitions["risk_types"].append(sample.risk_types)
+                    transitions["lane_oob_risk"].append(sample.lane_oob)
+                    transitions["candidate_legal"].append(float(sample.candidate_legal))
+                    transitions["traffic_risk"].append(sample.traffic_risk)
+                    transitions["risk_sample_weight"].append(candidate_sample_weight(sample))
                     transitions["episode_id"].append(episode)
                     transitions["candidate_target_lane_gap"].append(sample.local_stats.target_lane_gap)
                     transitions["candidate_ramp_local_risk"].append(float(sample.local_stats.ramp_local_risk))
                     transitions["candidate_merge_zone_risk"].append(float(sample.local_stats.merge_zone_risk))
                 executed_sample = candidate_by_action.get(action)
                 executed_candidate_risk = float(executed_sample.overall_risk) if executed_sample is not None else 0.0
+                executed_candidate_legal = (
+                    bool(executed_sample.candidate_legal) if executed_sample is not None else True
+                )
+                executed_lane_oob_risk = float(executed_sample.lane_oob) if executed_sample is not None else 0.0
                 actual_risk_types = np.asarray(
                     [
                         float(info.get("collision", False)),
@@ -126,6 +138,8 @@ def run(cfg) -> Path:
                                 "action": action,
                                 "sampling_mode": sampling_mode,
                                 "executed_candidate_risk": executed_candidate_risk,
+                                "executed_candidate_legal": executed_candidate_legal,
+                                "executed_lane_oob_risk": executed_lane_oob_risk,
                                 "collision": info.get("collision"),
                                 "near_miss": info.get("near_miss"),
                                 "min_distance": info.get("min_distance"),
@@ -178,6 +192,11 @@ def run(cfg) -> Path:
     if bool(cfg.stage1.get("audit_enabled", True)):
         audit_report = audit_stage1_buffer(output, stage_dir / "audit")
         stage_log("stage1", f"audit={stage_dir / 'audit' / 'stage1_data_audit.json'}")
+    candidate_actions = np.asarray(transitions["actions"], dtype=np.int64)
+    traffic_risk = np.asarray(transitions["traffic_risk"], dtype=np.float32)
+    lane_oob_risk = np.asarray(transitions["lane_oob_risk"], dtype=np.float32)
+    candidate_legal = np.asarray(transitions["candidate_legal"], dtype=np.float32) > 0.5
+    legal_risk = traffic_risk[candidate_legal]
     report = {
         "stage": "stage1",
         "run_id": cfg.run.run_id,
@@ -219,6 +238,38 @@ def run(cfg) -> Path:
                 if transitions["candidate_merge_zone_risk"]
                 else 0.0
             ),
+        },
+        "risk_labels": {
+            "overall_risk_semantics": "traffic_risk_only",
+            "overall_risk_rate": float(np.mean(traffic_risk)) if traffic_risk.size else 0.0,
+            "traffic_risk_rate": float(np.mean(traffic_risk)) if traffic_risk.size else 0.0,
+            "lane_oob_risk_rate": float(np.mean(lane_oob_risk)) if lane_oob_risk.size else 0.0,
+            "illegal_candidate_rate": float(np.mean(~candidate_legal)) if candidate_legal.size else 0.0,
+            "legal_candidate_risk_rate": float(np.mean(legal_risk)) if legal_risk.size else 0.0,
+            "traffic_risk_by_action": {
+                str(index): (
+                    float(np.mean(traffic_risk[candidate_actions == index]))
+                    if np.any(candidate_actions == index)
+                    else 0.0
+                )
+                for index in range(9)
+            },
+            "lane_oob_by_action": {
+                str(index): (
+                    float(np.mean(lane_oob_risk[candidate_actions == index]))
+                    if np.any(candidate_actions == index)
+                    else 0.0
+                )
+                for index in range(9)
+            },
+            "legal_candidate_action_risk_rate": {
+                str(index): (
+                    float(np.mean(traffic_risk[(candidate_actions == index) & candidate_legal]))
+                    if np.any((candidate_actions == index) & candidate_legal)
+                    else 0.0
+                )
+                for index in range(9)
+            },
         },
         "metrics": aggregate_episode_reports(reports),
     }

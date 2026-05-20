@@ -19,7 +19,39 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--delay-ms", type=float, default=0.0, help="Sleep after each SUMO simulation step for smooth GUI playback.")
     parser.add_argument("--control-delay-ms", type=float, default=0.0, help="Additional sleep between recorded RL control actions.")
     parser.add_argument("--risk-checkpoint", default=None, help="Override risk checkpoint for shield-enabled replays.")
+    parser.add_argument(
+        "--ego-color",
+        default="255,0,0,255",
+        help="RGBA color for the replay ego vehicle. Use an empty string to disable.",
+    )
     return parser.parse_args()
+
+
+def _parse_rgba(value: str) -> tuple[int, int, int, int] | None:
+    if not value:
+        return None
+    parts = [part.strip() for part in value.split(",")]
+    if len(parts) not in (3, 4):
+        raise ValueError("--ego-color must be R,G,B or R,G,B,A")
+    channels = [int(part) for part in parts]
+    if len(channels) == 3:
+        channels.append(255)
+    if any(channel < 0 or channel > 255 for channel in channels):
+        raise ValueError("--ego-color channels must be in [0, 255]")
+    return tuple(channels)  # type: ignore[return-value]
+
+
+def _color_ego(env, rgba: tuple[int, int, int, int] | None) -> None:
+    if rgba is None:
+        return
+    traci = getattr(env, "_traci", None)
+    if traci is None:
+        return
+    try:
+        if env.ego_id in traci.vehicle.getIDList():
+            traci.vehicle.setColor(env.ego_id, rgba)
+    except Exception:
+        return
 
 
 def run() -> None:
@@ -39,6 +71,7 @@ def run() -> None:
     seed = int(replay["seed"])
     shield_enabled = bool(replay.get("shield_enabled", False))
     risk_checkpoint = args.risk_checkpoint or replay.get("risk_checkpoint")
+    ego_color = _parse_rgba(str(args.ego_color))
     stage_log("replay", f"file={replay_path}")
     stage_log("replay", f"stage={replay.get('stage')} episode={replay.get('episode')} seed={seed}")
     stage_log("replay", f"sumo_binary={cfg.scenario.sumo_binary} shield={shield_enabled}")
@@ -53,11 +86,13 @@ def run() -> None:
     )
     try:
         obs, _info = env.reset(seed=seed)
+        _color_ego(env, ego_color)
         terminated = truncated = False
         for step, action in enumerate(actions):
             if terminated or truncated:
                 break
             obs, reward, terminated, truncated, info = env.step(action)
+            _color_ego(env, ego_color)
             stage_log(
                 "replay",
                 f"step={step} action={action} reward={float(reward):.3f} "

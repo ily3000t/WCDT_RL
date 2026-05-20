@@ -15,10 +15,17 @@ def _prediction_loss_summary(checkpoint: str | None) -> dict | None:
         return None
     report_path = Path(checkpoint).parent / "stage2_training_report.json"
     if not report_path.exists():
-        return None
+        return _prediction_loss_summary_from_checkpoint(checkpoint)
     with report_path.open("r", encoding="utf-8") as file:
         report = json.load(file)
     history = report.get("prediction_loss_history")
+    if not history:
+        initial_path = report.get("initial_prediction_report")
+        if initial_path and Path(initial_path).exists():
+            with Path(initial_path).open("r", encoding="utf-8") as file:
+                history = json.load(file).get("prediction_loss_history")
+    if not history:
+        return _prediction_loss_summary_from_checkpoint(checkpoint)
     if not history:
         return report.get("prediction_skip_reason") and {"prediction_skip_reason": report["prediction_skip_reason"]}
     return {
@@ -26,6 +33,26 @@ def _prediction_loss_summary(checkpoint: str | None) -> dict | None:
         "first": float(history[0]),
         "last": float(history[-1]),
         "min": float(min(history)),
+    }
+
+
+def _prediction_loss_summary_from_checkpoint(checkpoint: str) -> dict | None:
+    try:
+        import torch
+        payload = torch.load(checkpoint, map_location="cpu")
+    except Exception:
+        return None
+    if not isinstance(payload, dict):
+        return None
+    history = payload.get("loss_history")
+    if not history:
+        return None
+    return {
+        "epochs": len(history),
+        "first": float(history[0]),
+        "last": float(history[-1]),
+        "min": float(min(history)),
+        "source": "checkpoint",
     }
 
 

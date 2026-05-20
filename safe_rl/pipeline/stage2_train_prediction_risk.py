@@ -65,6 +65,17 @@ def _cpu_state_dict(model: Any) -> dict[str, Any]:
     return {key: value.detach().cpu() for key, value in model.state_dict().items()}
 
 
+def _prediction_loss_summary(history: list[float] | None) -> dict | None:
+    if not history:
+        return None
+    return {
+        "epochs": len(history),
+        "first": float(history[0]),
+        "last": float(history[-1]),
+        "min": float(min(history)),
+    }
+
+
 def _stage1_path(cfg) -> Path:
     if cfg.stage2.input_stage1:
         return Path(cfg.stage2.input_stage1)
@@ -83,9 +94,144 @@ def _stage4_path(cfg) -> Path | None:
 def _merge_risk_buffers(stage1_data: Any, stage4_data: Any | None) -> dict[str, np.ndarray] | Any:
     if stage4_data is None:
         return stage1_data
-    risk_keys = ("risk_features", "actions", "overall_risk", "risk_types")
-    merged = {key: np.concatenate([stage1_data[key], stage4_data[key]], axis=0) for key in risk_keys}
+    risk_keys = (
+        "risk_features",
+        "actions",
+        "overall_risk",
+        "risk_types",
+        "lane_oob_risk",
+        "candidate_legal",
+        "traffic_risk",
+        "risk_sample_weight",
+    )
+    stage1 = _risk_training_arrays(stage1_data)
+    stage4 = _risk_training_arrays(stage4_data)
+    merged = {key: np.concatenate([stage1[key], stage4[key]], axis=0) for key in risk_keys}
     return merged
+
+
+def _has_key(data: Any, key: str) -> bool:
+    return key in data.files if hasattr(data, "files") else key in data
+
+
+def _risk_training_arrays(data: Any) -> dict[str, np.ndarray]:
+    risk_features = np.asarray(data["risk_features"], dtype=np.float32)
+    actions = np.asarray(data["actions"], dtype=np.int64)
+    risk_types = np.asarray(data["risk_types"], dtype=np.float32)
+    if _has_key(data, "traffic_risk"):
+        traffic_risk = np.asarray(data["traffic_risk"], dtype=np.float32)
+    elif risk_types.ndim == 2 and risk_types.shape[1] > 0:
+        traffic_risk = np.max(risk_types, axis=1).astype(np.float32)
+    else:
+        traffic_risk = np.asarray(data["overall_risk"], dtype=np.float32)
+    if _has_key(data, "lane_oob_risk"):
+        lane_oob = np.asarray(data["lane_oob_risk"], dtype=np.float32)
+    elif risk_features.ndim == 2 and risk_features.shape[1] > 5:
+        lane_oob = (risk_features[:, 5] > 0.5).astype(np.float32)
+    else:
+        lane_oob = np.zeros_like(traffic_risk, dtype=np.float32)
+    if _has_key(data, "candidate_legal"):
+        candidate_legal = (np.asarray(data["candidate_legal"], dtype=np.float32) > 0.5).astype(np.float32)
+    else:
+        candidate_legal = (lane_oob <= 0.5).astype(np.float32)
+    if _has_key(data, "risk_sample_weight"):
+        sample_weight = np.asarray(data["risk_sample_weight"], dtype=np.float32)
+    else:
+        sample_weight = candidate_legal.astype(np.float32)
+    return {
+        "risk_features": risk_features,
+        "actions": actions,
+        "overall_risk": traffic_risk.astype(np.float32),
+        "risk_types": risk_types,
+        "lane_oob_risk": lane_oob.astype(np.float32),
+        "candidate_legal": candidate_legal.astype(np.float32),
+        "traffic_risk": traffic_risk.astype(np.float32),
+        "risk_sample_weight": sample_weight.astype(np.float32),
+    }
+
+
+def _configured_sample_weight(cfg: Any, arrays: dict[str, np.ndarray]) -> np.ndarray:
+    legal = arrays["candidate_legal"] > 0.5
+    if bool(cfg.risk_module.get("legal_candidates_only_for_training", True)):
+        weights = np.where(
+            legal,
+            np.maximum(arrays["risk_sample_weight"], 1.0),
+            float(cfg.risk_module.get("illegal_candidate_sample_weight", 0.0)),
+        ).astype(np.float32)
+    else:
+        weights = np.ones_like(arrays["traffic_risk"], dtype=np.float32)
+    weights = weights * np.where(
+        arrays["traffic_risk"] > 0.5,
+        float(cfg.risk_module.get("positive_traffic_risk_weight", 1.0)),
+        1.0,
+    ).astype(np.float32)
+    if arrays["risk_types"].ndim == 2 and arrays["risk_types"].shape[1] > 4:
+        weights = weights * np.where(
+            arrays["risk_types"][:, 4] > 0.5,
+            float(cfg.risk_module.get("merge_conflict_weight", 1.0)),
+            1.0,
+        ).astype(np.float32)
+    return weights.astype(np.float32)
+
+
+def _split_indices(count: int, val_split: float, seed: int) -> tuple[np.ndarray, np.ndarray]:
+    indices = np.arange(count, dtype=np.int64)
+    if count <= 1 or val_split <= 0.0:
+        return indices, np.asarray([], dtype=np.int64)
+    rng = np.random.default_rng(seed)
+    rng.shuffle(indices)
+    val_count = int(round(count * val_split))
+    val_count = min(max(val_count, 1), count - 1)
+    return indices[val_count:], indices[:val_count]
+
+
+def _risk_data_summary(arrays: dict[str, np.ndarray], sample_weight: np.ndarray) -> dict:
+    actions = arrays["actions"]
+    legal = arrays["candidate_legal"] > 0.5
+    risk = arrays["traffic_risk"]
+    lane_oob = arrays["lane_oob_risk"]
+    weighted = sample_weight > 0.0
+    return {
+        "sample_count": int(risk.shape[0]),
+        "traffic_risk_rate": float(np.mean(risk)) if risk.size else 0.0,
+        "lane_oob_risk_rate": float(np.mean(lane_oob)) if lane_oob.size else 0.0,
+        "illegal_candidate_rate": float(np.mean(~legal)) if legal.size else 0.0,
+        "legal_candidate_risk_rate": float(np.mean(risk[legal])) if np.any(legal) else 0.0,
+        "weighted_sample_rate": float(np.mean(weighted)) if weighted.size else 0.0,
+        "weighted_positive_risk_rate": float(np.mean(risk[weighted])) if np.any(weighted) else 0.0,
+        "traffic_risk_by_action": {
+            str(index): float(np.mean(risk[actions == index])) if np.any(actions == index) else 0.0
+            for index in range(9)
+        },
+        "legal_candidate_action_risk_rate": {
+            str(index): (
+                float(np.mean(risk[(actions == index) & legal])) if np.any((actions == index) & legal) else 0.0
+            )
+            for index in range(9)
+        },
+    }
+
+
+def _risk_validation_summary(pred: np.ndarray, target: np.ndarray, sample_weight: np.ndarray, legal: np.ndarray) -> dict:
+    if pred.size == 0:
+        return {"sample_count": 0}
+    active = sample_weight > 0.0
+    legal_mask = legal > 0.5
+    legal_active = active & legal_mask
+    pred_label = pred >= 0.5
+    target_label = target >= 0.5
+    weighted_abs = np.abs(pred - target)
+    return {
+        "sample_count": int(pred.shape[0]),
+        "active_sample_count": int(np.sum(active)),
+        "positive_risk_rate": float(np.mean(target[active])) if np.any(active) else 0.0,
+        "predicted_positive_rate": float(np.mean(pred_label[active])) if np.any(active) else 0.0,
+        "accuracy": float(np.mean(pred_label[active] == target_label[active])) if np.any(active) else 0.0,
+        "legal_candidate_accuracy": (
+            float(np.mean(pred_label[legal_active] == target_label[legal_active])) if np.any(legal_active) else 0.0
+        ),
+        "mean_abs_calibration_error": float(np.mean(weighted_abs[active])) if np.any(active) else 0.0,
+    }
 
 
 def _train_risk_module(
@@ -98,13 +244,33 @@ def _train_risk_module(
     torch, DataLoader, TensorDataset = _require_torch()
     from safe_rl.risk.risk_module import RiskModule, risk_loss
 
-    x = torch.tensor(data["risk_features"], dtype=torch.float32)
-    actions = torch.tensor(data["actions"], dtype=torch.long)
-    y = torch.tensor(data["overall_risk"], dtype=torch.float32)
-    risk_types = torch.tensor(data["risk_types"], dtype=torch.float32)
-    dataset = TensorDataset(x, actions, y, risk_types)
+    arrays = _risk_training_arrays(data)
+    sample_weight = _configured_sample_weight(cfg, arrays)
+    train_indices, val_indices = _split_indices(
+        int(arrays["traffic_risk"].shape[0]),
+        float(cfg.risk_module.get("validation_split", 0.0)),
+        int(cfg.run.seed),
+    )
+
+    def _dataset(indices: np.ndarray):
+        return TensorDataset(
+            torch.tensor(arrays["risk_features"][indices], dtype=torch.float32),
+            torch.tensor(arrays["actions"][indices], dtype=torch.long),
+            torch.tensor(arrays["traffic_risk"][indices], dtype=torch.float32),
+            torch.tensor(arrays["risk_types"][indices], dtype=torch.float32),
+            torch.tensor(sample_weight[indices], dtype=torch.float32),
+            torch.tensor(arrays["candidate_legal"][indices], dtype=torch.float32),
+        )
+
+    train_dataset = _dataset(train_indices)
+    val_dataset = _dataset(val_indices) if val_indices.size else None
     loader_kwargs = _loader_kwargs(cfg, device)
-    loader = DataLoader(dataset, batch_size=int(cfg.risk_module.batch_size), shuffle=True, **loader_kwargs)
+    loader = DataLoader(train_dataset, batch_size=int(cfg.risk_module.batch_size), shuffle=True, **loader_kwargs)
+    val_loader = (
+        DataLoader(val_dataset, batch_size=int(cfg.risk_module.batch_size), shuffle=False, **loader_kwargs)
+        if val_dataset is not None
+        else None
+    )
     model = RiskModule(
         explicit_dim=int(cfg.risk_module.explicit_feature_dim),
         latent_dim=int(cfg.risk_module.latent_dim),
@@ -114,15 +280,18 @@ def _train_risk_module(
     optimizer = torch.optim.Adam(model.parameters(), lr=float(cfg.risk_module.learning_rate))
     weights = dict(cfg.risk_module.loss_weights)
     history: list[float] = []
+    val_history: list[float] = []
     stage_log(
         "stage2",
-        f"risk module samples={len(dataset)}, batch_size={cfg.risk_module.batch_size}, "
+        f"risk module samples={len(train_dataset)}, val_samples={len(val_dataset) if val_dataset is not None else 0}, "
+        f"batch_size={cfg.risk_module.batch_size}, "
         f"pin_memory={loader_kwargs['pin_memory']}",
     )
     for epoch in progress_iter(range(int(cfg.risk_module.epochs)), desc="Stage2 risk epochs"):
         losses = []
+        model.train()
         for batch in loader:
-            batch_x, batch_actions, batch_y, batch_types = _to_device(
+            batch_x, batch_actions, batch_y, batch_types, batch_weights, _batch_legal = _to_device(
                 batch,
                 device,
                 non_blocking=bool(loader_kwargs["pin_memory"]),
@@ -130,16 +299,18 @@ def _train_risk_module(
             output = model(batch_x, batch_actions)
             loss = risk_loss(
                 output,
-                {"risk_score": batch_y, "risk_types": batch_types},
+                {"risk_score": batch_y, "risk_types": batch_types, "sample_weight": batch_weights},
                 {"risk": weights.get("risk", 1.0), "calibration": weights.get("calibration", 0.1)},
             )
             if bool(cfg.risk_module.ranking_loss_enabled) and batch_y.numel() > 1:
-                scores = output["risk_score"]
-                pos = batch_y.view(-1, 1)
+                active = batch_weights > 0.0
+                scores = output["risk_score"][active]
+                active_y = batch_y[active]
+                pos = active_y.view(-1, 1)
                 label_diff = pos - pos.t()
                 score_diff = scores.view(-1, 1) - scores.view(1, -1)
                 mask = label_diff > 0
-                if torch.any(mask):
+                if scores.numel() > 1 and torch.any(mask):
                     rank_loss = torch.relu(0.05 - score_diff[mask]).mean()
                     loss = loss + weights.get("ranking", 0.5) * rank_loss
             optimizer.zero_grad()
@@ -148,11 +319,77 @@ def _train_risk_module(
             losses.append(float(loss.detach().cpu()))
         epoch_loss = float(np.mean(losses)) if losses else 0.0
         history.append(epoch_loss)
+        val_loss = 0.0
+        if val_loader is not None:
+            model.eval()
+            val_losses = []
+            with torch.no_grad():
+                for batch in val_loader:
+                    batch_x, batch_actions, batch_y, batch_types, batch_weights, _batch_legal = _to_device(
+                        batch,
+                        device,
+                        non_blocking=bool(loader_kwargs["pin_memory"]),
+                    )
+                    output = model(batch_x, batch_actions)
+                    loss = risk_loss(
+                        output,
+                        {"risk_score": batch_y, "risk_types": batch_types, "sample_weight": batch_weights},
+                        {"risk": weights.get("risk", 1.0), "calibration": weights.get("calibration", 0.1)},
+                    )
+                    val_losses.append(float(loss.detach().cpu()))
+            val_loss = float(np.mean(val_losses)) if val_losses else 0.0
+            val_history.append(val_loss)
         tb.scalar("stage2/risk_loss", epoch_loss, epoch)
-        stage_log("stage2", f"risk epoch={epoch + 1}/{cfg.risk_module.epochs} loss={epoch_loss:.6f}")
+        if val_loader is not None:
+            tb.scalar("stage2/risk_val_loss", val_loss, epoch)
+            stage_log(
+                "stage2",
+                f"risk epoch={epoch + 1}/{cfg.risk_module.epochs} loss={epoch_loss:.6f} val_loss={val_loss:.6f}",
+            )
+        else:
+            stage_log("stage2", f"risk epoch={epoch + 1}/{cfg.risk_module.epochs} loss={epoch_loss:.6f}")
     checkpoint = stage_dir / "risk_module.pt"
-    torch.save({"model_state_dict": _cpu_state_dict(model), "loss_history": history}, checkpoint)
-    return {"risk_checkpoint": str(checkpoint), "risk_loss_history": history}
+    validation_summary = {"sample_count": 0}
+    if val_indices.size:
+        model.eval()
+        val_x = torch.tensor(arrays["risk_features"][val_indices], dtype=torch.float32, device=device)
+        val_actions = torch.tensor(arrays["actions"][val_indices], dtype=torch.long, device=device)
+        with torch.no_grad():
+            val_pred = model(val_x, val_actions)["risk_score"].detach().cpu().numpy()
+        validation_summary = _risk_validation_summary(
+            val_pred,
+            arrays["traffic_risk"][val_indices],
+            sample_weight[val_indices],
+            arrays["candidate_legal"][val_indices],
+        )
+    training_summary = {
+        "data": _risk_data_summary(arrays, sample_weight),
+        "train_sample_count": int(train_indices.shape[0]),
+        "validation_sample_count": int(val_indices.shape[0]),
+        "validation": validation_summary,
+        "config": {
+            "legal_candidates_only_for_training": bool(cfg.risk_module.get("legal_candidates_only_for_training", True)),
+            "illegal_candidate_sample_weight": float(cfg.risk_module.get("illegal_candidate_sample_weight", 0.0)),
+            "positive_traffic_risk_weight": float(cfg.risk_module.get("positive_traffic_risk_weight", 1.0)),
+            "merge_conflict_weight": float(cfg.risk_module.get("merge_conflict_weight", 1.0)),
+            "validation_split": float(cfg.risk_module.get("validation_split", 0.0)),
+        },
+    }
+    torch.save(
+        {
+            "model_state_dict": _cpu_state_dict(model),
+            "loss_history": history,
+            "val_loss_history": val_history,
+            "training_summary": training_summary,
+        },
+        checkpoint,
+    )
+    return {
+        "risk_checkpoint": str(checkpoint),
+        "risk_loss_history": history,
+        "risk_val_loss_history": val_history,
+        "risk_training_summary": training_summary,
+    }
 
 
 def _build_wcdt_batch(cfg: Any, data: np.lib.npyio.NpzFile, device: Any | None = None):
@@ -300,6 +537,7 @@ def run(cfg) -> Path:
     else:
         stage_log("stage2", f"device={device}")
     tb = TensorboardLogger(stage_dir / "tensorboard", enabled=bool(cfg.run.get("tensorboard", True)))
+    initial_prediction_report_path = stage_dir / "stage2_initial_prediction_report.json"
     data = np.load(input_path, allow_pickle=False)
     stage4_data = np.load(input_stage4_path, allow_pickle=False) if input_stage4_path is not None else None
     risk_data = _merge_risk_buffers(data, stage4_data)
@@ -338,6 +576,20 @@ def run(cfg) -> Path:
     report.update(_train_risk_module(cfg, risk_data, stage_dir, tb, device))
     if bool(cfg.prediction.train_enabled):
         report.update(_train_wcdt_predictor(cfg, data, stage_dir, tb, device))
+        if report.get("prediction_checkpoint"):
+            initial_prediction_report = {
+                "stage": "stage2_initial_prediction",
+                "run_id": cfg.run.run_id,
+                "input_stage1": str(input_path),
+                "prediction_checkpoint": report.get("prediction_checkpoint"),
+                "prediction_loss_history": report.get("prediction_loss_history", []),
+                "prediction_loss_summary": _prediction_loss_summary(report.get("prediction_loss_history", [])),
+                "device": str(device),
+            }
+            write_report(initial_prediction_report_path, initial_prediction_report)
+            report["initial_prediction_report"] = str(initial_prediction_report_path)
+    elif initial_prediction_report_path.exists():
+        report["initial_prediction_report"] = str(initial_prediction_report_path)
     write_report(stage_dir / "stage2_training_report.json", report)
     tb.close()
     stage_log("stage2", f"report={stage_dir / 'stage2_training_report.json'}")

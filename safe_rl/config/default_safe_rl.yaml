@@ -78,6 +78,11 @@ risk_module:
   action_conditioned: true
   ranking_loss_enabled: true
   calibration_enabled: true
+  legal_candidates_only_for_training: true
+  illegal_candidate_sample_weight: 0.0
+  positive_traffic_risk_weight: 1.5
+  merge_conflict_weight: 1.25
+  validation_split: 0.15
   epochs: 50
   batch_size: 64
   learning_rate: 0.0003
@@ -130,6 +135,7 @@ shield:
   fallback_min_ttc: 0.30
   fallback_min_distance: 0.75
   prefer_closest_safe_action: true
+  filter_illegal_candidates: true
   fallback_action: "decelerate"
   score_weights:
     risk: 1.0

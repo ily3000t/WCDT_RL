@@ -52,6 +52,9 @@ class CandidateRiskSample:
     overall_risk: float
     risk_types: np.ndarray
     local_stats: MergeLocalStats
+    lane_oob: float
+    candidate_legal: bool
+    traffic_risk: float
 
 
 def merge_x(config: Any) -> float:
@@ -257,6 +260,30 @@ def _rollout_dt(config: Any) -> float:
     return float(config.scenario.get("step_length", 0.1))
 
 
+def is_candidate_legal(
+    action: CandidateAction,
+    context: dict[str, Any],
+    *,
+    missing_ego_is_legal: bool = True,
+) -> bool:
+    ego = context.get("ego")
+    if ego is None:
+        return bool(missing_ego_is_legal)
+    lane_count = int(context.get("lane_count", 1))
+    target_lane = int(ego.lane_index) + int(action.lateral_cmd)
+    return 0 <= target_lane < lane_count
+
+
+def candidate_legality_counts(context: dict[str, Any]) -> dict[str, int]:
+    legal = sum(1 for action in ACTIONS if is_candidate_legal(action, context))
+    total = len(ACTIONS)
+    return {"legal": int(legal), "illegal": int(total - legal)}
+
+
+def candidate_sample_weight(sample: CandidateRiskSample) -> float:
+    return 1.0 if sample.candidate_legal else 0.0
+
+
 def evaluate_candidate_action_risk(action: CandidateAction, context: dict[str, Any]) -> CandidateRiskSample:
     ego = context.get("ego")
     config = context["config"]
@@ -269,10 +296,13 @@ def evaluate_candidate_action_risk(action: CandidateAction, context: dict[str, A
             overall_risk=1.0,
             risk_types=np.asarray([0.0, 0.0, 0.0, 0.0, 1.0], dtype=np.float32),
             local_stats=stats,
+            lane_oob=0.0,
+            candidate_legal=False,
+            traffic_risk=1.0,
         )
 
-    lane_count = int(context.get("lane_count", 1))
-    lane_oob = ego.lane_index + action.lateral_cmd < 0 or ego.lane_index + action.lateral_cmd >= lane_count
+    candidate_legal = is_candidate_legal(action, context, missing_ego_is_legal=False)
+    lane_oob = not candidate_legal
     horizon_steps = int(config.risk_module.get("collision_horizon_steps", 30))
     dt = _rollout_dt(config)
     ego_rollout = rollout_ego(ego, action, horizon_steps, dt)
@@ -339,12 +369,16 @@ def evaluate_candidate_action_risk(action: CandidateAction, context: dict[str, A
         [float(collision), float(near_miss), float(low_ttc), float(high_drac), float(merge_conflict)],
         dtype=np.float32,
     )
+    traffic_risk = float(np.max(risk_types))
     return CandidateRiskSample(
         action=action.index,
         features=features.astype(np.float32),
-        overall_risk=float(max(float(np.max(risk_types)), float(lane_oob))),
+        overall_risk=traffic_risk,
         risk_types=risk_types,
         local_stats=best_stats,
+        lane_oob=float(lane_oob),
+        candidate_legal=bool(candidate_legal),
+        traffic_risk=traffic_risk,
     )
 
 
