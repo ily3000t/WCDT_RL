@@ -52,6 +52,8 @@ def run(cfg) -> Path:
         "traffic_risk": [],
         "risk_sample_weight": [],
         "episode_id": [],
+        "candidate_transition_id": [],
+        "candidate_raw_action": [],
         "transition_episode_id": [],
         "candidate_target_lane_gap": [],
         "candidate_ramp_local_risk": [],
@@ -98,6 +100,7 @@ def run(cfg) -> Path:
                 transitions["ramp_local_risk"].append(float(local.ramp_local_risk))
                 transitions["merge_zone_risk"].append(float(local.merge_zone_risk))
                 transitions["sampling_modes"].append(sampling_mode)
+                transition_id = len(transitions["executed_actions"]) - 1
                 for sample in candidate_samples:
                     transitions["actions"].append(sample.action)
                     transitions["risk_features"].append(sample.features)
@@ -108,6 +111,8 @@ def run(cfg) -> Path:
                     transitions["traffic_risk"].append(sample.traffic_risk)
                     transitions["risk_sample_weight"].append(candidate_sample_weight(sample))
                     transitions["episode_id"].append(episode)
+                    transitions["candidate_transition_id"].append(transition_id)
+                    transitions["candidate_raw_action"].append(action)
                     transitions["candidate_target_lane_gap"].append(sample.local_stats.target_lane_gap)
                     transitions["candidate_ramp_local_risk"].append(float(sample.local_stats.ramp_local_risk))
                     transitions["candidate_merge_zone_risk"].append(float(sample.local_stats.merge_zone_risk))

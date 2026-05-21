@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from collections import Counter
 from pathlib import Path
 from typing import Any
 
@@ -103,9 +104,14 @@ def _merge_risk_buffers(stage1_data: Any, stage4_data: Any | None) -> dict[str, 
         "candidate_legal",
         "traffic_risk",
         "risk_sample_weight",
+        "candidate_transition_id",
+        "candidate_raw_action",
     )
     stage1 = _risk_training_arrays(stage1_data)
     stage4 = _risk_training_arrays(stage4_data)
+    if stage1["candidate_transition_id"].size and stage4["candidate_transition_id"].size:
+        offset = int(np.max(stage1["candidate_transition_id"])) + 1
+        stage4["candidate_transition_id"] = stage4["candidate_transition_id"] + offset
     merged = {key: np.concatenate([stage1[key], stage4[key]], axis=0) for key in risk_keys}
     return merged
 
@@ -138,6 +144,21 @@ def _risk_training_arrays(data: Any) -> dict[str, np.ndarray]:
         sample_weight = np.asarray(data["risk_sample_weight"], dtype=np.float32)
     else:
         sample_weight = candidate_legal.astype(np.float32)
+    if _has_key(data, "candidate_transition_id"):
+        transition_id = np.asarray(data["candidate_transition_id"], dtype=np.int64)
+        transition_id_source = "explicit"
+    else:
+        transition_id = (np.arange(actions.shape[0], dtype=np.int64) // 9).astype(np.int64)
+        transition_id_source = "inferred_by_9_rows"
+    if _has_key(data, "candidate_raw_action"):
+        raw_actions = np.asarray(data["candidate_raw_action"], dtype=np.int64)
+    elif _has_key(data, "executed_actions"):
+        executed = np.asarray(data["executed_actions"], dtype=np.int64)
+        raw_actions = np.full_like(actions, -1, dtype=np.int64)
+        valid = (transition_id >= 0) & (transition_id < executed.shape[0])
+        raw_actions[valid] = executed[transition_id[valid]]
+    else:
+        raw_actions = np.full_like(actions, -1, dtype=np.int64)
     return {
         "risk_features": risk_features,
         "actions": actions,
@@ -147,6 +168,9 @@ def _risk_training_arrays(data: Any) -> dict[str, np.ndarray]:
         "candidate_legal": candidate_legal.astype(np.float32),
         "traffic_risk": traffic_risk.astype(np.float32),
         "risk_sample_weight": sample_weight.astype(np.float32),
+        "candidate_transition_id": transition_id.astype(np.int64),
+        "candidate_raw_action": raw_actions.astype(np.int64),
+        "candidate_transition_id_source": np.asarray([transition_id_source]),
     }
 
 
@@ -185,6 +209,22 @@ def _split_indices(count: int, val_split: float, seed: int) -> tuple[np.ndarray,
     return indices[val_count:], indices[:val_count]
 
 
+def _split_risk_indices(arrays: dict[str, np.ndarray], val_split: float, seed: int) -> tuple[np.ndarray, np.ndarray]:
+    transition_ids = np.asarray(arrays.get("candidate_transition_id", []), dtype=np.int64)
+    if transition_ids.shape[0] != arrays["traffic_risk"].shape[0] or transition_ids.size == 0:
+        return _split_indices(int(arrays["traffic_risk"].shape[0]), val_split, seed)
+    unique_ids = np.unique(transition_ids)
+    if unique_ids.shape[0] <= 1 or val_split <= 0.0:
+        return np.arange(transition_ids.shape[0], dtype=np.int64), np.asarray([], dtype=np.int64)
+    rng = np.random.default_rng(seed)
+    rng.shuffle(unique_ids)
+    val_count = int(round(unique_ids.shape[0] * val_split))
+    val_count = min(max(val_count, 1), unique_ids.shape[0] - 1)
+    val_ids = set(int(item) for item in unique_ids[:val_count])
+    val_mask = np.asarray([int(item) in val_ids for item in transition_ids], dtype=bool)
+    return np.where(~val_mask)[0].astype(np.int64), np.where(val_mask)[0].astype(np.int64)
+
+
 def _risk_data_summary(arrays: dict[str, np.ndarray], sample_weight: np.ndarray) -> dict:
     actions = arrays["actions"]
     legal = arrays["candidate_legal"] > 0.5
@@ -209,6 +249,80 @@ def _risk_data_summary(arrays: dict[str, np.ndarray], sample_weight: np.ndarray)
             )
             for index in range(9)
         },
+    }
+
+
+def _risk_ranking_summary(arrays: dict[str, np.ndarray], indices: np.ndarray, predictions: np.ndarray) -> dict:
+    if indices.size == 0 or predictions.size == 0:
+        return {"available": False, "reason": "no validation samples"}
+    actions = arrays["actions"][indices]
+    risk = arrays["traffic_risk"][indices]
+    legal = arrays["candidate_legal"][indices] > 0.5
+    transition_ids = arrays["candidate_transition_id"][indices]
+    raw_actions = arrays["candidate_raw_action"][indices]
+    grouped: dict[int, list[int]] = {}
+    for local_idx, transition_id in enumerate(transition_ids.tolist()):
+        grouped.setdefault(int(transition_id), []).append(local_idx)
+
+    top1_matches = []
+    top3_matches = []
+    raw_ranks = []
+    oracle_best_risks = []
+    model_best_label_risks = []
+    model_minus_oracle = []
+    oracle_hist: Counter[str] = Counter()
+    model_hist: Counter[str] = Counter()
+    skipped_incomplete = 0
+    skipped_no_legal = 0
+    skipped_raw_missing = 0
+
+    for positions in grouped.values():
+        group_actions = actions[positions]
+        if set(int(item) for item in group_actions.tolist()) != set(range(9)):
+            skipped_incomplete += 1
+            continue
+        legal_positions = [pos for pos in positions if bool(legal[pos])]
+        if not legal_positions:
+            skipped_no_legal += 1
+            continue
+        pred_order = sorted(legal_positions, key=lambda pos: (float(predictions[pos]), int(actions[pos])))
+        label_order = sorted(legal_positions, key=lambda pos: (float(risk[pos]), int(actions[pos])))
+        oracle_pos = label_order[0]
+        model_pos = pred_order[0]
+        oracle_best = float(risk[oracle_pos])
+        model_label = float(risk[model_pos])
+        top3 = pred_order[: min(3, len(pred_order))]
+        top1_matches.append(float(model_label <= oracle_best + 1.0e-6))
+        top3_matches.append(float(any(float(risk[pos]) <= oracle_best + 1.0e-6 for pos in top3)))
+        oracle_best_risks.append(oracle_best)
+        model_best_label_risks.append(model_label)
+        model_minus_oracle.append(model_label - oracle_best)
+        oracle_hist[str(int(actions[oracle_pos]))] += 1
+        model_hist[str(int(actions[model_pos]))] += 1
+
+        raw_action = int(raw_actions[positions[0]])
+        rank = next((rank_idx + 1 for rank_idx, pos in enumerate(pred_order) if int(actions[pos]) == raw_action), None)
+        if rank is None:
+            skipped_raw_missing += 1
+        else:
+            raw_ranks.append(float(rank))
+
+    evaluated = len(top1_matches)
+    return {
+        "available": evaluated > 0,
+        "transition_group_count": int(len(grouped)),
+        "evaluated_group_count": int(evaluated),
+        "skipped_incomplete_group_count": int(skipped_incomplete),
+        "skipped_no_legal_group_count": int(skipped_no_legal),
+        "skipped_raw_missing_group_count": int(skipped_raw_missing),
+        "top1_match_rate": float(np.mean(top1_matches)) if top1_matches else 0.0,
+        "top3_match_rate": float(np.mean(top3_matches)) if top3_matches else 0.0,
+        "raw_action_rank_mean": float(np.mean(raw_ranks)) if raw_ranks else 0.0,
+        "oracle_best_action_histogram": dict(oracle_hist),
+        "model_best_action_histogram": dict(model_hist),
+        "mean_oracle_best_risk": float(np.mean(oracle_best_risks)) if oracle_best_risks else 0.0,
+        "mean_model_best_label_risk": float(np.mean(model_best_label_risks)) if model_best_label_risks else 0.0,
+        "mean_model_best_minus_oracle_risk": float(np.mean(model_minus_oracle)) if model_minus_oracle else 0.0,
     }
 
 
@@ -246,8 +360,8 @@ def _train_risk_module(
 
     arrays = _risk_training_arrays(data)
     sample_weight = _configured_sample_weight(cfg, arrays)
-    train_indices, val_indices = _split_indices(
-        int(arrays["traffic_risk"].shape[0]),
+    train_indices, val_indices = _split_risk_indices(
+        arrays,
         float(cfg.risk_module.get("validation_split", 0.0)),
         int(cfg.run.seed),
     )
@@ -350,6 +464,7 @@ def _train_risk_module(
             stage_log("stage2", f"risk epoch={epoch + 1}/{cfg.risk_module.epochs} loss={epoch_loss:.6f}")
     checkpoint = stage_dir / "risk_module.pt"
     validation_summary = {"sample_count": 0}
+    ranking_summary = {"available": False, "reason": "no validation samples"}
     if val_indices.size:
         model.eval()
         val_x = torch.tensor(arrays["risk_features"][val_indices], dtype=torch.float32, device=device)
@@ -362,11 +477,13 @@ def _train_risk_module(
             sample_weight[val_indices],
             arrays["candidate_legal"][val_indices],
         )
+        ranking_summary = _risk_ranking_summary(arrays, val_indices, val_pred)
     training_summary = {
         "data": _risk_data_summary(arrays, sample_weight),
         "train_sample_count": int(train_indices.shape[0]),
         "validation_sample_count": int(val_indices.shape[0]),
         "validation": validation_summary,
+        "ranking": ranking_summary,
         "config": {
             "legal_candidates_only_for_training": bool(cfg.risk_module.get("legal_candidates_only_for_training", True)),
             "illegal_candidate_sample_weight": float(cfg.risk_module.get("illegal_candidate_sample_weight", 0.0)),
@@ -389,6 +506,7 @@ def _train_risk_module(
         "risk_loss_history": history,
         "risk_val_loss_history": val_history,
         "risk_training_summary": training_summary,
+        "risk_ranking_summary": ranking_summary,
     }
 
 

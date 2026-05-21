@@ -10,8 +10,14 @@ import yaml
 
 from safe_rl.prediction.forecast_feature_augmentor import ForecastFeatureAugmentor
 from safe_rl.pipeline.run_full_pipeline import build_generated_configs, resolve_forecast_sources
-from safe_rl.pipeline.stage2_train_prediction_risk import _configured_sample_weight, _risk_training_arrays
-from safe_rl.pipeline.stage5_paired_eval import _build_acceptance, _build_paired_delta, _select_eval_seeds
+from safe_rl.pipeline.stage2_train_prediction_risk import (
+    _configured_sample_weight,
+    _risk_ranking_summary,
+    _risk_training_arrays,
+    _split_risk_indices,
+)
+from safe_rl.pipeline.stage5_paired_eval import _build_acceptance, _build_paired_delta, _group_overrides, _select_eval_seeds
+from safe_rl.pipeline.stage5_shield_sweep import DEFAULT_VARIANTS, build_sweep_groups
 from safe_rl.risk.candidate_risk_ranker import CandidateRiskRanker
 from safe_rl.risk.merge_local import candidate_action_risk_samples, is_candidate_legal, target_lane_neighbors
 from safe_rl.risk.risk_feature_extractor import extract_candidate_features
@@ -290,6 +296,48 @@ def test_stage2_infers_legacy_lane_oob_and_weights_from_features():
     assert weights[1] == pytest.approx(cfg.risk_module.positive_traffic_risk_weight)
 
 
+def test_stage2_ranking_summary_infers_legacy_nine_row_groups():
+    actions = np.asarray(list(range(9)) * 2, dtype=np.int64)
+    risk_features = np.zeros((18, 8), dtype=np.float32)
+    risk_features[:, 5] = np.where(np.isin(actions, [3, 4, 5]), 0.0, 1.0)
+    labels = np.zeros((18, 5), dtype=np.float32)
+    labels[actions == 3, 1] = 1.0
+    labels[actions == 4, 1] = 1.0
+    data = {
+        "risk_features": risk_features,
+        "actions": actions,
+        "overall_risk": np.max(labels, axis=1),
+        "risk_types": labels,
+        "executed_actions": np.asarray([4, 4], dtype=np.int64),
+    }
+    arrays = _risk_training_arrays(data)
+    train_idx, val_idx = _split_risk_indices(arrays, 0.5, seed=1)
+    assert train_idx.shape[0] % 9 == 0
+    assert val_idx.shape[0] % 9 == 0
+
+    predictions = np.ones((18,), dtype=np.float32)
+    predictions[actions == 5] = 0.1
+    summary = _risk_ranking_summary(arrays, np.arange(18), predictions)
+    assert summary["available"]
+    assert summary["evaluated_group_count"] == 2
+    assert summary["skipped_incomplete_group_count"] == 0
+    assert summary["top1_match_rate"] == pytest.approx(1.0)
+    assert summary["model_best_action_histogram"]["5"] == 2
+
+
+def test_stage2_ranking_summary_skips_incomplete_candidate_groups():
+    data = {
+        "risk_features": np.zeros((3, 8), dtype=np.float32),
+        "actions": np.asarray([0, 1, 2], dtype=np.int64),
+        "overall_risk": np.zeros((3,), dtype=np.float32),
+        "risk_types": np.zeros((3, 5), dtype=np.float32),
+    }
+    arrays = _risk_training_arrays(data)
+    summary = _risk_ranking_summary(arrays, np.arange(3), np.zeros((3,), dtype=np.float32))
+    assert not summary["available"]
+    assert summary["skipped_incomplete_group_count"] == 1
+
+
 def test_risk_loss_ignores_zero_weight_samples():
     torch = pytest.importorskip("torch")
     output = {
@@ -364,6 +412,37 @@ def test_stage5_metrics_distinguish_shield_calls_from_replacements():
     assert metrics["actual_replacement_rate"] == 0.5
     assert metrics["mean_shield_calls"] == pytest.approx(3.5)
     assert metrics["mean_actual_replacements"] == pytest.approx(1.0)
+
+
+def test_stage5_group_shield_overrides_update_shield_config():
+    group = SimpleNamespace(
+        forecast_features=False,
+        shield=True,
+        get=lambda key, default=None: {
+            "shield_overrides": {
+                "activation_risk_threshold": 0.85,
+                "replacement_margin": 0.10,
+            }
+        }.get(key, default),
+    )
+    overrides = _group_overrides(group)
+    assert overrides["shield"]["enabled"] is True
+    assert overrides["shield"]["activation_risk_threshold"] == pytest.approx(0.85)
+    assert overrides["shield"]["replacement_margin"] == pytest.approx(0.10)
+
+
+def test_stage5_shield_sweep_generates_default_threshold_variants():
+    groups = build_sweep_groups("safe_rl_test_run")
+    shield_groups = [group for group in groups if group["name"].startswith("ppo_shield_")]
+    assert len(DEFAULT_VARIANTS) == 4
+    assert len(shield_groups) == 4
+    assert {group["name"] for group in shield_groups} == {
+        "ppo_shield_a090_m015",
+        "ppo_shield_a085_m015",
+        "ppo_shield_a085_m010",
+        "ppo_shield_a080_m010",
+    }
+    assert all(group["shield_overrides"]["allow_fallback"] is False for group in shield_groups)
 
 
 def test_forecast_source_parser_rejects_conflicting_legacy_and_multi_args():

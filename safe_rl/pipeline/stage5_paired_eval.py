@@ -33,10 +33,14 @@ def _group_overrides(group) -> dict:
         forecast_overrides["source"] = str(group.forecast_source)
     if group.get("forecast_checkpoint"):
         forecast_overrides["checkpoint"] = str(group.forecast_checkpoint)
+    shield_overrides = {"enabled": bool(group.shield)}
+    requested_shield_overrides = group.get("shield_overrides")
+    if requested_shield_overrides:
+        shield_overrides.update(dict(requested_shield_overrides))
     return {
         "forecast_features": forecast_overrides,
         "rl": {"use_wcdt_forecast_features": bool(group.forecast_features)},
-        "shield": {"enabled": bool(group.shield)},
+        "shield": shield_overrides,
     }
 
 
@@ -247,6 +251,7 @@ def run(cfg) -> Path:
         else:
             group_reports[group.name]["forecast_source"] = ""
             group_reports[group.name]["forecast_checkpoint"] = ""
+        group_reports[group.name]["shield_overrides"] = dict(group.get("shield_overrides", {}) or {})
 
     shield_off = {name: report for name, report in group_reports.items() if not name.endswith("shield")}
     shield_on = {name: report for name, report in group_reports.items() if name.endswith("shield") or name == "full_prediction_shield"}

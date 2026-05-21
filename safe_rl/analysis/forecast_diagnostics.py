@@ -428,6 +428,74 @@ def _write_replay_commands(path: Path, rows: list[dict[str, Any]]) -> None:
     path.write_text("\n".join(lines), encoding="utf-8")
 
 
+def _action_histogram(actions: list[int]) -> dict[str, int]:
+    return {str(index): int(sum(1 for action in actions if int(action) == index)) for index in range(9)}
+
+
+def _load_replay_actions(path: Path) -> list[int] | None:
+    if not path.exists():
+        return None
+    with path.open("r", encoding="utf-8") as file:
+        payload = json.load(file)
+    return [int(action) for action in payload.get("actions", [])]
+
+
+def _forecast_behavior_diagnostics(base_run_id: str, stage5_report: dict[str, Any]) -> dict[str, Any]:
+    groups = stage5_report.get("groups", {})
+    cv = groups.get("ppo_cv_features", {})
+    wcdt = groups.get("ppo_wcdt_features", {})
+    if not cv or not wcdt:
+        return {"available": False, "reason": "missing ppo_cv_features or ppo_wcdt_features group"}
+    replay_dir = Path("safe_rl_output") / "runs" / base_run_id / "stage5" / "replay"
+    wcdt_by_seed = {int(item["seed"]): item for item in wcdt.get("episodes", [])}
+    rows = []
+    cv_actions_all: list[int] = []
+    wcdt_actions_all: list[int] = []
+    compared_steps = 0
+    matching_steps = 0
+    missing_replays = 0
+    for cv_episode in cv.get("episodes", []):
+        seed = int(cv_episode["seed"])
+        if seed not in wcdt_by_seed:
+            continue
+        cv_actions = _load_replay_actions(replay_dir / f"ppo_cv_features_seed_{seed}.json")
+        wcdt_actions = _load_replay_actions(replay_dir / f"ppo_wcdt_features_seed_{seed}.json")
+        if cv_actions is None or wcdt_actions is None:
+            missing_replays += 1
+            continue
+        cv_actions_all.extend(cv_actions)
+        wcdt_actions_all.extend(wcdt_actions)
+        limit = min(len(cv_actions), len(wcdt_actions))
+        compared_steps += limit
+        step_matches = sum(1 for idx in range(limit) if cv_actions[idx] == wcdt_actions[idx])
+        matching_steps += step_matches
+        first_diff = next((idx for idx in range(limit) if cv_actions[idx] != wcdt_actions[idx]), -1)
+        rows.append(
+            {
+                "seed": seed,
+                "cv_action_count": len(cv_actions),
+                "wcdt_action_count": len(wcdt_actions),
+                "exact_action_match": bool(len(cv_actions) == len(wcdt_actions) and step_matches == limit),
+                "step_action_agreement_rate": float(step_matches / limit) if limit else 0.0,
+                "first_diff_step": int(first_diff),
+            }
+        )
+    exact_rates = [float(row["exact_action_match"]) for row in rows]
+    return {
+        "available": bool(rows),
+        "compared_episode_count": int(len(rows)),
+        "missing_replay_count": int(missing_replays),
+        "exact_episode_action_match_rate": float(np.mean(exact_rates)) if exact_rates else 0.0,
+        "step_action_agreement_rate": float(matching_steps / compared_steps) if compared_steps else 0.0,
+        "cv_action_histogram": _action_histogram(cv_actions_all),
+        "wcdt_action_histogram": _action_histogram(wcdt_actions_all),
+        "episodes": rows,
+        "action_sensitive_to_forecast_source": bool(matching_steps < compared_steps or np.mean(exact_rates) < 1.0)
+        if rows
+        else False,
+    }
+
+
 def run_forecast_diagnostics(
     cfg: Any,
     max_samples: int = 512,
@@ -489,6 +557,7 @@ def run_forecast_diagnostics(
             stage5_report = json.load(file)
         low_rows = _low_min_distance_replays(str(cfg.run.run_id), stage5_report, int(low_seed_count))
         report["low_min_distance_ppo_cv_features"] = low_rows
+        report["forecast_behavior"] = _forecast_behavior_diagnostics(str(cfg.run.run_id), stage5_report)
         _write_replay_commands(output_dir / "replay_low_min_distance_ppo_cv_features.ps1", low_rows)
     output_path = output_dir / "forecast_diagnostics.json"
     write_report(output_path, report)

@@ -39,6 +39,40 @@ def _array_summary(values: list[float]) -> dict:
     }
 
 
+def _shadow_candidate_ranking(candidate_samples, raw_action, final_action, risk_model, context) -> dict:
+    legal_samples = [sample for sample in candidate_samples if bool(sample.candidate_legal)]
+    if not legal_samples:
+        return {
+            "raw_action_rank": None,
+            "chosen_action_rank": None,
+            "oracle_action_rank": None,
+            "model_vs_oracle_risk_delta": None,
+        }
+    predictions = {
+        sample.action: float(risk_model.predict(decode_action(sample.action), context).risk_score)
+        for sample in legal_samples
+    }
+    label_risks = {sample.action: float(sample.traffic_risk) for sample in legal_samples}
+    model_order = sorted(label_risks, key=lambda action: (predictions[action], action))
+    oracle_order = sorted(label_risks, key=lambda action: (label_risks[action], action))
+    model_rank = {action: rank + 1 for rank, action in enumerate(model_order)}
+    oracle_rank = {action: rank + 1 for rank, action in enumerate(oracle_order)}
+    oracle_action = oracle_order[0]
+    final_index = int(final_action.index)
+    return {
+        "raw_action_rank": model_rank.get(int(raw_action.index)),
+        "chosen_action_rank": model_rank.get(final_index),
+        "oracle_action_rank": oracle_rank.get(final_index),
+        "oracle_action": int(oracle_action),
+        "model_best_action": int(model_order[0]),
+        "model_vs_oracle_risk_delta": (
+            float(label_risks[final_index] - label_risks[oracle_action])
+            if final_index in label_risks
+            else None
+        ),
+    }
+
+
 def _shadow_summary(records: list[dict]) -> dict:
     if not records:
         return {
@@ -55,6 +89,18 @@ def _shadow_summary(records: list[dict]) -> dict:
         float(record["risk_before"]) - float(record["risk_after"])
         for record in records
         if bool(record.get("would_replace", False)) and bool(record.get("final_candidate_legal", True))
+    ]
+    raw_action_ranks = [float(record["raw_action_rank"]) for record in records if record.get("raw_action_rank") is not None]
+    chosen_action_ranks = [
+        float(record["chosen_action_rank"]) for record in records if record.get("chosen_action_rank") is not None
+    ]
+    oracle_action_ranks = [
+        float(record["oracle_action_rank"]) for record in records if record.get("oracle_action_rank") is not None
+    ]
+    model_vs_oracle = [
+        float(record["model_vs_oracle_risk_delta"])
+        for record in records
+        if record.get("model_vs_oracle_risk_delta") is not None
     ]
     return {
         "count": len(records),
@@ -82,6 +128,10 @@ def _shadow_summary(records: list[dict]) -> dict:
         "final_risk": _array_summary([float(record["risk_after"]) for record in records]),
         "replacement_risk_delta": _array_summary(replacement_deltas),
         "legal_replacement_risk_delta": _array_summary(legal_replacement_deltas),
+        "raw_action_rank": _array_summary(raw_action_ranks),
+        "chosen_action_rank": _array_summary(chosen_action_ranks),
+        "oracle_action_rank": _array_summary(oracle_action_ranks),
+        "model_vs_oracle_risk_delta": _array_summary(model_vs_oracle),
     }
 
 
@@ -124,6 +174,8 @@ def run(cfg) -> Path:
         "traffic_risk": [],
         "risk_sample_weight": [],
         "episode_id": [],
+        "candidate_transition_id": [],
+        "candidate_raw_action": [],
         "transition_episode_id": [],
         "candidate_target_lane_gap": [],
         "candidate_ramp_local_risk": [],
@@ -159,6 +211,9 @@ def run(cfg) -> Path:
                     raw_action = decode_action(action)
                     final_action, shadow_record = shadow_shield.select_action(raw_action, context)
                     shadow_record["would_replace"] = final_action.index != raw_action.index
+                    shadow_record.update(
+                        _shadow_candidate_ranking(candidate_samples, raw_action, final_action, risk_model, context)
+                    )
                     shadow_records.append(shadow_record)
                 next_obs, reward, terminated, truncated, info = env.step(action)
                 episode_reward += float(reward)
@@ -188,6 +243,7 @@ def run(cfg) -> Path:
                 transitions["target_lane_gap"].append(local.target_lane_gap)
                 transitions["ramp_local_risk"].append(float(local.ramp_local_risk))
                 transitions["merge_zone_risk"].append(float(local.merge_zone_risk))
+                transition_id = len(transitions["executed_actions"]) - 1
                 for sample in candidate_samples:
                     transitions["actions"].append(sample.action)
                     transitions["risk_features"].append(sample.features)
@@ -198,6 +254,8 @@ def run(cfg) -> Path:
                     transitions["traffic_risk"].append(sample.traffic_risk)
                     transitions["risk_sample_weight"].append(candidate_sample_weight(sample))
                     transitions["episode_id"].append(episode)
+                    transitions["candidate_transition_id"].append(transition_id)
+                    transitions["candidate_raw_action"].append(action)
                     transitions["candidate_target_lane_gap"].append(sample.local_stats.target_lane_gap)
                     transitions["candidate_ramp_local_risk"].append(float(sample.local_stats.ramp_local_risk))
                     transitions["candidate_merge_zone_risk"].append(float(sample.local_stats.merge_zone_risk))

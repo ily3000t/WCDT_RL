@@ -1,0 +1,251 @@
+from __future__ import annotations
+
+import argparse
+from pathlib import Path
+from typing import Any
+
+import yaml
+
+from safe_rl.pipeline.common import run_root, write_report
+from safe_rl.pipeline.stage5_paired_eval import (
+    _group_model_path,
+    _group_overrides,
+    _paired_delta,
+    _risk_path,
+    _select_eval_seeds,
+    _shield_acceptance,
+)
+from safe_rl.rl.evaluation import evaluate_ppo
+from safe_rl.utils.config import REPO_ROOT, clone_with_overrides, load_config, _to_config_dict
+from safe_rl.utils.progress import TensorboardLogger, stage_log
+
+
+DEFAULT_VARIANTS = (
+    {"activation_risk_threshold": 0.90, "replacement_margin": 0.15},
+    {"activation_risk_threshold": 0.85, "replacement_margin": 0.15},
+    {"activation_risk_threshold": 0.85, "replacement_margin": 0.10},
+    {"activation_risk_threshold": 0.80, "replacement_margin": 0.10},
+)
+
+
+def _variant_name(prefix: str, variant: dict[str, float]) -> str:
+    activation = int(round(float(variant["activation_risk_threshold"]) * 100))
+    margin = int(round(float(variant["replacement_margin"]) * 100))
+    return f"{prefix}_a{activation:03d}_m{margin:03d}"
+
+
+def _run_path(run_id: str, stage: str, name: str) -> str:
+    return (Path("safe_rl_output") / "runs" / run_id / stage / name).as_posix()
+
+
+def _forecast_run_id(run_id: str, source: str) -> str:
+    suffix = "cv" if source == "constant_velocity" else "wcdt"
+    return f"{run_id}_forecast_{suffix}"
+
+
+def _forecast_model_exists(run_id: str, source: str) -> bool:
+    path = REPO_ROOT / _run_path(_forecast_run_id(run_id, source), "stage3", "ppo_model.zip")
+    return path.exists()
+
+
+def build_sweep_groups(run_id: str, variants: tuple[dict[str, float], ...] = DEFAULT_VARIANTS) -> list[dict[str, Any]]:
+    groups: list[dict[str, Any]] = [
+        {
+            "name": "ppo",
+            "forecast_features": False,
+            "shield": False,
+            "model_path": _run_path(run_id, "stage3", "ppo_model.zip"),
+        }
+    ]
+    for variant in variants:
+        groups.append(
+            {
+                "name": _variant_name("ppo_shield", variant),
+                "forecast_features": False,
+                "shield": True,
+                "model_path": _run_path(run_id, "stage3", "ppo_model.zip"),
+                "shield_overrides": {**variant, "allow_fallback": False},
+            }
+        )
+
+    for source, base_name, shield_prefix in (
+        ("constant_velocity", "ppo_cv_features", "cv_prediction_shield"),
+        ("wcdt", "ppo_wcdt_features", "wcdt_prediction_shield"),
+    ):
+        if not _forecast_model_exists(run_id, source):
+            continue
+        forecast_run = _forecast_run_id(run_id, source)
+        base = {
+            "name": base_name,
+            "forecast_features": True,
+            "shield": False,
+            "model_path": _run_path(forecast_run, "stage3", "ppo_model.zip"),
+            "forecast_source": source,
+        }
+        if source == "wcdt":
+            base["forecast_checkpoint"] = _run_path(run_id, "stage2", "wcdt_predictor.pt")
+        groups.append(base)
+        for variant in variants:
+            shield_group = {
+                "name": _variant_name(shield_prefix, variant),
+                "forecast_features": True,
+                "shield": True,
+                "model_path": _run_path(forecast_run, "stage3", "ppo_model.zip"),
+                "forecast_source": source,
+                "shield_overrides": {**variant, "allow_fallback": False},
+            }
+            if source == "wcdt":
+                shield_group["forecast_checkpoint"] = _run_path(run_id, "stage2", "wcdt_predictor.pt")
+            groups.append(shield_group)
+    return groups
+
+
+def _sweep_payload(run_id: str, groups: list[dict[str, Any]], seeds: list[int]) -> dict[str, Any]:
+    return {
+        "run": {"run_id": run_id},
+        "stage5": {
+            "episodes_per_group": len(seeds),
+            "seeds": seeds,
+            "groups": groups,
+        },
+    }
+
+
+def _base_group_for(name: str) -> str | None:
+    if name.startswith("ppo_shield_"):
+        return "ppo"
+    if name.startswith("cv_prediction_shield_"):
+        return "ppo_cv_features"
+    if name.startswith("wcdt_prediction_shield_"):
+        return "ppo_wcdt_features"
+    return None
+
+
+def _variant_report(base: dict, candidate: dict) -> dict[str, Any]:
+    metrics = candidate.get("metrics", {})
+    base_metrics = base.get("metrics", {})
+    delta = _paired_delta(base, candidate)
+    acceptance = _shield_acceptance(base, candidate)
+    return {
+        "metrics": {
+            "average_reward": metrics.get("average_reward", 0.0),
+            "min_distance_p1": metrics.get("min_distance_p1", 0.0),
+            "ttc_p1": metrics.get("ttc_p1", 0.0),
+            "drac_p99": metrics.get("drac_p99", 0.0),
+            "actual_replacement_rate": metrics.get("actual_replacement_rate", 0.0),
+            "mean_actual_replacements": metrics.get("mean_actual_replacements", 0.0),
+            "fallback_rate": metrics.get("fallback_rate", 0.0),
+            "near_miss_rate": metrics.get("near_miss_rate", 0.0),
+            "collision_rate": metrics.get("collision_rate", 0.0),
+        },
+        "delta": delta,
+        "acceptance": acceptance,
+        "improved_tail": bool(
+            float(metrics.get("min_distance_p1", 0.0)) > float(base_metrics.get("min_distance_p1", 0.0))
+            or float(metrics.get("drac_p99", 0.0)) < float(base_metrics.get("drac_p99", 0.0))
+        ),
+    }
+
+
+def _recommend_variant(variants: dict[str, dict[str, Any]]) -> str | None:
+    best_name = None
+    best_score = None
+    for name, item in variants.items():
+        acceptance = item.get("acceptance", {})
+        metrics = item.get("metrics", {})
+        delta = item.get("delta") or {}
+        if acceptance.get("shield_regression", False):
+            continue
+        if float(metrics.get("mean_actual_replacements", 0.0)) <= 0.0:
+            continue
+        if not item.get("improved_tail", False):
+            continue
+        score = (
+            float(delta.get("mean_min_distance_delta", 0.0))
+            - 0.05 * float(delta.get("mean_drac_delta", 0.0))
+            + 0.01 * float(delta.get("mean_reward_delta", 0.0))
+        )
+        if best_score is None or score > best_score:
+            best_name = name
+            best_score = score
+    return best_name
+
+
+def run(cfg) -> Path:
+    stage_dir = run_root(cfg) / "stage5_sweep"
+    stage_dir.mkdir(parents=True, exist_ok=True)
+    generated_dir = stage_dir / "generated_configs"
+    generated_dir.mkdir(parents=True, exist_ok=True)
+    seeds = _select_eval_seeds(cfg)
+    groups = build_sweep_groups(str(cfg.run.run_id))
+    payload = _sweep_payload(str(cfg.run.run_id), groups, seeds)
+    config_path = generated_dir / "stage5_shield_sweep.yaml"
+    with config_path.open("w", encoding="utf-8") as file:
+        yaml.safe_dump(payload, file, sort_keys=False, allow_unicode=True)
+
+    risk_checkpoint = str(_risk_path(cfg))
+    tb = TensorboardLogger(stage_dir / "tensorboard", enabled=bool(cfg.run.get("tensorboard", True)))
+    replay_dir = stage_dir / "replay"
+    group_reports: dict[str, dict] = {}
+    stage_log("stage5_sweep", f"run_id={cfg.run.run_id}")
+    stage_log("stage5_sweep", f"groups={len(groups)} seeds={seeds}")
+    for group_idx, group_dict in enumerate(groups):
+        group = _to_config_dict(yaml.safe_load(yaml.safe_dump(group_dict)))
+        group_cfg = clone_with_overrides(cfg, _group_overrides(group))
+        model_path = _group_model_path(group, Path(_run_path(str(cfg.run.run_id), "stage3", "ppo_model.zip")))
+        stage_log("stage5_sweep", f"group={group['name']} model={model_path}")
+        report = evaluate_ppo(
+            group_cfg,
+            model_path,
+            seeds=seeds,
+            shield_enabled=bool(group["shield"]),
+            risk_checkpoint=risk_checkpoint if bool(group["shield"]) else None,
+            replay_dir=replay_dir if bool(cfg.stage5.get("replay_enabled", True)) and bool(cfg.run.get("replay", True)) else None,
+            group_name=str(group["name"]),
+            tensorboard=tb,
+            tensorboard_step_offset=group_idx * max(1, len(seeds)),
+        )
+        report["shield_overrides"] = dict(group.get("shield_overrides", {}) or {})
+        report["forecast_source"] = str(group.get("forecast_source", ""))
+        group_reports[str(group["name"])] = report
+    tb.close()
+
+    variants: dict[str, dict[str, Any]] = {}
+    for name, report in group_reports.items():
+        base_name = _base_group_for(name)
+        if base_name and base_name in group_reports:
+            variants[name] = _variant_report(group_reports[base_name], report)
+    recommended = _recommend_variant(variants)
+    final_report = {
+        "stage": "stage5_sweep",
+        "run_id": cfg.run.run_id,
+        "config": str(config_path),
+        "risk_checkpoint": risk_checkpoint,
+        "seeds": seeds,
+        "groups": group_reports,
+        "variants": variants,
+        "recommended_variant": recommended,
+        "recommendation_reason": (
+            "selected non-regressive variant with actual replacements and improved min_distance_p1 or drac_p99"
+            if recommended
+            else "no sweep variant improved tail safety without regression; keep default 0.90/0.15"
+        ),
+    }
+    report_path = stage_dir / "shield_sweep_report.json"
+    write_report(report_path, final_report)
+    stage_log("stage5_sweep", f"report={report_path}")
+    return report_path
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(description="Stage5 Shield threshold sweep")
+    parser.add_argument("--config", default=None, help="Optional YAML config overlay.")
+    parser.add_argument("--run-id", required=True, help="Existing run id to evaluate.")
+    args = parser.parse_args()
+    cfg = load_config(args.config)
+    cfg.run["run_id"] = args.run_id
+    run(cfg)
+
+
+if __name__ == "__main__":
+    main()

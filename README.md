@@ -271,6 +271,23 @@ safe_rl/config/advanced/stage5_four_groups.example.yaml
 python -m safe_rl.pipeline.stage5_paired_eval --run-id $RUN_ID --config path\to\your_stage5_four_groups.yaml
 ```
 
+### Stage5 Shield 阈值扫描
+
+当已有完整 run 输出后，可以不重训 Stage1-Stage4，直接复用当前 PPO、forecast PPO 和 `stage2/risk_module.pt` 扫描 Shield 阈值：
+
+```powershell
+python -m safe_rl.pipeline.stage5_shield_sweep --run-id $RUN_ID
+```
+
+默认扫描 `activation_risk_threshold/replacement_margin` 的四组组合：`0.90/0.15`、`0.85/0.15`、`0.85/0.10`、`0.80/0.10`。输出写入：
+
+```text
+safe_rl_output/runs/<run_id>/stage5_sweep/shield_sweep_report.json
+safe_rl_output/runs/<run_id>/stage5_sweep/generated_configs/
+```
+
+报告会按 variant 汇总 reward、min distance、TTC、DRAC、真实 replacement、fallback 和 regression 检查，并给出 `recommended_variant`。
+
 ## 一键顺序运行示例
 
 推荐直接使用全流程 runner。它会重建网络、做 SUMO smoke check、依次运行 Stage1/2/3/4、用 Stage4 buffer 重训 Risk Module，然后在同一份 Stage1/Stage4 数据、同一个 Risk Module、同一个 baseline PPO 上分别训练 CV forecast PPO 和 WcDT forecast PPO，并完成多组 Stage5 paired evaluation：
