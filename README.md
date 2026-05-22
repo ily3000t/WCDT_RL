@@ -154,10 +154,14 @@ python -m safe_rl.pipeline.stage2_train_prediction_risk --run-id $RUN_ID
 
 ```text
 safe_rl_output/runs/<run_id>/stage2/wcdt_predictor.pt
+safe_rl_output/runs/<run_id>/stage2/wcdt_predictor_best.pt
 safe_rl_output/runs/<run_id>/stage2/risk_module.pt
+safe_rl_output/runs/<run_id>/stage2/stage2_initial_prediction_report.json
 safe_rl_output/runs/<run_id>/stage2/stage2_training_report.json
 safe_rl_output/runs/<run_id>/stage2/tensorboard/
 ```
+
+Stage2 的 WcDT-style predictor 会从 Stage1 trajectory windows 中划分 train/validation，按 validation `FDE + 0.5 * target_lane_gap_abs_error + 0.5 * future_min_distance_abs_error` 选择 best checkpoint。`wcdt_predictor_best.pt` 保存最佳权重；兼容路径 `wcdt_predictor.pt` 也写入同一 best 权重，避免后续 Stage3/Stage5 加载最后一个退化 epoch。
 
 说明：当前仓库没有预训练 WcDT checkpoint，因此默认从 SUMO 采集数据训练；如有外部权重，可在配置中设置：
 
@@ -286,7 +290,24 @@ safe_rl_output/runs/<run_id>/stage5_sweep/shield_sweep_report.json
 safe_rl_output/runs/<run_id>/stage5_sweep/generated_configs/
 ```
 
-报告会按 variant 汇总 reward、min distance、TTC、DRAC、真实 replacement、fallback 和 regression 检查，并给出 `recommended_variant`。
+报告会按 variant 汇总 reward、min distance、TTC、DRAC、真实 replacement、fallback 和 regression 检查，并给出 `recommended_variant`。同时会输出 Shield score 饱和诊断，包括 raw risk score、best candidate risk score、replacement risk delta、reason ratio 和 raw risk 到 activation threshold 的 margin 分布，用来判断为什么不同阈值组合可能产生完全相同的动作。
+
+默认阈值仍保持保守设置：
+
+```yaml
+shield:
+  activation_risk_threshold: 0.90
+  replacement_margin: 0.15
+  allow_fallback: false
+```
+
+如果只想做诊断，可以额外扫描更激进阈值：
+
+```powershell
+python -m safe_rl.pipeline.stage5_shield_sweep --run-id $RUN_ID --include-aggressive
+```
+
+`--include-aggressive` 只用于解释风险分数饱和和阈值敏感性，不会自动改写默认 Shield 配置。当前推荐主结果仍优先报告 `ppo`、`ppo_shield`、`ppo_cv_features`、`cv_prediction_shield`；WcDT 分支需要结合 `stage5/diagnostics/forecast_diagnostics.json` 中的 ADE/FDE、uncertainty 和 `wcdt_recommended_for_stage5` 判断是否可靠。
 
 ## 一键顺序运行示例
 

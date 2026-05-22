@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 from pathlib import Path
 from typing import Any
 
@@ -117,7 +118,9 @@ def json_ready(value: Any) -> Any:
     if isinstance(value, np.ndarray):
         return value.tolist()
     if isinstance(value, (np.floating, np.integer)):
-        return value.item()
+        return json_ready(value.item())
+    if isinstance(value, float):
+        return value if math.isfinite(value) else None
     if isinstance(value, dict):
         return {key: json_ready(val) for key, val in value.items()}
     if isinstance(value, list):
@@ -128,4 +131,4 @@ def json_ready(value: Any) -> Any:
 def write_report(path: Path, payload: dict[str, Any]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("w", encoding="utf-8") as file:
-        json.dump(json_ready(payload), file, ensure_ascii=False, indent=2)
+        json.dump(json_ready(payload), file, ensure_ascii=False, indent=2, allow_nan=False)

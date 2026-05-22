@@ -77,6 +77,86 @@ def _prediction_loss_summary(history: list[float] | None) -> dict | None:
     }
 
 
+LANE_CENTERS = {0: -8.0, 1: -4.8, 2: -1.6}
+
+
+def _prediction_val_score(metrics: dict[str, Any], cfg: Any) -> float:
+    fde = float(metrics.get("fde", {}).get("mean", 0.0))
+    gap = float(metrics.get("target_lane_gap_abs_error", {}).get("mean", 0.0))
+    min_distance = float(metrics.get("future_min_distance_abs_error", {}).get("mean", 0.0))
+    return (
+        fde
+        + float(cfg.prediction.get("target_lane_gap_metric_weight", 0.5)) * gap
+        + float(cfg.prediction.get("future_min_distance_metric_weight", 0.5)) * min_distance
+    )
+
+
+def _summary(values: list[float] | np.ndarray) -> dict[str, float | int]:
+    arr = np.asarray(values, dtype=np.float32).reshape(-1)
+    arr = arr[np.isfinite(arr)]
+    if arr.size == 0:
+        return {"count": 0}
+    return {
+        "count": int(arr.size),
+        "mean": float(np.mean(arr)),
+        "std": float(np.std(arr)),
+        "p01": float(np.percentile(arr, 1)),
+        "p05": float(np.percentile(arr, 5)),
+        "p50": float(np.percentile(arr, 50)),
+        "p95": float(np.percentile(arr, 95)),
+        "p99": float(np.percentile(arr, 99)),
+        "min": float(np.min(arr)),
+        "max": float(np.max(arr)),
+    }
+
+
+def _correlation(a_values: list[float], b_values: list[float]) -> float:
+    a = np.asarray(a_values, dtype=np.float32)
+    b = np.asarray(b_values, dtype=np.float32)
+    mask = np.isfinite(a) & np.isfinite(b)
+    a = a[mask]
+    b = b[mask]
+    if a.size < 2 or float(np.std(a)) <= 1.0e-8 or float(np.std(b)) <= 1.0e-8:
+        return 0.0
+    return float(np.corrcoef(a, b)[0, 1])
+
+
+def _infer_lane_index(y: float) -> int:
+    return min(LANE_CENTERS, key=lambda lane: abs(float(y) - LANE_CENTERS[lane]))
+
+
+def _ordered_prediction_indices(cfg: Any, sample_history: np.ndarray, sample_mask: np.ndarray) -> list[int]:
+    if sample_history.shape[0] <= 1:
+        return []
+    ego = sample_history[0, -1]
+    ego_x = float(ego[0])
+    merge_x = float(cfg.scenario.get("merge_x", 220.0))
+    target_lane = int(cfg.scenario.get("merge_target_lane", 2))
+
+    def _priority(agent_idx: int) -> tuple[float, float, float, int]:
+        latest = sample_history[agent_idx, -1]
+        x = float(latest[0])
+        y = float(latest[1])
+        dx = x - ego_x
+        lane = _infer_lane_index(y)
+        is_ramp_local = y > 0.5 and x < merge_x + 20.0
+        is_target_lane = (not is_ramp_local) and lane == target_lane
+        if is_target_lane and dx >= 0.0:
+            group = 0
+        elif is_target_lane and dx < 0.0:
+            group = 1
+        elif is_target_lane:
+            group = 2
+        elif is_ramp_local:
+            group = 3
+        else:
+            group = 4
+        return (float(group), abs(dx), abs(y - LANE_CENTERS.get(target_lane, -1.6)), int(agent_idx))
+
+    valid = [idx for idx in range(1, sample_history.shape[0]) if float(sample_mask[idx]) > 0.0]
+    return sorted(valid, key=_priority)
+
+
 def _stage1_path(cfg) -> Path:
     if cfg.stage2.input_stage1:
         return Path(cfg.stage2.input_stage1)
@@ -510,38 +590,59 @@ def _train_risk_module(
     }
 
 
-def _build_wcdt_batch(cfg: Any, data: np.lib.npyio.NpzFile, device: Any | None = None):
+def _build_wcdt_batch(
+    cfg: Any,
+    data: np.lib.npyio.NpzFile,
+    device: Any | None = None,
+    indices: np.ndarray | None = None,
+    *,
+    shuffle: bool = True,
+):
     torch, DataLoader, TensorDataset = _require_torch()
     history = data["agent_history"]
     future = data["agent_future"]
     mask = data["agent_mask"]
     if history.shape[0] == 0 or history.ndim != 4:
         return None
+    sample_indices = np.asarray(indices if indices is not None else np.arange(history.shape[0]), dtype=np.int64)
+    if sample_indices.size == 0:
+        return None
     max_pred = int(cfg.prediction.max_pred_num)
     max_other = int(cfg.prediction.max_other_num)
     hist_steps = int(cfg.scenario.history_steps)
     horizon = future.shape[2]
-    padded_future = np.zeros((future.shape[0], max_pred, 80, 5), dtype=np.float32)
-    predicted_his = np.zeros((future.shape[0], max_pred, hist_steps, 5), dtype=np.float32)
-    other_his = np.zeros((future.shape[0], max_other, hist_steps, 5), dtype=np.float32)
-    predicted_mask = np.zeros((future.shape[0], max_pred), dtype=np.float32)
-    other_mask = np.zeros((future.shape[0], max_other), dtype=np.float32)
+    padded_future = np.zeros((sample_indices.shape[0], max_pred, 80, 5), dtype=np.float32)
+    ego_future = np.zeros((sample_indices.shape[0], horizon, 5), dtype=np.float32)
+    predicted_his = np.zeros((sample_indices.shape[0], max_pred, hist_steps, 5), dtype=np.float32)
+    other_his = np.zeros((sample_indices.shape[0], max_other, hist_steps, 5), dtype=np.float32)
+    predicted_mask = np.zeros((sample_indices.shape[0], max_pred), dtype=np.float32)
+    other_mask = np.zeros((sample_indices.shape[0], max_other), dtype=np.float32)
 
-    for sample_idx in range(history.shape[0]):
-        pred_agents = list(range(1, min(history.shape[1], max_pred + 1)))
-        other_agents = [0] + list(range(max_pred + 1, min(history.shape[1], max_pred + max_other)))
+    for output_idx, sample_idx in enumerate(sample_indices):
+        ordered_agents = _ordered_prediction_indices(cfg, history[sample_idx], mask[sample_idx])
+        pred_agents = ordered_agents[:max_pred]
+        leftover = [agent_idx for agent_idx in ordered_agents if agent_idx not in set(pred_agents)]
+        leftover.sort(
+            key=lambda agent_idx: (
+                abs(float(history[sample_idx, agent_idx, -1, 0] - history[sample_idx, 0, -1, 0]))
+                + abs(float(history[sample_idx, agent_idx, -1, 1] - history[sample_idx, 0, -1, 1])),
+                int(agent_idx),
+            )
+        )
+        other_agents = [0] + leftover
+        ego_future[output_idx] = future[sample_idx, 0, :horizon]
         for row, agent_idx in enumerate(pred_agents[:max_pred]):
-            predicted_his[sample_idx, row] = history[sample_idx, agent_idx]
-            padded_future[sample_idx, row, :horizon] = future[sample_idx, agent_idx]
+            predicted_his[output_idx, row] = history[sample_idx, agent_idx]
+            padded_future[output_idx, row, :horizon] = future[sample_idx, agent_idx]
             if horizon < 80:
-                padded_future[sample_idx, row, horizon:] = future[sample_idx, agent_idx, -1]
-            predicted_mask[sample_idx, row] = mask[sample_idx, agent_idx]
+                padded_future[output_idx, row, horizon:] = future[sample_idx, agent_idx, -1]
+            predicted_mask[output_idx, row] = mask[sample_idx, agent_idx]
         for row, agent_idx in enumerate(other_agents[:max_other]):
-            other_his[sample_idx, row] = history[sample_idx, agent_idx]
-            other_mask[sample_idx, row] = mask[sample_idx, agent_idx]
+            other_his[output_idx, row] = history[sample_idx, agent_idx]
+            other_mask[output_idx, row] = mask[sample_idx, agent_idx]
 
-    predicted_feature = np.zeros((history.shape[0], max_pred, 7), dtype=np.float32)
-    other_feature = np.zeros((history.shape[0], max_other, 7), dtype=np.float32)
+    predicted_feature = np.zeros((sample_indices.shape[0], max_pred, 7), dtype=np.float32)
+    other_feature = np.zeros((sample_indices.shape[0], max_other, 7), dtype=np.float32)
     predicted_feature[..., 0] = 1.8
     predicted_feature[..., 1] = 4.8
     predicted_feature[..., 3] = 1.0
@@ -552,11 +653,12 @@ def _build_wcdt_batch(cfg: Any, data: np.lib.npyio.NpzFile, device: Any | None =
     from safe_rl.prediction.sumo_wcdt_adapter import SumoWcDTAdapter
 
     lane_list = SumoWcDTAdapter(cfg).lane_list
-    lane_batch = np.repeat(lane_list[None, ...], history.shape[0], axis=0)
+    lane_batch = np.repeat(lane_list[None, ...], sample_indices.shape[0], axis=0)
     dataset = TensorDataset(
         torch.tensor(predicted_his, dtype=torch.float32),
         torch.tensor(padded_future, dtype=torch.float32),
         torch.tensor(predicted_mask, dtype=torch.float32),
+        torch.tensor(ego_future, dtype=torch.float32),
         torch.tensor(predicted_feature, dtype=torch.float32),
         torch.tensor(other_his, dtype=torch.float32),
         torch.tensor(other_feature, dtype=torch.float32),
@@ -564,7 +666,165 @@ def _build_wcdt_batch(cfg: Any, data: np.lib.npyio.NpzFile, device: Any | None =
         torch.tensor(lane_batch, dtype=torch.float32),
     )
     loader_kwargs = _loader_kwargs(cfg, device or torch.device("cpu"))
-    return DataLoader(dataset, batch_size=int(cfg.prediction.batch_size), shuffle=True, **loader_kwargs)
+    return DataLoader(dataset, batch_size=int(cfg.prediction.batch_size), shuffle=shuffle, **loader_kwargs)
+
+
+def _wcdt_data_dict(cfg: Any, pred_his, pred_future, pred_mask, pred_feat, other_his, other_feat, other_mask, lane_list, device):
+    return {
+        "predicted_feature": pred_feat,
+        "other_his_pos": other_his[:, :, -1, :2],
+        "other_his_traj_delt": other_his[:, :, 1:] - other_his[:, :, :-1],
+        "other_feature": other_feat,
+        "other_traj_mask": other_mask,
+        "predicted_his_pos": pred_his[:, :, -1, :2],
+        "predicted_his_traj_delt": pred_his[:, :, 1:] - pred_his[:, :, :-1],
+        "predicted_his_traj": pred_his,
+        "predicted_future_traj": pred_future,
+        "predicted_traj_mask": pred_mask,
+        "traffic_light": torch_zeros_like(
+            pred_his,
+            (pred_his.shape[0], int(cfg.prediction.max_traffic_light), int(cfg.scenario.history_steps)),
+            device,
+        ),
+        "traffic_light_pos": torch_zeros_like(
+            pred_his,
+            (pred_his.shape[0], int(cfg.prediction.max_traffic_light), 2),
+            device,
+        ),
+        "lane_list": lane_list,
+    }
+
+
+def torch_zeros_like(reference, shape: tuple[int, ...], device):
+    return reference.new_zeros(shape).to(device)
+
+
+def _select_best_mode(trajectories: np.ndarray, confidence: np.ndarray | None) -> np.ndarray:
+    if trajectories.ndim == 4:
+        return trajectories
+    if trajectories.ndim != 5:
+        raise ValueError(f"unexpected WcDT trajectory shape: {trajectories.shape}")
+    if confidence is None:
+        mode_idx = np.zeros((trajectories.shape[0], trajectories.shape[1]), dtype=np.int64)
+    else:
+        mode_idx = np.argmax(confidence, axis=-1)
+    selected = np.zeros((trajectories.shape[0], trajectories.shape[1], trajectories.shape[3], trajectories.shape[4]), dtype=np.float32)
+    for batch_idx in range(trajectories.shape[0]):
+        for agent_idx in range(trajectories.shape[1]):
+            selected[batch_idx, agent_idx] = trajectories[batch_idx, agent_idx, mode_idx[batch_idx, agent_idx]]
+    return selected
+
+
+def _future_min_distance(ego_future: np.ndarray, other_future: np.ndarray, other_mask: np.ndarray) -> float:
+    min_distance = 1.0e6
+    horizon = min(ego_future.shape[0], other_future.shape[1])
+    for agent_idx in range(other_future.shape[0]):
+        if float(other_mask[agent_idx]) <= 0.0:
+            continue
+        distances = np.linalg.norm(other_future[agent_idx, :horizon, :2] - ego_future[:horizon, :2], axis=-1) - 3.0
+        min_distance = min(min_distance, float(np.min(np.maximum(0.0, distances))))
+    return float(min_distance)
+
+
+def _target_lane_gap(ego_future: np.ndarray, other_future: np.ndarray, other_mask: np.ndarray, cfg: Any) -> float:
+    target_y = LANE_CENTERS.get(int(cfg.scenario.get("merge_target_lane", 2)), -1.6)
+    min_gap = 1.0e6
+    horizon = min(ego_future.shape[0], other_future.shape[1])
+    for step_idx in range(horizon):
+        ego_x = float(ego_future[step_idx, 0])
+        for agent_idx in range(other_future.shape[0]):
+            if float(other_mask[agent_idx]) <= 0.0:
+                continue
+            x = float(other_future[agent_idx, step_idx, 0])
+            y = float(other_future[agent_idx, step_idx, 1])
+            if abs(y - target_y) > 2.0:
+                continue
+            min_gap = min(min_gap, max(0.0, abs(x - ego_x) - 4.8))
+    return float(min_gap)
+
+
+def _wcdt_validation_metrics(cfg: Any, model: Any, loader: Any, device: Any, pin_memory: bool) -> dict[str, Any]:
+    torch, _DataLoader, _TensorDataset = _require_torch()
+    ade: list[float] = []
+    fde: list[float] = []
+    future_min_distance_errors: list[float] = []
+    future_min_distance_abs_errors: list[float] = []
+    target_gap_errors: list[float] = []
+    target_gap_abs_errors: list[float] = []
+    uncertainty_values: list[float] = []
+    confidence_values: list[float] = []
+    confidence_fde_values: list[float] = []
+    val_losses: list[float] = []
+    model.eval()
+    with torch.no_grad():
+        for batch in loader:
+            pred_his, pred_future, pred_mask, ego_future, pred_feat, other_his, other_feat, other_mask, lane_list = _to_device(
+                batch,
+                device,
+                non_blocking=pin_memory,
+            )
+            data_dict = _wcdt_data_dict(
+                cfg,
+                pred_his,
+                pred_future,
+                pred_mask,
+                pred_feat,
+                other_his,
+                other_feat,
+                other_mask,
+                lane_list,
+                device,
+            )
+            diffusion_loss, traj_loss, confidence_loss, _min_loss_traj = model(data_dict)
+            val_losses.append(float((diffusion_loss.mean() + traj_loss.mean() + confidence_loss.mean()).detach().cpu()))
+            horizon = min(int(cfg.forecast_features.get("horizon_steps", cfg.scenario.forecast_horizon_steps)), ego_future.shape[1])
+            output = model.predict(data_dict, horizon_steps=horizon)
+            traj = output["future_trajectories"].detach().cpu().numpy()
+            confidence = output.get("mode_confidence")
+            confidence_np = confidence.detach().cpu().numpy() if confidence is not None else None
+            selected = _select_best_mode(traj, confidence_np)
+            actual_future = pred_future[:, :, :horizon].detach().cpu().numpy()
+            ego_future_np = ego_future[:, :horizon].detach().cpu().numpy()
+            pred_mask_np = pred_mask.detach().cpu().numpy()
+            uncertainty = output.get("uncertainty")
+            uncertainty_np = uncertainty.detach().cpu().numpy() if uncertainty is not None else np.zeros(pred_mask_np.shape)
+            max_confidence_np = (
+                np.max(confidence_np, axis=-1) if confidence_np is not None else np.ones(pred_mask_np.shape, dtype=np.float32)
+            )
+            for row in range(selected.shape[0]):
+                valid = pred_mask_np[row] > 0.0
+                if not np.any(valid):
+                    continue
+                diff = selected[row, valid, :, :2] - actual_future[row, valid, :, :2]
+                per_step = np.linalg.norm(diff, axis=-1)
+                row_ade = float(np.mean(per_step))
+                row_fde = float(np.mean(per_step[:, -1]))
+                ade.append(row_ade)
+                fde.append(row_fde)
+                confidence_values.append(float(np.mean(max_confidence_np[row][valid])))
+                confidence_fde_values.append(row_fde)
+                uncertainty_values.append(float(np.mean(uncertainty_np[row][valid])))
+                pred_min = _future_min_distance(ego_future_np[row], selected[row], pred_mask_np[row])
+                actual_min = _future_min_distance(ego_future_np[row], actual_future[row], pred_mask_np[row])
+                future_min_distance_errors.append(float(pred_min - actual_min))
+                future_min_distance_abs_errors.append(abs(float(pred_min - actual_min)))
+                pred_gap = _target_lane_gap(ego_future_np[row], selected[row], pred_mask_np[row], cfg)
+                actual_gap = _target_lane_gap(ego_future_np[row], actual_future[row], pred_mask_np[row], cfg)
+                if pred_gap < 1.0e6 and actual_gap < 1.0e6:
+                    target_gap_errors.append(float(pred_gap - actual_gap))
+                    target_gap_abs_errors.append(abs(float(pred_gap - actual_gap)))
+    return {
+        "loss": float(np.mean(val_losses)) if val_losses else 0.0,
+        "ade": _summary(ade),
+        "fde": _summary(fde),
+        "future_min_distance_error": _summary(future_min_distance_errors),
+        "future_min_distance_abs_error": _summary(future_min_distance_abs_errors),
+        "target_lane_gap_error": _summary(target_gap_errors),
+        "target_lane_gap_abs_error": _summary(target_gap_abs_errors),
+        "uncertainty": _summary(uncertainty_values),
+        "confidence": _summary(confidence_values),
+        "confidence_fde_correlation": _correlation(confidence_values, confidence_fde_values),
+    }
 
 
 def _train_wcdt_predictor(
@@ -574,9 +834,16 @@ def _train_wcdt_predictor(
     tb: TensorboardLogger,
     device: Any,
 ) -> dict:
-    loader = _build_wcdt_batch(cfg, data, device=device)
+    sample_count = int(data["agent_history"].shape[0]) if _has_key(data, "agent_history") else 0
+    train_indices, val_indices = _split_indices(
+        sample_count,
+        float(cfg.prediction.get("validation_split", 0.15)),
+        int(cfg.run.seed),
+    )
+    loader = _build_wcdt_batch(cfg, data, device=device, indices=train_indices, shuffle=True)
     if loader is None:
         return {"prediction_skipped": True, "prediction_skip_reason": "no trajectory samples in Stage1 buffer"}
+    val_loader = _build_wcdt_batch(cfg, data, device=device, indices=val_indices, shuffle=False) if val_indices.size else None
     torch, _DataLoader, _TensorDataset = _require_torch()
     from net_works import BackBone
     from utils import MathUtil
@@ -588,41 +855,38 @@ def _train_wcdt_predictor(
         model.load_state_dict(state.get("model_state_dict", state), strict=False)
     optimizer = torch.optim.Adam(model.parameters(), lr=float(cfg.prediction.learning_rate))
     loss_history: list[float] = []
+    val_loss_history: list[float] = []
+    validation_history: list[dict[str, Any]] = []
+    best_payload: dict[str, Any] | None = None
+    best_score: float | None = None
+    best_epoch = 0
     pin_memory = bool(getattr(loader, "pin_memory", False))
     stage_log(
         "stage2",
-        f"WcDT predictor batches={len(loader)}, batch_size={cfg.prediction.batch_size}, "
-        f"pin_memory={pin_memory}",
+        f"WcDT predictor train_samples={train_indices.shape[0]}, val_samples={val_indices.shape[0]}, "
+        f"batches={len(loader)}, batch_size={cfg.prediction.batch_size}, pin_memory={pin_memory}",
     )
     for epoch in progress_iter(range(int(cfg.prediction.epochs)), desc="Stage2 prediction epochs"):
         losses = []
+        model.train()
         for batch in loader:
-            pred_his, pred_future, pred_mask, pred_feat, other_his, other_feat, other_mask, lane_list = _to_device(
+            pred_his, pred_future, pred_mask, _ego_future, pred_feat, other_his, other_feat, other_mask, lane_list = _to_device(
                 batch,
                 device,
                 non_blocking=pin_memory,
             )
-            data_dict = {
-                "predicted_feature": pred_feat,
-                "other_his_pos": other_his[:, :, -1, :2],
-                "other_his_traj_delt": other_his[:, :, 1:] - other_his[:, :, :-1],
-                "other_feature": other_feat,
-                "other_traj_mask": other_mask,
-                "predicted_his_pos": pred_his[:, :, -1, :2],
-                "predicted_his_traj_delt": pred_his[:, :, 1:] - pred_his[:, :, :-1],
-                "predicted_his_traj": pred_his,
-                "predicted_future_traj": pred_future,
-                "predicted_traj_mask": pred_mask,
-                "traffic_light": torch.zeros(
-                    (pred_his.shape[0], int(cfg.prediction.max_traffic_light), int(cfg.scenario.history_steps)),
-                    device=device,
-                ),
-                "traffic_light_pos": torch.zeros(
-                    (pred_his.shape[0], int(cfg.prediction.max_traffic_light), 2),
-                    device=device,
-                ),
-                "lane_list": lane_list,
-            }
+            data_dict = _wcdt_data_dict(
+                cfg,
+                pred_his,
+                pred_future,
+                pred_mask,
+                pred_feat,
+                other_his,
+                other_feat,
+                other_mask,
+                lane_list,
+                device,
+            )
             diffusion_loss, traj_loss, confidence_loss, _min_loss_traj = model(data_dict)
             loss = diffusion_loss.mean() + traj_loss.mean() + confidence_loss.mean()
             optimizer.zero_grad()
@@ -632,10 +896,70 @@ def _train_wcdt_predictor(
         epoch_loss = float(np.mean(losses)) if losses else 0.0
         loss_history.append(epoch_loss)
         tb.scalar("stage2/prediction_loss", epoch_loss, epoch)
-        stage_log("stage2", f"prediction epoch={epoch + 1}/{cfg.prediction.epochs} loss={epoch_loss:.6f}")
+        validation_metrics: dict[str, Any] | None = None
+        val_loss = 0.0
+        val_score = epoch_loss
+        if val_loader is not None:
+            validation_metrics = _wcdt_validation_metrics(cfg, model, val_loader, device, pin_memory)
+            validation_metrics["epoch"] = int(epoch + 1)
+            val_loss = float(validation_metrics.get("loss", 0.0))
+            val_loss_history.append(val_loss)
+            val_score = _prediction_val_score(validation_metrics, cfg)
+            validation_metrics["val_score"] = float(val_score)
+            validation_history.append(validation_metrics)
+            tb.scalar("stage2/prediction_val_loss", val_loss, epoch)
+            tb.scalar("stage2/prediction_val_score", val_score, epoch)
+            tb.scalar("stage2/prediction_val_ade", float(validation_metrics["ade"].get("mean", 0.0)), epoch)
+            tb.scalar("stage2/prediction_val_fde", float(validation_metrics["fde"].get("mean", 0.0)), epoch)
+        if best_score is None or val_score < best_score:
+            best_score = float(val_score)
+            best_epoch = int(epoch + 1)
+            best_payload = {
+                "model_state_dict": _cpu_state_dict(model),
+                "loss_history": list(loss_history),
+                "val_loss_history": list(val_loss_history),
+                "validation_history": list(validation_history),
+                "best_epoch": best_epoch,
+                "best_val_score": float(best_score),
+                "best_metric": "val_score" if val_loader is not None else "train_loss",
+                "train_sample_count": int(train_indices.shape[0]),
+                "validation_sample_count": int(val_indices.shape[0]),
+            }
+        if validation_metrics is not None:
+            stage_log(
+                "stage2",
+                f"prediction epoch={epoch + 1}/{cfg.prediction.epochs} loss={epoch_loss:.6f} "
+                f"val_loss={val_loss:.6f} val_score={val_score:.6f} "
+                f"ade={float(validation_metrics['ade'].get('mean', 0.0)):.3f} "
+                f"fde={float(validation_metrics['fde'].get('mean', 0.0)):.3f}",
+            )
+        else:
+            stage_log("stage2", f"prediction epoch={epoch + 1}/{cfg.prediction.epochs} loss={epoch_loss:.6f}")
     checkpoint = stage_dir / "wcdt_predictor.pt"
-    torch.save({"model_state_dict": _cpu_state_dict(model), "loss_history": loss_history}, checkpoint)
-    return {"prediction_checkpoint": str(checkpoint), "prediction_loss_history": loss_history}
+    best_checkpoint = stage_dir / "wcdt_predictor_best.pt"
+    if best_payload is None:
+        best_payload = {
+            "model_state_dict": _cpu_state_dict(model),
+            "loss_history": list(loss_history),
+            "val_loss_history": list(val_loss_history),
+            "validation_history": list(validation_history),
+            "best_epoch": int(len(loss_history)),
+            "best_val_score": float(loss_history[-1]) if loss_history else 0.0,
+            "best_metric": "train_loss",
+            "train_sample_count": int(train_indices.shape[0]),
+            "validation_sample_count": int(val_indices.shape[0]),
+        }
+    torch.save(best_payload, best_checkpoint)
+    torch.save(best_payload, checkpoint)
+    return {
+        "prediction_checkpoint": str(checkpoint),
+        "prediction_best_checkpoint": str(best_checkpoint),
+        "prediction_loss_history": loss_history,
+        "prediction_val_loss_history": val_loss_history,
+        "prediction_validation_history": validation_history,
+        "prediction_best_epoch": int(best_payload["best_epoch"]),
+        "prediction_best_val_score": float(best_payload["best_val_score"]),
+    }
 
 
 def run(cfg) -> Path:
@@ -700,8 +1024,13 @@ def run(cfg) -> Path:
                 "run_id": cfg.run.run_id,
                 "input_stage1": str(input_path),
                 "prediction_checkpoint": report.get("prediction_checkpoint"),
+                "prediction_best_checkpoint": report.get("prediction_best_checkpoint"),
                 "prediction_loss_history": report.get("prediction_loss_history", []),
+                "prediction_val_loss_history": report.get("prediction_val_loss_history", []),
+                "prediction_validation_history": report.get("prediction_validation_history", []),
                 "prediction_loss_summary": _prediction_loss_summary(report.get("prediction_loss_history", [])),
+                "prediction_best_epoch": report.get("prediction_best_epoch"),
+                "prediction_best_val_score": report.get("prediction_best_val_score"),
                 "device": str(device),
             }
             write_report(initial_prediction_report_path, initial_prediction_report)

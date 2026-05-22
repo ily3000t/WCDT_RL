@@ -7,8 +7,12 @@ from typing import Any
 
 import numpy as np
 
+from safe_rl.risk.merge_local import merge_target_lane, merge_x
 from safe_rl.sim.history_buffer import HistoryBuffer
 from safe_rl.sim.types import VehicleState
+
+
+LANE_CENTERS = {0: -8.0, 1: -4.8, 2: -1.6}
 
 
 class SumoWcDTAdapter:
@@ -28,10 +32,11 @@ class SumoWcDTAdapter:
         torch = _require_torch()
         agent_history, agent_mask = history.to_tensor_arrays(ego_id)
         latest = history.latest()
-        predicted_ids = [vehicle_id for vehicle_id in history.agent_ids(ego_id) if vehicle_id != ego_id]
+        ordered_ids = self._ordered_agent_ids(history, ego_id)
+        predicted_ids = [vehicle_id for vehicle_id in ordered_ids if vehicle_id != ego_id]
         predicted_ids = predicted_ids[: self.max_pred_num]
         other_ids = [ego_id] + [
-            vehicle_id for vehicle_id in history.agent_ids(ego_id) if vehicle_id not in predicted_ids and vehicle_id != ego_id
+            vehicle_id for vehicle_id in ordered_ids if vehicle_id not in predicted_ids and vehicle_id != ego_id
         ]
         other_ids = other_ids[: self.max_other_num]
 
@@ -74,6 +79,37 @@ class SumoWcDTAdapter:
             "predicted_ids": predicted_ids,
         }
         return data
+
+    def _ordered_agent_ids(self, history: HistoryBuffer, ego_id: str) -> list[str]:
+        latest = history.latest()
+        ego = latest.get(ego_id)
+        ids = [vehicle_id for vehicle_id in history.agent_ids(ego_id) if vehicle_id != ego_id]
+        if ego is None:
+            return ids
+        target_lane = merge_target_lane(self.config)
+        target_center = LANE_CENTERS.get(target_lane, -1.6)
+        merge_location = merge_x(self.config)
+
+        def _priority(vehicle_id: str) -> tuple[float, float, float, str]:
+            state = latest.get(vehicle_id)
+            if state is None:
+                return (9.0, 1.0e6, 1.0e6, vehicle_id)
+            dx = float(state.x - ego.x)
+            is_target_lane = state.edge_id in ("main_in", "main_out") and int(state.lane_index) == target_lane
+            is_ramp_local = state.edge_id == "ramp_in" and abs(float(state.lane_pos - ego.lane_pos)) < 80.0
+            if is_target_lane and dx >= 0.0:
+                group = 0
+            elif is_target_lane and dx < 0.0:
+                group = 1
+            elif is_target_lane:
+                group = 2
+            elif is_ramp_local and state.x < merge_location + 20.0:
+                group = 3
+            else:
+                group = 4
+            return (float(group), abs(dx), abs(float(state.y) - target_center), vehicle_id)
+
+        return sorted(ids, key=_priority)
 
     def _vehicle_feature(self, state: VehicleState | None) -> np.ndarray:
         if state is None:

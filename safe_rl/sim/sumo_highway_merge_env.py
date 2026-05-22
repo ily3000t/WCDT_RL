@@ -481,6 +481,19 @@ class SumoHighwayMergeEnv(gym.Env):
         reason_counts = Counter(str(item.get("replacement_reason", "")) for item in self._interventions)
         raw_actions = Counter(str(item.get("raw_action", "")) for item in self._interventions)
         final_actions = Counter(str(item.get("final_action", "")) for item in self._interventions)
+        score_records = [
+            {
+                "replacement_reason": str(item.get("replacement_reason", "")),
+                "raw_risk_score": float(item.get("risk_before", 0.0)),
+                "final_risk_score": float(item.get("risk_after", 0.0)),
+                "best_candidate_risk_score": float(item.get("best_candidate_risk", item.get("risk_after", 0.0))),
+                "replacement_risk_delta": float(item.get("replacement_risk_delta", 0.0)),
+                "best_candidate_risk_delta": float(item.get("best_candidate_risk_delta", 0.0)),
+                "raw_candidate_legal": bool(item.get("raw_candidate_legal", True)),
+                "final_candidate_legal": bool(item.get("final_candidate_legal", True)),
+            }
+            for item in self._interventions
+        ]
         return {
             "seed": self.seed_value,
             "steps": self._episode_step,
@@ -497,6 +510,7 @@ class SumoHighwayMergeEnv(gym.Env):
             "replacement_reason_counts": dict(reason_counts),
             "raw_action_histogram": dict(raw_actions),
             "final_action_histogram": dict(final_actions),
+            "shield_score_records": score_records,
         }
 
     def trajectory_window_samples(self) -> tuple[np.ndarray, np.ndarray, np.ndarray]:

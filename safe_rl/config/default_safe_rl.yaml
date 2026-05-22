@@ -46,6 +46,9 @@ prediction:
   epochs: 50
   batch_size: 16
   learning_rate: 0.0001
+  validation_split: 0.15
+  target_lane_gap_metric_weight: 0.5
+  future_min_distance_metric_weight: 0.5
   max_pred_num: 8
   max_other_num: 6
   max_traffic_light: 8

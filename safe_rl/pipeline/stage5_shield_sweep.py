@@ -4,6 +4,7 @@ import argparse
 from pathlib import Path
 from typing import Any
 
+import numpy as np
 import yaml
 
 from safe_rl.pipeline.common import run_root, write_report
@@ -26,6 +27,27 @@ DEFAULT_VARIANTS = (
     {"activation_risk_threshold": 0.85, "replacement_margin": 0.10},
     {"activation_risk_threshold": 0.80, "replacement_margin": 0.10},
 )
+
+AGGRESSIVE_VARIANTS = (
+    {"activation_risk_threshold": 0.75, "replacement_margin": 0.10},
+    {"activation_risk_threshold": 0.70, "replacement_margin": 0.10},
+    {"activation_risk_threshold": 0.70, "replacement_margin": 0.05},
+    {"activation_risk_threshold": 0.60, "replacement_margin": 0.05},
+)
+
+
+def sweep_variants(include_aggressive: bool = False) -> tuple[dict[str, float], ...]:
+    if not include_aggressive:
+        return DEFAULT_VARIANTS
+    seen: set[tuple[float, float]] = set()
+    variants: list[dict[str, float]] = []
+    for variant in (*DEFAULT_VARIANTS, *AGGRESSIVE_VARIANTS):
+        key = (float(variant["activation_risk_threshold"]), float(variant["replacement_margin"]))
+        if key in seen:
+            continue
+        seen.add(key)
+        variants.append(dict(variant))
+    return tuple(variants)
 
 
 def _variant_name(prefix: str, variant: dict[str, float]) -> str:
@@ -121,6 +143,56 @@ def _base_group_for(name: str) -> str | None:
     return None
 
 
+def _summary(values: list[float]) -> dict[str, float | int]:
+    arr = np.asarray(values, dtype=np.float32)
+    arr = arr[np.isfinite(arr)]
+    if arr.size == 0:
+        return {"count": 0}
+    return {
+        "count": int(arr.size),
+        "mean": float(np.mean(arr)),
+        "std": float(np.std(arr)),
+        "p01": float(np.percentile(arr, 1)),
+        "p05": float(np.percentile(arr, 5)),
+        "p50": float(np.percentile(arr, 50)),
+        "p95": float(np.percentile(arr, 95)),
+        "p99": float(np.percentile(arr, 99)),
+        "min": float(np.min(arr)),
+        "max": float(np.max(arr)),
+    }
+
+
+def _reason_ratios(counts: dict[str, int], total: int) -> dict[str, float]:
+    if total <= 0:
+        return {}
+    return {key: float(value / total) for key, value in sorted(counts.items())}
+
+
+def _shield_score_diagnostics(report: dict[str, Any]) -> dict[str, Any]:
+    records: list[dict[str, Any]] = []
+    for episode in report.get("episodes", []):
+        records.extend(episode.get("shield_score_records", []) or [])
+    reason_counts: dict[str, int] = {}
+    for record in records:
+        reason = str(record.get("replacement_reason", ""))
+        reason_counts[reason] = reason_counts.get(reason, 0) + 1
+    raw_scores = [float(record.get("raw_risk_score", 0.0)) for record in records]
+    best_scores = [float(record.get("best_candidate_risk_score", 0.0)) for record in records]
+    replacement_delta = [float(record.get("replacement_risk_delta", 0.0)) for record in records]
+    best_delta = [float(record.get("best_candidate_risk_delta", 0.0)) for record in records]
+    activation = float((report.get("shield_overrides") or {}).get("activation_risk_threshold", 0.90))
+    return {
+        "record_count": int(len(records)),
+        "raw_risk_score": _summary(raw_scores),
+        "best_candidate_risk_score": _summary(best_scores),
+        "replacement_risk_delta": _summary(replacement_delta),
+        "best_candidate_risk_delta": _summary(best_delta),
+        "raw_risk_activation_margin": _summary([score - activation for score in raw_scores]),
+        "reason_counts": reason_counts,
+        "reason_ratios": _reason_ratios(reason_counts, len(records)),
+    }
+
+
 def _variant_report(base: dict, candidate: dict) -> dict[str, Any]:
     metrics = candidate.get("metrics", {})
     base_metrics = base.get("metrics", {})
@@ -140,6 +212,7 @@ def _variant_report(base: dict, candidate: dict) -> dict[str, Any]:
         },
         "delta": delta,
         "acceptance": acceptance,
+        "shield_score_diagnostics": _shield_score_diagnostics(candidate),
         "improved_tail": bool(
             float(metrics.get("min_distance_p1", 0.0)) > float(base_metrics.get("min_distance_p1", 0.0))
             or float(metrics.get("drac_p99", 0.0)) < float(base_metrics.get("drac_p99", 0.0))
@@ -171,13 +244,14 @@ def _recommend_variant(variants: dict[str, dict[str, Any]]) -> str | None:
     return best_name
 
 
-def run(cfg) -> Path:
+def run(cfg, include_aggressive: bool = False) -> Path:
     stage_dir = run_root(cfg) / "stage5_sweep"
     stage_dir.mkdir(parents=True, exist_ok=True)
     generated_dir = stage_dir / "generated_configs"
     generated_dir.mkdir(parents=True, exist_ok=True)
     seeds = _select_eval_seeds(cfg)
-    groups = build_sweep_groups(str(cfg.run.run_id))
+    variants_to_run = sweep_variants(include_aggressive=include_aggressive)
+    groups = build_sweep_groups(str(cfg.run.run_id), variants_to_run)
     payload = _sweep_payload(str(cfg.run.run_id), groups, seeds)
     config_path = generated_dir / "stage5_shield_sweep.yaml"
     with config_path.open("w", encoding="utf-8") as file:
@@ -222,6 +296,8 @@ def run(cfg) -> Path:
         "config": str(config_path),
         "risk_checkpoint": risk_checkpoint,
         "seeds": seeds,
+        "include_aggressive": bool(include_aggressive),
+        "sweep_variants": list(variants_to_run),
         "groups": group_reports,
         "variants": variants,
         "recommended_variant": recommended,
@@ -241,10 +317,15 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="Stage5 Shield threshold sweep")
     parser.add_argument("--config", default=None, help="Optional YAML config overlay.")
     parser.add_argument("--run-id", required=True, help="Existing run id to evaluate.")
+    parser.add_argument(
+        "--include-aggressive",
+        action="store_true",
+        help="Also scan lower diagnostic thresholds. These are not part of the default recommendation set.",
+    )
     args = parser.parse_args()
     cfg = load_config(args.config)
     cfg.run["run_id"] = args.run_id
-    run(cfg)
+    run(cfg, include_aggressive=bool(args.include_aggressive))
 
 
 if __name__ == "__main__":

@@ -20,12 +20,23 @@ class SafetyShield:
         raw_prediction = self.ranker.risk_model.predict(raw_action, context)
         raw_legal = is_candidate_legal(raw_action, context)
         counts = candidate_legality_counts(context)
+        ranked = self.ranker.rank(raw_action, context)
+        best_candidate = ranked[0] if ranked else None
         activation_threshold = float(
             self.config.shield.get("activation_risk_threshold", self.config.shield.risk_threshold)
         )
         if raw_legal and raw_prediction.risk_score < activation_threshold:
             return raw_action, self._record(
-                raw_action, raw_action, raw_prediction, raw_prediction, "raw_safe", False, raw_legal, raw_legal, counts
+                raw_action,
+                raw_action,
+                raw_prediction,
+                raw_prediction,
+                "raw_safe",
+                False,
+                raw_legal,
+                raw_legal,
+                counts,
+                best_candidate,
             )
         if raw_legal and raw_prediction.risk_uncertainty >= float(self.config.shield.uncertainty_threshold):
             return raw_action, self._record(
@@ -38,9 +49,9 @@ class SafetyShield:
                 raw_legal,
                 raw_legal,
                 counts,
+                best_candidate,
             )
 
-        ranked = self.ranker.rank(raw_action, context)
         margin = float(self.config.shield.get("replacement_margin", 0.15))
         for candidate, prediction, _score in ranked:
             if candidate.index == raw_action.index:
@@ -57,6 +68,7 @@ class SafetyShield:
                     raw_legal,
                     is_candidate_legal(candidate, context),
                     counts,
+                    best_candidate,
                 )
 
         if not self._fallback_allowed(context):
@@ -65,7 +77,16 @@ class SafetyShield:
             else:
                 reason = "fallback_disabled" if not bool(self.config.shield.get("allow_fallback", False)) else "raw_tolerated"
             return raw_action, self._record(
-                raw_action, raw_action, raw_prediction, raw_prediction, reason, False, raw_legal, raw_legal, counts
+                raw_action,
+                raw_action,
+                raw_prediction,
+                raw_prediction,
+                reason,
+                False,
+                raw_legal,
+                raw_legal,
+                counts,
+                best_candidate,
             )
 
         fallback = self.fallback_policy.select()
@@ -80,6 +101,7 @@ class SafetyShield:
             raw_legal,
             is_candidate_legal(fallback, context),
             counts,
+            best_candidate,
         )
 
     def _safe(self, prediction: RiskPrediction) -> bool:
@@ -112,12 +134,20 @@ class SafetyShield:
         raw_candidate_legal: bool,
         final_candidate_legal: bool,
         candidate_counts: dict[str, int],
+        best_candidate: tuple[CandidateAction, RiskPrediction, float] | None = None,
     ) -> dict[str, Any]:
+        best_action, best_prediction, best_score = best_candidate if best_candidate is not None else (None, None, None)
+        best_risk = best_prediction.risk_score if best_prediction is not None else raw_prediction.risk_score
+        best_uncertainty = (
+            best_prediction.risk_uncertainty if best_prediction is not None else raw_prediction.risk_uncertainty
+        )
         return {
             "raw_action": raw_action.index,
             "raw_action_name": raw_action.name,
             "final_action": final_action.index,
             "final_action_name": final_action.name,
+            "best_candidate_action": best_action.index if best_action is not None else raw_action.index,
+            "best_candidate_action_name": best_action.name if best_action is not None else raw_action.name,
             "raw_candidate_legal": bool(raw_candidate_legal),
             "final_candidate_legal": bool(final_candidate_legal),
             "legal_candidate_count": int(candidate_counts.get("legal", 0)),
@@ -125,6 +155,11 @@ class SafetyShield:
             "replacement_reason": reason,
             "risk_before": raw_prediction.risk_score,
             "risk_after": final_prediction.risk_score,
+            "best_candidate_risk": float(best_risk),
+            "best_candidate_uncertainty": float(best_uncertainty),
+            "best_candidate_score": float(best_score) if best_score is not None else float(raw_prediction.risk_score),
+            "replacement_risk_delta": float(raw_prediction.risk_score - final_prediction.risk_score),
+            "best_candidate_risk_delta": float(raw_prediction.risk_score - best_risk),
             "uncertainty_before": raw_prediction.risk_uncertainty,
             "uncertainty_after": final_prediction.risk_uncertainty,
             "fallback": fallback,

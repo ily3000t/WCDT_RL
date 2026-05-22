@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import xml.etree.ElementTree as ET
+import json
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -9,15 +10,26 @@ import pytest
 import yaml
 
 from safe_rl.prediction.forecast_feature_augmentor import ForecastFeatureAugmentor
+from safe_rl.analysis.forecast_diagnostics import _forecast_conclusion
 from safe_rl.pipeline.run_full_pipeline import build_generated_configs, resolve_forecast_sources
+from safe_rl.pipeline.common import write_report
 from safe_rl.pipeline.stage2_train_prediction_risk import (
     _configured_sample_weight,
+    _ordered_prediction_indices,
     _risk_ranking_summary,
     _risk_training_arrays,
+    _split_indices,
     _split_risk_indices,
 )
 from safe_rl.pipeline.stage5_paired_eval import _build_acceptance, _build_paired_delta, _group_overrides, _select_eval_seeds
-from safe_rl.pipeline.stage5_shield_sweep import DEFAULT_VARIANTS, build_sweep_groups
+from safe_rl.pipeline.stage5_shield_sweep import (
+    AGGRESSIVE_VARIANTS,
+    DEFAULT_VARIANTS,
+    _shield_score_diagnostics,
+    build_sweep_groups,
+    sweep_variants,
+)
+from safe_rl.prediction.sumo_wcdt_adapter import SumoWcDTAdapter
 from safe_rl.risk.candidate_risk_ranker import CandidateRiskRanker
 from safe_rl.risk.merge_local import candidate_action_risk_samples, is_candidate_legal, target_lane_neighbors
 from safe_rl.risk.risk_feature_extractor import extract_candidate_features
@@ -27,11 +39,13 @@ from safe_rl.risk.stage1_sampling import configured_sampling_probs, sampling_sum
 from safe_rl.rl.evaluation import validate_model_env_observation_shape
 from safe_rl.shield.safety_shield import SafetyShield
 from safe_rl.sim.action_space import ACTIONS, decode_action
+from safe_rl.sim.history_buffer import HistoryBuffer
 from safe_rl.sim.metrics import compute_step_metrics
 from safe_rl.sim.scenario_validation import validate_scenario_geometry
 from safe_rl.sim.sumo_highway_merge_env import SumoHighwayMergeEnv
 from safe_rl.sim.types import StepMetrics, VehicleState
 from safe_rl.utils.config import load_config
+from safe_rl.utils.io import write_json
 
 
 def test_action_space_has_nine_actions():
@@ -172,6 +186,49 @@ def test_constant_velocity_forecast_runs_without_checkpoint():
     assert np.all(np.isfinite(features))
 
 
+def test_json_writers_convert_non_finite_numbers_to_null(tmp_path):
+    report_path = tmp_path / "report.json"
+    write_report(
+        report_path,
+        {
+            "nan": float("nan"),
+            "inf": float("inf"),
+            "nested": {"np_nan": np.float32(np.nan), "ok": 1.0},
+        },
+    )
+    text = report_path.read_text(encoding="utf-8")
+    assert "NaN" not in text
+    assert "Infinity" not in text
+    parsed = json.loads(text)
+    assert parsed["nan"] is None
+    assert parsed["inf"] is None
+    assert parsed["nested"]["np_nan"] is None
+    assert parsed["nested"]["ok"] == pytest.approx(1.0)
+
+    io_path = tmp_path / "io.json"
+    write_json(io_path, {"bad": np.float64(np.inf)})
+    assert json.loads(io_path.read_text(encoding="utf-8"))["bad"] is None
+
+
+def test_forecast_conclusion_rejects_wcdt_with_worse_fde_and_flat_uncertainty():
+    report = {
+        "cv_prediction": {"ade": {"mean": 2.0}, "fde": {"mean": 4.0}},
+        "wcdt_prediction": {
+            "available": True,
+            "ade": {"mean": 6.0},
+            "fde": {"mean": 13.0},
+            "uncertainty": {"std": 0.0},
+            "confidence_fde_correlation": 0.0,
+        },
+        "forecast_behavior": {"step_action_agreement_rate": 0.2},
+    }
+    conclusion = _forecast_conclusion(report)
+    assert conclusion["cv_vs_wcdt_action_agreement"] == pytest.approx(0.2)
+    assert not conclusion["wcdt_prediction_quality_pass"]
+    assert not conclusion["wcdt_uncertainty_quality_pass"]
+    assert not conclusion["wcdt_recommended_for_stage5"]
+
+
 class _StaticRiskModel:
     def __init__(self, scores: dict[int, float], uncertainty: float = 0.1):
         self.scores = scores
@@ -255,6 +312,9 @@ def test_shield_replaces_only_when_candidate_improves_by_margin():
     assert final.index == 5
     assert record["replacement_reason"] == "replacement"
     assert record["risk_before"] - record["risk_after"] >= cfg.shield.replacement_margin
+    assert record["best_candidate_action"] == 5
+    assert record["best_candidate_risk"] == pytest.approx(0.40)
+    assert record["best_candidate_risk_delta"] == pytest.approx(0.55)
 
 
 def test_ranker_filters_illegal_candidates_on_ramp():
@@ -336,6 +396,51 @@ def test_stage2_ranking_summary_skips_incomplete_candidate_groups():
     summary = _risk_ranking_summary(arrays, np.arange(3), np.zeros((3,), dtype=np.float32))
     assert not summary["available"]
     assert summary["skipped_incomplete_group_count"] == 1
+
+
+def test_stage2_prediction_split_has_disjoint_validation_samples():
+    train_idx, val_idx = _split_indices(10, 0.2, seed=1)
+    assert len(train_idx) == 8
+    assert len(val_idx) == 2
+    assert set(train_idx).isdisjoint(set(val_idx))
+    assert set(train_idx).union(set(val_idx)) == set(range(10))
+
+
+def test_stage2_wcdt_prediction_order_prioritizes_merge_local_agents():
+    cfg = load_config()
+    history = np.zeros((6, cfg.scenario.history_steps, 5), dtype=np.float32)
+    mask = np.ones((6,), dtype=np.float32)
+    history[:, :, 3] = 20.0
+    history[0, :, 0] = 200.0
+    history[0, :, 1] = 0.0
+    history[1, :, 0] = 212.0
+    history[1, :, 1] = -1.6
+    history[2, :, 0] = 190.0
+    history[2, :, 1] = -1.6
+    history[3, :, 0] = 205.0
+    history[3, :, 1] = 2.0
+    history[4, :, 0] = 201.0
+    history[4, :, 1] = -8.0
+    history[5, :, 0] = 260.0
+    history[5, :, 1] = -4.8
+    ordered = _ordered_prediction_indices(cfg, history, mask)
+    assert ordered[:3] == [1, 2, 3]
+
+
+def test_runtime_wcdt_adapter_prioritizes_target_lane_front_rear_and_ramp():
+    cfg = load_config()
+    history = HistoryBuffer(cfg.scenario.history_steps, max_agents=6)
+    states = [
+        VehicleState("ego", 200.0, 2.0, 0.0, 20.0, 0, "ramp_0", 100.0, "ramp_in"),
+        VehicleState("target_front", 214.0, -1.6, 0.0, 20.0, 2, "main_2", 214.0, "main_in"),
+        VehicleState("target_rear", 190.0, -1.6, 0.0, 20.0, 2, "main_2", 190.0, "main_in"),
+        VehicleState("ramp_front", 208.0, 2.0, 0.0, 18.0, 0, "ramp_0", 108.0, "ramp_in"),
+        VehicleState("other_lane", 202.0, -8.0, 0.0, 20.0, 0, "main_0", 202.0, "main_in"),
+    ]
+    for _ in range(cfg.scenario.history_steps):
+        history.append(states)
+    ordered = SumoWcDTAdapter(cfg)._ordered_agent_ids(history, "ego")
+    assert ordered[:3] == ["target_front", "target_rear", "ramp_front"]
 
 
 def test_risk_loss_ignores_zero_weight_samples():
@@ -443,6 +548,47 @@ def test_stage5_shield_sweep_generates_default_threshold_variants():
         "ppo_shield_a080_m010",
     }
     assert all(group["shield_overrides"]["allow_fallback"] is False for group in shield_groups)
+
+
+def test_stage5_shield_sweep_aggressive_variants_are_opt_in():
+    assert len(sweep_variants()) == len(DEFAULT_VARIANTS)
+    variants = sweep_variants(include_aggressive=True)
+    assert len(variants) == len(DEFAULT_VARIANTS) + len(AGGRESSIVE_VARIANTS)
+    groups = build_sweep_groups("safe_rl_test_run", variants)
+    names = {group["name"] for group in groups if group["name"].startswith("ppo_shield_")}
+    assert "ppo_shield_a060_m005" in names
+    assert "ppo_shield_a075_m010" in names
+
+
+def test_stage5_shield_sweep_score_diagnostics_summarize_records():
+    report = {
+        "shield_overrides": {"activation_risk_threshold": 0.90},
+        "episodes": [
+            {
+                "shield_score_records": [
+                    {
+                        "replacement_reason": "raw_safe",
+                        "raw_risk_score": 0.4,
+                        "best_candidate_risk_score": 0.3,
+                        "replacement_risk_delta": 0.0,
+                        "best_candidate_risk_delta": 0.1,
+                    },
+                    {
+                        "replacement_reason": "replacement",
+                        "raw_risk_score": 0.95,
+                        "best_candidate_risk_score": 0.5,
+                        "replacement_risk_delta": 0.45,
+                        "best_candidate_risk_delta": 0.45,
+                    },
+                ]
+            }
+        ],
+    }
+    diagnostics = _shield_score_diagnostics(report)
+    assert diagnostics["record_count"] == 2
+    assert diagnostics["raw_risk_score"]["count"] == 2
+    assert diagnostics["reason_ratios"]["replacement"] == pytest.approx(0.5)
+    assert diagnostics["raw_risk_activation_margin"]["max"] == pytest.approx(0.05)
 
 
 def test_forecast_source_parser_rejects_conflicting_legacy_and_multi_args():

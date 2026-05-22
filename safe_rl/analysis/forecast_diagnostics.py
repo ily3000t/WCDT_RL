@@ -83,6 +83,76 @@ def _cv_feature_matrix(cfg: Any, history: np.ndarray, mask: np.ndarray, indices:
     return np.asarray(rows, dtype=np.float32)
 
 
+def _constant_velocity_future(last: np.ndarray, horizon: int, dt: float) -> np.ndarray:
+    output = np.zeros((horizon, 5), dtype=np.float32)
+    x = float(last[0])
+    y = float(last[1])
+    heading = float(last[2])
+    speed = max(0.0, float(last[3]))
+    vx = speed * np.cos(heading)
+    vy = speed * np.sin(heading)
+    for step_idx in range(horizon):
+        x += vx * dt
+        y += vy * dt
+        output[step_idx] = [x, y, heading, speed, 0.0]
+    return output
+
+
+def _cv_prediction_diagnostics(
+    cfg: Any,
+    history: np.ndarray,
+    future: np.ndarray,
+    mask: np.ndarray,
+    indices: np.ndarray,
+) -> dict[str, Any]:
+    horizon = int(min(future.shape[2], cfg.forecast_features.get("horizon_steps", cfg.scenario.forecast_horizon_steps)))
+    dt = float(cfg.scenario.step_length)
+    ade: list[float] = []
+    fde: list[float] = []
+    min_distance_errors: list[float] = []
+    min_distance_abs_errors: list[float] = []
+    target_gap_errors: list[float] = []
+    target_gap_abs_errors: list[float] = []
+    for sample_idx in indices:
+        actual_future = future[sample_idx, :, :horizon]
+        pred_future = np.zeros_like(actual_future)
+        for agent_idx in range(history.shape[1]):
+            if float(mask[sample_idx, agent_idx]) <= 0.0:
+                continue
+            pred_future[agent_idx] = _constant_velocity_future(history[sample_idx, agent_idx, -1], horizon, dt)
+        valid_agents = mask[sample_idx] > 0.0
+        if np.sum(valid_agents) <= 1:
+            continue
+        other_valid = valid_agents.copy()
+        other_valid[0] = False
+        if not np.any(other_valid):
+            continue
+        diff = pred_future[other_valid, :, :2] - actual_future[other_valid, :, :2]
+        per_step = np.linalg.norm(diff, axis=-1)
+        ade.append(float(np.mean(per_step)))
+        fde.append(float(np.mean(per_step[:, -1])))
+        other_mask = mask[sample_idx].copy()
+        other_mask[0] = 0.0
+        pred_min = _future_min_distance(actual_future[0], pred_future, other_mask)
+        actual_min = _future_min_distance(actual_future[0], actual_future, other_mask)
+        min_distance_errors.append(float(pred_min - actual_min))
+        min_distance_abs_errors.append(abs(float(pred_min - actual_min)))
+        pred_gap = _target_lane_gap(actual_future[0], pred_future, other_mask, cfg)
+        actual_gap = _target_lane_gap(actual_future[0], actual_future, other_mask, cfg)
+        if pred_gap < INF_TTC and actual_gap < INF_TTC:
+            target_gap_errors.append(float(pred_gap - actual_gap))
+            target_gap_abs_errors.append(abs(float(pred_gap - actual_gap)))
+    return {
+        "sample_count": int(len(ade)),
+        "ade": _summary(ade),
+        "fde": _summary(fde),
+        "future_min_distance_error": _summary(min_distance_errors),
+        "future_min_distance_abs_error": _summary(min_distance_abs_errors),
+        "target_lane_gap_error": _summary(target_gap_errors),
+        "target_lane_gap_abs_error": _summary(target_gap_abs_errors),
+    }
+
+
 def _require_torch():
     try:
         import torch
@@ -305,6 +375,8 @@ def _wcdt_diagnostics(
     target_gap_errors: list[float] = []
     target_gap_abs_errors: list[float] = []
     uncertainty_values: list[float] = []
+    confidence_values: list[float] = []
+    confidence_fde_values: list[float] = []
 
     with torch.no_grad():
         for start in range(0, indices.shape[0], batch_size):
@@ -326,8 +398,10 @@ def _wcdt_diagnostics(
                     continue
                 diff = selected[row, valid_agents, :, :2] - actual_future[row, valid_agents, :, :2]
                 per_step = np.linalg.norm(diff, axis=-1)
-                ade.append(float(np.mean(per_step)))
-                fde.append(float(np.mean(per_step[:, -1])))
+                row_ade = float(np.mean(per_step))
+                row_fde = float(np.mean(per_step[:, -1]))
+                ade.append(row_ade)
+                fde.append(row_fde)
                 pred_min_distance = _future_min_distance(ego_future[row], selected[row], pred_mask[row])
                 actual_min_distance = _future_min_distance(ego_future[row], actual_future[row], pred_mask[row])
                 min_distance_errors.append(float(pred_min_distance - actual_min_distance))
@@ -342,6 +416,9 @@ def _wcdt_diagnostics(
                 if ego is not None:
                     sample_uncertainty = float(np.mean(uncertainty_np[row][valid_agents]))
                     uncertainty_values.append(sample_uncertainty)
+                    if confidence_np is not None:
+                        confidence_values.append(float(np.mean(np.max(confidence_np[row][valid_agents], axis=-1))))
+                        confidence_fde_values.append(row_fde)
                     features = _forecast_features_from_prediction(ego, selected[row, valid_agents], sample_uncertainty, cfg)
                     if bool(cfg.forecast_features.normalize):
                         features = augmentor._normalize(features)
@@ -370,8 +447,53 @@ def _wcdt_diagnostics(
         "target_lane_gap_error": _summary(target_gap_errors),
         "target_lane_gap_abs_error": _summary(target_gap_abs_errors),
         "uncertainty": _summary(uncertainty_values),
+        "confidence": _summary(confidence_values),
+        "confidence_fde_correlation": _correlation(confidence_values, confidence_fde_values),
     }
     return np.asarray(feature_rows, dtype=np.float32), report
+
+
+def _correlation(a_values: list[float], b_values: list[float]) -> float:
+    a = np.asarray(a_values, dtype=np.float32)
+    b = np.asarray(b_values, dtype=np.float32)
+    mask = np.isfinite(a) & np.isfinite(b)
+    a = a[mask]
+    b = b[mask]
+    if a.size < 2 or float(np.std(a)) <= 1.0e-8 or float(np.std(b)) <= 1.0e-8:
+        return 0.0
+    return float(np.corrcoef(a, b)[0, 1])
+
+
+def _forecast_conclusion(report: dict[str, Any]) -> dict[str, Any]:
+    cv = report.get("cv_prediction", {})
+    wcdt = report.get("wcdt_prediction", {})
+    behavior = report.get("forecast_behavior", {})
+    cv_ade = float(cv.get("ade", {}).get("mean", 0.0))
+    cv_fde = float(cv.get("fde", {}).get("mean", 0.0))
+    wcdt_ade = float(wcdt.get("ade", {}).get("mean", 1.0e6))
+    wcdt_fde = float(wcdt.get("fde", {}).get("mean", 1.0e6))
+    quality_pass = bool(
+        wcdt.get("available", False)
+        and wcdt_ade <= max(cv_ade * 1.10, cv_ade + 1.0)
+        and wcdt_fde <= max(cv_fde * 1.10, cv_fde + 1.0)
+    )
+    uncertainty_std = float(wcdt.get("uncertainty", {}).get("std", 0.0))
+    confidence_corr = float(wcdt.get("confidence_fde_correlation", 0.0))
+    uncertainty_pass = bool(wcdt.get("available", False) and uncertainty_std >= 0.02 and abs(confidence_corr) >= 0.10)
+    return {
+        "cv_vs_wcdt_action_agreement": float(behavior.get("step_action_agreement_rate", 0.0)),
+        "wcdt_prediction_quality_pass": quality_pass,
+        "wcdt_uncertainty_quality_pass": uncertainty_pass,
+        "wcdt_recommended_for_stage5": bool(quality_pass and uncertainty_pass),
+        "decision_basis": {
+            "cv_ade_mean": cv_ade,
+            "cv_fde_mean": cv_fde,
+            "wcdt_ade_mean": wcdt_ade,
+            "wcdt_fde_mean": wcdt_fde,
+            "wcdt_uncertainty_std": uncertainty_std,
+            "wcdt_confidence_fde_correlation": confidence_corr,
+        },
+    }
 
 
 def _feature_distribution_report(cv_features: np.ndarray, wcdt_features: np.ndarray) -> dict[str, Any]:
@@ -518,6 +640,7 @@ def run_forecast_diagnostics(
     rng = np.random.default_rng(int(cfg.run.seed))
     indices = np.sort(rng.choice(history.shape[0], size=sample_count, replace=False))
     cv_features = _cv_feature_matrix(cfg, history, mask, indices)
+    cv_prediction = _cv_prediction_diagnostics(cfg, history, future, mask, indices)
     wcdt_features = np.zeros((0, ForecastFeatureAugmentor.feature_dim(cfg)), dtype=np.float32)
     wcdt_report: dict[str, Any] = {"available": False, "checkpoint": str(checkpoint)}
     if checkpoint.exists():
@@ -548,6 +671,7 @@ def run_forecast_diagnostics(
             name: _summary(cv_features[:, idx])
             for idx, name in enumerate(ForecastFeatureAugmentor.FEATURE_NAMES)
         },
+        "cv_prediction": cv_prediction,
         "wcdt_prediction": wcdt_report,
     }
     if wcdt_features.shape[0] > 0:
@@ -559,6 +683,7 @@ def run_forecast_diagnostics(
         report["low_min_distance_ppo_cv_features"] = low_rows
         report["forecast_behavior"] = _forecast_behavior_diagnostics(str(cfg.run.run_id), stage5_report)
         _write_replay_commands(output_dir / "replay_low_min_distance_ppo_cv_features.ps1", low_rows)
+    report["forecast_conclusion"] = _forecast_conclusion(report)
     output_path = output_dir / "forecast_diagnostics.json"
     write_report(output_path, report)
     return output_path

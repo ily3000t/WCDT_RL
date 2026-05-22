@@ -5,6 +5,8 @@ import xml.etree.ElementTree as ET
 from pathlib import Path
 from typing import Any
 
+from safe_rl.utils.io import json_ready
+
 
 def _resolve(path: str | Path, base: Path | None = None) -> Path:
     path = Path(path)
@@ -136,5 +138,5 @@ def validate_scenario_geometry(cfg_file: str | Path) -> dict[str, Any]:
 def write_validation_report(cfg_file: str | Path, output_file: str | Path) -> dict[str, Any]:
     report = validate_scenario_geometry(cfg_file)
     with Path(output_file).open("w", encoding="utf-8") as file:
-        json.dump(report, file, ensure_ascii=False, indent=2)
+        json.dump(json_ready(report), file, ensure_ascii=False, indent=2, allow_nan=False)
     return report
