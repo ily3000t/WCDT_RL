@@ -98,6 +98,8 @@ class RiskModuleWrapper:
         self.config = config
         self.estimator: HeuristicRiskEstimator | None = HeuristicRiskEstimator(config)
         self.model = None
+        self.temperature = 1.0
+        self.apply_temperature = False
         if checkpoint:
             self.load(checkpoint)
 
@@ -115,6 +117,14 @@ class RiskModuleWrapper:
         model.load_state_dict(state)
         model.eval()
         self.model = model
+        calibration_cfg = self.config.risk_module.get("calibration", {})
+        if not isinstance(calibration_cfg, dict):
+            calibration_cfg = {}
+        self.temperature = float(payload.get("temperature", 1.0)) if isinstance(payload, dict) else 1.0
+        self.apply_temperature = bool(
+            (payload.get("apply_temperature", False) if isinstance(payload, dict) else False)
+            or calibration_cfg.get("use_for_runtime", False)
+        )
 
     def save(self, checkpoint: str | Path) -> None:
         if torch is None or self.model is None:
@@ -130,8 +140,13 @@ class RiskModuleWrapper:
             explicit = torch.tensor(features, dtype=torch.float32).unsqueeze(0)
             action_index = torch.tensor([action.index], dtype=torch.long)
             output = self.model(explicit, action_index)
+        risk_score = float(output["risk_score"].cpu().numpy()[0])
+        if self.apply_temperature and self.temperature > 1.0e-6:
+            clipped = float(np.clip(risk_score, 1.0e-6, 1.0 - 1.0e-6))
+            logit = np.log(clipped / (1.0 - clipped))
+            risk_score = float(1.0 / (1.0 + np.exp(-logit / self.temperature)))
         return RiskPrediction(
-            risk_score=float(output["risk_score"].cpu().numpy()[0]),
+            risk_score=risk_score,
             risk_type_logits=output["risk_type_logits"].cpu().numpy()[0],
             risk_uncertainty=float(output["risk_uncertainty"].cpu().numpy()[0]),
             explicit_features=features,

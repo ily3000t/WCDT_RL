@@ -37,11 +37,15 @@ def _group_overrides(group) -> dict:
     requested_shield_overrides = group.get("shield_overrides")
     if requested_shield_overrides:
         shield_overrides.update(dict(requested_shield_overrides))
-    return {
+    overrides = {
         "forecast_features": forecast_overrides,
         "rl": {"use_wcdt_forecast_features": bool(group.forecast_features)},
         "shield": shield_overrides,
     }
+    requested_risk_overrides = group.get("risk_module_overrides")
+    if requested_risk_overrides:
+        overrides["risk_module"] = dict(requested_risk_overrides)
+    return overrides
 
 
 def _group_model_path(group, default_model: Path) -> Path:
@@ -149,24 +153,35 @@ def _add_delta(target: dict, key: str, a_report: dict | None, b_report: dict | N
 def _build_paired_delta(group_reports: dict) -> dict:
     paired_delta: dict = {}
     _add_delta(paired_delta, "ppo_vs_ppo_shield", group_reports.get("ppo"), group_reports.get("ppo_shield"))
-    _add_delta(
-        paired_delta,
-        "ppo_cv_features_vs_cv_prediction_shield",
-        group_reports.get("ppo_cv_features"),
-        group_reports.get("cv_prediction_shield"),
-    )
-    _add_delta(
-        paired_delta,
-        "ppo_wcdt_features_vs_wcdt_prediction_shield",
-        group_reports.get("ppo_wcdt_features"),
-        group_reports.get("wcdt_prediction_shield"),
-    )
+    for base_name, shield_name in (
+        ("ppo_cv_features", "cv_prediction_shield"),
+        ("ppo_wcdt_features", "wcdt_prediction_shield"),
+        ("ppo_wcdt_v2_features", "wcdt_v2_prediction_shield"),
+    ):
+        _add_delta(
+            paired_delta,
+            f"{base_name}_vs_{shield_name}",
+            group_reports.get(base_name),
+            group_reports.get(shield_name),
+        )
     _add_delta(paired_delta, "ppo_vs_ppo_cv_features", group_reports.get("ppo"), group_reports.get("ppo_cv_features"))
     _add_delta(
         paired_delta,
         "ppo_cv_features_vs_ppo_wcdt_features",
         group_reports.get("ppo_cv_features"),
         group_reports.get("ppo_wcdt_features"),
+    )
+    _add_delta(
+        paired_delta,
+        "ppo_cv_features_vs_ppo_wcdt_v2_features",
+        group_reports.get("ppo_cv_features"),
+        group_reports.get("ppo_wcdt_v2_features"),
+    )
+    _add_delta(
+        paired_delta,
+        "ppo_wcdt_features_vs_ppo_wcdt_v2_features",
+        group_reports.get("ppo_wcdt_features"),
+        group_reports.get("ppo_wcdt_v2_features"),
     )
     legacy_forecast = _forecast_baseline_group(group_reports)
     if "full_prediction_shield" in group_reports and legacy_forecast:
@@ -193,6 +208,11 @@ def _build_acceptance(group_reports: dict) -> dict:
             group_reports.get("ppo_wcdt_features"),
             group_reports.get("wcdt_prediction_shield"),
         )
+    if "wcdt_v2_prediction_shield" in group_reports:
+        acceptance["wcdt_v2_prediction_shield"] = _shield_acceptance(
+            group_reports.get("ppo_wcdt_v2_features"),
+            group_reports.get("wcdt_v2_prediction_shield"),
+        )
     if "ppo_cv_features" in group_reports:
         acceptance["forecast_cv_vs_baseline"] = _forecast_acceptance(
             group_reports.get("ppo"),
@@ -202,6 +222,11 @@ def _build_acceptance(group_reports: dict) -> dict:
         acceptance["forecast_wcdt_vs_cv"] = _forecast_acceptance(
             group_reports.get("ppo_cv_features"),
             group_reports.get("ppo_wcdt_features"),
+        )
+    if "ppo_wcdt_v2_features" in group_reports and "ppo_cv_features" in group_reports:
+        acceptance["forecast_wcdt_v2_vs_cv"] = _forecast_acceptance(
+            group_reports.get("ppo_cv_features"),
+            group_reports.get("ppo_wcdt_v2_features"),
         )
     legacy_forecast = _forecast_baseline_group(group_reports)
     if "full_prediction_shield" in group_reports and legacy_forecast:
@@ -252,6 +277,7 @@ def run(cfg) -> Path:
             group_reports[group.name]["forecast_source"] = ""
             group_reports[group.name]["forecast_checkpoint"] = ""
         group_reports[group.name]["shield_overrides"] = dict(group.get("shield_overrides", {}) or {})
+        group_reports[group.name]["risk_module_overrides"] = dict(group.get("risk_module_overrides", {}) or {})
 
     shield_off = {name: report for name, report in group_reports.items() if not name.endswith("shield")}
     shield_on = {name: report for name, report in group_reports.items() if name.endswith("shield") or name == "full_prediction_shield"}

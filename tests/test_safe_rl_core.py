@@ -14,12 +14,15 @@ from safe_rl.analysis.forecast_diagnostics import _forecast_conclusion
 from safe_rl.pipeline.run_full_pipeline import build_generated_configs, resolve_forecast_sources
 from safe_rl.pipeline.common import write_report
 from safe_rl.pipeline.stage2_train_prediction_risk import (
+    _binary_calibration_summary,
     _configured_sample_weight,
     _ordered_prediction_indices,
     _risk_ranking_summary,
     _risk_training_arrays,
     _split_indices,
     _split_risk_indices,
+    _temperature_scaled_probabilities,
+    _temperature_scaling_diagnostics,
 )
 from safe_rl.pipeline.stage5_paired_eval import _build_acceptance, _build_paired_delta, _group_overrides, _select_eval_seeds
 from safe_rl.pipeline.stage5_shield_sweep import (
@@ -30,6 +33,11 @@ from safe_rl.pipeline.stage5_shield_sweep import (
     sweep_variants,
 )
 from safe_rl.prediction.sumo_wcdt_adapter import SumoWcDTAdapter
+from safe_rl.prediction.wcdt_v2_predictor import (
+    INPUT_DIM as WCDT_V2_INPUT_DIM,
+    build_v2_numpy_batch,
+    ordered_merge_local_indices,
+)
 from safe_rl.risk.candidate_risk_ranker import CandidateRiskRanker
 from safe_rl.risk.merge_local import candidate_action_risk_samples, is_candidate_legal, target_lane_neighbors
 from safe_rl.risk.risk_feature_extractor import extract_candidate_features
@@ -210,6 +218,35 @@ def test_json_writers_convert_non_finite_numbers_to_null(tmp_path):
     assert json.loads(io_path.read_text(encoding="utf-8"))["bad"] is None
 
 
+def test_risk_calibration_summary_reports_ece_brier_and_nll():
+    pred = np.asarray([0.05, 0.20, 0.80, 0.95], dtype=np.float32)
+    target = np.asarray([0.0, 0.0, 1.0, 1.0], dtype=np.float32)
+    weight = np.ones((4,), dtype=np.float32)
+    legal = np.ones((4,), dtype=np.float32)
+    summary = _binary_calibration_summary(pred, target, weight, legal, bin_count=2)
+    assert summary["sample_count"] == 4
+    assert summary["brier"] < 0.05
+    assert summary["nll"] < 0.25
+    assert len(summary["reliability_bins"]) == 2
+    assert summary["ece"] >= 0.0
+
+
+def test_temperature_scaling_diagnostics_can_improve_nll_without_changing_rank():
+    cfg = load_config()
+    pred = np.asarray([0.01, 0.20, 0.80, 0.99], dtype=np.float32)
+    target = np.asarray([1.0, 1.0, 0.0, 0.0], dtype=np.float32)
+    weight = np.ones((4,), dtype=np.float32)
+    legal = np.ones((4,), dtype=np.float32)
+    cfg.risk_module["calibration"]["temperature_grid"] = [1.0, 2.0, 5.0]
+    report = _temperature_scaling_diagnostics(pred, target, weight, legal, cfg)
+    assert report["available"]
+    scaled = _temperature_scaled_probabilities(pred, report["temperature"])
+    assert list(np.argsort(pred)) == list(np.argsort(scaled))
+    assert report["calibrated_summary"]["nll"] <= _binary_calibration_summary(
+        pred, target, weight, legal
+    )["nll"]
+
+
 def test_forecast_conclusion_rejects_wcdt_with_worse_fde_and_flat_uncertainty():
     report = {
         "cv_prediction": {"ade": {"mean": 2.0}, "fde": {"mean": 4.0}},
@@ -227,6 +264,7 @@ def test_forecast_conclusion_rejects_wcdt_with_worse_fde_and_flat_uncertainty():
     assert not conclusion["wcdt_prediction_quality_pass"]
     assert not conclusion["wcdt_uncertainty_quality_pass"]
     assert not conclusion["wcdt_recommended_for_stage5"]
+    assert not conclusion["wcdt_v2_recommended_for_stage5"]
 
 
 class _StaticRiskModel:
@@ -443,6 +481,54 @@ def test_runtime_wcdt_adapter_prioritizes_target_lane_front_rear_and_ramp():
     assert ordered[:3] == ["target_front", "target_rear", "ramp_front"]
 
 
+def test_wcdt_v2_actor_selection_prioritizes_merge_local_agents():
+    cfg = load_config()
+    history = np.zeros((6, cfg.scenario.history_steps, 5), dtype=np.float32)
+    mask = np.ones((6,), dtype=np.float32)
+    history[:, :, 3] = 20.0
+    history[0, :, 0] = 200.0
+    history[0, :, 1] = 2.0
+    history[1, :, 0] = 214.0
+    history[1, :, 1] = -1.6
+    history[2, :, 0] = 190.0
+    history[2, :, 1] = -1.6
+    history[3, :, 0] = 208.0
+    history[3, :, 1] = 2.0
+    history[4, :, 0] = 202.0
+    history[4, :, 1] = -8.0
+    history[5, :, 0] = 260.0
+    history[5, :, 1] = -4.8
+    ordered = ordered_merge_local_indices(cfg, history, mask)
+    assert ordered[:3] == [1, 2, 3]
+
+
+def test_wcdt_v2_batch_has_fixed_shape_and_cv_baseline():
+    cfg = load_config()
+    cfg.prediction["wcdt_v2_max_agents"] = 3
+    history = np.zeros((2, 5, cfg.scenario.history_steps, 5), dtype=np.float32)
+    future = np.zeros((2, 5, cfg.scenario.forecast_horizon_steps, 5), dtype=np.float32)
+    mask = np.ones((2, 5), dtype=np.float32)
+    history[..., 3] = 10.0
+    history[:, 0, :, 0] = 200.0
+    history[:, 0, :, 1] = 2.0
+    history[:, 1, :, 0] = 212.0
+    history[:, 1, :, 1] = -1.6
+    history[:, 2, :, 0] = 190.0
+    history[:, 2, :, 1] = -1.6
+    history[:, 3, :, 0] = 208.0
+    history[:, 3, :, 1] = 2.0
+    history[:, 4, :, 0] = 240.0
+    history[:, 4, :, 1] = -8.0
+    batch = build_v2_numpy_batch(cfg, history, future, mask, np.asarray([0, 1], dtype=np.int64))
+    assert batch["features"].shape == (2, 3, WCDT_V2_INPUT_DIM)
+    assert batch["baseline"].shape == (2, 3, cfg.scenario.forecast_horizon_steps, 5)
+    assert batch["target"].shape == (2, 3, cfg.scenario.forecast_horizon_steps, 5)
+    assert batch["mask"].shape == (2, 3)
+    assert np.all(np.isfinite(batch["features"]))
+    assert batch["selected_indices"][0].tolist() == [1, 2, 3]
+    assert batch["baseline"][0, 0, 0, 0] > history[0, 1, -1, 0]
+
+
 def test_risk_loss_ignores_zero_weight_samples():
     torch = pytest.importorskip("torch")
     output = {
@@ -527,13 +613,15 @@ def test_stage5_group_shield_overrides_update_shield_config():
             "shield_overrides": {
                 "activation_risk_threshold": 0.85,
                 "replacement_margin": 0.10,
-            }
+            },
+            "risk_module_overrides": {"calibration": {"use_for_runtime": True}},
         }.get(key, default),
     )
     overrides = _group_overrides(group)
     assert overrides["shield"]["enabled"] is True
     assert overrides["shield"]["activation_risk_threshold"] == pytest.approx(0.85)
     assert overrides["shield"]["replacement_margin"] == pytest.approx(0.10)
+    assert overrides["risk_module"]["calibration"]["use_for_runtime"] is True
 
 
 def test_stage5_shield_sweep_generates_default_threshold_variants():
@@ -558,6 +646,13 @@ def test_stage5_shield_sweep_aggressive_variants_are_opt_in():
     names = {group["name"] for group in groups if group["name"].startswith("ppo_shield_")}
     assert "ppo_shield_a060_m005" in names
     assert "ppo_shield_a075_m010" in names
+
+
+def test_stage5_shield_sweep_can_generate_calibrated_variants():
+    groups = build_sweep_groups("safe_rl_test_run", include_calibrated=True)
+    calibrated = [group for group in groups if group["name"].startswith("ppo_shield_cal_")]
+    assert len(calibrated) == len(DEFAULT_VARIANTS)
+    assert calibrated[0]["risk_module_overrides"]["calibration"]["use_for_runtime"] is True
 
 
 def test_stage5_shield_sweep_score_diagnostics_summarize_records():
@@ -592,7 +687,7 @@ def test_stage5_shield_sweep_score_diagnostics_summarize_records():
 
 
 def test_forecast_source_parser_rejects_conflicting_legacy_and_multi_args():
-    assert resolve_forecast_sources("constant_velocity,wcdt") == ["constant_velocity", "wcdt"]
+    assert resolve_forecast_sources("constant_velocity,wcdt,wcdt_v2") == ["constant_velocity", "wcdt", "wcdt_v2"]
     assert resolve_forecast_sources(forecast_source="wcdt") == ["wcdt"]
     with pytest.raises(ValueError, match="either"):
         resolve_forecast_sources("wcdt", forecast_source="constant_velocity")
@@ -607,6 +702,7 @@ def test_full_pipeline_generated_configs_use_forecast_model_and_checkpoint(tmp_p
     )
     assert "forecast_cv_ppo" in configs
     assert "forecast_wcdt_ppo" in configs
+    assert "forecast_wcdt_v2_ppo" not in configs
     stage5 = yaml.safe_load(configs["stage5_multi_groups"].read_text(encoding="utf-8"))
     groups = {item["name"]: item for item in stage5["stage5"]["groups"]}
     assert stage5["stage5"]["episodes_per_group"] == 20
@@ -679,6 +775,23 @@ def test_full_pipeline_generated_configs_support_single_forecast_source(tmp_path
         "safe_rl_output/runs/safe_rl_test_run/stage2/wcdt_predictor.pt"
     )
 
+    v2_configs = build_generated_configs(
+        "safe_rl_test_run",
+        tmp_path / "wcdt_v2",
+        forecast_sources=["wcdt_v2"],
+    )
+    v2_stage5 = yaml.safe_load(v2_configs["stage5_multi_groups"].read_text(encoding="utf-8"))
+    v2_groups = {item["name"]: item for item in v2_stage5["stage5"]["groups"]}
+    assert "ppo_wcdt_v2_features" in v2_groups
+    assert "wcdt_v2_prediction_shield" in v2_groups
+    assert "forecast_wcdt_v2_ppo" in v2_configs
+    assert v2_groups["ppo_wcdt_v2_features"]["model_path"] == (
+        "safe_rl_output/runs/safe_rl_test_run_forecast_wcdt_v2/stage3/ppo_model.zip"
+    )
+    assert v2_groups["ppo_wcdt_v2_features"]["forecast_checkpoint"] == (
+        "safe_rl_output/runs/safe_rl_test_run/stage2/wcdt_v2_predictor.pt"
+    )
+
 
 def _fake_group(seed_rewards: list[tuple[int, float]], reward: float, near_miss: float = 0.0, min_distance: float = 5.0):
     return {
@@ -712,21 +825,27 @@ def test_stage5_dynamic_paired_delta_and_acceptance_for_optional_forecast_groups
         "cv_prediction_shield": _fake_group([(1, 100.0)], 100.0),
         "ppo_wcdt_features": _fake_group([(1, 98.0)], 98.0),
         "wcdt_prediction_shield": _fake_group([(1, 99.0)], 99.0),
+        "ppo_wcdt_v2_features": _fake_group([(1, 100.0)], 100.0),
+        "wcdt_v2_prediction_shield": _fake_group([(1, 101.0)], 101.0),
     }
     paired = _build_paired_delta(reports)
     assert set(paired) >= {
         "ppo_vs_ppo_shield",
         "ppo_cv_features_vs_cv_prediction_shield",
         "ppo_wcdt_features_vs_wcdt_prediction_shield",
+        "ppo_wcdt_v2_features_vs_wcdt_v2_prediction_shield",
         "ppo_vs_ppo_cv_features",
         "ppo_cv_features_vs_ppo_wcdt_features",
+        "ppo_cv_features_vs_ppo_wcdt_v2_features",
     }
     acceptance = _build_acceptance(reports)
     assert acceptance["ppo_shield"]["available"]
     assert acceptance["cv_prediction_shield"]["available"]
     assert acceptance["wcdt_prediction_shield"]["available"]
+    assert acceptance["wcdt_v2_prediction_shield"]["available"]
     assert acceptance["forecast_cv_vs_baseline"]["available"]
     assert acceptance["forecast_wcdt_vs_cv"]["available"]
+    assert acceptance["forecast_wcdt_v2_vs_cv"]["available"]
 
     single = {
         "ppo": reports["ppo"],

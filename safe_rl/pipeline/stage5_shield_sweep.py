@@ -50,10 +50,11 @@ def sweep_variants(include_aggressive: bool = False) -> tuple[dict[str, float], 
     return tuple(variants)
 
 
-def _variant_name(prefix: str, variant: dict[str, float]) -> str:
+def _variant_name(prefix: str, variant: dict[str, float], calibrated: bool = False) -> str:
     activation = int(round(float(variant["activation_risk_threshold"]) * 100))
     margin = int(round(float(variant["replacement_margin"]) * 100))
-    return f"{prefix}_a{activation:03d}_m{margin:03d}"
+    calibration_suffix = "_cal" if calibrated else ""
+    return f"{prefix}{calibration_suffix}_a{activation:03d}_m{margin:03d}"
 
 
 def _run_path(run_id: str, stage: str, name: str) -> str:
@@ -61,7 +62,12 @@ def _run_path(run_id: str, stage: str, name: str) -> str:
 
 
 def _forecast_run_id(run_id: str, source: str) -> str:
-    suffix = "cv" if source == "constant_velocity" else "wcdt"
+    if source == "constant_velocity":
+        suffix = "cv"
+    elif source == "wcdt_v2":
+        suffix = "wcdt_v2"
+    else:
+        suffix = "wcdt"
     return f"{run_id}_forecast_{suffix}"
 
 
@@ -70,7 +76,18 @@ def _forecast_model_exists(run_id: str, source: str) -> bool:
     return path.exists()
 
 
-def build_sweep_groups(run_id: str, variants: tuple[dict[str, float], ...] = DEFAULT_VARIANTS) -> list[dict[str, Any]]:
+def _calibrated_group(group: dict[str, Any]) -> dict[str, Any]:
+    calibrated = dict(group)
+    calibrated["name"] = str(group["name"]).replace("_a", "_cal_a", 1)
+    calibrated["risk_module_overrides"] = {"calibration": {"use_for_runtime": True}}
+    return calibrated
+
+
+def build_sweep_groups(
+    run_id: str,
+    variants: tuple[dict[str, float], ...] = DEFAULT_VARIANTS,
+    include_calibrated: bool = False,
+) -> list[dict[str, Any]]:
     groups: list[dict[str, Any]] = [
         {
             "name": "ppo",
@@ -80,19 +97,21 @@ def build_sweep_groups(run_id: str, variants: tuple[dict[str, float], ...] = DEF
         }
     ]
     for variant in variants:
-        groups.append(
-            {
-                "name": _variant_name("ppo_shield", variant),
-                "forecast_features": False,
-                "shield": True,
-                "model_path": _run_path(run_id, "stage3", "ppo_model.zip"),
-                "shield_overrides": {**variant, "allow_fallback": False},
-            }
-        )
+        raw_group = {
+            "name": _variant_name("ppo_shield", variant),
+            "forecast_features": False,
+            "shield": True,
+            "model_path": _run_path(run_id, "stage3", "ppo_model.zip"),
+            "shield_overrides": {**variant, "allow_fallback": False},
+        }
+        groups.append(raw_group)
+        if include_calibrated:
+            groups.append(_calibrated_group(raw_group))
 
     for source, base_name, shield_prefix in (
         ("constant_velocity", "ppo_cv_features", "cv_prediction_shield"),
         ("wcdt", "ppo_wcdt_features", "wcdt_prediction_shield"),
+        ("wcdt_v2", "ppo_wcdt_v2_features", "wcdt_v2_prediction_shield"),
     ):
         if not _forecast_model_exists(run_id, source):
             continue
@@ -104,8 +123,9 @@ def build_sweep_groups(run_id: str, variants: tuple[dict[str, float], ...] = DEF
             "model_path": _run_path(forecast_run, "stage3", "ppo_model.zip"),
             "forecast_source": source,
         }
-        if source == "wcdt":
-            base["forecast_checkpoint"] = _run_path(run_id, "stage2", "wcdt_predictor.pt")
+        if source in ("wcdt", "wcdt_v2"):
+            checkpoint_name = "wcdt_v2_predictor.pt" if source == "wcdt_v2" else "wcdt_predictor.pt"
+            base["forecast_checkpoint"] = _run_path(run_id, "stage2", checkpoint_name)
         groups.append(base)
         for variant in variants:
             shield_group = {
@@ -116,9 +136,12 @@ def build_sweep_groups(run_id: str, variants: tuple[dict[str, float], ...] = DEF
                 "forecast_source": source,
                 "shield_overrides": {**variant, "allow_fallback": False},
             }
-            if source == "wcdt":
-                shield_group["forecast_checkpoint"] = _run_path(run_id, "stage2", "wcdt_predictor.pt")
+            if source in ("wcdt", "wcdt_v2"):
+                checkpoint_name = "wcdt_v2_predictor.pt" if source == "wcdt_v2" else "wcdt_predictor.pt"
+                shield_group["forecast_checkpoint"] = _run_path(run_id, "stage2", checkpoint_name)
             groups.append(shield_group)
+            if include_calibrated:
+                groups.append(_calibrated_group(shield_group))
     return groups
 
 
@@ -134,12 +157,14 @@ def _sweep_payload(run_id: str, groups: list[dict[str, Any]], seeds: list[int]) 
 
 
 def _base_group_for(name: str) -> str | None:
-    if name.startswith("ppo_shield_"):
+    if name.startswith("ppo_shield"):
         return "ppo"
-    if name.startswith("cv_prediction_shield_"):
+    if name.startswith("cv_prediction_shield"):
         return "ppo_cv_features"
-    if name.startswith("wcdt_prediction_shield_"):
+    if name.startswith("wcdt_prediction_shield"):
         return "ppo_wcdt_features"
+    if name.startswith("wcdt_v2_prediction_shield"):
+        return "ppo_wcdt_v2_features"
     return None
 
 
@@ -244,14 +269,14 @@ def _recommend_variant(variants: dict[str, dict[str, Any]]) -> str | None:
     return best_name
 
 
-def run(cfg, include_aggressive: bool = False) -> Path:
+def run(cfg, include_aggressive: bool = False, include_calibrated: bool = False) -> Path:
     stage_dir = run_root(cfg) / "stage5_sweep"
     stage_dir.mkdir(parents=True, exist_ok=True)
     generated_dir = stage_dir / "generated_configs"
     generated_dir.mkdir(parents=True, exist_ok=True)
     seeds = _select_eval_seeds(cfg)
     variants_to_run = sweep_variants(include_aggressive=include_aggressive)
-    groups = build_sweep_groups(str(cfg.run.run_id), variants_to_run)
+    groups = build_sweep_groups(str(cfg.run.run_id), variants_to_run, include_calibrated=include_calibrated)
     payload = _sweep_payload(str(cfg.run.run_id), groups, seeds)
     config_path = generated_dir / "stage5_shield_sweep.yaml"
     with config_path.open("w", encoding="utf-8") as file:
@@ -280,6 +305,7 @@ def run(cfg, include_aggressive: bool = False) -> Path:
             tensorboard_step_offset=group_idx * max(1, len(seeds)),
         )
         report["shield_overrides"] = dict(group.get("shield_overrides", {}) or {})
+        report["risk_module_overrides"] = dict(group.get("risk_module_overrides", {}) or {})
         report["forecast_source"] = str(group.get("forecast_source", ""))
         group_reports[str(group["name"])] = report
     tb.close()
@@ -297,6 +323,7 @@ def run(cfg, include_aggressive: bool = False) -> Path:
         "risk_checkpoint": risk_checkpoint,
         "seeds": seeds,
         "include_aggressive": bool(include_aggressive),
+        "include_calibrated": bool(include_calibrated),
         "sweep_variants": list(variants_to_run),
         "groups": group_reports,
         "variants": variants,
@@ -322,10 +349,15 @@ def main() -> None:
         action="store_true",
         help="Also scan lower diagnostic thresholds. These are not part of the default recommendation set.",
     )
+    parser.add_argument(
+        "--include-calibrated",
+        action="store_true",
+        help="Also evaluate groups with risk_module.calibration.use_for_runtime=true.",
+    )
     args = parser.parse_args()
     cfg = load_config(args.config)
     cfg.run["run_id"] = args.run_id
-    run(cfg, include_aggressive=bool(args.include_aggressive))
+    run(cfg, include_aggressive=bool(args.include_aggressive), include_calibrated=bool(args.include_calibrated))
 
 
 if __name__ == "__main__":

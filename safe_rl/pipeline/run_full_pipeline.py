@@ -21,7 +21,7 @@ from safe_rl.utils.config import REPO_ROOT, load_config, prepare_run_dir
 from safe_rl.utils.progress import stage_log
 
 
-VALID_FORECAST_SOURCES = ("constant_velocity", "wcdt")
+VALID_FORECAST_SOURCES = ("constant_velocity", "wcdt", "wcdt_v2")
 DEFAULT_FORECAST_SOURCES = ("constant_velocity", "wcdt")
 
 
@@ -37,7 +37,11 @@ def _write_yaml(path: Path, payload: dict[str, Any]) -> Path:
 
 
 def _source_suffix(source: str) -> str:
-    return "cv" if source == "constant_velocity" else "wcdt"
+    if source == "constant_velocity":
+        return "cv"
+    if source == "wcdt_v2":
+        return "wcdt_v2"
+    return "wcdt"
 
 
 def _forecast_run_id(run_id: str, source: str) -> str:
@@ -70,11 +74,27 @@ def resolve_forecast_sources(
 
 
 def _forecast_group_name(source: str) -> str:
-    return "ppo_wcdt_features" if source == "wcdt" else "ppo_cv_features"
+    if source == "wcdt":
+        return "ppo_wcdt_features"
+    if source == "wcdt_v2":
+        return "ppo_wcdt_v2_features"
+    return "ppo_cv_features"
 
 
 def _forecast_shield_group_name(source: str) -> str:
-    return "wcdt_prediction_shield" if source == "wcdt" else "cv_prediction_shield"
+    if source == "wcdt":
+        return "wcdt_prediction_shield"
+    if source == "wcdt_v2":
+        return "wcdt_v2_prediction_shield"
+    return "cv_prediction_shield"
+
+
+def _forecast_checkpoint_name(source: str) -> str | None:
+    if source == "wcdt":
+        return "wcdt_predictor.pt"
+    if source == "wcdt_v2":
+        return "wcdt_v2_predictor.pt"
+    return None
 
 
 def _forecast_payload(run_id: str, source: str, ppo_timesteps: int | None) -> dict[str, Any]:
@@ -85,7 +105,11 @@ def _forecast_payload(run_id: str, source: str, ppo_timesteps: int | None) -> di
             "enabled": True,
             "use_for_ppo_observation": True,
             "source": source,
-            "checkpoint": _relative_run_path(run_id, "stage2", "wcdt_predictor.pt") if source == "wcdt" else None,
+            "checkpoint": (
+                _relative_run_path(run_id, "stage2", _forecast_checkpoint_name(source))
+                if _forecast_checkpoint_name(source)
+                else None
+            ),
             "allow_heuristic_fallback": False,
         },
         "rl": {"use_wcdt_forecast_features": True},
@@ -111,8 +135,9 @@ def _forecast_stage5_groups(run_id: str, source: str) -> list[dict[str, Any]]:
         "model_path": _relative_run_path(forecast_run_id, "stage3", "ppo_model.zip"),
         "forecast_source": source,
     }
-    if source == "wcdt":
-        checkpoint = _relative_run_path(run_id, "stage2", "wcdt_predictor.pt")
+    checkpoint_name = _forecast_checkpoint_name(source)
+    if checkpoint_name:
+        checkpoint = _relative_run_path(run_id, "stage2", checkpoint_name)
         base["forecast_checkpoint"] = checkpoint
         shield["forecast_checkpoint"] = checkpoint
     return [base, shield]

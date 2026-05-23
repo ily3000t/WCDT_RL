@@ -61,17 +61,22 @@ def _resolve_repo_path(path: str | Path) -> Path:
     return path if path.is_absolute() else REPO_ROOT / path
 
 
-def _forecast_checkpoint_path(cfg: ConfigDict) -> Path:
+def _forecast_checkpoint_name(source: str) -> str:
+    return "wcdt_v2_predictor.pt" if source == "wcdt_v2" else "wcdt_predictor.pt"
+
+
+def _forecast_checkpoint_path(cfg: ConfigDict, source: str = "wcdt") -> Path:
     checkpoint = cfg.forecast_features.get("checkpoint")
     if checkpoint:
         path = _resolve_repo_path(checkpoint)
         if path.exists():
             return path
         raise FileNotFoundError(f"forecast_features.checkpoint does not exist: {path}")
-    candidate = stage_file(cfg, "stage2", "wcdt_predictor.pt")
+    checkpoint_name = _forecast_checkpoint_name(source)
+    candidate = stage_file(cfg, "stage2", checkpoint_name)
     if candidate.exists():
         return candidate
-    return latest_stage_file(cfg, "stage2", "wcdt_predictor.pt")
+    return latest_stage_file(cfg, "stage2", checkpoint_name)
 
 
 def make_forecast_augmentor(cfg: ConfigDict) -> ForecastFeatureAugmentor | None:
@@ -79,15 +84,21 @@ def make_forecast_augmentor(cfg: ConfigDict) -> ForecastFeatureAugmentor | None:
     if not forecast_enabled:
         return None
     source = str(cfg.forecast_features.get("source", "heuristic")).lower()
-    if source != "wcdt":
+    if source == "constant_velocity":
         return ForecastFeatureAugmentor(cfg)
     try:
-        checkpoint = _forecast_checkpoint_path(cfg)
+        checkpoint = _forecast_checkpoint_path(cfg, source)
     except FileNotFoundError:
         if bool(cfg.forecast_features.get("allow_heuristic_fallback", False)):
             return ForecastFeatureAugmentor(cfg)
         raise
-    return ForecastFeatureAugmentor(cfg, predictor=WcDTPredictor(cfg, checkpoint))
+    if source == "wcdt_v2":
+        from safe_rl.prediction.wcdt_v2_predictor import WcDTV2Predictor
+
+        return ForecastFeatureAugmentor(cfg, predictor=WcDTV2Predictor(cfg, checkpoint))
+    if source == "wcdt":
+        return ForecastFeatureAugmentor(cfg, predictor=WcDTPredictor(cfg, checkpoint))
+    return ForecastFeatureAugmentor(cfg)
 
 
 def make_env(

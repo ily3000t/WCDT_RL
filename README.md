@@ -155,6 +155,8 @@ python -m safe_rl.pipeline.stage2_train_prediction_risk --run-id $RUN_ID
 ```text
 safe_rl_output/runs/<run_id>/stage2/wcdt_predictor.pt
 safe_rl_output/runs/<run_id>/stage2/wcdt_predictor_best.pt
+safe_rl_output/runs/<run_id>/stage2/wcdt_v2_predictor.pt
+safe_rl_output/runs/<run_id>/stage2/wcdt_v2_predictor_best.pt
 safe_rl_output/runs/<run_id>/stage2/risk_module.pt
 safe_rl_output/runs/<run_id>/stage2/stage2_initial_prediction_report.json
 safe_rl_output/runs/<run_id>/stage2/stage2_training_report.json
@@ -162,6 +164,8 @@ safe_rl_output/runs/<run_id>/stage2/tensorboard/
 ```
 
 Stage2 的 WcDT-style predictor 会从 Stage1 trajectory windows 中划分 train/validation，按 validation `FDE + 0.5 * target_lane_gap_abs_error + 0.5 * future_min_distance_abs_error` 选择 best checkpoint。`wcdt_predictor_best.pt` 保存最佳权重；兼容路径 `wcdt_predictor.pt` 也写入同一 best 权重，避免后续 Stage3/Stage5 加载最后一个退化 epoch。
+
+Stage2 还会训练独立的 `wcdt_v2` residual-over-CV predictor。它不覆盖旧 WcDT，输入更偏 merge-centric：target lane 2 front/rear、ramp front/rear 和 nearest conflict vehicle。默认保存 3-model ensemble，`uncertainty` 来自 ensemble 方差。Risk Module validation 报告新增 legal candidate 上的 `ECE / Brier / NLL / reliability_bins`，并计算可选 temperature scaling 诊断；默认不把 calibration 写入 runtime，只有显式开启配置后 Shield 才使用 calibrated score。
 
 说明：当前仓库没有预训练 WcDT checkpoint，因此默认从 SUMO 采集数据训练；如有外部权重，可在配置中设置：
 
@@ -267,7 +271,7 @@ safe_rl_output/runs/<run_id>/stage5/tensorboard/
 safe_rl/config/advanced/stage5_four_groups.example.yaml
 ```
 
-模板中的 forecast 组必须显式设置对应 63 维 forecast PPO 的 `model_path`。CV 与 WcDT 虽然 observation 都是 63 维，但 forecast feature 分布不同，应分别训练 PPO。`forecast_source: "wcdt"` 还要设置 `forecast_checkpoint` 指向 Stage2 的 `wcdt_predictor.pt`；`forecast_source: "constant_velocity"` 不需要 checkpoint。Stage5 会在评估前校验 PPO model 和环境 observation shape，不匹配会直接失败。
+模板中的 forecast 组必须显式设置对应 63 维 forecast PPO 的 `model_path`。CV、WcDT v1 和 WcDT v2 虽然 observation 都是 63 维，但 forecast feature 分布不同，应分别训练 PPO。`forecast_source: "wcdt"` 还要设置 `forecast_checkpoint` 指向 Stage2 的 `wcdt_predictor.pt`；`forecast_source: "wcdt_v2"` 指向 `wcdt_v2_predictor.pt`；`forecast_source: "constant_velocity"` 不需要 checkpoint。Stage5 会在评估前校验 PPO model 和环境 observation shape，不匹配会直接失败。
 
 命令：
 
@@ -307,21 +311,28 @@ shield:
 python -m safe_rl.pipeline.stage5_shield_sweep --run-id $RUN_ID --include-aggressive
 ```
 
-`--include-aggressive` 只用于解释风险分数饱和和阈值敏感性，不会自动改写默认 Shield 配置。当前推荐主结果仍优先报告 `ppo`、`ppo_shield`、`ppo_cv_features`、`cv_prediction_shield`；WcDT 分支需要结合 `stage5/diagnostics/forecast_diagnostics.json` 中的 ADE/FDE、uncertainty 和 `wcdt_recommended_for_stage5` 判断是否可靠。
+如需对比 raw risk score 与 temperature-scaled score 对 Shield 行为的影响，增加：
+
+```powershell
+python -m safe_rl.pipeline.stage5_shield_sweep --run-id $RUN_ID --include-calibrated
+```
+
+`--include-aggressive` 和 `--include-calibrated` 只用于解释风险分数饱和、校准效果和阈值敏感性，不会自动改写默认 Shield 配置。当前推荐主结果仍优先报告 `ppo`、`ppo_shield`、`ppo_cv_features`、`cv_prediction_shield`；WcDT 分支需要结合 `stage5/diagnostics/forecast_diagnostics.json` 中的 ADE/FDE、uncertainty 和 `wcdt_recommended_for_stage5` / `wcdt_v2_recommended_for_stage5` 判断是否可靠。
 
 ## 一键顺序运行示例
 
 推荐直接使用全流程 runner。它会重建网络、做 SUMO smoke check、依次运行 Stage1/2/3/4、用 Stage4 buffer 重训 Risk Module，然后在同一份 Stage1/Stage4 数据、同一个 Risk Module、同一个 baseline PPO 上分别训练 CV forecast PPO 和 WcDT forecast PPO，并完成多组 Stage5 paired evaluation：
 
 ```powershell
-python -m safe_rl.pipeline.run_full_pipeline --run-id safe_rl_merge_local_001 --forecast-sources constant_velocity,wcdt
+python -m safe_rl.pipeline.run_full_pipeline --run-id safe_rl_merge_local_001 --forecast-sources constant_velocity,wcdt_v2
 ```
 
-默认 `--forecast-sources` 就是 `constant_velocity,wcdt`。如果只想跑其中一个 forecast 分支：
+默认 `--forecast-sources` 仍是 `constant_velocity,wcdt`，用于兼容旧实验。新一轮建议显式使用 `constant_velocity,wcdt_v2`；如果要同时保留 v1 对照，可运行 `constant_velocity,wcdt,wcdt_v2`。如果只想跑其中一个 forecast 分支：
 
 ```powershell
 python -m safe_rl.pipeline.run_full_pipeline --run-id safe_rl_merge_local_cv_001 --forecast-sources constant_velocity
 python -m safe_rl.pipeline.run_full_pipeline --run-id safe_rl_merge_local_wcdt_001 --forecast-sources wcdt
+python -m safe_rl.pipeline.run_full_pipeline --run-id safe_rl_merge_local_wcdt_v2_001 --forecast-sources wcdt_v2
 ```
 
 旧参数 `--forecast-source wcdt` 仍可用于单分支兼容，但不要和 `--forecast-sources` 同时使用。
@@ -329,7 +340,7 @@ python -m safe_rl.pipeline.run_full_pipeline --run-id safe_rl_merge_local_wcdt_0
 如需覆盖采样轮数和 PPO 训练步数：
 
 ```powershell
-python -m safe_rl.pipeline.run_full_pipeline --run-id safe_rl_merge_local_001 --stage1-episodes 500 --ppo-timesteps 20000 --forecast-sources constant_velocity,wcdt
+python -m safe_rl.pipeline.run_full_pipeline --run-id safe_rl_merge_local_001 --stage1-episodes 500 --ppo-timesteps 20000 --forecast-sources constant_velocity,wcdt_v2
 ```
 
 生成的临时配置会写入：
@@ -338,6 +349,7 @@ python -m safe_rl.pipeline.run_full_pipeline --run-id safe_rl_merge_local_001 --
 safe_rl_output/runs/<run_id>/generated_configs/
 safe_rl_output/runs/<run_id>/generated_configs/forecast_cv_ppo.yaml
 safe_rl_output/runs/<run_id>/generated_configs/forecast_wcdt_ppo.yaml
+safe_rl_output/runs/<run_id>/generated_configs/forecast_wcdt_v2_ppo.yaml
 safe_rl_output/runs/<run_id>/generated_configs/stage5_multi_groups.yaml
 safe_rl_output/runs/<run_id>/stage5/diagnostics/forecast_diagnostics.json
 ```

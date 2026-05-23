@@ -9,6 +9,7 @@ import numpy as np
 from safe_rl.pipeline.common import run_root, stage_file, write_report
 from safe_rl.prediction.forecast_feature_augmentor import ForecastFeatureAugmentor
 from safe_rl.prediction.sumo_wcdt_adapter import SumoWcDTAdapter
+from safe_rl.prediction.wcdt_v2_predictor import build_v2_numpy_batch, ensemble_predict, load_v2_ensemble, tensorize_batch
 from safe_rl.risk.merge_local import merge_target_lane
 from safe_rl.sim.metrics import INF_TTC
 from safe_rl.sim.types import VehicleState
@@ -453,6 +454,88 @@ def _wcdt_diagnostics(
     return np.asarray(feature_rows, dtype=np.float32), report
 
 
+def _wcdt_v2_diagnostics(
+    cfg: Any,
+    checkpoint: Path,
+    history: np.ndarray,
+    future: np.ndarray,
+    mask: np.ndarray,
+    indices: np.ndarray,
+    batch_size: int,
+) -> tuple[np.ndarray, dict[str, Any]]:
+    torch = _require_torch()
+    device = _resolve_device(cfg, torch)
+    models, payload, device = load_v2_ensemble(cfg, checkpoint, device)
+    augmentor = ForecastFeatureAugmentor(cfg)
+    feature_rows: list[np.ndarray] = []
+    ade: list[float] = []
+    fde: list[float] = []
+    min_distance_errors: list[float] = []
+    min_distance_abs_errors: list[float] = []
+    target_gap_errors: list[float] = []
+    target_gap_abs_errors: list[float] = []
+    uncertainty_values: list[float] = []
+    uncertainty_fde_values: list[float] = []
+
+    for start in range(0, indices.shape[0], batch_size):
+        batch_indices = indices[start : start + batch_size]
+        numpy_batch = build_v2_numpy_batch(cfg, history, future, mask, batch_indices)
+        tensor_batch = tensorize_batch(numpy_batch, torch, device)
+        pred, uncertainty = ensemble_predict(models, tensor_batch)
+        selected = pred.detach().cpu().numpy()
+        actual_future = numpy_batch["target"]
+        pred_mask = numpy_batch["mask"]
+        ego_future = numpy_batch["ego_future"]
+        uncertainty_np = uncertainty.detach().cpu().numpy()
+        for row in range(selected.shape[0]):
+            valid_agents = pred_mask[row] > 0.0
+            if not np.any(valid_agents):
+                continue
+            diff = selected[row, valid_agents, :, :2] - actual_future[row, valid_agents, :, :2]
+            per_step = np.linalg.norm(diff, axis=-1)
+            row_ade = float(np.mean(per_step))
+            row_fde = float(np.mean(per_step[:, -1]))
+            ade.append(row_ade)
+            fde.append(row_fde)
+            sample_uncertainty = float(uncertainty_np[row])
+            uncertainty_values.append(sample_uncertainty)
+            uncertainty_fde_values.append(row_fde)
+            pred_min_distance = _future_min_distance(ego_future[row], selected[row], pred_mask[row])
+            actual_min_distance = _future_min_distance(ego_future[row], actual_future[row], pred_mask[row])
+            min_distance_errors.append(float(pred_min_distance - actual_min_distance))
+            min_distance_abs_errors.append(abs(float(pred_min_distance - actual_min_distance)))
+            pred_gap = _target_lane_gap(ego_future[row], selected[row], pred_mask[row], cfg)
+            actual_gap = _target_lane_gap(ego_future[row], actual_future[row], pred_mask[row], cfg)
+            if pred_gap < INF_TTC and actual_gap < INF_TTC:
+                target_gap_errors.append(float(pred_gap - actual_gap))
+                target_gap_abs_errors.append(abs(float(pred_gap - actual_gap)))
+            states = _latest_states(history[batch_indices[row]], mask[batch_indices[row]])
+            ego = next((state for state in states if state.vehicle_id == "ego"), None)
+            if ego is not None:
+                features = _forecast_features_from_prediction(ego, selected[row, valid_agents], sample_uncertainty, cfg)
+                if bool(cfg.forecast_features.normalize):
+                    features = augmentor._normalize(features)
+                feature_rows.append(features)
+
+    report = {
+        "device": str(device),
+        "checkpoint": str(checkpoint),
+        "ensemble_size": int(payload.get("ensemble_size", len(models))) if isinstance(payload, dict) else len(models),
+        "sample_count": int(len(feature_rows)),
+        "ade": _summary(ade),
+        "fde": _summary(fde),
+        "future_min_distance_error": _summary(min_distance_errors),
+        "future_min_distance_abs_error": _summary(min_distance_abs_errors),
+        "target_lane_gap_error": _summary(target_gap_errors),
+        "target_lane_gap_abs_error": _summary(target_gap_abs_errors),
+        "uncertainty": _summary(uncertainty_values),
+        "uncertainty_fde_correlation": _correlation(uncertainty_values, uncertainty_fde_values),
+        "cv_baseline_validation": payload.get("cv_baseline_validation") if isinstance(payload, dict) else None,
+        "ensemble_validation": payload.get("ensemble_validation") if isinstance(payload, dict) else None,
+    }
+    return np.asarray(feature_rows, dtype=np.float32), report
+
+
 def _correlation(a_values: list[float], b_values: list[float]) -> float:
     a = np.asarray(a_values, dtype=np.float32)
     b = np.asarray(b_values, dtype=np.float32)
@@ -467,9 +550,11 @@ def _correlation(a_values: list[float], b_values: list[float]) -> float:
 def _forecast_conclusion(report: dict[str, Any]) -> dict[str, Any]:
     cv = report.get("cv_prediction", {})
     wcdt = report.get("wcdt_prediction", {})
+    wcdt_v2 = report.get("wcdt_v2_prediction", {})
     behavior = report.get("forecast_behavior", {})
     cv_ade = float(cv.get("ade", {}).get("mean", 0.0))
     cv_fde = float(cv.get("fde", {}).get("mean", 0.0))
+    cv_min_distance_error = float(cv.get("future_min_distance_abs_error", {}).get("mean", 1.0e6))
     wcdt_ade = float(wcdt.get("ade", {}).get("mean", 1.0e6))
     wcdt_fde = float(wcdt.get("fde", {}).get("mean", 1.0e6))
     quality_pass = bool(
@@ -480,18 +565,40 @@ def _forecast_conclusion(report: dict[str, Any]) -> dict[str, Any]:
     uncertainty_std = float(wcdt.get("uncertainty", {}).get("std", 0.0))
     confidence_corr = float(wcdt.get("confidence_fde_correlation", 0.0))
     uncertainty_pass = bool(wcdt.get("available", False) and uncertainty_std >= 0.02 and abs(confidence_corr) >= 0.10)
+    wcdt_v2_fde = float(wcdt_v2.get("fde", {}).get("mean", 1.0e6))
+    wcdt_v2_min_distance_error = float(wcdt_v2.get("future_min_distance_abs_error", {}).get("mean", 1.0e6))
+    wcdt_v2_quality_pass = bool(
+        wcdt_v2.get("available", False)
+        and wcdt_v2_fde <= cv_fde
+        and wcdt_v2_min_distance_error <= cv_min_distance_error
+    )
+    wcdt_v2_uncertainty_std = float(wcdt_v2.get("uncertainty", {}).get("std", 0.0))
+    wcdt_v2_uncertainty_corr = float(wcdt_v2.get("uncertainty_fde_correlation", 0.0))
+    wcdt_v2_uncertainty_pass = bool(
+        wcdt_v2.get("available", False)
+        and wcdt_v2_uncertainty_std > 0.02
+        and wcdt_v2_uncertainty_corr > 0.0
+    )
     return {
         "cv_vs_wcdt_action_agreement": float(behavior.get("step_action_agreement_rate", 0.0)),
         "wcdt_prediction_quality_pass": quality_pass,
         "wcdt_uncertainty_quality_pass": uncertainty_pass,
         "wcdt_recommended_for_stage5": bool(quality_pass and uncertainty_pass),
+        "wcdt_v2_prediction_quality_pass": wcdt_v2_quality_pass,
+        "wcdt_v2_uncertainty_quality_pass": wcdt_v2_uncertainty_pass,
+        "wcdt_v2_recommended_for_stage5": bool(wcdt_v2_quality_pass and wcdt_v2_uncertainty_pass),
         "decision_basis": {
             "cv_ade_mean": cv_ade,
             "cv_fde_mean": cv_fde,
+            "cv_future_min_distance_abs_error_mean": cv_min_distance_error,
             "wcdt_ade_mean": wcdt_ade,
             "wcdt_fde_mean": wcdt_fde,
             "wcdt_uncertainty_std": uncertainty_std,
             "wcdt_confidence_fde_correlation": confidence_corr,
+            "wcdt_v2_fde_mean": wcdt_v2_fde,
+            "wcdt_v2_future_min_distance_abs_error_mean": wcdt_v2_min_distance_error,
+            "wcdt_v2_uncertainty_std": wcdt_v2_uncertainty_std,
+            "wcdt_v2_uncertainty_fde_correlation": wcdt_v2_uncertainty_corr,
         },
     }
 
@@ -627,6 +734,7 @@ def run_forecast_diagnostics(
     base_run = run_root(cfg)
     stage1_path = stage_file(cfg, "stage1", str(cfg.stage1.output_name))
     checkpoint = stage_file(cfg, "stage2", "wcdt_predictor.pt")
+    wcdt_v2_checkpoint = stage_file(cfg, "stage2", "wcdt_v2_predictor.pt")
     stage5_path = stage_file(cfg, "stage5", "formal_paired_eval_report.json")
     output_dir = base_run / "stage5" / "diagnostics"
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -643,6 +751,8 @@ def run_forecast_diagnostics(
     cv_prediction = _cv_prediction_diagnostics(cfg, history, future, mask, indices)
     wcdt_features = np.zeros((0, ForecastFeatureAugmentor.feature_dim(cfg)), dtype=np.float32)
     wcdt_report: dict[str, Any] = {"available": False, "checkpoint": str(checkpoint)}
+    wcdt_v2_features = np.zeros((0, ForecastFeatureAugmentor.feature_dim(cfg)), dtype=np.float32)
+    wcdt_v2_report: dict[str, Any] = {"available": False, "checkpoint": str(wcdt_v2_checkpoint)}
     if checkpoint.exists():
         wcdt_features, wcdt_report = _wcdt_diagnostics(cfg, checkpoint, history, future, mask, indices, batch_size)
         wcdt_report["available"] = True
@@ -662,6 +772,11 @@ def run_forecast_diagnostics(
             )
         if initial_report_path.exists():
             wcdt_report["initial_prediction_report"] = str(initial_report_path)
+    if wcdt_v2_checkpoint.exists():
+        wcdt_v2_features, wcdt_v2_report = _wcdt_v2_diagnostics(
+            cfg, wcdt_v2_checkpoint, history, future, mask, indices, batch_size
+        )
+        wcdt_v2_report["available"] = True
     report: dict[str, Any] = {
         "run_id": str(cfg.run.run_id),
         "stage1_buffer": str(stage1_path),
@@ -673,9 +788,12 @@ def run_forecast_diagnostics(
         },
         "cv_prediction": cv_prediction,
         "wcdt_prediction": wcdt_report,
+        "wcdt_v2_prediction": wcdt_v2_report,
     }
     if wcdt_features.shape[0] > 0:
         report["cv_vs_wcdt_feature_distribution"] = _feature_distribution_report(cv_features, wcdt_features)
+    if wcdt_v2_features.shape[0] > 0:
+        report["cv_vs_wcdt_v2_feature_distribution"] = _feature_distribution_report(cv_features, wcdt_v2_features)
     if stage5_path.exists():
         with stage5_path.open("r", encoding="utf-8") as file:
             stage5_report = json.load(file)
