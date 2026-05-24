@@ -354,6 +354,28 @@ safe_rl_output/runs/<run_id>/generated_configs/stage5_multi_groups.yaml
 safe_rl_output/runs/<run_id>/stage5/diagnostics/forecast_diagnostics.json
 ```
 
+完成 full pipeline 后，推荐用 50 seeds 做最终复验。该命令只复用已有 Stage1/2/3/4 输出，不重训模型：
+
+```powershell
+python -m safe_rl.pipeline.stage5_confirmatory_eval --run-id safe_rl_merge_local_001
+```
+
+短流程 smoke 可以先跑：
+
+```powershell
+python -m safe_rl.pipeline.stage5_confirmatory_eval --run-id safe_rl_merge_local_001 --episodes 5
+```
+
+confirmatory 输出：
+
+```text
+safe_rl_output/runs/<run_id>/stage5_confirmatory/formal_paired_eval_report.json
+safe_rl_output/runs/<run_id>/stage5_confirmatory/confirmatory_summary.json
+safe_rl_output/runs/<run_id>/stage5_confirmatory/generated_configs/stage5_confirmatory.yaml
+```
+
+`confirmatory_summary.json` 会把主结果明确分成：可信 Shield 主线 `ppo/ppo_shield`、forecast 对照 `ppo_cv_features`、当前推荐预测分支 `ppo_wcdt_v2_features`。如果 `wcdt_v2_prediction_shield` 没有实际替换但不退化，会标记 `shield_not_needed_on_wcdt_v2_policy=true`，表示 WcDT v2 PPO 本身已经足够安全，而不是 Shield 失败。
+
 如果需要手动逐阶段运行，命令如下：
 
 ```powershell

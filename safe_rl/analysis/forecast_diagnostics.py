@@ -618,41 +618,56 @@ def _feature_distribution_report(cv_features: np.ndarray, wcdt_features: np.ndar
     return report
 
 
-def _low_min_distance_replays(base_run_id: str, stage5_report: dict[str, Any], count: int) -> list[dict[str, Any]]:
-    group = stage5_report.get("groups", {}).get("ppo_cv_features", {})
+def _low_min_distance_replays(
+    base_run_id: str,
+    stage5_report: dict[str, Any],
+    count: int,
+    *,
+    group_name: str = "ppo_cv_features",
+    compare_group_name: str | None = "cv_prediction_shield",
+) -> list[dict[str, Any]]:
+    group = stage5_report.get("groups", {}).get(group_name, {})
     episodes = sorted(group.get("episodes", []), key=lambda item: float(item.get("min_distance", INF_TTC)))
     rows = []
     for item in episodes[:count]:
         seed = int(item["seed"])
-        replay_path = Path("safe_rl_output") / "runs" / base_run_id / "stage5" / "replay" / f"ppo_cv_features_seed_{seed}.json"
-        shield_replay_path = Path("safe_rl_output") / "runs" / base_run_id / "stage5" / "replay" / f"cv_prediction_shield_seed_{seed}.json"
-        rows.append(
-            {
-                "seed": seed,
-                "min_distance": float(item.get("min_distance", INF_TTC)),
-                "ttc_p1": float(item.get("ttc_p1", INF_TTC)),
-                "drac_p99": float(item.get("drac_p99", 0.0)),
-                "episode_reward": float(item.get("episode_reward", 0.0)),
-                "replay": str(replay_path),
-                "command": f"python -m safe_rl.tools.replay_episode --replay {replay_path} --gui --delay-ms 200",
-                "shield_replay": str(shield_replay_path),
-                "shield_command": f"python -m safe_rl.tools.replay_episode --replay {shield_replay_path} --gui --delay-ms 200",
-            }
-        )
+        replay_path = Path("safe_rl_output") / "runs" / base_run_id / "stage5" / "replay" / f"{group_name}_seed_{seed}.json"
+        row = {
+            "seed": seed,
+            "group": group_name,
+            "min_distance": float(item.get("min_distance", INF_TTC)),
+            "ttc_p1": float(item.get("ttc_p1", INF_TTC)),
+            "drac_p99": float(item.get("drac_p99", 0.0)),
+            "episode_reward": float(item.get("episode_reward", 0.0)),
+            "replay": str(replay_path),
+            "command": f"python -m safe_rl.tools.replay_episode --replay {replay_path} --gui --delay-ms 200",
+        }
+        if compare_group_name:
+            compare_path = (
+                Path("safe_rl_output") / "runs" / base_run_id / "stage5" / "replay" / f"{compare_group_name}_seed_{seed}.json"
+            )
+            row["compare_group"] = compare_group_name
+            row["compare_replay"] = str(compare_path)
+            row["compare_command"] = f"python -m safe_rl.tools.replay_episode --replay {compare_path} --gui --delay-ms 200"
+        rows.append(row)
     return rows
 
 
-def _write_replay_commands(path: Path, rows: list[dict[str, Any]]) -> None:
+def _write_replay_commands(path: Path, rows: list[dict[str, Any]], *, title: str) -> None:
     lines = [
-        "# Low-min-distance ppo_cv_features replay commands",
+        f"# {title}",
         "# Run one command at a time in PowerShell.",
         "",
     ]
     for row in rows:
-        lines.append(f"# seed={row['seed']} min_distance={row['min_distance']:.3f} ttc_p1={row['ttc_p1']:.3f}")
+        lines.append(
+            f"# group={row.get('group', '')} seed={row['seed']} "
+            f"min_distance={row['min_distance']:.3f} ttc_p1={row['ttc_p1']:.3f}"
+        )
         lines.append(row["command"])
-        lines.append(f"# Compare with CV shield for the same seed")
-        lines.append(row["shield_command"])
+        if row.get("compare_command"):
+            lines.append(f"# Compare with {row.get('compare_group')} for the same seed")
+            lines.append(row["compare_command"])
         lines.append("")
     path.write_text("\n".join(lines), encoding="utf-8")
 
@@ -669,42 +684,50 @@ def _load_replay_actions(path: Path) -> list[int] | None:
     return [int(action) for action in payload.get("actions", [])]
 
 
-def _forecast_behavior_diagnostics(base_run_id: str, stage5_report: dict[str, Any]) -> dict[str, Any]:
+def _behavior_pair_diagnostics(
+    base_run_id: str,
+    stage5_report: dict[str, Any],
+    left_name: str,
+    right_name: str,
+) -> dict[str, Any]:
     groups = stage5_report.get("groups", {})
-    cv = groups.get("ppo_cv_features", {})
-    wcdt = groups.get("ppo_wcdt_features", {})
-    if not cv or not wcdt:
-        return {"available": False, "reason": "missing ppo_cv_features or ppo_wcdt_features group"}
+    left_group = groups.get(left_name, {})
+    right_group = groups.get(right_name, {})
+    if not left_group or not right_group:
+        return {"available": False, "reason": f"missing {left_name} or {right_name} group"}
     replay_dir = Path("safe_rl_output") / "runs" / base_run_id / "stage5" / "replay"
-    wcdt_by_seed = {int(item["seed"]): item for item in wcdt.get("episodes", [])}
+    right_by_seed = {int(item["seed"]): item for item in right_group.get("episodes", [])}
     rows = []
-    cv_actions_all: list[int] = []
-    wcdt_actions_all: list[int] = []
+    left_actions_all: list[int] = []
+    right_actions_all: list[int] = []
     compared_steps = 0
     matching_steps = 0
     missing_replays = 0
-    for cv_episode in cv.get("episodes", []):
-        seed = int(cv_episode["seed"])
-        if seed not in wcdt_by_seed:
+    first_diff_steps: list[int] = []
+    for left_episode in left_group.get("episodes", []):
+        seed = int(left_episode["seed"])
+        if seed not in right_by_seed:
             continue
-        cv_actions = _load_replay_actions(replay_dir / f"ppo_cv_features_seed_{seed}.json")
-        wcdt_actions = _load_replay_actions(replay_dir / f"ppo_wcdt_features_seed_{seed}.json")
-        if cv_actions is None or wcdt_actions is None:
+        left_actions = _load_replay_actions(replay_dir / f"{left_name}_seed_{seed}.json")
+        right_actions = _load_replay_actions(replay_dir / f"{right_name}_seed_{seed}.json")
+        if left_actions is None or right_actions is None:
             missing_replays += 1
             continue
-        cv_actions_all.extend(cv_actions)
-        wcdt_actions_all.extend(wcdt_actions)
-        limit = min(len(cv_actions), len(wcdt_actions))
+        left_actions_all.extend(left_actions)
+        right_actions_all.extend(right_actions)
+        limit = min(len(left_actions), len(right_actions))
         compared_steps += limit
-        step_matches = sum(1 for idx in range(limit) if cv_actions[idx] == wcdt_actions[idx])
+        step_matches = sum(1 for idx in range(limit) if left_actions[idx] == right_actions[idx])
         matching_steps += step_matches
-        first_diff = next((idx for idx in range(limit) if cv_actions[idx] != wcdt_actions[idx]), -1)
+        first_diff = next((idx for idx in range(limit) if left_actions[idx] != right_actions[idx]), -1)
+        if first_diff >= 0:
+            first_diff_steps.append(float(first_diff))
         rows.append(
             {
                 "seed": seed,
-                "cv_action_count": len(cv_actions),
-                "wcdt_action_count": len(wcdt_actions),
-                "exact_action_match": bool(len(cv_actions) == len(wcdt_actions) and step_matches == limit),
+                "left_action_count": len(left_actions),
+                "right_action_count": len(right_actions),
+                "exact_action_match": bool(len(left_actions) == len(right_actions) and step_matches == limit),
                 "step_action_agreement_rate": float(step_matches / limit) if limit else 0.0,
                 "first_diff_step": int(first_diff),
             }
@@ -712,16 +735,46 @@ def _forecast_behavior_diagnostics(base_run_id: str, stage5_report: dict[str, An
     exact_rates = [float(row["exact_action_match"]) for row in rows]
     return {
         "available": bool(rows),
+        "left_group": left_name,
+        "right_group": right_name,
         "compared_episode_count": int(len(rows)),
         "missing_replay_count": int(missing_replays),
         "exact_episode_action_match_rate": float(np.mean(exact_rates)) if exact_rates else 0.0,
         "step_action_agreement_rate": float(matching_steps / compared_steps) if compared_steps else 0.0,
-        "cv_action_histogram": _action_histogram(cv_actions_all),
-        "wcdt_action_histogram": _action_histogram(wcdt_actions_all),
+        "left_action_histogram": _action_histogram(left_actions_all),
+        "right_action_histogram": _action_histogram(right_actions_all),
+        "first_diff_step_summary": _summary(first_diff_steps),
         "episodes": rows,
         "action_sensitive_to_forecast_source": bool(matching_steps < compared_steps or np.mean(exact_rates) < 1.0)
         if rows
         else False,
+    }
+
+
+def _forecast_behavior_diagnostics(base_run_id: str, stage5_report: dict[str, Any]) -> dict[str, Any]:
+    pairs = [
+        ("ppo_cv_features", "ppo_wcdt_features"),
+        ("ppo_cv_features", "ppo_wcdt_v2_features"),
+        ("ppo_wcdt_v2_features", "wcdt_v2_prediction_shield"),
+    ]
+    comparisons = {
+        f"{left}_vs_{right}": _behavior_pair_diagnostics(base_run_id, stage5_report, left, right)
+        for left, right in pairs
+    }
+    available = {name: item for name, item in comparisons.items() if item.get("available")}
+    primary_key = (
+        "ppo_cv_features_vs_ppo_wcdt_v2_features"
+        if comparisons.get("ppo_cv_features_vs_ppo_wcdt_v2_features", {}).get("available")
+        else "ppo_cv_features_vs_ppo_wcdt_features"
+    )
+    primary = comparisons.get(primary_key, {})
+    return {
+        "available": bool(available),
+        "primary_comparison": primary_key if primary.get("available") else None,
+        "comparisons": comparisons,
+        "step_action_agreement_rate": primary.get("step_action_agreement_rate", 0.0),
+        "action_sensitive_to_forecast_source": bool(primary.get("action_sensitive_to_forecast_source", False)),
+        "reason": None if available else "no supported forecast behavior comparison groups were available",
     }
 
 
@@ -797,10 +850,33 @@ def run_forecast_diagnostics(
     if stage5_path.exists():
         with stage5_path.open("r", encoding="utf-8") as file:
             stage5_report = json.load(file)
-        low_rows = _low_min_distance_replays(str(cfg.run.run_id), stage5_report, int(low_seed_count))
+        low_rows = _low_min_distance_replays(
+            str(cfg.run.run_id),
+            stage5_report,
+            int(low_seed_count),
+            group_name="ppo_cv_features",
+            compare_group_name="cv_prediction_shield",
+        )
+        low_v2_rows = _low_min_distance_replays(
+            str(cfg.run.run_id),
+            stage5_report,
+            int(low_seed_count),
+            group_name="ppo_wcdt_v2_features",
+            compare_group_name="wcdt_v2_prediction_shield",
+        )
         report["low_min_distance_ppo_cv_features"] = low_rows
+        report["low_min_distance_ppo_wcdt_v2_features"] = low_v2_rows
         report["forecast_behavior"] = _forecast_behavior_diagnostics(str(cfg.run.run_id), stage5_report)
-        _write_replay_commands(output_dir / "replay_low_min_distance_ppo_cv_features.ps1", low_rows)
+        _write_replay_commands(
+            output_dir / "replay_low_min_distance_ppo_cv_features.ps1",
+            low_rows,
+            title="Low-min-distance ppo_cv_features replay commands",
+        )
+        _write_replay_commands(
+            output_dir / "replay_low_min_distance_ppo_wcdt_v2_features.ps1",
+            low_v2_rows,
+            title="Low-min-distance ppo_wcdt_v2_features replay commands",
+        )
     report["forecast_conclusion"] = _forecast_conclusion(report)
     output_path = output_dir / "forecast_diagnostics.json"
     write_report(output_path, report)

@@ -10,7 +10,7 @@ import pytest
 import yaml
 
 from safe_rl.prediction.forecast_feature_augmentor import ForecastFeatureAugmentor
-from safe_rl.analysis.forecast_diagnostics import _forecast_conclusion
+from safe_rl.analysis.forecast_diagnostics import _forecast_behavior_diagnostics, _forecast_conclusion
 from safe_rl.pipeline.run_full_pipeline import build_generated_configs, resolve_forecast_sources
 from safe_rl.pipeline.common import write_report
 from safe_rl.pipeline.stage2_train_prediction_risk import (
@@ -25,6 +25,11 @@ from safe_rl.pipeline.stage2_train_prediction_risk import (
     _temperature_scaling_diagnostics,
 )
 from safe_rl.pipeline.stage5_paired_eval import _build_acceptance, _build_paired_delta, _group_overrides, _select_eval_seeds
+from safe_rl.pipeline.stage5_confirmatory_eval import (
+    build_confirmatory_payload,
+    build_confirmatory_summary,
+    validate_confirmatory_inputs,
+)
 from safe_rl.pipeline.stage5_shield_sweep import (
     AGGRESSIVE_VARIANTS,
     DEFAULT_VARIANTS,
@@ -793,7 +798,15 @@ def test_full_pipeline_generated_configs_support_single_forecast_source(tmp_path
     )
 
 
-def _fake_group(seed_rewards: list[tuple[int, float]], reward: float, near_miss: float = 0.0, min_distance: float = 5.0):
+def _fake_group(
+    seed_rewards: list[tuple[int, float]],
+    reward: float,
+    near_miss: float = 0.0,
+    min_distance: float = 5.0,
+    drac: float = 1.0,
+    success: float = 1.0,
+    replacements: float = 0.0,
+):
     return {
         "episodes": [
             {
@@ -801,9 +814,9 @@ def _fake_group(seed_rewards: list[tuple[int, float]], reward: float, near_miss:
                 "episode_reward": episode_reward,
                 "min_distance": min_distance,
                 "ttc_p1": 2.0,
-                "drac_p99": 1.0,
+                "drac_p99": drac,
                 "intervention_count": 0,
-                "actual_replacement_count": 0,
+                "actual_replacement_count": int(replacements),
                 "fallback_count": 0,
             }
             for seed, episode_reward in seed_rewards
@@ -813,6 +826,10 @@ def _fake_group(seed_rewards: list[tuple[int, float]], reward: float, near_miss:
             "near_miss_rate": near_miss,
             "min_distance_p1": min_distance,
             "fallback_rate": 0.0,
+            "drac_p99": drac,
+            "merge_success_rate": success,
+            "mean_actual_replacements": replacements,
+            "actual_replacement_rate": float(replacements > 0.0),
         },
     }
 
@@ -856,6 +873,70 @@ def test_stage5_dynamic_paired_delta_and_acceptance_for_optional_forecast_groups
     single_acceptance = _build_acceptance(single)
     assert "forecast_wcdt_vs_cv" not in single_acceptance
     assert single_acceptance["wcdt_prediction_shield"]["available"]
+
+
+def test_forecast_behavior_diagnostics_supports_cv_vs_wcdt_v2(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    replay_dir = tmp_path / "safe_rl_output" / "runs" / "safe_rl_behavior_test" / "stage5" / "replay"
+    replay_dir.mkdir(parents=True)
+    (replay_dir / "ppo_cv_features_seed_1.json").write_text(json.dumps({"actions": [4, 4, 5]}), encoding="utf-8")
+    (replay_dir / "ppo_wcdt_v2_features_seed_1.json").write_text(json.dumps({"actions": [4, 5, 5]}), encoding="utf-8")
+    report = {
+        "groups": {
+            "ppo_cv_features": {"episodes": [{"seed": 1}]},
+            "ppo_wcdt_v2_features": {"episodes": [{"seed": 1}]},
+        }
+    }
+    diagnostics = _forecast_behavior_diagnostics("safe_rl_behavior_test", report)
+    assert diagnostics["available"]
+    assert diagnostics["primary_comparison"] == "ppo_cv_features_vs_ppo_wcdt_v2_features"
+    comparison = diagnostics["comparisons"]["ppo_cv_features_vs_ppo_wcdt_v2_features"]
+    assert comparison["available"]
+    assert comparison["step_action_agreement_rate"] == pytest.approx(2 / 3)
+    assert comparison["first_diff_step_summary"]["min"] == 1
+    assert comparison["left_action_histogram"]["4"] == 2
+    assert comparison["right_action_histogram"]["5"] == 2
+
+
+def test_confirmatory_payload_generates_fifty_seed_six_group_config():
+    payload = build_confirmatory_payload("safe_rl_test_run")
+    groups = {item["name"]: item for item in payload["stage5"]["groups"]}
+    assert payload["stage5"]["episodes_per_group"] == 50
+    assert payload["stage5"]["seeds"] == list(range(1, 51))
+    assert set(groups) == {
+        "ppo",
+        "ppo_shield",
+        "ppo_cv_features",
+        "cv_prediction_shield",
+        "ppo_wcdt_v2_features",
+        "wcdt_v2_prediction_shield",
+    }
+    assert groups["ppo_wcdt_v2_features"]["forecast_checkpoint"] == (
+        "safe_rl_output/runs/safe_rl_test_run/stage2/wcdt_v2_predictor.pt"
+    )
+
+
+def test_confirmatory_input_validation_reports_missing_checkpoints():
+    payload = build_confirmatory_payload("safe_rl_missing_confirmatory_run", episodes=5)
+    with pytest.raises(FileNotFoundError, match="Stage5 confirmatory eval requires existing"):
+        validate_confirmatory_inputs(payload)
+
+
+def test_confirmatory_summary_marks_wcdt_v2_shield_not_needed():
+    reports = {
+        "ppo": _fake_group([(1, 100.0)], 100.0, min_distance=2.0),
+        "ppo_shield": _fake_group([(1, 101.0)], 101.0, min_distance=2.1, replacements=1.0),
+        "ppo_cv_features": _fake_group([(1, 105.0)], 105.0, min_distance=3.0, drac=8.0),
+        "ppo_wcdt_v2_features": _fake_group([(1, 110.0)], 110.0, min_distance=5.0, drac=4.0),
+        "wcdt_v2_prediction_shield": _fake_group([(1, 110.0)], 110.0, min_distance=5.0, drac=4.0),
+    }
+    paired = _build_paired_delta(reports)
+    acceptance = _build_acceptance(reports)
+    summary = build_confirmatory_summary(reports, paired, acceptance)
+    assert summary["ppo_shield_mainline"]["pass"]
+    assert summary["wcdt_v2_forecast_mainline"]["pass"]
+    assert summary["wcdt_v2_shield"]["shield_not_needed_on_wcdt_v2_policy"]
+    assert summary["overall_pass"]
 
 
 def test_sumo_start_retries_after_transient_traci_failure(monkeypatch):
