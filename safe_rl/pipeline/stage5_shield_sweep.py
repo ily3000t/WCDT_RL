@@ -269,6 +269,136 @@ def _recommend_variant(variants: dict[str, dict[str, Any]]) -> str | None:
     return best_name
 
 
+def _is_calibrated_variant(name: str) -> bool:
+    return "_cal_a" in name
+
+
+def _raw_variant_name(name: str) -> str:
+    return name.replace("_cal_a", "_a")
+
+
+def _variant_family(name: str) -> tuple[str, bool] | None:
+    marker = "_cal_a" if _is_calibrated_variant(name) else "_a"
+    if marker not in name:
+        return None
+    return name.split(marker, 1)[0], _is_calibrated_variant(name)
+
+
+def _metric_delta(left: dict[str, Any], right: dict[str, Any]) -> dict[str, float]:
+    left_metrics = left.get("metrics", {})
+    right_metrics = right.get("metrics", {})
+    keys = (
+        "average_reward",
+        "min_distance_p1",
+        "ttc_p1",
+        "drac_p99",
+        "actual_replacement_rate",
+        "mean_actual_replacements",
+        "fallback_rate",
+        "near_miss_rate",
+        "collision_rate",
+    )
+    return {
+        f"{key}_delta": float(right_metrics.get(key, 0.0)) - float(left_metrics.get(key, 0.0))
+        for key in keys
+    }
+
+
+def _calibration_effect_summary(variants: dict[str, dict[str, Any]], include_calibrated: bool) -> dict[str, Any]:
+    raw_variants = {name: item for name, item in variants.items() if not _is_calibrated_variant(name)}
+    calibrated_variants = {name: item for name, item in variants.items() if _is_calibrated_variant(name)}
+    pairs: dict[str, dict[str, Any]] = {}
+    for calibrated_name, calibrated_item in calibrated_variants.items():
+        raw_name = _raw_variant_name(calibrated_name)
+        raw_item = raw_variants.get(raw_name)
+        if raw_item is None:
+            continue
+        delta = _metric_delta(raw_item, calibrated_item)
+        pairs[raw_name] = {
+            "raw_variant": raw_name,
+            "calibrated_variant": calibrated_name,
+            "metric_delta_calibrated_minus_raw": delta,
+            "replacement_rate_changed": abs(delta["actual_replacement_rate_delta"]) > 1.0e-6,
+            "mean_replacements_changed": abs(delta["mean_actual_replacements_delta"]) > 1.0e-6,
+            "calibrated_regression": bool(
+                calibrated_item.get("acceptance", {}).get("shield_regression", False)
+            ),
+        }
+    raw_recommended = _recommend_variant(raw_variants)
+    calibrated_recommended = _recommend_variant(calibrated_variants)
+    normalized_calibrated = _raw_variant_name(calibrated_recommended) if calibrated_recommended else None
+    recommendation_changed = (
+        bool(raw_recommended or normalized_calibrated) and raw_recommended != normalized_calibrated
+    )
+    return {
+        "available": bool(include_calibrated and pairs),
+        "include_calibrated": bool(include_calibrated),
+        "raw_variant_count": len(raw_variants),
+        "calibrated_variant_count": len(calibrated_variants),
+        "paired_variant_count": len(pairs),
+        "raw_recommended_variant": raw_recommended,
+        "calibrated_recommended_variant": calibrated_recommended,
+        "recommended_variant_changed": recommendation_changed,
+        "calibrated_regression_count": sum(1 for item in pairs.values() if item["calibrated_regression"]),
+        "replacement_behavior_changed_count": sum(
+            1
+            for item in pairs.values()
+            if item["replacement_rate_changed"] or item["mean_replacements_changed"]
+        ),
+        "pairs": pairs,
+    }
+
+
+def _threshold_sensitivity_summary(variants: dict[str, dict[str, Any]]) -> dict[str, Any]:
+    grouped: dict[tuple[str, bool], list[tuple[str, dict[str, Any]]]] = {}
+    for name, item in variants.items():
+        family = _variant_family(name)
+        if family is None:
+            continue
+        grouped.setdefault(family, []).append((name, item))
+
+    families: dict[str, dict[str, Any]] = {}
+    raw_sensitive = False
+    calibrated_sensitive = False
+    for (prefix, calibrated), rows in sorted(grouped.items()):
+        if len(rows) < 2:
+            continue
+        replacement_rates = [
+            float(item.get("metrics", {}).get("actual_replacement_rate", 0.0)) for _, item in rows
+        ]
+        mean_replacements = [
+            float(item.get("metrics", {}).get("mean_actual_replacements", 0.0)) for _, item in rows
+        ]
+        rate_range = max(replacement_rates) - min(replacement_rates)
+        mean_range = max(mean_replacements) - min(mean_replacements)
+        threshold_sensitive = bool(rate_range > 0.05 or mean_range > 0.25)
+        key = f"{prefix}{'_calibrated' if calibrated else '_raw'}"
+        families[key] = {
+            "group_count": len(rows),
+            "variant_names": [name for name, _ in rows],
+            "replacement_rate_min": min(replacement_rates),
+            "replacement_rate_max": max(replacement_rates),
+            "replacement_rate_range": rate_range,
+            "mean_replacements_min": min(mean_replacements),
+            "mean_replacements_max": max(mean_replacements),
+            "mean_replacements_range": mean_range,
+            "threshold_sensitive": threshold_sensitive,
+        }
+        if calibrated:
+            calibrated_sensitive = calibrated_sensitive or threshold_sensitive
+        else:
+            raw_sensitive = raw_sensitive or threshold_sensitive
+
+    raw_families = [item for key, item in families.items() if key.endswith("_raw")]
+    return {
+        "available": bool(families),
+        "families": families,
+        "risk_score_saturation_suspected": bool(raw_families and not raw_sensitive),
+        "calibration_helpful_for_shield": bool(calibrated_sensitive and not raw_sensitive),
+        "sensitivity_rule": "sensitive if replacement_rate_range > 0.05 or mean_replacements_range > 0.25",
+    }
+
+
 def run(cfg, include_aggressive: bool = False, include_calibrated: bool = False) -> Path:
     stage_dir = run_root(cfg) / "stage5_sweep"
     stage_dir.mkdir(parents=True, exist_ok=True)
@@ -316,6 +446,8 @@ def run(cfg, include_aggressive: bool = False, include_calibrated: bool = False)
         if base_name and base_name in group_reports:
             variants[name] = _variant_report(group_reports[base_name], report)
     recommended = _recommend_variant(variants)
+    calibration_effect = _calibration_effect_summary(variants, include_calibrated=include_calibrated)
+    threshold_sensitivity = _threshold_sensitivity_summary(variants)
     final_report = {
         "stage": "stage5_sweep",
         "run_id": cfg.run.run_id,
@@ -327,6 +459,8 @@ def run(cfg, include_aggressive: bool = False, include_calibrated: bool = False)
         "sweep_variants": list(variants_to_run),
         "groups": group_reports,
         "variants": variants,
+        "calibration_effect_summary": calibration_effect,
+        "threshold_sensitivity_summary": threshold_sensitivity,
         "recommended_variant": recommended,
         "recommendation_reason": (
             "selected non-regressive variant with actual replacements and improved min_distance_p1 or drac_p99"

@@ -24,6 +24,92 @@ from safe_rl.utils.progress import TensorboardLogger, stage_log
 
 DEFAULT_FORECAST_SOURCES = ("constant_velocity", "wcdt_v2")
 
+MODEL_ROLE_EXPLANATIONS: dict[str, dict[str, str | bool]] = {
+    "ppo": {
+        "role": "baseline_policy",
+        "observation": "52D base observation",
+        "forecast_source": "none",
+        "shield_enabled": False,
+        "meaning": "Baseline PPO policy without forecast features or Shield.",
+    },
+    "ppo_shield": {
+        "role": "trusted_shield_mainline",
+        "observation": "52D base observation",
+        "forecast_source": "none",
+        "shield_enabled": True,
+        "meaning": "Baseline PPO policy with Risk Module Shield action replacement enabled.",
+    },
+    "ppo_cv_features": {
+        "role": "forecast_control",
+        "observation": "63D forecast-augmented observation",
+        "forecast_source": "constant_velocity",
+        "shield_enabled": False,
+        "meaning": "Forecast-feature PPO trained with constant-velocity forecast features.",
+    },
+    "cv_prediction_shield": {
+        "role": "forecast_control_with_shield",
+        "observation": "63D forecast-augmented observation",
+        "forecast_source": "constant_velocity",
+        "shield_enabled": True,
+        "meaning": "Constant-velocity forecast-feature PPO with Shield enabled.",
+    },
+    "ppo_wcdt_features": {
+        "role": "diagnostic_only",
+        "observation": "63D forecast-augmented observation",
+        "forecast_source": "wcdt",
+        "shield_enabled": False,
+        "meaning": "Legacy WcDT v1 forecast-feature PPO kept for ablation/diagnostics only.",
+    },
+    "wcdt_prediction_shield": {
+        "role": "diagnostic_only",
+        "observation": "63D forecast-augmented observation",
+        "forecast_source": "wcdt",
+        "shield_enabled": True,
+        "meaning": "Legacy WcDT v1 forecast-feature PPO with Shield, kept for diagnostics only.",
+    },
+    "ppo_wcdt_v2_features": {
+        "role": "recommended_prediction_branch",
+        "observation": "63D forecast-augmented observation",
+        "forecast_source": "wcdt_v2",
+        "shield_enabled": False,
+        "meaning": "Recommended WcDT v2 forecast-feature PPO branch.",
+    },
+    "wcdt_v2_prediction_shield": {
+        "role": "best_safety_combo",
+        "observation": "63D forecast-augmented observation",
+        "forecast_source": "wcdt_v2",
+        "shield_enabled": True,
+        "meaning": "WcDT v2 forecast-feature PPO with Shield enabled.",
+    },
+}
+
+REPORTING_RECOMMENDATION: list[dict[str, str]] = [
+    {
+        "comparison": "ppo_vs_ppo_shield",
+        "purpose": "Report the trusted Shield mainline against the baseline PPO.",
+    },
+    {
+        "comparison": "ppo_cv_features_vs_ppo_wcdt_v2_features",
+        "purpose": "Report WcDT v2 forecast features against the constant-velocity forecast control.",
+    },
+    {
+        "comparison": "ppo_wcdt_v2_features_vs_wcdt_v2_prediction_shield",
+        "purpose": "Report whether Shield further improves the WcDT v2 forecast policy.",
+    },
+    {
+        "comparison": "legacy_wcdt_v1",
+        "purpose": "Keep old WcDT v1 groups in ablation/diagnostic tables only.",
+    },
+]
+
+FINAL_RESULT_SUMMARY: dict[str, str | list[str]] = {
+    "trusted_mainline": ["ppo", "ppo_shield"],
+    "forecast_control": "ppo_cv_features",
+    "recommended_prediction_branch": "ppo_wcdt_v2_features",
+    "best_safety_combo": "wcdt_v2_prediction_shield",
+    "diagnostic_only": ["ppo_wcdt_features", "wcdt_prediction_shield"],
+}
+
 
 def _resolve_repo_path(path: str | Path) -> Path:
     path = Path(path)
@@ -129,15 +215,31 @@ def _wcdt_v2_shield_summary(group_reports: dict[str, dict]) -> dict[str, Any]:
     base = group_reports.get("ppo_wcdt_v2_features")
     shielded = group_reports.get("wcdt_v2_prediction_shield")
     acceptance = _shield_acceptance(base, shielded)
+    mean_replacements = _metric(shielded, "mean_actual_replacements", 0.0)
+    not_regressed = not acceptance.get("shield_regression", False)
     shield_not_needed = bool(
         base
         and shielded
-        and _metric(shielded, "mean_actual_replacements", 0.0) == 0.0
-        and not acceptance.get("shield_regression", False)
+        and mean_replacements == 0.0
+        and not_regressed
     )
+    low_frequency_backstop = bool(base and shielded and 0.0 < mean_replacements <= 0.25 and not_regressed)
+    if not base or not shielded:
+        shield_status = "unavailable"
+    elif acceptance.get("shield_regression", False):
+        shield_status = "regression"
+    elif shield_not_needed:
+        shield_status = "shield_not_needed_on_wcdt_v2_policy"
+    elif low_frequency_backstop:
+        shield_status = "low_frequency_safety_backstop"
+    else:
+        shield_status = "active_safety_backstop"
     return {
         "available": bool(base and shielded),
         "shield_not_needed_on_wcdt_v2_policy": shield_not_needed,
+        "low_frequency_safety_backstop": low_frequency_backstop,
+        "mean_actual_replacements": mean_replacements,
+        "shield_status": shield_status,
         "acceptance": acceptance,
     }
 
@@ -147,6 +249,9 @@ def build_confirmatory_summary(group_reports: dict[str, dict], paired_delta: dic
     wcdt_v2 = _wcdt_v2_forecast_summary(group_reports)
     wcdt_v2_shield = _wcdt_v2_shield_summary(group_reports)
     return {
+        "final_result_summary": FINAL_RESULT_SUMMARY,
+        "model_role_explanations": MODEL_ROLE_EXPLANATIONS,
+        "reporting_recommendation": REPORTING_RECOMMENDATION,
         "main_result_groups": {
             "trusted_baseline": ["ppo", "ppo_shield"],
             "forecast_control": "ppo_cv_features",

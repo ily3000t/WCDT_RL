@@ -33,7 +33,9 @@ from safe_rl.pipeline.stage5_confirmatory_eval import (
 from safe_rl.pipeline.stage5_shield_sweep import (
     AGGRESSIVE_VARIANTS,
     DEFAULT_VARIANTS,
+    _calibration_effect_summary,
     _shield_score_diagnostics,
+    _threshold_sensitivity_summary,
     build_sweep_groups,
     sweep_variants,
 )
@@ -935,8 +937,90 @@ def test_confirmatory_summary_marks_wcdt_v2_shield_not_needed():
     summary = build_confirmatory_summary(reports, paired, acceptance)
     assert summary["ppo_shield_mainline"]["pass"]
     assert summary["wcdt_v2_forecast_mainline"]["pass"]
+    assert summary["final_result_summary"]["trusted_mainline"] == ["ppo", "ppo_shield"]
+    assert summary["final_result_summary"]["best_safety_combo"] == "wcdt_v2_prediction_shield"
+    assert summary["model_role_explanations"]["wcdt_v2_prediction_shield"]["shield_enabled"] is True
+    assert summary["reporting_recommendation"][0]["comparison"] == "ppo_vs_ppo_shield"
     assert summary["wcdt_v2_shield"]["shield_not_needed_on_wcdt_v2_policy"]
     assert summary["overall_pass"]
+
+
+def test_confirmatory_summary_marks_wcdt_v2_shield_low_frequency_backstop():
+    reports = {
+        "ppo": _fake_group([(1, 100.0)], 100.0, min_distance=2.0),
+        "ppo_shield": _fake_group([(1, 101.0)], 101.0, min_distance=2.1, replacements=1.0),
+        "ppo_cv_features": _fake_group([(1, 105.0)], 105.0, min_distance=3.0, drac=8.0),
+        "ppo_wcdt_v2_features": _fake_group([(1, 110.0)], 110.0, min_distance=5.0, drac=4.0),
+        "wcdt_v2_prediction_shield": _fake_group([(1, 110.5)], 110.5, min_distance=5.2, drac=3.8, replacements=0.1),
+    }
+    paired = _build_paired_delta(reports)
+    acceptance = _build_acceptance(reports)
+    summary = build_confirmatory_summary(reports, paired, acceptance)
+    assert not summary["wcdt_v2_shield"]["shield_not_needed_on_wcdt_v2_policy"]
+    assert summary["wcdt_v2_shield"]["low_frequency_safety_backstop"]
+    assert summary["wcdt_v2_shield"]["shield_status"] == "low_frequency_safety_backstop"
+    assert summary["overall_pass"]
+
+
+def test_shield_sweep_summarizes_calibration_effect_and_threshold_sensitivity():
+    variants = {
+        "ppo_shield_a090_m015": {
+            "metrics": {
+                "average_reward": 100.0,
+                "min_distance_p1": 2.0,
+                "ttc_p1": 1.0,
+                "drac_p99": 5.0,
+                "actual_replacement_rate": 0.2,
+                "mean_actual_replacements": 1.0,
+                "fallback_rate": 0.0,
+                "near_miss_rate": 0.0,
+                "collision_rate": 0.0,
+            },
+            "acceptance": {"shield_regression": False},
+            "delta": {"mean_min_distance_delta": 0.1, "mean_drac_delta": -0.1, "mean_reward_delta": 0.0},
+            "improved_tail": True,
+        },
+        "ppo_shield_cal_a090_m015": {
+            "metrics": {
+                "average_reward": 100.5,
+                "min_distance_p1": 2.2,
+                "ttc_p1": 1.1,
+                "drac_p99": 4.8,
+                "actual_replacement_rate": 0.3,
+                "mean_actual_replacements": 1.5,
+                "fallback_rate": 0.0,
+                "near_miss_rate": 0.0,
+                "collision_rate": 0.0,
+            },
+            "acceptance": {"shield_regression": False},
+            "delta": {"mean_min_distance_delta": 0.2, "mean_drac_delta": -0.2, "mean_reward_delta": 0.5},
+            "improved_tail": True,
+        },
+        "ppo_shield_a085_m015": {
+            "metrics": {"actual_replacement_rate": 0.2, "mean_actual_replacements": 1.0},
+            "acceptance": {"shield_regression": False},
+            "delta": {},
+            "improved_tail": False,
+        },
+        "ppo_shield_cal_a085_m015": {
+            "metrics": {"actual_replacement_rate": 0.4, "mean_actual_replacements": 2.0},
+            "acceptance": {"shield_regression": False},
+            "delta": {},
+            "improved_tail": False,
+        },
+    }
+    calibration = _calibration_effect_summary(variants, include_calibrated=True)
+    assert calibration["available"]
+    assert calibration["paired_variant_count"] == 2
+    assert calibration["replacement_behavior_changed_count"] == 2
+    assert calibration["pairs"]["ppo_shield_a090_m015"]["mean_replacements_changed"]
+
+    sensitivity = _threshold_sensitivity_summary(variants)
+    assert sensitivity["available"]
+    assert sensitivity["families"]["ppo_shield_raw"]["threshold_sensitive"] is False
+    assert sensitivity["families"]["ppo_shield_calibrated"]["threshold_sensitive"] is True
+    assert sensitivity["risk_score_saturation_suspected"]
+    assert sensitivity["calibration_helpful_for_shield"]
 
 
 def test_sumo_start_retries_after_transient_traci_failure(monkeypatch):

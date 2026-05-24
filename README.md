@@ -317,14 +317,18 @@ python -m safe_rl.pipeline.stage5_shield_sweep --run-id $RUN_ID --include-aggres
 python -m safe_rl.pipeline.stage5_shield_sweep --run-id $RUN_ID --include-calibrated
 ```
 
-`--include-aggressive` 和 `--include-calibrated` 只用于解释风险分数饱和、校准效果和阈值敏感性，不会自动改写默认 Shield 配置。当前推荐主结果仍优先报告 `ppo`、`ppo_shield`、`ppo_cv_features`、`cv_prediction_shield`；WcDT 分支需要结合 `stage5/diagnostics/forecast_diagnostics.json` 中的 ADE/FDE、uncertainty 和 `wcdt_recommended_for_stage5` / `wcdt_v2_recommended_for_stage5` 判断是否可靠。
+`--include-aggressive` 和 `--include-calibrated` 只用于解释风险分数饱和、校准效果和阈值敏感性，不会自动改写默认 Shield 配置。sweep report 会输出 `calibration_effect_summary` 和 `threshold_sensitivity_summary`，用于判断 calibrated score 是否真正改变替换率、是否造成 regression、不同阈值下替换率是否可解释变化。当前默认 Shield 仍保持 `0.90/0.15`。
 
 ## 一键顺序运行示例
 
-推荐直接使用全流程 runner。它会重建网络、做 SUMO smoke check、依次运行 Stage1/2/3/4、用 Stage4 buffer 重训 Risk Module，然后在同一份 Stage1/Stage4 数据、同一个 Risk Module、同一个 baseline PPO 上分别训练 CV forecast PPO 和 WcDT forecast PPO，并完成多组 Stage5 paired evaluation：
+当前推荐实验顺序只包含三步：full pipeline、50-seed confirmatory、calibrated sweep。100-seed 复验、分层 confirmatory 和提高场景难度放到模型链路完全验证之后再做。
+
+推荐直接使用全流程 runner。它会重建网络、做 SUMO smoke check、依次运行 Stage1/2/3/4、用 Stage4 buffer 重训 Risk Module，然后在同一份 Stage1/Stage4 数据、同一个 Risk Module、同一个 baseline PPO 上分别训练 CV forecast PPO 和 WcDT v2 forecast PPO，并完成多组 Stage5 paired evaluation：
 
 ```powershell
-python -m safe_rl.pipeline.run_full_pipeline --run-id safe_rl_merge_local_001 --forecast-sources constant_velocity,wcdt_v2
+python -m safe_rl.pipeline.run_full_pipeline --run-id safe_rl_wcdt_v2_002 --forecast-sources constant_velocity,wcdt_v2
+python -m safe_rl.pipeline.stage5_confirmatory_eval --run-id safe_rl_wcdt_v2_002 --episodes 50
+python -m safe_rl.pipeline.stage5_shield_sweep --run-id safe_rl_wcdt_v2_002 --include-calibrated
 ```
 
 默认 `--forecast-sources` 仍是 `constant_velocity,wcdt`，用于兼容旧实验。新一轮建议显式使用 `constant_velocity,wcdt_v2`；如果要同时保留 v1 对照，可运行 `constant_velocity,wcdt,wcdt_v2`。如果只想跑其中一个 forecast 分支：
@@ -374,7 +378,9 @@ safe_rl_output/runs/<run_id>/stage5_confirmatory/confirmatory_summary.json
 safe_rl_output/runs/<run_id>/stage5_confirmatory/generated_configs/stage5_confirmatory.yaml
 ```
 
-`confirmatory_summary.json` 会把主结果明确分成：可信 Shield 主线 `ppo/ppo_shield`、forecast 对照 `ppo_cv_features`、当前推荐预测分支 `ppo_wcdt_v2_features`。如果 `wcdt_v2_prediction_shield` 没有实际替换但不退化，会标记 `shield_not_needed_on_wcdt_v2_policy=true`，表示 WcDT v2 PPO 本身已经足够安全，而不是 Shield 失败。
+`confirmatory_summary.json` 会把主结果明确分成：可信 Shield 主线 `ppo/ppo_shield`、forecast 对照 `ppo_cv_features`、当前推荐预测分支 `ppo_wcdt_v2_features`、当前最强安全组合 `wcdt_v2_prediction_shield`。报告还会写入 `model_role_explanations` 和 `reporting_recommendation`，方便直接整理结果表。旧 WcDT v1 的 `ppo_wcdt_features` / `wcdt_prediction_shield` 不删除，但只作为 ablation/diagnostic，不作为最终有效预测模块结论。
+
+如果 `wcdt_v2_prediction_shield` 没有实际替换但不退化，会标记 `shield_not_needed_on_wcdt_v2_policy=true`；如果只发生少量替换但安全指标不退化，会标记 `low_frequency_safety_backstop=true`，表示 Shield 在 WcDT v2 policy 上作为低频补强，而不是失败。
 
 如果需要手动逐阶段运行，命令如下：
 
