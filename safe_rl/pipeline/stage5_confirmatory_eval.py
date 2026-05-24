@@ -100,6 +100,13 @@ REPORTING_RECOMMENDATION: list[dict[str, str]] = [
         "comparison": "legacy_wcdt_v1",
         "purpose": "Keep old WcDT v1 groups in ablation/diagnostic tables only.",
     },
+    {
+        "comparison": "main_result_table",
+        "purpose": (
+            "Report safety, merge_success_rate, completion_time_mean, ego_speed_mean, "
+            "hard_brake_rate, and Shield replacement metrics together."
+        ),
+    },
 ]
 
 FINAL_RESULT_SUMMARY: dict[str, str | list[str]] = {

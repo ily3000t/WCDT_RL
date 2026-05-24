@@ -75,6 +75,9 @@ def _paired_delta(a_report: dict | None, b_report: dict | None) -> dict | None:
                 "min_distance_delta": float(item["min_distance"] - left["min_distance"]),
                 "ttc_delta": float(item["ttc_p1"] - left["ttc_p1"]),
                 "drac_delta": float(item["drac_p99"] - left["drac_p99"]),
+                "completion_time_delta": float(item.get("completion_time", 0.0) - left.get("completion_time", 0.0)),
+                "ego_speed_mean_delta": float(item.get("ego_speed_mean", 0.0) - left.get("ego_speed_mean", 0.0)),
+                "hard_brake_rate_delta": float(item.get("hard_brake_rate", 0.0) - left.get("hard_brake_rate", 0.0)),
                 "intervention_delta": int(item["intervention_count"] - left["intervention_count"]),
                 "actual_replacement_delta": int(
                     item.get("actual_replacement_count", 0) - left.get("actual_replacement_count", 0)
@@ -90,6 +93,9 @@ def _paired_delta(a_report: dict | None, b_report: dict | None) -> dict | None:
         "mean_min_distance_delta": sum(row["min_distance_delta"] for row in rows) / len(rows),
         "mean_ttc_delta": sum(row["ttc_delta"] for row in rows) / len(rows),
         "mean_drac_delta": sum(row["drac_delta"] for row in rows) / len(rows),
+        "mean_completion_time_delta": sum(row["completion_time_delta"] for row in rows) / len(rows),
+        "mean_ego_speed_delta": sum(row["ego_speed_mean_delta"] for row in rows) / len(rows),
+        "mean_hard_brake_rate_delta": sum(row["hard_brake_rate_delta"] for row in rows) / len(rows),
         "mean_intervention_delta": sum(row["intervention_delta"] for row in rows) / len(rows),
         "mean_actual_replacement_delta": sum(row["actual_replacement_delta"] for row in rows) / len(rows),
         "mean_fallback_delta": sum(row["fallback_delta"] for row in rows) / len(rows),

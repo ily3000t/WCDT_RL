@@ -36,6 +36,7 @@ from safe_rl.pipeline.stage5_shield_sweep import (
     _calibration_effect_summary,
     _shield_score_diagnostics,
     _threshold_sensitivity_summary,
+    _variant_report,
     build_sweep_groups,
     sweep_variants,
 )
@@ -588,6 +589,11 @@ def test_stage5_metrics_distinguish_shield_calls_from_replacements():
                 "min_distance": 5.0,
                 "ttc_p1": 2.0,
                 "drac_p99": 1.0,
+                "steps": 100,
+                "completion_time": 10.0,
+                "ego_speed_mean": 20.0,
+                "ego_speed_p10": 15.0,
+                "hard_brake_rate": 0.0,
                 "intervention_count": 3,
                 "shield_call_count": 3,
                 "actual_replacement_count": 0,
@@ -599,6 +605,11 @@ def test_stage5_metrics_distinguish_shield_calls_from_replacements():
                 "min_distance": 4.0,
                 "ttc_p1": 1.5,
                 "drac_p99": 1.2,
+                "steps": 120,
+                "completion_time": 12.0,
+                "ego_speed_mean": 18.0,
+                "ego_speed_p10": 12.0,
+                "hard_brake_rate": 0.25,
                 "intervention_count": 4,
                 "shield_call_count": 4,
                 "actual_replacement_count": 2,
@@ -610,6 +621,41 @@ def test_stage5_metrics_distinguish_shield_calls_from_replacements():
     assert metrics["actual_replacement_rate"] == 0.5
     assert metrics["mean_shield_calls"] == pytest.approx(3.5)
     assert metrics["mean_actual_replacements"] == pytest.approx(1.0)
+    assert metrics["steps_mean"] == pytest.approx(110.0)
+    assert metrics["steps_p95"] == pytest.approx(119.0)
+    assert metrics["completion_time_mean"] == pytest.approx(11.0)
+    assert metrics["completion_time_p95"] == pytest.approx(11.9)
+    assert metrics["ego_speed_mean"] == pytest.approx(19.0)
+    assert metrics["ego_speed_p10"] == pytest.approx(12.3)
+    assert metrics["hard_brake_rate"] == pytest.approx(0.125)
+
+
+def test_episode_report_includes_efficiency_and_comfort_metrics():
+    cfg = load_config()
+    env = SumoHighwayMergeEnv(cfg, seed=1)
+    env._episode_step = 10
+    env._ego_speeds = [10.0, 20.0, 30.0]
+    env._episode_metrics = [
+        StepMetrics(5.0, 2.0, 1.0, False, False, False, False, 20.0, hard_brake=False),
+        StepMetrics(4.0, 1.0, 2.0, False, False, False, False, 18.0, hard_brake=True),
+    ]
+    report = env.episode_report()
+    assert report["completion_time"] == pytest.approx(10 * float(cfg.scenario.step_length))
+    assert report["ego_speed_mean"] == pytest.approx(20.0)
+    assert report["ego_speed_p10"] == pytest.approx(12.0)
+    assert report["hard_brake_count"] == 1
+    assert report["hard_brake_rate"] == pytest.approx(0.5)
+
+
+def test_episode_report_defaults_efficiency_metrics_without_ego_samples():
+    cfg = load_config()
+    env = SumoHighwayMergeEnv(cfg, seed=1)
+    report = env.episode_report()
+    assert report["completion_time"] == 0.0
+    assert report["ego_speed_mean"] == 0.0
+    assert report["ego_speed_p10"] == 0.0
+    assert report["hard_brake_count"] == 0
+    assert report["hard_brake_rate"] == 0.0
 
 
 def test_stage5_group_shield_overrides_update_shield_config():
@@ -691,6 +737,24 @@ def test_stage5_shield_sweep_score_diagnostics_summarize_records():
     assert diagnostics["raw_risk_score"]["count"] == 2
     assert diagnostics["reason_ratios"]["replacement"] == pytest.approx(0.5)
     assert diagnostics["raw_risk_activation_margin"]["max"] == pytest.approx(0.05)
+
+
+def test_stage5_shield_sweep_variant_report_includes_efficiency_metrics():
+    base = _fake_group([(1, 100.0)], 100.0, completion_time=10.0, ego_speed=20.0, hard_brake_rate=0.0)
+    candidate = _fake_group(
+        [(1, 101.0)],
+        101.0,
+        completion_time=9.5,
+        ego_speed=21.0,
+        hard_brake_rate=0.1,
+        replacements=1.0,
+    )
+    variant = _variant_report(base, candidate)
+    assert variant["metrics"]["merge_success_rate"] == pytest.approx(1.0)
+    assert variant["metrics"]["completion_time_mean"] == pytest.approx(9.5)
+    assert variant["metrics"]["ego_speed_mean"] == pytest.approx(21.0)
+    assert variant["metrics"]["hard_brake_rate"] == pytest.approx(0.1)
+    assert variant["delta"]["mean_completion_time_delta"] == pytest.approx(-0.5)
 
 
 def test_forecast_source_parser_rejects_conflicting_legacy_and_multi_args():
@@ -808,6 +872,9 @@ def _fake_group(
     drac: float = 1.0,
     success: float = 1.0,
     replacements: float = 0.0,
+    completion_time: float = 10.0,
+    ego_speed: float = 20.0,
+    hard_brake_rate: float = 0.0,
 ):
     return {
         "episodes": [
@@ -817,6 +884,9 @@ def _fake_group(
                 "min_distance": min_distance,
                 "ttc_p1": 2.0,
                 "drac_p99": drac,
+                "completion_time": completion_time,
+                "ego_speed_mean": ego_speed,
+                "hard_brake_rate": hard_brake_rate,
                 "intervention_count": 0,
                 "actual_replacement_count": int(replacements),
                 "fallback_count": 0,
@@ -830,6 +900,11 @@ def _fake_group(
             "fallback_rate": 0.0,
             "drac_p99": drac,
             "merge_success_rate": success,
+            "completion_time_mean": completion_time,
+            "completion_time_p95": completion_time,
+            "ego_speed_mean": ego_speed,
+            "ego_speed_p10": ego_speed,
+            "hard_brake_rate": hard_brake_rate,
             "mean_actual_replacements": replacements,
             "actual_replacement_rate": float(replacements > 0.0),
         },
@@ -839,7 +914,7 @@ def _fake_group(
 def test_stage5_dynamic_paired_delta_and_acceptance_for_optional_forecast_groups():
     reports = {
         "ppo": _fake_group([(1, 100.0)], 100.0),
-        "ppo_shield": _fake_group([(1, 101.0)], 101.0),
+        "ppo_shield": _fake_group([(1, 101.0)], 101.0, completion_time=9.0, ego_speed=21.0, hard_brake_rate=0.1),
         "ppo_cv_features": _fake_group([(1, 99.0)], 99.0),
         "cv_prediction_shield": _fake_group([(1, 100.0)], 100.0),
         "ppo_wcdt_features": _fake_group([(1, 98.0)], 98.0),
@@ -857,6 +932,9 @@ def test_stage5_dynamic_paired_delta_and_acceptance_for_optional_forecast_groups
         "ppo_cv_features_vs_ppo_wcdt_features",
         "ppo_cv_features_vs_ppo_wcdt_v2_features",
     }
+    assert paired["ppo_vs_ppo_shield"]["mean_completion_time_delta"] == pytest.approx(-1.0)
+    assert paired["ppo_vs_ppo_shield"]["mean_ego_speed_delta"] == pytest.approx(1.0)
+    assert paired["ppo_vs_ppo_shield"]["mean_hard_brake_rate_delta"] == pytest.approx(0.1)
     acceptance = _build_acceptance(reports)
     assert acceptance["ppo_shield"]["available"]
     assert acceptance["cv_prediction_shield"]["available"]

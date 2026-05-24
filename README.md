@@ -382,6 +382,17 @@ safe_rl_output/runs/<run_id>/stage5_confirmatory/generated_configs/stage5_confir
 
 如果 `wcdt_v2_prediction_shield` 没有实际替换但不退化，会标记 `shield_not_needed_on_wcdt_v2_policy=true`；如果只发生少量替换但安全指标不退化，会标记 `low_frequency_safety_backstop=true`，表示 Shield 在 WcDT v2 policy 上作为低频补强，而不是失败。
 
+主结果表建议同时报告四类指标：
+
+```text
+Safety: collision_rate, near_miss_rate, min_distance_p1, ttc_p1, drac_p99
+Task/Efficiency: merge_success_rate, completion_time_mean, completion_time_p95
+Driving Behavior: ego_speed_mean, ego_speed_p10, hard_brake_rate
+Shield: mean_actual_replacements, actual_replacement_rate, fallback_rate
+```
+
+补充效率和舒适性指标后，不需要重跑 Stage1/2/3/4；只需要重跑 Stage5 confirmatory 和 calibrated sweep 即可刷新报告。
+
 如果需要手动逐阶段运行，命令如下：
 
 ```powershell

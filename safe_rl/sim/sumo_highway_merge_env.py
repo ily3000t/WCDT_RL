@@ -73,6 +73,7 @@ class SumoHighwayMergeEnv(gym.Env):
         self._last_ego_speed = 0.0
         self._last_ego_x = 0.0
         self._episode_metrics: list[StepMetrics] = []
+        self._ego_speeds: list[float] = []
         self._interventions: list[dict[str, Any]] = []
         self._trajectory_frames: list[dict[str, VehicleState]] = []
 
@@ -111,6 +112,7 @@ class SumoHighwayMergeEnv(gym.Env):
         self.history.clear()
         self._episode_step = 0
         self._episode_metrics.clear()
+        self._ego_speeds.clear()
         self._interventions.clear()
         self._trajectory_frames.clear()
 
@@ -162,6 +164,8 @@ class SumoHighwayMergeEnv(gym.Env):
             lane_oob=lane_oob,
         )
         self._episode_metrics.append(metrics)
+        if ego is not None:
+            self._ego_speeds.append(float(ego.speed))
 
         terminated, done_reason = self._done(metrics)
         truncated = self._episode_step >= self.episode_steps
@@ -473,6 +477,11 @@ class SumoHighwayMergeEnv(gym.Env):
         min_distances = [metric.min_distance for metric in self._episode_metrics]
         ttcs = [metric.min_ttc for metric in self._episode_metrics if metric.min_ttc < INF_TTC]
         dracs = [metric.max_drac for metric in self._episode_metrics]
+        hard_brake_count = sum(1 for metric in self._episode_metrics if metric.hard_brake)
+        hard_brake_rate = float(hard_brake_count / len(self._episode_metrics)) if self._episode_metrics else 0.0
+        ego_speed_mean = float(np.mean(self._ego_speeds)) if self._ego_speeds else 0.0
+        ego_speed_p10 = float(np.percentile(self._ego_speeds, 10)) if self._ego_speeds else 0.0
+        completion_time = float(self._episode_step * self.step_length)
         replacement_count = sum(
             1
             for item in self._interventions
@@ -497,11 +506,16 @@ class SumoHighwayMergeEnv(gym.Env):
         return {
             "seed": self.seed_value,
             "steps": self._episode_step,
+            "completion_time": completion_time,
             "collision": any(collisions),
             "near_miss": any(near_misses),
             "min_distance": float(min(min_distances)) if min_distances else INF_TTC,
             "ttc_p1": float(np.percentile(ttcs, 1)) if ttcs else INF_TTC,
             "drac_p99": float(np.percentile(dracs, 99)) if dracs else 0.0,
+            "ego_speed_mean": ego_speed_mean,
+            "ego_speed_p10": ego_speed_p10,
+            "hard_brake_count": int(hard_brake_count),
+            "hard_brake_rate": hard_brake_rate,
             "intervention_count": len(self._interventions),
             "shield_call_count": len(self._interventions),
             "actual_replacement_count": replacement_count,
