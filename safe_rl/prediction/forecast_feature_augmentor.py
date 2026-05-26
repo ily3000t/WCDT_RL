@@ -158,6 +158,7 @@ class ForecastFeatureAugmentor:
         dt = float(self.config.scenario.step_length)
         horizon = int(min(trajectories.shape[-2], self.config.forecast_features.get("horizon_steps", trajectories.shape[-2])))
         ego_rollout = constant_velocity_rollout(ego, horizon, dt)
+        target_lane_gap = forecast_target_lane_gap_from_trajectories(ego_rollout, trajectories, self.config)
         for traj in trajectories:
             agent_min = 50.0
             previous_distance = INF_TTC
@@ -195,7 +196,7 @@ class ForecastFeatureAugmentor:
                 max_drac,
                 collision_probability,
                 float(uncertainty),
-                min_distance,
+                target_lane_gap,
                 nearest_dx,
                 nearest_dy,
                 float(top[0]),
@@ -214,3 +215,55 @@ class ForecastFeatureAugmentor:
         normalized[6] = np.clip(normalized[6] / 100.0, -1.0, 1.0)
         normalized[7] = np.clip(normalized[7] / 25.0, -1.0, 1.0)
         return normalized
+
+
+LANE_CENTERS = {0: -8.0, 1: -4.8, 2: -1.6}
+
+
+def _ego_future_xy(ego_rollout: list[Any] | np.ndarray) -> np.ndarray:
+    if isinstance(ego_rollout, np.ndarray):
+        arr = np.asarray(ego_rollout, dtype=np.float32)
+        return arr[:, :2]
+    return np.asarray([[float(state.x), float(state.y)] for state in ego_rollout], dtype=np.float32)
+
+
+def forecast_target_lane_gap_from_trajectories(
+    ego_rollout: list[Any] | np.ndarray,
+    trajectories: np.ndarray,
+    config: Any,
+    *,
+    default_gap: float = 50.0,
+) -> float:
+    """Estimate the future target-lane gap used by forecast feature index 5."""
+
+    ego_xy = _ego_future_xy(ego_rollout)
+    trajectories = np.asarray(trajectories, dtype=np.float32)
+    if trajectories.ndim == 4:
+        trajectories = trajectories[:, 0]
+    if trajectories.ndim != 3 or trajectories.shape[0] == 0 or ego_xy.size == 0:
+        return float(default_gap)
+    horizon = min(int(ego_xy.shape[0]), int(trajectories.shape[1]))
+    if horizon <= 0:
+        return float(default_gap)
+    target_y = float(LANE_CENTERS.get(merge_target_lane(config), -1.6))
+    min_gap = float(default_gap)
+    for step_idx in range(horizon):
+        ego_x = float(ego_xy[step_idx, 0])
+        front_gap = float(default_gap)
+        rear_gap = float(default_gap)
+        saw_target_lane_vehicle = False
+        for traj in trajectories:
+            x = float(traj[step_idx, 0])
+            y = float(traj[step_idx, 1])
+            if abs(y - target_y) > 2.0:
+                continue
+            saw_target_lane_vehicle = True
+            dx = x - ego_x
+            gap = min(float(default_gap), max(0.0, abs(dx) - 4.8))
+            if dx >= 0.0:
+                front_gap = min(front_gap, gap)
+            else:
+                rear_gap = min(rear_gap, gap)
+        if saw_target_lane_vehicle:
+            min_gap = min(min_gap, front_gap, rear_gap)
+    return float(min_gap)

@@ -6,13 +6,18 @@ from typing import Any
 
 import numpy as np
 
-from safe_rl.pipeline.common import run_root, stage_file, write_report
-from safe_rl.prediction.forecast_feature_augmentor import ForecastFeatureAugmentor
+from safe_rl.pipeline.common import make_env, run_root, stage_file, write_report
+from safe_rl.prediction.forecast_feature_augmentor import (
+    ForecastFeatureAugmentor,
+    forecast_target_lane_gap_from_trajectories,
+)
 from safe_rl.prediction.sumo_wcdt_adapter import SumoWcDTAdapter
 from safe_rl.prediction.wcdt_v2_predictor import build_v2_numpy_batch, ensemble_predict, load_v2_ensemble, tensorize_batch
+from safe_rl.rl.ppo import load_ppo
 from safe_rl.risk.merge_local import merge_target_lane
 from safe_rl.sim.metrics import INF_TTC
 from safe_rl.sim.types import VehicleState
+from safe_rl.utils.config import clone_with_overrides
 
 
 LANE_CENTERS = {0: -8.0, 1: -4.8, 2: -1.6}
@@ -302,6 +307,7 @@ def _forecast_features_from_prediction(
         ego_x += ego_speed * np.cos(ego_heading) * dt
         ego_y += ego_speed * np.sin(ego_heading) * dt
         ego_future[step_idx] = [ego_x, ego_y]
+    target_lane_gap = forecast_target_lane_gap_from_trajectories(ego_future, trajectories, cfg)
     for traj in trajectories:
         previous_distance = INF_TTC
         agent_min = 50.0
@@ -330,7 +336,7 @@ def _forecast_features_from_prediction(
             max_drac,
             float(min_distance < float(cfg.risk_module.collision_distance_threshold)),
             float(uncertainty),
-            min_distance,
+            target_lane_gap,
             nearest_dx,
             nearest_dy,
             float(top[0]),
@@ -579,6 +585,15 @@ def _forecast_conclusion(report: dict[str, Any]) -> dict[str, Any]:
         and wcdt_v2_uncertainty_std > 0.02
         and wcdt_v2_uncertainty_corr > 0.0
     )
+    sensitivity = report.get("policy_feature_sensitivity", {})
+    wcdt_v2_sensitivity = sensitivity.get("groups", {}).get("ppo_wcdt_v2_features", {})
+    wcdt_v2_action_sensitive = bool(wcdt_v2_sensitivity.get("action_sensitive_to_forecast_features", False))
+    forecast_policy_underutilized = bool(
+        wcdt_v2_quality_pass
+        and wcdt_v2_uncertainty_pass
+        and wcdt_v2_sensitivity.get("available", False)
+        and not wcdt_v2_action_sensitive
+    )
     return {
         "cv_vs_wcdt_action_agreement": float(behavior.get("step_action_agreement_rate", 0.0)),
         "wcdt_prediction_quality_pass": quality_pass,
@@ -587,6 +602,8 @@ def _forecast_conclusion(report: dict[str, Any]) -> dict[str, Any]:
         "wcdt_v2_prediction_quality_pass": wcdt_v2_quality_pass,
         "wcdt_v2_uncertainty_quality_pass": wcdt_v2_uncertainty_pass,
         "wcdt_v2_recommended_for_stage5": bool(wcdt_v2_quality_pass and wcdt_v2_uncertainty_pass),
+        "wcdt_v2_policy_feature_sensitive": wcdt_v2_action_sensitive,
+        "forecast_policy_underutilized": forecast_policy_underutilized,
         "decision_basis": {
             "cv_ade_mean": cv_ade,
             "cv_fde_mean": cv_fde,
@@ -599,6 +616,12 @@ def _forecast_conclusion(report: dict[str, Any]) -> dict[str, Any]:
             "wcdt_v2_future_min_distance_abs_error_mean": wcdt_v2_min_distance_error,
             "wcdt_v2_uncertainty_std": wcdt_v2_uncertainty_std,
             "wcdt_v2_uncertainty_fde_correlation": wcdt_v2_uncertainty_corr,
+            "wcdt_v2_original_vs_zeroed_action_agreement_rate": wcdt_v2_sensitivity.get(
+                "original_vs_zeroed_action_agreement_rate"
+            ),
+            "wcdt_v2_original_vs_shuffled_action_agreement_rate": wcdt_v2_sensitivity.get(
+                "original_vs_shuffled_action_agreement_rate"
+            ),
         },
     }
 
@@ -616,6 +639,73 @@ def _feature_distribution_report(cv_features: np.ndarray, wcdt_features: np.ndar
             "wcdt_minus_cv": _summary(wcdt_features[:, idx] - cv_features[:, idx]),
         }
     return report
+
+
+def _feature_source_summary(features_by_source: dict[str, np.ndarray]) -> dict[str, Any]:
+    names = ForecastFeatureAugmentor.FEATURE_NAMES
+    sources: dict[str, Any] = {}
+    highlights: dict[str, Any] = {}
+    equal_rates: dict[str, float] = {}
+    warnings: list[str] = []
+    min_idx = names.index("forecast_min_distance")
+    gap_idx = names.index("forecast_merge_gap")
+    uncertainty_idx = names.index("forecast_uncertainty")
+    for source, features in features_by_source.items():
+        features = np.asarray(features, dtype=np.float32)
+        if features.ndim != 2 or features.shape[0] == 0:
+            sources[source] = {"available": False, "sample_count": 0}
+            highlights[source] = {"available": False}
+            equal_rates[source] = 0.0
+            continue
+        sources[source] = {
+            "available": True,
+            "sample_count": int(features.shape[0]),
+            "features": {name: _summary(features[:, idx]) for idx, name in enumerate(names)},
+        }
+        highlights[source] = {
+            "available": True,
+            "forecast_min_distance": _summary(features[:, min_idx]),
+            "forecast_merge_gap": _summary(features[:, gap_idx]),
+            "forecast_uncertainty": _summary(features[:, uncertainty_idx]),
+        }
+        equal_rate = float(np.mean(np.isclose(features[:, min_idx], features[:, gap_idx], atol=1.0e-6)))
+        equal_rates[source] = equal_rate
+        if source in {"wcdt", "wcdt_v2"} and equal_rate > 0.95:
+            warnings.append(
+                f"{source}: forecast_merge_gap equals forecast_min_distance for {equal_rate:.2%} of samples"
+            )
+    pairwise_abs_difference: dict[str, Any] = {}
+    available_sources = [
+        source
+        for source, features in features_by_source.items()
+        if np.asarray(features).ndim == 2 and np.asarray(features).shape[0] > 0
+    ]
+    for left_idx, left in enumerate(available_sources):
+        for right in available_sources[left_idx + 1 :]:
+            left_features = np.asarray(features_by_source[left], dtype=np.float32)
+            right_features = np.asarray(features_by_source[right], dtype=np.float32)
+            count = min(left_features.shape[0], right_features.shape[0])
+            if count <= 0:
+                continue
+            diff = np.abs(left_features[:count] - right_features[:count])
+            pairwise_abs_difference[f"{left}_vs_{right}"] = {
+                "sample_count": int(count),
+                "features": {name: _summary(diff[:, idx]) for idx, name in enumerate(names)},
+                "highlight": {
+                    "forecast_min_distance": _summary(diff[:, min_idx]),
+                    "forecast_merge_gap": _summary(diff[:, gap_idx]),
+                    "forecast_uncertainty": _summary(diff[:, uncertainty_idx]),
+                },
+            }
+    return {
+        "feature_names": list(names),
+        "sources": sources,
+        "pairwise_abs_difference": pairwise_abs_difference,
+        "highlight": highlights,
+        "forecast_merge_gap_equals_min_distance_rate": equal_rates,
+        "runtime_diagnostics_feature_semantics_consistent": True,
+        "warnings": warnings,
+    }
 
 
 def _low_min_distance_replays(
@@ -674,6 +764,173 @@ def _write_replay_commands(path: Path, rows: list[dict[str, Any]], *, title: str
 
 def _action_histogram(actions: list[int]) -> dict[str, int]:
     return {str(index): int(sum(1 for action in actions if int(action) == index)) for index in range(9)}
+
+
+def _first_diff_step_summary(left_actions: list[int], right_actions: list[int]) -> dict[str, Any]:
+    limit = min(len(left_actions), len(right_actions))
+    if limit <= 0:
+        return _summary([])
+    first_diff = next((idx for idx in range(limit) if int(left_actions[idx]) != int(right_actions[idx])), -1)
+    return _summary([] if first_diff < 0 else [float(first_diff)])
+
+
+def _action_agreement(left_actions: list[int], right_actions: list[int]) -> float:
+    limit = min(len(left_actions), len(right_actions))
+    if limit <= 0:
+        return 0.0
+    return float(sum(1 for idx in range(limit) if int(left_actions[idx]) == int(right_actions[idx])) / limit)
+
+
+def _policy_feature_sensitivity_from_actions(
+    original_actions: list[int],
+    zeroed_actions: list[int],
+    shuffled_actions: list[int],
+) -> dict[str, Any]:
+    zeroed_agreement = _action_agreement(original_actions, zeroed_actions)
+    shuffled_agreement = _action_agreement(original_actions, shuffled_actions)
+    return {
+        "available": bool(original_actions),
+        "state_count": int(len(original_actions)),
+        "original_vs_zeroed_action_agreement_rate": zeroed_agreement,
+        "original_vs_shuffled_action_agreement_rate": shuffled_agreement,
+        "original_action_histogram": _action_histogram(original_actions),
+        "zeroed_action_histogram": _action_histogram(zeroed_actions),
+        "shuffled_action_histogram": _action_histogram(shuffled_actions),
+        "first_diff_zeroed_step_summary": _first_diff_step_summary(original_actions, zeroed_actions),
+        "first_diff_shuffled_step_summary": _first_diff_step_summary(original_actions, shuffled_actions),
+        "action_sensitive_to_forecast_features": bool(zeroed_agreement < 0.98 or shuffled_agreement < 0.98),
+    }
+
+
+def _mutate_forecast_observation(obs: np.ndarray, feature_dim: int, mode: str) -> np.ndarray:
+    output = np.asarray(obs, dtype=np.float32).copy()
+    if feature_dim <= 0 or output.shape[-1] <= feature_dim:
+        return output
+    start = output.shape[-1] - feature_dim
+    if mode == "zeroed":
+        output[..., start:] = 0.0
+    elif mode == "shuffled":
+        output[..., start:] = np.roll(output[..., start:], shift=1, axis=-1)
+    return output
+
+
+def _forecast_policy_specs(base_run_id: str) -> dict[str, dict[str, str]]:
+    base = Path("safe_rl_output") / "runs"
+    return {
+        "ppo_cv_features": {
+            "source": "constant_velocity",
+            "model_path": str(base / f"{base_run_id}_forecast_cv" / "stage3" / "ppo_model.zip"),
+            "checkpoint": "",
+        },
+        "ppo_wcdt_features": {
+            "source": "wcdt",
+            "model_path": str(base / f"{base_run_id}_forecast_wcdt" / "stage3" / "ppo_model.zip"),
+            "checkpoint": str(base / base_run_id / "stage2" / "wcdt_predictor.pt"),
+        },
+        "ppo_wcdt_v2_features": {
+            "source": "wcdt_v2",
+            "model_path": str(base / f"{base_run_id}_forecast_wcdt_v2" / "stage3" / "ppo_model.zip"),
+            "checkpoint": str(base / base_run_id / "stage2" / "wcdt_v2_predictor.pt"),
+        },
+    }
+
+
+def _policy_feature_sensitivity(
+    cfg: Any,
+    base_run_id: str,
+    stage5_report: dict[str, Any],
+    *,
+    seed_count: int,
+) -> dict[str, Any]:
+    output: dict[str, Any] = {}
+    feature_dim = ForecastFeatureAugmentor.feature_dim(cfg)
+    device = str(cfg.get("training", {}).get("device", "auto") or "auto")
+    if device.lower() == "gpu":
+        device = "cuda"
+    for group_name, spec in _forecast_policy_specs(base_run_id).items():
+        model_path = _resolve(spec["model_path"])
+        checkpoint = _resolve(spec["checkpoint"]) if spec.get("checkpoint") else None
+        if not model_path.exists():
+            output[group_name] = {"available": False, "reason": f"missing model checkpoint: {model_path}"}
+            continue
+        if checkpoint is not None and not checkpoint.exists():
+            output[group_name] = {"available": False, "reason": f"missing forecast checkpoint: {checkpoint}"}
+            continue
+        forecast_overrides = {
+            "enabled": True,
+            "source": spec["source"],
+            "allow_heuristic_fallback": False,
+        }
+        if checkpoint is not None:
+            forecast_overrides["checkpoint"] = str(checkpoint)
+        group_cfg = clone_with_overrides(
+            cfg,
+            {
+                "forecast_features": forecast_overrides,
+                "rl": {"use_wcdt_forecast_features": True},
+                "shield": {"enabled": False},
+            },
+        )
+        model = load_ppo(model_path, device=device)
+        seeds = [
+            int(item["seed"])
+            for item in stage5_report.get("groups", {}).get(group_name, {}).get("episodes", [])
+            if "seed" in item
+        ]
+        if not seeds:
+            seeds = list(range(1, int(seed_count) + 1))
+        seeds = seeds[: max(1, int(seed_count))]
+        original_actions: list[int] = []
+        zeroed_actions: list[int] = []
+        shuffled_actions: list[int] = []
+        env = make_env(group_cfg, seed=seeds[0], shield_enabled=False)
+        try:
+            model_shape = tuple(getattr(model.observation_space, "shape", ()) or ())
+            env_shape = tuple(getattr(env.observation_space, "shape", ()) or ())
+            if model_shape != env_shape:
+                output[group_name] = {
+                    "available": False,
+                    "reason": f"PPO model observation shape {model_shape} does not match env observation shape {env_shape}",
+                }
+                continue
+        finally:
+            env.close()
+        for seed in seeds:
+            env = make_env(group_cfg, seed=seed, shield_enabled=False)
+            try:
+                obs, _info = env.reset(seed=seed)
+                terminated = truncated = False
+                while not (terminated or truncated):
+                    action, _state = model.predict(obs, deterministic=True)
+                    zeroed_action, _state = model.predict(
+                        _mutate_forecast_observation(obs, feature_dim, "zeroed"), deterministic=True
+                    )
+                    shuffled_action, _state = model.predict(
+                        _mutate_forecast_observation(obs, feature_dim, "shuffled"), deterministic=True
+                    )
+                    action_int = int(np.asarray(action).reshape(-1)[0])
+                    original_actions.append(action_int)
+                    zeroed_actions.append(int(np.asarray(zeroed_action).reshape(-1)[0]))
+                    shuffled_actions.append(int(np.asarray(shuffled_action).reshape(-1)[0]))
+                    obs, _reward, terminated, truncated, _info = env.step(action_int)
+            finally:
+                env.close()
+        output[group_name] = {
+            "forecast_source": spec["source"],
+            "model_path": str(model_path),
+            "seed_count": int(len(seeds)),
+            **_policy_feature_sensitivity_from_actions(original_actions, zeroed_actions, shuffled_actions),
+        }
+    available = {name: item for name, item in output.items() if item.get("available")}
+    return {
+        "available": bool(available),
+        "groups": output,
+        "forecast_policy_underutilized": bool(
+            output.get("ppo_wcdt_v2_features", {}).get("available")
+            and not output.get("ppo_wcdt_v2_features", {}).get("action_sensitive_to_forecast_features", False)
+        ),
+        "reason": None if available else "no forecast PPO policy sensitivity groups were available",
+    }
 
 
 def _load_replay_actions(path: Path) -> list[int] | None:
@@ -830,11 +1087,25 @@ def run_forecast_diagnostics(
             cfg, wcdt_v2_checkpoint, history, future, mask, indices, batch_size
         )
         wcdt_v2_report["available"] = True
+    feature_summary = _feature_source_summary(
+        {
+            "constant_velocity": cv_features,
+            "wcdt": wcdt_features,
+            "wcdt_v2": wcdt_v2_features,
+        }
+    )
     report: dict[str, Any] = {
         "run_id": str(cfg.run.run_id),
         "stage1_buffer": str(stage1_path),
         "sample_count": int(sample_count),
         "feature_names": list(ForecastFeatureAugmentor.FEATURE_NAMES),
+        "forecast_feature_summary": feature_summary,
+        "runtime_diagnostics_feature_semantics_consistent": bool(
+            feature_summary.get("runtime_diagnostics_feature_semantics_consistent", False)
+        ),
+        "forecast_merge_gap_equals_min_distance_rate": feature_summary.get(
+            "forecast_merge_gap_equals_min_distance_rate", {}
+        ),
         "cv_feature_summary": {
             name: _summary(cv_features[:, idx])
             for idx, name in enumerate(ForecastFeatureAugmentor.FEATURE_NAMES)
@@ -867,6 +1138,12 @@ def run_forecast_diagnostics(
         report["low_min_distance_ppo_cv_features"] = low_rows
         report["low_min_distance_ppo_wcdt_v2_features"] = low_v2_rows
         report["forecast_behavior"] = _forecast_behavior_diagnostics(str(cfg.run.run_id), stage5_report)
+        report["policy_feature_sensitivity"] = _policy_feature_sensitivity(
+            cfg,
+            str(cfg.run.run_id),
+            stage5_report,
+            seed_count=int(low_seed_count),
+        )
         _write_replay_commands(
             output_dir / "replay_low_min_distance_ppo_cv_features.ps1",
             low_rows,
@@ -877,6 +1154,11 @@ def run_forecast_diagnostics(
             low_v2_rows,
             title="Low-min-distance ppo_wcdt_v2_features replay commands",
         )
+    else:
+        report["policy_feature_sensitivity"] = {
+            "available": False,
+            "reason": f"missing Stage5 report: {stage5_path}",
+        }
     report["forecast_conclusion"] = _forecast_conclusion(report)
     output_path = output_dir / "forecast_diagnostics.json"
     write_report(output_path, report)

@@ -9,8 +9,17 @@ import numpy as np
 import pytest
 import yaml
 
-from safe_rl.prediction.forecast_feature_augmentor import ForecastFeatureAugmentor
-from safe_rl.analysis.forecast_diagnostics import _forecast_behavior_diagnostics, _forecast_conclusion
+from safe_rl.prediction.forecast_feature_augmentor import (
+    ForecastFeatureAugmentor,
+    forecast_target_lane_gap_from_trajectories,
+)
+from safe_rl.analysis.forecast_diagnostics import (
+    _feature_source_summary,
+    _forecast_behavior_diagnostics,
+    _forecast_conclusion,
+    _forecast_features_from_prediction,
+    _policy_feature_sensitivity_from_actions,
+)
 from safe_rl.pipeline.run_full_pipeline import build_generated_configs, resolve_forecast_sources
 from safe_rl.pipeline.common import write_report
 from safe_rl.pipeline.stage2_train_prediction_risk import (
@@ -200,6 +209,80 @@ def test_constant_velocity_forecast_runs_without_checkpoint():
     features = ForecastFeatureAugmentor(cfg).extract({"ego": ego, "vehicles": [ego, vehicle], "config": cfg})
     assert features.shape == (ForecastFeatureAugmentor.feature_dim(cfg),)
     assert np.all(np.isfinite(features))
+
+
+def test_wcdt_forecast_merge_gap_uses_target_lane_gap_not_min_distance():
+    cfg = load_config()
+    ego = VehicleState("ego", 0.0, -1.6, 0.0, 0.0, 2, "main_2", 0.0, "main_in")
+    trajectories = np.zeros((3, 4, 5), dtype=np.float32)
+    trajectories[0, :, :2] = np.asarray([20.0, -1.6], dtype=np.float32)
+    trajectories[1, :, :2] = np.asarray([-12.0, -1.6], dtype=np.float32)
+    trajectories[2, :, :2] = np.asarray([2.0, -8.0], dtype=np.float32)
+    features = ForecastFeatureAugmentor(cfg)._from_prediction(
+        ego,
+        [],
+        {"future_trajectories": trajectories, "uncertainty": 0.25},
+    )
+    assert features[5] == pytest.approx(7.2, abs=1.0e-5)
+    assert features[5] != pytest.approx(features[0])
+
+    wider_gap = trajectories.copy()
+    wider_gap[1, :, 0] = -30.0
+    wider_features = ForecastFeatureAugmentor(cfg)._from_prediction(
+        ego,
+        [],
+        {"future_trajectories": wider_gap, "uncertainty": 0.25},
+    )
+    assert wider_features[5] > features[5]
+
+
+def test_forecast_diagnostics_prediction_features_match_runtime_gap_semantics():
+    cfg = load_config()
+    ego = VehicleState("ego", 0.0, -1.6, 0.0, 0.0, 2, "main_2", 0.0, "main_in")
+    trajectories = np.zeros((3, 4, 5), dtype=np.float32)
+    trajectories[0, :, :2] = np.asarray([20.0, -1.6], dtype=np.float32)
+    trajectories[1, :, :2] = np.asarray([-12.0, -1.6], dtype=np.float32)
+    trajectories[2, :, :2] = np.asarray([2.0, -8.0], dtype=np.float32)
+    runtime = ForecastFeatureAugmentor(cfg)._from_prediction(
+        ego,
+        [],
+        {"future_trajectories": trajectories, "uncertainty": 0.25},
+    )
+    diagnostics = _forecast_features_from_prediction(ego, trajectories, 0.25, cfg)
+    assert diagnostics[5] == pytest.approx(runtime[5])
+    assert diagnostics[5] != pytest.approx(diagnostics[0])
+    assert forecast_target_lane_gap_from_trajectories(np.zeros((4, 2), dtype=np.float32), trajectories, cfg) == pytest.approx(
+        diagnostics[5]
+    )
+
+
+def test_forecast_feature_summary_reports_gap_min_distance_equal_rate():
+    features = np.asarray(
+        [
+            [1.0, 2.0, 0.0, 0.0, 0.1, 1.0, 0.0, 0.0, 0.2, 0.1, 0.0],
+            [2.0, 3.0, 0.0, 0.0, 0.2, 5.0, 0.0, 0.0, 0.3, 0.1, 0.0],
+        ],
+        dtype=np.float32,
+    )
+    summary = _feature_source_summary({"wcdt_v2": features})
+    assert summary["runtime_diagnostics_feature_semantics_consistent"]
+    assert summary["sources"]["wcdt_v2"]["features"]["forecast_merge_gap"]["count"] == 2
+    assert summary["highlight"]["wcdt_v2"]["forecast_uncertainty"]["mean"] == pytest.approx(0.15)
+    assert summary["forecast_merge_gap_equals_min_distance_rate"]["wcdt_v2"] == pytest.approx(0.5)
+
+
+def test_policy_feature_sensitivity_detects_zero_and_shuffle_action_changes():
+    sensitivity = _policy_feature_sensitivity_from_actions(
+        original_actions=[4, 4, 5, 5],
+        zeroed_actions=[4, 3, 5, 5],
+        shuffled_actions=[4, 4, 4, 5],
+    )
+    assert sensitivity["available"]
+    assert sensitivity["original_vs_zeroed_action_agreement_rate"] == pytest.approx(0.75)
+    assert sensitivity["original_vs_shuffled_action_agreement_rate"] == pytest.approx(0.75)
+    assert sensitivity["first_diff_zeroed_step_summary"]["min"] == 1
+    assert sensitivity["first_diff_shuffled_step_summary"]["min"] == 2
+    assert sensitivity["action_sensitive_to_forecast_features"]
 
 
 def test_json_writers_convert_non_finite_numbers_to_null(tmp_path):
@@ -1020,6 +1103,7 @@ def test_confirmatory_summary_marks_wcdt_v2_shield_not_needed():
     assert summary["model_role_explanations"]["wcdt_v2_prediction_shield"]["shield_enabled"] is True
     assert summary["reporting_recommendation"][0]["comparison"] == "ppo_vs_ppo_shield"
     assert summary["wcdt_v2_shield"]["shield_not_needed_on_wcdt_v2_policy"]
+    assert summary["forecast_policy_utilization_summary"]["available"] is False
     assert summary["overall_pass"]
 
 
@@ -1038,6 +1122,40 @@ def test_confirmatory_summary_marks_wcdt_v2_shield_low_frequency_backstop():
     assert summary["wcdt_v2_shield"]["low_frequency_safety_backstop"]
     assert summary["wcdt_v2_shield"]["shield_status"] == "low_frequency_safety_backstop"
     assert summary["overall_pass"]
+
+
+def test_confirmatory_summary_uses_forecast_policy_utilization_diagnostics():
+    reports = {
+        "ppo": _fake_group([(1, 100.0)], 100.0, min_distance=2.0),
+        "ppo_shield": _fake_group([(1, 101.0)], 101.0, min_distance=2.1, replacements=1.0),
+        "ppo_cv_features": _fake_group([(1, 105.0)], 105.0, min_distance=3.0, drac=8.0),
+        "ppo_wcdt_v2_features": _fake_group([(1, 110.0)], 110.0, min_distance=5.0, drac=4.0),
+        "wcdt_v2_prediction_shield": _fake_group([(1, 110.0)], 110.0, min_distance=5.0, drac=4.0),
+    }
+    diagnostics = {
+        "path": "safe_rl_output/runs/test/stage5/diagnostics/forecast_diagnostics.json",
+        "forecast_conclusion": {
+            "wcdt_v2_prediction_quality_pass": True,
+            "wcdt_v2_uncertainty_quality_pass": True,
+            "wcdt_v2_recommended_for_stage5": True,
+        },
+        "policy_feature_sensitivity": {
+            "groups": {
+                "ppo_wcdt_v2_features": {
+                    "available": True,
+                    "action_sensitive_to_forecast_features": False,
+                    "original_vs_zeroed_action_agreement_rate": 1.0,
+                    "original_vs_shuffled_action_agreement_rate": 1.0,
+                }
+            }
+        },
+    }
+    summary = build_confirmatory_summary(reports, _build_paired_delta(reports), _build_acceptance(reports), diagnostics)
+    utilization = summary["forecast_policy_utilization_summary"]
+    assert utilization["available"]
+    assert utilization["wcdt_v2_predictor_quality_pass"]
+    assert utilization["wcdt_v2_ppo_better_than_cv"]
+    assert utilization["forecast_policy_underutilized"]
 
 
 def test_shield_sweep_summarizes_calibration_effect_and_threshold_sensitivity():

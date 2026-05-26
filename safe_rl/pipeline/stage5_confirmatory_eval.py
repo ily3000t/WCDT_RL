@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import json
 from pathlib import Path
 from typing import Any
 
@@ -251,7 +252,63 @@ def _wcdt_v2_shield_summary(group_reports: dict[str, dict]) -> dict[str, Any]:
     }
 
 
-def build_confirmatory_summary(group_reports: dict[str, dict], paired_delta: dict, acceptance: dict) -> dict[str, Any]:
+def _forecast_policy_utilization_summary(
+    group_reports: dict[str, dict],
+    diagnostics: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    if not diagnostics:
+        return {
+            "available": False,
+            "reason": "forecast diagnostics not found; run python -m safe_rl.pipeline.forecast_diagnostics first",
+        }
+    conclusion = diagnostics.get("forecast_conclusion", {})
+    sensitivity_groups = diagnostics.get("policy_feature_sensitivity", {}).get("groups", {})
+    wcdt_v2_sensitivity = sensitivity_groups.get("ppo_wcdt_v2_features", {})
+    wcdt_v2 = _wcdt_v2_forecast_summary(group_reports)
+    action_sensitive = bool(wcdt_v2_sensitivity.get("action_sensitive_to_forecast_features", False))
+    predictor_quality_pass = bool(conclusion.get("wcdt_v2_prediction_quality_pass", False))
+    predictor_uncertainty_pass = bool(conclusion.get("wcdt_v2_uncertainty_quality_pass", False))
+    policy_underutilized = bool(
+        predictor_quality_pass
+        and predictor_uncertainty_pass
+        and wcdt_v2_sensitivity.get("available", False)
+        and not action_sensitive
+    )
+    return {
+        "available": True,
+        "wcdt_v2_predictor_quality_pass": predictor_quality_pass,
+        "wcdt_v2_predictor_uncertainty_pass": predictor_uncertainty_pass,
+        "wcdt_v2_recommended_for_stage5": bool(conclusion.get("wcdt_v2_recommended_for_stage5", False)),
+        "wcdt_v2_ppo_better_than_cv": bool(wcdt_v2.get("pass", False)),
+        "feature_sensitivity_available": bool(wcdt_v2_sensitivity.get("available", False)),
+        "wcdt_v2_action_sensitive_to_forecast_features": action_sensitive,
+        "original_vs_zeroed_action_agreement_rate": wcdt_v2_sensitivity.get(
+            "original_vs_zeroed_action_agreement_rate"
+        ),
+        "original_vs_shuffled_action_agreement_rate": wcdt_v2_sensitivity.get(
+            "original_vs_shuffled_action_agreement_rate"
+        ),
+        "forecast_policy_underutilized": policy_underutilized,
+        "diagnostics_path": diagnostics.get("path", ""),
+    }
+
+
+def _load_forecast_diagnostics(cfg: Any) -> dict[str, Any] | None:
+    path = run_root(cfg) / "stage5" / "diagnostics" / "forecast_diagnostics.json"
+    if not path.exists():
+        return None
+    with path.open("r", encoding="utf-8") as file:
+        payload = json.load(file)
+    payload["path"] = str(path)
+    return payload
+
+
+def build_confirmatory_summary(
+    group_reports: dict[str, dict],
+    paired_delta: dict,
+    acceptance: dict,
+    diagnostics: dict[str, Any] | None = None,
+) -> dict[str, Any]:
     mainline = _mainline_shield_summary(group_reports)
     wcdt_v2 = _wcdt_v2_forecast_summary(group_reports)
     wcdt_v2_shield = _wcdt_v2_shield_summary(group_reports)
@@ -268,6 +325,7 @@ def build_confirmatory_summary(group_reports: dict[str, dict], paired_delta: dic
         "ppo_shield_mainline": mainline,
         "wcdt_v2_forecast_mainline": wcdt_v2,
         "wcdt_v2_shield": wcdt_v2_shield,
+        "forecast_policy_utilization_summary": _forecast_policy_utilization_summary(group_reports, diagnostics),
         "overall_pass": bool(mainline.get("pass") and wcdt_v2.get("pass")),
         "paired_delta": paired_delta,
         "acceptance": acceptance,
@@ -319,7 +377,7 @@ def run(cfg, episodes: int = 50) -> Path:
 
     paired_delta = _build_paired_delta(group_reports)
     acceptance = _build_acceptance(group_reports)
-    summary = build_confirmatory_summary(group_reports, paired_delta, acceptance)
+    summary = build_confirmatory_summary(group_reports, paired_delta, acceptance, _load_forecast_diagnostics(cfg))
     report = {
         "stage": "stage5_confirmatory",
         "config": str(config_path),
