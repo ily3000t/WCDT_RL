@@ -62,6 +62,7 @@ from safe_rl.risk.risk_aggregator import aggregate_episode_reports
 from safe_rl.risk.risk_module import RiskPrediction, risk_loss
 from safe_rl.risk.stage1_sampling import configured_sampling_probs, sampling_summary, select_stage1_action
 from safe_rl.rl.evaluation import validate_model_env_observation_shape
+from safe_rl.rl.ppo import _safety_score
 from safe_rl.shield.safety_shield import SafetyShield
 from safe_rl.sim.action_space import ACTIONS, decode_action
 from safe_rl.sim.history_buffer import HistoryBuffer
@@ -672,6 +673,10 @@ def test_stage5_metrics_distinguish_shield_calls_from_replacements():
                 "min_distance": 5.0,
                 "ttc_p1": 2.0,
                 "drac_p99": 1.0,
+                "drac_p99_raw": 1.0,
+                "drac_p99_capped": 1.0,
+                "proxy_collision": False,
+                "safety_violation": False,
                 "steps": 100,
                 "completion_time": 10.0,
                 "ego_speed_mean": 20.0,
@@ -687,7 +692,11 @@ def test_stage5_metrics_distinguish_shield_calls_from_replacements():
                 "near_miss": False,
                 "min_distance": 4.0,
                 "ttc_p1": 1.5,
-                "drac_p99": 1.2,
+                "drac_p99": 1.0e6,
+                "drac_p99_raw": 1.0e6,
+                "drac_p99_capped": 20.0,
+                "proxy_collision": True,
+                "safety_violation": True,
                 "steps": 120,
                 "completion_time": 12.0,
                 "ego_speed_mean": 18.0,
@@ -704,6 +713,10 @@ def test_stage5_metrics_distinguish_shield_calls_from_replacements():
     assert metrics["actual_replacement_rate"] == 0.5
     assert metrics["mean_shield_calls"] == pytest.approx(3.5)
     assert metrics["mean_actual_replacements"] == pytest.approx(1.0)
+    assert metrics["proxy_collision_rate"] == pytest.approx(0.5)
+    assert metrics["safety_violation_rate"] == pytest.approx(0.5)
+    assert metrics["drac_p99_raw"] > 900000.0
+    assert metrics["drac_p99_capped"] == pytest.approx(19.81)
     assert metrics["steps_mean"] == pytest.approx(110.0)
     assert metrics["steps_p95"] == pytest.approx(119.0)
     assert metrics["completion_time_mean"] == pytest.approx(11.0)
@@ -728,6 +741,10 @@ def test_episode_report_includes_efficiency_and_comfort_metrics():
     assert report["ego_speed_p10"] == pytest.approx(12.0)
     assert report["hard_brake_count"] == 1
     assert report["hard_brake_rate"] == pytest.approx(0.5)
+    assert report["drac_p99_raw"] == pytest.approx(report["drac_p99"])
+    assert report["drac_p99_capped"] == pytest.approx(report["drac_p99"])
+    assert not report["proxy_collision"]
+    assert not report["safety_violation"]
 
 
 def test_episode_report_defaults_efficiency_metrics_without_ego_samples():
@@ -739,6 +756,35 @@ def test_episode_report_defaults_efficiency_metrics_without_ego_samples():
     assert report["ego_speed_p10"] == 0.0
     assert report["hard_brake_count"] == 0
     assert report["hard_brake_rate"] == 0.0
+    assert report["proxy_collision"] is False
+    assert report["safety_violation"] is False
+
+
+def test_safety_forecast_reward_profile_penalizes_tail_risk():
+    cfg = load_config()
+    cfg.rl["reward_profile"] = "safety_forecast"
+    env = SumoHighwayMergeEnv(cfg, seed=1)
+    ego = VehicleState("ego", float(cfg.scenario.merge_x), 0.0, 0.0, 20.0, 0, "ramp_0", 120.0, "ramp_in")
+    front = VehicleState("front", ego.x + 5.0, 0.0, 0.0, 15.0, 2, "main_2", ego.x + 5.0, "main_in")
+    rear = VehicleState("rear", ego.x - 4.0, 0.0, 0.0, 22.0, 2, "main_2", ego.x - 4.0, "main_in")
+    env.history.append([ego, front, rear])
+    risky = StepMetrics(1.0, 0.5, 10.0, False, False, True, True, 5.0)
+    safe = StepMetrics(10.0, 5.0, 0.0, False, False, False, False, 20.0)
+    assert env._safety_forecast_reward_adjustment(ego, risky) < env._safety_forecast_reward_adjustment(ego, safe)
+
+
+def test_stage3_safety_score_penalizes_proxy_collision_and_capped_drac():
+    score = _safety_score(
+        {
+            "average_reward": 100.0,
+            "min_distance_p1": 2.0,
+            "ttc_p1": 1.0,
+            "drac_p99_capped": 20.0,
+            "proxy_collision_rate": 1.0,
+            "safety_violation_rate": 1.0,
+        }
+    )
+    assert score == pytest.approx(-14.0)
 
 
 def test_stage5_group_shield_overrides_update_shield_config():
@@ -947,12 +993,32 @@ def test_full_pipeline_generated_configs_support_single_forecast_source(tmp_path
     )
 
 
+def test_full_pipeline_forecast_ppo_overrides_are_forecast_only(tmp_path):
+    configs = build_generated_configs(
+        "safe_rl_test_run",
+        tmp_path,
+        ppo_timesteps=20000,
+        forecast_ppo_timesteps=100000,
+        forecast_ppo_profile="safety",
+        forecast_sources=["constant_velocity"],
+    )
+    main = yaml.safe_load(configs["main"].read_text(encoding="utf-8"))
+    forecast_cv = yaml.safe_load(configs["forecast_cv_ppo"].read_text(encoding="utf-8"))
+    assert main["rl"]["total_timesteps"] == 20000
+    assert "reward_profile" not in main["rl"]
+    assert forecast_cv["rl"]["total_timesteps"] == 100000
+    assert forecast_cv["rl"]["reward_profile"] == "safety_forecast"
+
+
 def _fake_group(
     seed_rewards: list[tuple[int, float]],
     reward: float,
     near_miss: float = 0.0,
     min_distance: float = 5.0,
     drac: float = 1.0,
+    drac_capped: float | None = None,
+    proxy_collision: float = 0.0,
+    safety_violation: float = 0.0,
     success: float = 1.0,
     replacements: float = 0.0,
     completion_time: float = 10.0,
@@ -967,6 +1033,10 @@ def _fake_group(
                 "min_distance": min_distance,
                 "ttc_p1": 2.0,
                 "drac_p99": drac,
+                "drac_p99_raw": drac,
+                "drac_p99_capped": drac if drac_capped is None else drac_capped,
+                "proxy_collision": bool(proxy_collision),
+                "safety_violation": bool(safety_violation),
                 "completion_time": completion_time,
                 "ego_speed_mean": ego_speed,
                 "hard_brake_rate": hard_brake_rate,
@@ -982,6 +1052,10 @@ def _fake_group(
             "min_distance_p1": min_distance,
             "fallback_rate": 0.0,
             "drac_p99": drac,
+            "drac_p99_raw": drac,
+            "drac_p99_capped": drac if drac_capped is None else drac_capped,
+            "proxy_collision_rate": proxy_collision,
+            "safety_violation_rate": safety_violation,
             "merge_success_rate": success,
             "completion_time_mean": completion_time,
             "completion_time_p95": completion_time,

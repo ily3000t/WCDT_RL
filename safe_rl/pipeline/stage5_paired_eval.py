@@ -75,6 +75,20 @@ def _paired_delta(a_report: dict | None, b_report: dict | None) -> dict | None:
                 "min_distance_delta": float(item["min_distance"] - left["min_distance"]),
                 "ttc_delta": float(item["ttc_p1"] - left["ttc_p1"]),
                 "drac_delta": float(item["drac_p99"] - left["drac_p99"]),
+                "drac_raw_delta": float(
+                    item.get("drac_p99_raw", item.get("drac_p99", 0.0))
+                    - left.get("drac_p99_raw", left.get("drac_p99", 0.0))
+                ),
+                "drac_capped_delta": float(
+                    item.get("drac_p99_capped", min(float(item.get("drac_p99", 0.0)), 20.0))
+                    - left.get("drac_p99_capped", min(float(left.get("drac_p99", 0.0)), 20.0))
+                ),
+                "proxy_collision_delta": int(
+                    int(bool(item.get("proxy_collision", False))) - int(bool(left.get("proxy_collision", False)))
+                ),
+                "safety_violation_delta": int(
+                    int(bool(item.get("safety_violation", False))) - int(bool(left.get("safety_violation", False)))
+                ),
                 "completion_time_delta": float(item.get("completion_time", 0.0) - left.get("completion_time", 0.0)),
                 "ego_speed_mean_delta": float(item.get("ego_speed_mean", 0.0) - left.get("ego_speed_mean", 0.0)),
                 "hard_brake_rate_delta": float(item.get("hard_brake_rate", 0.0) - left.get("hard_brake_rate", 0.0)),
@@ -93,6 +107,10 @@ def _paired_delta(a_report: dict | None, b_report: dict | None) -> dict | None:
         "mean_min_distance_delta": sum(row["min_distance_delta"] for row in rows) / len(rows),
         "mean_ttc_delta": sum(row["ttc_delta"] for row in rows) / len(rows),
         "mean_drac_delta": sum(row["drac_delta"] for row in rows) / len(rows),
+        "mean_drac_raw_delta": sum(row["drac_raw_delta"] for row in rows) / len(rows),
+        "mean_drac_capped_delta": sum(row["drac_capped_delta"] for row in rows) / len(rows),
+        "mean_proxy_collision_delta": sum(row["proxy_collision_delta"] for row in rows) / len(rows),
+        "mean_safety_violation_delta": sum(row["safety_violation_delta"] for row in rows) / len(rows),
         "mean_completion_time_delta": sum(row["completion_time_delta"] for row in rows) / len(rows),
         "mean_ego_speed_delta": sum(row["ego_speed_mean_delta"] for row in rows) / len(rows),
         "mean_hard_brake_rate_delta": sum(row["hard_brake_rate_delta"] for row in rows) / len(rows),
@@ -111,6 +129,9 @@ def _shield_acceptance(baseline: dict | None, shielded: dict | None) -> dict:
         "reward_not_degraded": float(shield["average_reward"]) >= float(base["average_reward"]) - 5.0,
         "near_miss_not_worse": float(shield["near_miss_rate"]) <= float(base["near_miss_rate"]),
         "min_distance_not_degraded": float(shield["min_distance_p1"]) >= float(base["min_distance_p1"]) - 1.0,
+        "safety_violation_not_worse": float(shield.get("safety_violation_rate", 0.0))
+        <= float(base.get("safety_violation_rate", 0.0)),
+        "proxy_collision_zero": float(shield.get("proxy_collision_rate", 0.0)) == 0.0,
         "fallback_rate_low": float(shield["fallback_rate"]) < 0.10,
     }
     return {
@@ -129,6 +150,9 @@ def _forecast_acceptance(reference: dict | None, candidate: dict | None) -> dict
         "reward_not_degraded": float(item["average_reward"]) >= float(ref["average_reward"]) - 5.0,
         "near_miss_not_worse": float(item["near_miss_rate"]) <= float(ref["near_miss_rate"]),
         "min_distance_not_degraded": float(item["min_distance_p1"]) >= float(ref["min_distance_p1"]) - 1.0,
+        "safety_violation_not_worse": float(item.get("safety_violation_rate", 0.0))
+        <= float(ref.get("safety_violation_rate", 0.0)),
+        "proxy_collision_zero": float(item.get("proxy_collision_rate", 0.0)) == 0.0,
     }
     return {
         "available": True,

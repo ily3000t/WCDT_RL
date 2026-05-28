@@ -404,7 +404,39 @@ class SumoHighwayMergeEnv(gym.Env):
             reward += reward_cfg.hard_brake
         if metrics.lane_oob:
             reward += reward_cfg.lane_oob
+        if str(self.config.rl.get("reward_profile", "default")) == "safety_forecast":
+            reward += self._safety_forecast_reward_adjustment(ego, metrics)
         return float(reward)
+
+    def _safety_forecast_reward_adjustment(self, ego: VehicleState | None, metrics: StepMetrics) -> float:
+        if ego is None:
+            return 0.0
+        cfg = self.config.rl.get("safety_reward", {})
+        distance_threshold = float(cfg.get("distance_threshold", 5.0))
+        ttc_threshold = float(cfg.get("ttc_threshold", 2.0))
+        drac_cap = float(cfg.get("drac_cap", 20.0))
+        merge_gap_threshold = float(cfg.get("merge_gap_threshold", 8.0))
+        merge_zone_margin = float(cfg.get("merge_zone_margin", 30.0))
+
+        adjustment = 0.0
+        if metrics.min_distance < distance_threshold:
+            penalty = (distance_threshold - max(0.0, metrics.min_distance)) / max(distance_threshold, 1.0e-6)
+            adjustment += float(cfg.get("distance_penalty_weight", -8.0)) * penalty
+        if metrics.min_ttc < ttc_threshold:
+            penalty = (ttc_threshold - max(0.0, metrics.min_ttc)) / max(ttc_threshold, 1.0e-6)
+            adjustment += float(cfg.get("ttc_penalty_weight", -4.0)) * penalty
+        if metrics.max_drac > float(self.config.risk_module.drac_threshold):
+            penalty = min(max(0.0, metrics.max_drac), drac_cap) / max(drac_cap, 1.0e-6)
+            adjustment += float(cfg.get("drac_penalty_weight", -3.0)) * penalty
+
+        near_merge = abs(merge_x(self.config) - ego.x) <= merge_zone_margin
+        if near_merge:
+            latest = self.history.latest()
+            local = merge_local_stats(ego, list(latest.values()), self.config)
+            if local.target_lane_gap < merge_gap_threshold:
+                penalty = (merge_gap_threshold - max(0.0, local.target_lane_gap)) / max(merge_gap_threshold, 1.0e-6)
+                adjustment += float(cfg.get("merge_gap_penalty_weight", -4.0)) * penalty
+        return float(adjustment)
 
     def _info(
         self,
@@ -482,6 +514,13 @@ class SumoHighwayMergeEnv(gym.Env):
         ego_speed_mean = float(np.mean(self._ego_speeds)) if self._ego_speeds else 0.0
         ego_speed_p10 = float(np.percentile(self._ego_speeds, 10)) if self._ego_speeds else 0.0
         completion_time = float(self._episode_step * self.step_length)
+        min_distance = float(min(min_distances)) if min_distances else INF_TTC
+        ttc_p1 = float(np.percentile(ttcs, 1)) if ttcs else INF_TTC
+        drac_raw = float(np.percentile(dracs, 99)) if dracs else 0.0
+        drac_cap = float(self.config.rl.get("safety_reward", {}).get("drac_cap", 20.0))
+        drac_capped = float(np.percentile(np.minimum(np.asarray(dracs, dtype=np.float32), drac_cap), 99)) if dracs else 0.0
+        proxy_collision = min_distance <= float(self.config.risk_module.collision_distance_threshold)
+        safety_violation = bool(any(collisions) or proxy_collision or any(near_misses) or ttc_p1 < 0.3)
         replacement_count = sum(
             1
             for item in self._interventions
@@ -509,9 +548,13 @@ class SumoHighwayMergeEnv(gym.Env):
             "completion_time": completion_time,
             "collision": any(collisions),
             "near_miss": any(near_misses),
-            "min_distance": float(min(min_distances)) if min_distances else INF_TTC,
-            "ttc_p1": float(np.percentile(ttcs, 1)) if ttcs else INF_TTC,
-            "drac_p99": float(np.percentile(dracs, 99)) if dracs else 0.0,
+            "proxy_collision": bool(proxy_collision),
+            "safety_violation": safety_violation,
+            "min_distance": min_distance,
+            "ttc_p1": ttc_p1,
+            "drac_p99": drac_raw,
+            "drac_p99_raw": drac_raw,
+            "drac_p99_capped": drac_capped,
             "ego_speed_mean": ego_speed_mean,
             "ego_speed_p10": ego_speed_p10,
             "hard_brake_count": int(hard_brake_count),

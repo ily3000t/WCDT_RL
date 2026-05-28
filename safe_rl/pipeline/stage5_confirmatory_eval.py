@@ -208,7 +208,11 @@ def _wcdt_v2_forecast_summary(group_reports: dict[str, dict]) -> dict[str, Any]:
     checks = {
         "reward_not_degraded_vs_cv": _metric(v2, "average_reward") >= _metric(cv, "average_reward") - 5.0,
         "min_distance_p1_not_worse_than_cv": _metric(v2, "min_distance_p1") >= _metric(cv, "min_distance_p1"),
-        "drac_p99_not_worse_than_cv": _metric(v2, "drac_p99", 1.0e9) <= _metric(cv, "drac_p99", -1.0),
+        "drac_p99_capped_not_worse_than_cv": _metric(v2, "drac_p99_capped", _metric(v2, "drac_p99", 1.0e9))
+        <= _metric(cv, "drac_p99_capped", _metric(cv, "drac_p99", -1.0)),
+        "safety_violation_not_worse_than_cv": _metric(v2, "safety_violation_rate")
+        <= _metric(cv, "safety_violation_rate"),
+        "proxy_collision_zero": _metric(v2, "proxy_collision_rate") == 0.0,
         "merge_success_complete": _metric(v2, "merge_success_rate") == 1.0,
     }
     return {

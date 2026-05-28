@@ -125,6 +125,7 @@ risk_module:
 rl:
   backend: "sb3"
   use_wcdt_forecast_features: false
+  reward_profile: "default"
   total_timesteps: 20000
   learning_rate: 0.0003
   n_steps: 1024
@@ -143,6 +144,16 @@ rl:
     high_drac: -2.0
     hard_brake: -1.0
     lane_oob: -5.0
+  safety_reward:
+    drac_cap: 20.0
+    distance_threshold: 5.0
+    distance_penalty_weight: -8.0
+    ttc_threshold: 2.0
+    ttc_penalty_weight: -4.0
+    drac_penalty_weight: -3.0
+    merge_gap_threshold: 8.0
+    merge_gap_penalty_weight: -4.0
+    merge_zone_margin: 30.0
 
 shield:
   enabled: false
@@ -183,6 +194,9 @@ stage2:
 stage3:
   model_name: "ppo_model.zip"
   tensorboard_log_name: "ppo"
+  eval_enabled: true
+  eval_freq: 10000
+  eval_seeds: [1, 2, 3, 4, 5, 6, 7, 8, 9, 10]
 
 stage4:
   episodes: 100

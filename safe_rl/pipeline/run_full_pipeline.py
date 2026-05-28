@@ -23,6 +23,7 @@ from safe_rl.utils.progress import stage_log
 
 VALID_FORECAST_SOURCES = ("constant_velocity", "wcdt", "wcdt_v2")
 DEFAULT_FORECAST_SOURCES = ("constant_velocity", "wcdt")
+VALID_FORECAST_PPO_PROFILES = ("default", "safety")
 
 
 def _relative_run_path(run_id: str, stage: str, name: str) -> str:
@@ -97,7 +98,12 @@ def _forecast_checkpoint_name(source: str) -> str | None:
     return None
 
 
-def _forecast_payload(run_id: str, source: str, ppo_timesteps: int | None) -> dict[str, Any]:
+def _forecast_payload(
+    run_id: str,
+    source: str,
+    ppo_timesteps: int | None,
+    forecast_ppo_profile: str = "default",
+) -> dict[str, Any]:
     forecast_run_id = _forecast_run_id(run_id, source)
     payload: dict[str, Any] = {
         "run": {"run_id": forecast_run_id},
@@ -114,6 +120,11 @@ def _forecast_payload(run_id: str, source: str, ppo_timesteps: int | None) -> di
         },
         "rl": {"use_wcdt_forecast_features": True},
     }
+    profile = str(forecast_ppo_profile or "default").lower()
+    if profile not in VALID_FORECAST_PPO_PROFILES:
+        raise ValueError(f"forecast PPO profile must be one of {VALID_FORECAST_PPO_PROFILES}; got {profile!r}")
+    if profile == "safety":
+        payload["rl"]["reward_profile"] = "safety_forecast"
     if ppo_timesteps is not None:
         payload["rl"]["total_timesteps"] = int(ppo_timesteps)
     return payload
@@ -148,6 +159,8 @@ def build_generated_configs(
     generated_dir: str | Path,
     stage1_episodes: int | None = None,
     ppo_timesteps: int | None = None,
+    forecast_ppo_timesteps: int | None = None,
+    forecast_ppo_profile: str = "default",
     forecast_sources: str | list[str] | tuple[str, ...] | None = None,
     forecast_source: str | None = None,
 ) -> dict[str, Path]:
@@ -200,7 +213,15 @@ def build_generated_configs(
     configs["stage5_four_groups"] = configs["stage5_multi_groups"]
     for source in sources:
         key = f"forecast_{_source_suffix(source)}_ppo"
-        configs[key] = _write_yaml(generated_dir / f"{key}.yaml", _forecast_payload(run_id, source, ppo_timesteps))
+        configs[key] = _write_yaml(
+            generated_dir / f"{key}.yaml",
+            _forecast_payload(
+                run_id,
+                source,
+                forecast_ppo_timesteps if forecast_ppo_timesteps is not None else ppo_timesteps,
+                forecast_ppo_profile=forecast_ppo_profile,
+            ),
+        )
     if sources:
         configs["forecast_ppo"] = configs[f"forecast_{_source_suffix(sources[0])}_ppo"]
     return configs
@@ -255,6 +276,8 @@ def run_full_pipeline(
     run_id: str,
     stage1_episodes: int | None = None,
     ppo_timesteps: int | None = None,
+    forecast_ppo_timesteps: int | None = None,
+    forecast_ppo_profile: str = "default",
     forecast_sources: str | list[str] | tuple[str, ...] | None = None,
     forecast_source: str | None = None,
 ) -> Path:
@@ -266,13 +289,18 @@ def run_full_pipeline(
     configs = build_generated_configs(
         run_id,
         generated_dir,
-        stage1_episodes,
-        ppo_timesteps,
+        stage1_episodes=stage1_episodes,
+        ppo_timesteps=ppo_timesteps,
+        forecast_ppo_timesteps=forecast_ppo_timesteps,
+        forecast_ppo_profile=forecast_ppo_profile,
         forecast_sources=sources,
     )
 
     stage_log("full", f"run_id={run_id}")
     stage_log("full", f"forecast_sources={sources}")
+    stage_log("full", f"forecast_ppo_profile={forecast_ppo_profile}")
+    if forecast_ppo_timesteps is not None:
+        stage_log("full", f"forecast_ppo_timesteps={forecast_ppo_timesteps}")
     for source in sources:
         stage_log("full", f"forecast_run_id[{source}]={_forecast_run_id(run_id, source)}")
     stage_log("full", f"generated_configs={generated_dir}")
@@ -308,6 +336,18 @@ def main() -> None:
     parser.add_argument("--stage1-episodes", type=int, default=None, help="Optional override for Stage1 episodes.")
     parser.add_argument("--ppo-timesteps", type=int, default=None, help="Optional override for baseline and forecast PPO timesteps.")
     parser.add_argument(
+        "--forecast-ppo-timesteps",
+        type=int,
+        default=None,
+        help="Optional override for forecast PPO timesteps only.",
+    )
+    parser.add_argument(
+        "--forecast-ppo-profile",
+        choices=list(VALID_FORECAST_PPO_PROFILES),
+        default="default",
+        help="Forecast PPO reward profile. 'safety' writes rl.reward_profile=safety_forecast for forecast PPO only.",
+    )
+    parser.add_argument(
         "--forecast-source",
         choices=list(VALID_FORECAST_SOURCES),
         default=None,
@@ -325,6 +365,8 @@ def main() -> None:
         args.run_id,
         stage1_episodes=args.stage1_episodes,
         ppo_timesteps=args.ppo_timesteps,
+        forecast_ppo_timesteps=args.forecast_ppo_timesteps,
+        forecast_ppo_profile=args.forecast_ppo_profile,
         forecast_sources=args.forecast_sources,
         forecast_source=args.forecast_source,
     )

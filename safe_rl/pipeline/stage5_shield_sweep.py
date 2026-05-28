@@ -230,6 +230,10 @@ def _variant_report(base: dict, candidate: dict) -> dict[str, Any]:
             "min_distance_p1": metrics.get("min_distance_p1", 0.0),
             "ttc_p1": metrics.get("ttc_p1", 0.0),
             "drac_p99": metrics.get("drac_p99", 0.0),
+            "drac_p99_raw": metrics.get("drac_p99_raw", metrics.get("drac_p99", 0.0)),
+            "drac_p99_capped": metrics.get("drac_p99_capped", metrics.get("drac_p99", 0.0)),
+            "proxy_collision_rate": metrics.get("proxy_collision_rate", 0.0),
+            "safety_violation_rate": metrics.get("safety_violation_rate", 0.0),
             "steps_mean": metrics.get("steps_mean", 0.0),
             "steps_p95": metrics.get("steps_p95", 0.0),
             "completion_time_mean": metrics.get("completion_time_mean", 0.0),
@@ -248,7 +252,8 @@ def _variant_report(base: dict, candidate: dict) -> dict[str, Any]:
         "shield_score_diagnostics": _shield_score_diagnostics(candidate),
         "improved_tail": bool(
             float(metrics.get("min_distance_p1", 0.0)) > float(base_metrics.get("min_distance_p1", 0.0))
-            or float(metrics.get("drac_p99", 0.0)) < float(base_metrics.get("drac_p99", 0.0))
+            or float(metrics.get("drac_p99_capped", metrics.get("drac_p99", 0.0)))
+            < float(base_metrics.get("drac_p99_capped", base_metrics.get("drac_p99", 0.0)))
         ),
     }
 
@@ -301,6 +306,10 @@ def _metric_delta(left: dict[str, Any], right: dict[str, Any]) -> dict[str, floa
         "min_distance_p1",
         "ttc_p1",
         "drac_p99",
+        "drac_p99_raw",
+        "drac_p99_capped",
+        "proxy_collision_rate",
+        "safety_violation_rate",
         "steps_mean",
         "steps_p95",
         "completion_time_mean",

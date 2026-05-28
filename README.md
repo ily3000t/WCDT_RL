@@ -385,11 +385,13 @@ safe_rl_output/runs/<run_id>/stage5_confirmatory/generated_configs/stage5_confir
 主结果表建议同时报告四类指标：
 
 ```text
-Safety: collision_rate, near_miss_rate, min_distance_p1, ttc_p1, drac_p99
+Safety: collision_rate, near_miss_rate, proxy_collision_rate, safety_violation_rate, min_distance_p1, ttc_p1, drac_p99_capped
 Task/Efficiency: merge_success_rate, completion_time_mean, completion_time_p95
 Driving Behavior: ego_speed_mean, ego_speed_p10, hard_brake_rate
 Shield: mean_actual_replacements, actual_replacement_rate, fallback_rate
 ```
+
+报告仍保留 `drac_p99_raw` 和兼容字段 `drac_p99`，用于 debug `minD=0 / DRAC=1e6` 这类极端异常；主表优先使用 capped 后的 `drac_p99_capped`。
 
 补充效率和舒适性指标后，不需要重跑 Stage1/2/3/4；只需要重跑 Stage5 confirmatory 和 calibrated sweep 即可刷新报告。
 
@@ -409,6 +411,25 @@ python -m safe_rl.pipeline.forecast_diagnostics --run-id safe_rl_wcdt_v2_feature
 python -m safe_rl.pipeline.run_full_pipeline --run-id safe_rl_wcdt_v2_longppo_001 --forecast-sources constant_velocity,wcdt_v2 --ppo-timesteps 100000
 python -m safe_rl.pipeline.stage5_confirmatory_eval --run-id safe_rl_wcdt_v2_longppo_001 --episodes 50
 ```
+
+如果长训练后 forecast PPO 变激进、尾部安全不稳定，使用 safety-aware forecast PPO。该配置只作用于 forecast PPO，baseline PPO 仍使用默认 reward：
+
+```powershell
+python -m safe_rl.pipeline.run_full_pipeline --run-id safe_rl_wcdt_v2_safetyppo_001 --forecast-sources constant_velocity,wcdt_v2 --forecast-ppo-profile safety --forecast-ppo-timesteps 100000
+python -m safe_rl.pipeline.stage5_confirmatory_eval --run-id safe_rl_wcdt_v2_safetyppo_001 --episodes 50
+python -m safe_rl.pipeline.forecast_diagnostics --run-id safe_rl_wcdt_v2_safetyppo_001 --max-samples 512 --low-seed-count 5
+```
+
+Stage3 默认启用 safety checkpoint selection。训练结束后会同时输出：
+
+```text
+safe_rl_output/runs/<run_id>/stage3/ppo_model_final.zip
+safe_rl_output/runs/<run_id>/stage3/ppo_model_best_safety.zip
+safe_rl_output/runs/<run_id>/stage3/ppo_model.zip
+safe_rl_output/runs/<run_id>/stage3/stage3_checkpoint_selection_report.json
+```
+
+下游 Stage5 仍读取 `ppo_model.zip`，该路径会保存/复制为 safety score 最好的 checkpoint，避免最后一个 checkpoint 过于激进。
 
 如果需要手动逐阶段运行，命令如下：
 

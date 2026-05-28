@@ -3,14 +3,40 @@ from __future__ import annotations
 import numpy as np
 
 
+DRAC_REPORT_CAP_DEFAULT = 20.0
+
+
+def _report_safety_violation(report: dict) -> float:
+    if "safety_violation" in report:
+        return float(bool(report.get("safety_violation", False)))
+    return float(
+        bool(report.get("collision", False))
+        or bool(report.get("proxy_collision", False))
+        or bool(report.get("near_miss", False))
+        or float(report.get("ttc_p1", 1.0e6)) < 0.3
+    )
+
+
 def aggregate_episode_reports(reports: list[dict]) -> dict:
     if not reports:
         return {}
     collisions = np.asarray([float(report.get("collision", False)) for report in reports], dtype=np.float32)
     near_misses = np.asarray([float(report.get("near_miss", False)) for report in reports], dtype=np.float32)
+    proxy_collisions = np.asarray([float(report.get("proxy_collision", False)) for report in reports], dtype=np.float32)
+    safety_violations = np.asarray([_report_safety_violation(report) for report in reports], dtype=np.float32)
     min_distances = np.asarray([float(report.get("min_distance", 0.0)) for report in reports], dtype=np.float32)
     ttc = np.asarray([float(report.get("ttc_p1", 1.0e6)) for report in reports], dtype=np.float32)
-    drac = np.asarray([float(report.get("drac_p99", 0.0)) for report in reports], dtype=np.float32)
+    drac_raw = np.asarray(
+        [float(report.get("drac_p99_raw", report.get("drac_p99", 0.0))) for report in reports],
+        dtype=np.float32,
+    )
+    drac_capped = np.asarray(
+        [
+            float(report.get("drac_p99_capped", min(float(report.get("drac_p99", 0.0)), DRAC_REPORT_CAP_DEFAULT)))
+            for report in reports
+        ],
+        dtype=np.float32,
+    )
     steps = np.asarray([float(report.get("steps", 0.0)) for report in reports], dtype=np.float32)
     completion_time = np.asarray([float(report.get("completion_time", 0.0)) for report in reports], dtype=np.float32)
     ego_speed_mean = np.asarray([float(report.get("ego_speed_mean", 0.0)) for report in reports], dtype=np.float32)
@@ -24,9 +50,13 @@ def aggregate_episode_reports(reports: list[dict]) -> dict:
         "episodes": len(reports),
         "collision_rate": float(np.mean(collisions)),
         "near_miss_rate": float(np.mean(near_misses)),
+        "proxy_collision_rate": float(np.mean(proxy_collisions)),
+        "safety_violation_rate": float(np.mean(safety_violations)),
         "min_distance_p1": float(np.percentile(min_distances, 1)),
         "ttc_p1": float(np.percentile(ttc, 1)),
-        "drac_p99": float(np.percentile(drac, 99)),
+        "drac_p99": float(np.percentile(drac_raw, 99)),
+        "drac_p99_raw": float(np.percentile(drac_raw, 99)),
+        "drac_p99_capped": float(np.percentile(drac_capped, 99)),
         "steps_mean": float(np.mean(steps)),
         "steps_p95": float(np.percentile(steps, 95)),
         "completion_time_mean": float(np.mean(completion_time)),
