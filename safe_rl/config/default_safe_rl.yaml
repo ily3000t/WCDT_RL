@@ -175,6 +175,13 @@ shield:
   allow_fallback: false
   fallback_min_ttc: 0.30
   fallback_min_distance: 0.75
+  emergency_fallback_enabled: true
+  emergency_min_ttc: 0.30
+  emergency_min_distance: 1.0
+  emergency_watch_min_ttc: 0.75
+  emergency_watch_min_distance: 2.0
+  emergency_saturated_risk_threshold: 0.99
+  emergency_actions: ["keep_decelerate", "keep_hold"]
   prefer_closest_safe_action: true
   filter_illegal_candidates: true
   fallback_action: "decelerate"

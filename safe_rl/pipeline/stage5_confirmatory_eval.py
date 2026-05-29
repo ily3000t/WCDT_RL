@@ -228,6 +228,8 @@ def _wcdt_v2_shield_summary(group_reports: dict[str, dict]) -> dict[str, Any]:
     shielded = group_reports.get("wcdt_v2_prediction_shield")
     acceptance = _shield_acceptance(base, shielded)
     mean_replacements = _metric(shielded, "mean_actual_replacements", 0.0)
+    mean_emergency_fallbacks = _metric(shielded, "mean_emergency_fallbacks", 0.0)
+    emergency_fallback_rate = _metric(shielded, "emergency_fallback_rate", 0.0)
     not_regressed = not acceptance.get("shield_regression", False)
     shield_not_needed = bool(
         base
@@ -251,6 +253,9 @@ def _wcdt_v2_shield_summary(group_reports: dict[str, dict]) -> dict[str, Any]:
         "shield_not_needed_on_wcdt_v2_policy": shield_not_needed,
         "low_frequency_safety_backstop": low_frequency_backstop,
         "mean_actual_replacements": mean_replacements,
+        "mean_emergency_fallbacks": mean_emergency_fallbacks,
+        "emergency_fallback_rate": emergency_fallback_rate,
+        "emergency_fallback_count": int(_metric(shielded, "emergency_fallback_count", 0.0)),
         "shield_status": shield_status,
         "acceptance": acceptance,
     }

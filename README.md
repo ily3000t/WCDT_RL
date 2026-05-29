@@ -304,7 +304,10 @@ shield:
   activation_risk_threshold: 0.90
   replacement_margin: 0.15
   allow_fallback: false
+  emergency_fallback_enabled: true
 ```
+
+`emergency_fallback` 是独立的极端物理风险兜底，只在 `min_ttc <= 0.30`、`min_distance <= 1.0`，或 raw/best candidate 风险都饱和且进入 watch 区时触发。它优先选择合法的 `keep_decelerate` / `keep_hold`，并单独记录为 `emergency_fallback_count`，不会混入普通 `fallback_count`。
 
 如果只想做诊断，可以额外扫描更激进阈值：
 
@@ -398,7 +401,7 @@ safe_rl_output/runs/<run_id>/stage5_confirmatory/generated_configs/stage5_confir
 Safety: collision_rate, near_miss_rate, proxy_collision_rate, safety_violation_rate, proxy_collision_count, safety_violation_count, min_distance_le_collision_threshold_count, min_distance_p1, ttc_p1, drac_p99_capped
 Task/Efficiency: merge_success_rate, completion_time_mean, completion_time_p95
 Driving Behavior: ego_speed_mean, ego_speed_p10, hard_brake_rate
-Shield: mean_actual_replacements, actual_replacement_rate, fallback_rate
+Shield: mean_actual_replacements, actual_replacement_rate, fallback_rate, emergency_fallback_count, emergency_fallback_rate
 ```
 
 报告仍保留 `drac_p99_raw` 和兼容字段 `drac_p99`，用于 debug `minD=0 / DRAC=1e6` 这类极端异常；主表优先使用 capped 后的 `drac_p99_capped`。
@@ -623,6 +626,7 @@ python -c "from safe_rl.utils.config import load_config; from safe_rl.sim.sumo_h
 - PPO observation 默认包含 ego 状态、top-k 周车相对状态、merge 几何；启用 forecast features 后拼接低维预测风险特征。
 - Risk Module 同时使用显式物理风险特征和学习型 MLP 风险头。
 - Shield V2 默认只在 raw action 风险高于 `activation_risk_threshold=0.90`、候选动作风险至少降低 `replacement_margin=0.15` 且 uncertainty 低于阈值时替换；`allow_fallback=false`，没有明显更安全候选动作时继续执行 raw action。
+- `emergency_fallback` 不是普通 fallback 的恢复，而是极端物理危险下的低频 backstop；报告中应同时看 `fallback_rate == 0` 和 `emergency_fallback_rate` 是否低频。
 
 ## 原始 WcDT 说明
 

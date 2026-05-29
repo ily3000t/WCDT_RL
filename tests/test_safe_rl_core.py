@@ -384,11 +384,11 @@ def _shield_cfg():
     return cfg
 
 
-def _shield_context():
+def _shield_context(min_distance: float = 5.0, min_ttc: float = 5.0):
     return {
         "current_metrics": StepMetrics(
-            min_distance=5.0,
-            min_ttc=5.0,
+            min_distance=min_distance,
+            min_ttc=min_ttc,
             max_drac=0.0,
             collision=False,
             near_miss=False,
@@ -445,6 +445,7 @@ def test_shield_keeps_raw_action_below_activation_threshold():
     assert final.index == raw.index
     assert record["replacement_reason"] == "raw_safe"
     assert not record["fallback"]
+    assert not record["emergency_fallback"]
     assert record["raw_candidate_legal"]
     assert record["legal_candidate_count"] == 9
 
@@ -457,6 +458,59 @@ def test_shield_does_not_fallback_without_clear_safe_replacement():
     assert final.index == raw.index
     assert record["replacement_reason"] == "fallback_disabled"
     assert not record["fallback"]
+    assert not record["emergency_trigger"]
+
+
+def test_shield_emergency_fallback_on_extreme_physical_risk():
+    cfg = _shield_cfg()
+    shield = SafetyShield(cfg, _StaticRiskModel({4: 0.10, 3: 0.20, 5: 0.20}))
+    raw = decode_action(4)
+    final, record = shield.select_action(raw, _shield_context(min_distance=0.8, min_ttc=5.0))
+    assert final.name == "keep_decelerate"
+    assert record["replacement_reason"] == "emergency_fallback"
+    assert record["emergency_fallback"]
+    assert record["emergency_trigger"]
+    assert record["emergency_reason"] == "min_distance"
+    assert not record["fallback"]
+
+
+def test_shield_emergency_fallback_on_saturated_risk_watch_zone():
+    cfg = _shield_cfg()
+    shield = SafetyShield(cfg, _StaticRiskModel({index: 1.0 for index in range(9)}))
+    raw = decode_action(4)
+    final, record = shield.select_action(raw, _shield_context(min_distance=1.5, min_ttc=5.0))
+    assert final.name == "keep_decelerate"
+    assert record["replacement_reason"] == "emergency_fallback"
+    assert record["emergency_reason"] == "saturated_risk_watch_zone"
+    assert record["best_candidate_risk"] == pytest.approx(1.0)
+
+
+def test_shield_emergency_action_must_be_legal():
+    cfg = _shield_cfg()
+    cfg.shield["emergency_actions"] = ["left_decelerate", "keep_hold"]
+    context = _shield_context_with_ramp_ego()
+    context["config"] = cfg
+    context["current_metrics"] = _shield_context(min_distance=0.8)["current_metrics"]
+    shield = SafetyShield(cfg, _StaticRiskModel({index: 1.0 for index in range(9)}))
+    final, record = shield.select_action(decode_action(5), context)
+    assert final.name == "keep_hold"
+    assert record["replacement_reason"] == "emergency_fallback"
+    assert record["final_candidate_legal"]
+
+
+def test_shield_records_emergency_unavailable_when_no_legal_backstop():
+    cfg = _shield_cfg()
+    context = _shield_context_with_ramp_ego()
+    context["config"] = cfg
+    context["lane_count"] = 0
+    context["current_metrics"] = _shield_context(min_distance=0.8)["current_metrics"]
+    shield = SafetyShield(cfg, _StaticRiskModel({index: 1.0 for index in range(9)}))
+    raw = decode_action(5)
+    final, record = shield.select_action(raw, context)
+    assert final.index == raw.index
+    assert record["replacement_reason"] == "emergency_unavailable"
+    assert record["emergency_trigger"]
+    assert not record["emergency_fallback"]
 
 
 def test_shield_replaces_only_when_candidate_improves_by_margin():
@@ -711,6 +765,7 @@ def test_stage5_metrics_distinguish_shield_calls_from_replacements():
                 "shield_call_count": 3,
                 "actual_replacement_count": 0,
                 "fallback_count": 0,
+                "emergency_fallback_count": 0,
             },
             {
                 "collision": False,
@@ -731,6 +786,7 @@ def test_stage5_metrics_distinguish_shield_calls_from_replacements():
                 "shield_call_count": 4,
                 "actual_replacement_count": 2,
                 "fallback_count": 0,
+                "emergency_fallback_count": 1,
             },
         ]
     )
@@ -738,6 +794,10 @@ def test_stage5_metrics_distinguish_shield_calls_from_replacements():
     assert metrics["actual_replacement_rate"] == 0.5
     assert metrics["mean_shield_calls"] == pytest.approx(3.5)
     assert metrics["mean_actual_replacements"] == pytest.approx(1.0)
+    assert metrics["fallback_rate"] == pytest.approx(0.0)
+    assert metrics["emergency_fallback_rate"] == pytest.approx(0.5)
+    assert metrics["mean_emergency_fallbacks"] == pytest.approx(0.5)
+    assert metrics["emergency_fallback_count"] == 1
     assert metrics["proxy_collision_rate"] == pytest.approx(0.5)
     assert metrics["safety_violation_rate"] == pytest.approx(0.5)
     assert metrics["proxy_collision_count"] == 1
@@ -763,6 +823,24 @@ def test_episode_report_includes_efficiency_and_comfort_metrics():
         StepMetrics(5.0, 2.0, 1.0, False, False, False, False, 20.0, hard_brake=False),
         StepMetrics(4.0, 1.0, 2.0, False, False, False, False, 18.0, hard_brake=True),
     ]
+    env._interventions = [
+        {
+            "raw_action": 4,
+            "final_action": 3,
+            "replacement_reason": "emergency_fallback",
+            "risk_before": 1.0,
+            "risk_after": 1.0,
+            "best_candidate_risk": 1.0,
+            "replacement_risk_delta": 0.0,
+            "best_candidate_risk_delta": 0.0,
+            "raw_candidate_legal": True,
+            "final_candidate_legal": True,
+            "fallback": False,
+            "emergency_fallback": True,
+            "emergency_trigger": True,
+            "emergency_reason": "min_distance",
+        }
+    ]
     report = env.episode_report()
     assert report["completion_time"] == pytest.approx(10 * float(cfg.scenario.step_length))
     assert report["ego_speed_mean"] == pytest.approx(20.0)
@@ -776,6 +854,11 @@ def test_episode_report_includes_efficiency_and_comfort_metrics():
     assert report["proxy_collision_count"] == 0
     assert report["safety_violation_count"] == 0
     assert report["min_distance_le_collision_threshold_count"] == 0
+    assert report["actual_replacement_count"] == 1
+    assert report["fallback_count"] == 0
+    assert report["emergency_fallback_count"] == 1
+    assert report["emergency_fallback_rate"] == 1.0
+    assert report["shield_score_records"][0]["emergency_reason"] == "min_distance"
 
 
 def test_episode_report_defaults_efficiency_metrics_without_ego_samples():
@@ -791,6 +874,7 @@ def test_episode_report_defaults_efficiency_metrics_without_ego_samples():
     assert report["safety_violation"] is False
     assert report["proxy_collision_count"] == 0
     assert report["safety_violation_count"] == 0
+    assert report["emergency_fallback_count"] == 0
 
 
 def test_safety_forecast_reward_profile_penalizes_tail_risk():
@@ -932,6 +1016,7 @@ def test_stage5_shield_sweep_variant_report_includes_efficiency_metrics():
         ego_speed=21.0,
         hard_brake_rate=0.1,
         replacements=1.0,
+        emergency_fallbacks=1.0,
     )
     variant = _variant_report(base, candidate)
     assert variant["metrics"]["merge_success_rate"] == pytest.approx(1.0)
@@ -940,7 +1025,10 @@ def test_stage5_shield_sweep_variant_report_includes_efficiency_metrics():
     assert variant["metrics"]["hard_brake_rate"] == pytest.approx(0.1)
     assert variant["metrics"]["proxy_collision_count"] == 0
     assert variant["metrics"]["safety_violation_count"] == 0
+    assert variant["metrics"]["emergency_fallback_count"] == 1
+    assert variant["metrics"]["emergency_fallback_rate"] == pytest.approx(1.0)
     assert variant["delta"]["mean_completion_time_delta"] == pytest.approx(-0.5)
+    assert variant["delta"]["emergency_fallback_count_delta"] == 1
 
 
 def test_forecast_source_parser_rejects_conflicting_legacy_and_multi_args():
@@ -1125,6 +1213,7 @@ def _fake_group(
     completion_time: float = 10.0,
     ego_speed: float = 20.0,
     hard_brake_rate: float = 0.0,
+    emergency_fallbacks: float = 0.0,
 ):
     return {
         "episodes": [
@@ -1147,6 +1236,7 @@ def _fake_group(
                 "intervention_count": 0,
                 "actual_replacement_count": int(replacements),
                 "fallback_count": 0,
+                "emergency_fallback_count": int(emergency_fallbacks),
             }
             for seed, episode_reward in seed_rewards
         ],
@@ -1171,6 +1261,9 @@ def _fake_group(
             "hard_brake_rate": hard_brake_rate,
             "mean_actual_replacements": replacements,
             "actual_replacement_rate": float(replacements > 0.0),
+            "emergency_fallback_rate": float(emergency_fallbacks > 0.0),
+            "mean_emergency_fallbacks": emergency_fallbacks,
+            "emergency_fallback_count": int(emergency_fallbacks),
         },
     }
 
@@ -1201,6 +1294,7 @@ def test_stage5_dynamic_paired_delta_and_acceptance_for_optional_forecast_groups
     assert paired["ppo_vs_ppo_shield"]["mean_hard_brake_rate_delta"] == pytest.approx(0.1)
     assert paired["ppo_vs_ppo_shield"]["proxy_collision_count_delta"] == 0
     assert paired["ppo_vs_ppo_shield"]["safety_violation_count_delta"] == 0
+    assert paired["ppo_vs_ppo_shield"]["emergency_fallback_count_delta"] == 0
     acceptance = _build_acceptance(reports)
     assert acceptance["ppo_shield"]["available"]
     assert acceptance["cv_prediction_shield"]["available"]
@@ -1296,7 +1390,14 @@ def test_confirmatory_summary_marks_wcdt_v2_shield_low_frequency_backstop():
         "ppo_shield": _fake_group([(1, 101.0)], 101.0, min_distance=2.1, replacements=1.0),
         "ppo_cv_features": _fake_group([(1, 105.0)], 105.0, min_distance=3.0, drac=8.0),
         "ppo_wcdt_v2_features": _fake_group([(1, 110.0)], 110.0, min_distance=5.0, drac=4.0),
-        "wcdt_v2_prediction_shield": _fake_group([(1, 110.5)], 110.5, min_distance=5.2, drac=3.8, replacements=0.1),
+        "wcdt_v2_prediction_shield": _fake_group(
+            [(1, 110.5)],
+            110.5,
+            min_distance=5.2,
+            drac=3.8,
+            replacements=0.1,
+            emergency_fallbacks=0.1,
+        ),
     }
     paired = _build_paired_delta(reports)
     acceptance = _build_acceptance(reports)
@@ -1304,6 +1405,7 @@ def test_confirmatory_summary_marks_wcdt_v2_shield_low_frequency_backstop():
     assert not summary["wcdt_v2_shield"]["shield_not_needed_on_wcdt_v2_policy"]
     assert summary["wcdt_v2_shield"]["low_frequency_safety_backstop"]
     assert summary["wcdt_v2_shield"]["shield_status"] == "low_frequency_safety_backstop"
+    assert summary["wcdt_v2_shield"]["mean_emergency_fallbacks"] == pytest.approx(0.1)
     assert summary["overall_pass"]
 
 

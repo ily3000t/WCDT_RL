@@ -72,6 +72,10 @@ def aggregate_episode_reports(reports: list[dict]) -> dict:
     shield_calls = np.asarray([float(report.get("shield_call_count", report.get("intervention_count", 0))) for report in reports], dtype=np.float32)
     replacements = np.asarray([float(report.get("actual_replacement_count", 0)) for report in reports], dtype=np.float32)
     fallbacks = np.asarray([float(report.get("fallback_count", 0)) for report in reports], dtype=np.float32)
+    emergency_fallbacks = np.asarray(
+        [float(report.get("emergency_fallback_count", 0)) for report in reports],
+        dtype=np.float32,
+    )
     return {
         "episodes": len(reports),
         "collision_rate": float(np.mean(collisions)),
@@ -99,4 +103,7 @@ def aggregate_episode_reports(reports: list[dict]) -> dict:
         "actual_replacement_rate": float(np.mean(replacements > 0)),
         "mean_actual_replacements": float(np.mean(replacements)),
         "fallback_rate": float(np.mean(fallbacks > 0)),
+        "emergency_fallback_rate": float(np.mean(emergency_fallbacks > 0)),
+        "mean_emergency_fallbacks": float(np.mean(emergency_fallbacks)),
+        "emergency_fallback_count": int(np.sum(emergency_fallbacks)),
     }

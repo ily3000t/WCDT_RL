@@ -631,6 +631,7 @@ class SumoHighwayMergeEnv(gym.Env):
         reason_counts = Counter(str(item.get("replacement_reason", "")) for item in self._interventions)
         raw_actions = Counter(str(item.get("raw_action", "")) for item in self._interventions)
         final_actions = Counter(str(item.get("final_action", "")) for item in self._interventions)
+        emergency_fallback_count = sum(1 for item in self._interventions if item.get("emergency_fallback"))
         score_records = [
             {
                 "replacement_reason": str(item.get("replacement_reason", "")),
@@ -641,6 +642,9 @@ class SumoHighwayMergeEnv(gym.Env):
                 "best_candidate_risk_delta": float(item.get("best_candidate_risk_delta", 0.0)),
                 "raw_candidate_legal": bool(item.get("raw_candidate_legal", True)),
                 "final_candidate_legal": bool(item.get("final_candidate_legal", True)),
+                "emergency_fallback": bool(item.get("emergency_fallback", False)),
+                "emergency_trigger": bool(item.get("emergency_trigger", False)),
+                "emergency_reason": str(item.get("emergency_reason", "")),
             }
             for item in self._interventions
         ]
@@ -669,6 +673,10 @@ class SumoHighwayMergeEnv(gym.Env):
             "actual_replacement_count": replacement_count,
             "actual_replacement_rate": float(replacement_count / len(self._interventions)) if self._interventions else 0.0,
             "fallback_count": sum(1 for item in self._interventions if item.get("fallback")),
+            "emergency_fallback_count": int(emergency_fallback_count),
+            "emergency_fallback_rate": (
+                float(emergency_fallback_count / len(self._interventions)) if self._interventions else 0.0
+            ),
             "replacement_reason_counts": dict(reason_counts),
             "raw_action_histogram": dict(raw_actions),
             "final_action_histogram": dict(final_actions),

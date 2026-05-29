@@ -119,6 +119,9 @@ def _paired_delta(a_report: dict | None, b_report: dict | None) -> dict | None:
                     item.get("actual_replacement_count", 0) - left.get("actual_replacement_count", 0)
                 ),
                 "fallback_delta": int(item["fallback_count"] - left["fallback_count"]),
+                "emergency_fallback_delta": int(
+                    item.get("emergency_fallback_count", 0) - left.get("emergency_fallback_count", 0)
+                ),
             }
         )
     if not rows:
@@ -144,6 +147,8 @@ def _paired_delta(a_report: dict | None, b_report: dict | None) -> dict | None:
         "mean_intervention_delta": sum(row["intervention_delta"] for row in rows) / len(rows),
         "mean_actual_replacement_delta": sum(row["actual_replacement_delta"] for row in rows) / len(rows),
         "mean_fallback_delta": sum(row["fallback_delta"] for row in rows) / len(rows),
+        "mean_emergency_fallback_delta": sum(row["emergency_fallback_delta"] for row in rows) / len(rows),
+        "emergency_fallback_count_delta": sum(row["emergency_fallback_delta"] for row in rows),
     }
 
 
@@ -160,6 +165,7 @@ def _shield_acceptance(baseline: dict | None, shielded: dict | None) -> dict:
         <= float(base.get("safety_violation_rate", 0.0)),
         "proxy_collision_zero": float(shield.get("proxy_collision_rate", 0.0)) == 0.0,
         "fallback_rate_low": float(shield["fallback_rate"]) < 0.10,
+        "fallback_rate_zero": float(shield["fallback_rate"]) == 0.0,
     }
     return {
         "available": True,

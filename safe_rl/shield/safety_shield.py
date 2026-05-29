@@ -6,7 +6,7 @@ from safe_rl.risk.merge_local import candidate_legality_counts, is_candidate_leg
 from safe_rl.risk.candidate_risk_ranker import CandidateRiskRanker
 from safe_rl.risk.risk_module import RiskModuleWrapper, RiskPrediction
 from safe_rl.shield.fallback_policy import FallbackPolicy
-from safe_rl.sim.action_space import CandidateAction
+from safe_rl.sim.action_space import ACTIONS, CandidateAction
 
 
 class SafetyShield:
@@ -25,7 +25,12 @@ class SafetyShield:
         activation_threshold = float(
             self.config.shield.get("activation_risk_threshold", self.config.shield.risk_threshold)
         )
-        if raw_legal and raw_prediction.risk_score < activation_threshold:
+        emergency_triggered, emergency_reason = self._emergency_trigger(
+            raw_prediction,
+            best_candidate[1] if best_candidate is not None else raw_prediction,
+            context,
+        )
+        if raw_legal and raw_prediction.risk_score < activation_threshold and not emergency_triggered:
             return raw_action, self._record(
                 raw_action,
                 raw_action,
@@ -37,8 +42,9 @@ class SafetyShield:
                 raw_legal,
                 counts,
                 best_candidate,
+                emergency_trigger=False,
             )
-        if raw_legal and raw_prediction.risk_uncertainty >= float(self.config.shield.uncertainty_threshold):
+        if raw_legal and raw_prediction.risk_uncertainty >= float(self.config.shield.uncertainty_threshold) and not emergency_triggered:
             return raw_action, self._record(
                 raw_action,
                 raw_action,
@@ -50,6 +56,7 @@ class SafetyShield:
                 raw_legal,
                 counts,
                 best_candidate,
+                emergency_trigger=False,
             )
 
         margin = float(self.config.shield.get("replacement_margin", 0.15))
@@ -69,7 +76,42 @@ class SafetyShield:
                     is_candidate_legal(candidate, context),
                     counts,
                     best_candidate,
+                    emergency_trigger=False,
                 )
+
+        if emergency_triggered:
+            emergency_action = self._select_emergency_action(context)
+            if emergency_action is not None:
+                emergency_prediction = self.ranker.risk_model.predict(emergency_action, context)
+                return emergency_action, self._record(
+                    raw_action,
+                    emergency_action,
+                    raw_prediction,
+                    emergency_prediction,
+                    "emergency_fallback",
+                    False,
+                    raw_legal,
+                    is_candidate_legal(emergency_action, context),
+                    counts,
+                    best_candidate,
+                    emergency_fallback=True,
+                    emergency_trigger=True,
+                    emergency_reason=emergency_reason,
+                )
+            return raw_action, self._record(
+                raw_action,
+                raw_action,
+                raw_prediction,
+                raw_prediction,
+                "emergency_unavailable",
+                False,
+                raw_legal,
+                raw_legal,
+                counts,
+                best_candidate,
+                emergency_trigger=True,
+                emergency_reason=emergency_reason,
+            )
 
         if not self._fallback_allowed(context):
             if not raw_legal:
@@ -87,6 +129,7 @@ class SafetyShield:
                 raw_legal,
                 counts,
                 best_candidate,
+                emergency_trigger=False,
             )
 
         fallback = self.fallback_policy.select()
@@ -102,6 +145,7 @@ class SafetyShield:
             is_candidate_legal(fallback, context),
             counts,
             best_candidate,
+            emergency_trigger=False,
         )
 
     def _safe(self, prediction: RiskPrediction) -> bool:
@@ -123,6 +167,50 @@ class SafetyShield:
             or min_distance < float(self.config.shield.get("fallback_min_distance", 0.75))
         )
 
+    def _emergency_trigger(
+        self,
+        raw_prediction: RiskPrediction,
+        best_prediction: RiskPrediction,
+        context: dict[str, Any],
+    ) -> tuple[bool, str]:
+        if not bool(self.config.shield.get("emergency_fallback_enabled", True)):
+            return False, ""
+        metrics = context.get("current_metrics")
+        if metrics is None:
+            return False, ""
+        min_ttc = float(getattr(metrics, "min_ttc", 1.0e6))
+        min_distance = float(getattr(metrics, "min_distance", 1.0e6))
+        if min_ttc <= float(self.config.shield.get("emergency_min_ttc", 0.30)):
+            return True, "min_ttc"
+        if min_distance <= float(self.config.shield.get("emergency_min_distance", 1.0)):
+            return True, "min_distance"
+
+        saturated = float(self.config.shield.get("emergency_saturated_risk_threshold", 0.99))
+        in_watch_zone = (
+            min_ttc <= float(self.config.shield.get("emergency_watch_min_ttc", 0.75))
+            or min_distance <= float(self.config.shield.get("emergency_watch_min_distance", 2.0))
+        )
+        risks_saturated = (
+            float(raw_prediction.risk_score) >= saturated
+            and float(best_prediction.risk_score) >= saturated
+        )
+        if in_watch_zone and risks_saturated:
+            return True, "saturated_risk_watch_zone"
+        return False, ""
+
+    def _select_emergency_action(self, context: dict[str, Any]) -> CandidateAction | None:
+        configured = self.config.shield.get("emergency_actions", ["keep_decelerate", "keep_hold"])
+        names = [str(name) for name in configured]
+        by_name = {action.name: action for action in ACTIONS}
+        candidates: list[CandidateAction] = [by_name[name] for name in names if name in by_name]
+        candidates.extend(
+            action for action in ACTIONS if action.accel_cmd < 0 and action.name not in set(names)
+        )
+        for action in candidates:
+            if is_candidate_legal(action, context):
+                return action
+        return None
+
     def _record(
         self,
         raw_action: CandidateAction,
@@ -135,6 +223,9 @@ class SafetyShield:
         final_candidate_legal: bool,
         candidate_counts: dict[str, int],
         best_candidate: tuple[CandidateAction, RiskPrediction, float] | None = None,
+        emergency_fallback: bool = False,
+        emergency_trigger: bool = False,
+        emergency_reason: str = "",
     ) -> dict[str, Any]:
         best_action, best_prediction, best_score = best_candidate if best_candidate is not None else (None, None, None)
         best_risk = best_prediction.risk_score if best_prediction is not None else raw_prediction.risk_score
@@ -163,4 +254,7 @@ class SafetyShield:
             "uncertainty_before": raw_prediction.risk_uncertainty,
             "uncertainty_after": final_prediction.risk_uncertainty,
             "fallback": fallback,
+            "emergency_fallback": bool(emergency_fallback),
+            "emergency_trigger": bool(emergency_trigger),
+            "emergency_reason": str(emergency_reason),
         }
