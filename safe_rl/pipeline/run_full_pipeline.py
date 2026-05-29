@@ -23,7 +23,7 @@ from safe_rl.utils.progress import stage_log
 
 VALID_FORECAST_SOURCES = ("constant_velocity", "wcdt", "wcdt_v2")
 DEFAULT_FORECAST_SOURCES = ("constant_velocity", "wcdt")
-VALID_FORECAST_PPO_PROFILES = ("default", "safety")
+VALID_FORECAST_PPO_PROFILES = ("default", "safety", "shield_guided")
 
 
 def _relative_run_path(run_id: str, stage: str, name: str) -> str:
@@ -125,6 +125,11 @@ def _forecast_payload(
         raise ValueError(f"forecast PPO profile must be one of {VALID_FORECAST_PPO_PROFILES}; got {profile!r}")
     if profile == "safety":
         payload["rl"]["reward_profile"] = "safety_forecast"
+    elif profile == "shield_guided":
+        payload["rl"]["reward_profile"] = "shield_guided_forecast"
+        payload["rl"]["shield_guided_reward"] = {
+            "risk_checkpoint": _relative_run_path(run_id, "stage2", "risk_module.pt"),
+        }
     if ppo_timesteps is not None:
         payload["rl"]["total_timesteps"] = int(ppo_timesteps)
     return payload
@@ -345,7 +350,10 @@ def main() -> None:
         "--forecast-ppo-profile",
         choices=list(VALID_FORECAST_PPO_PROFILES),
         default="default",
-        help="Forecast PPO reward profile. 'safety' writes rl.reward_profile=safety_forecast for forecast PPO only.",
+        help=(
+            "Forecast PPO reward profile. 'safety' writes rl.reward_profile=safety_forecast; "
+            "'shield_guided' writes rl.reward_profile=shield_guided_forecast and binds the base risk module."
+        ),
     )
     parser.add_argument(
         "--forecast-source",

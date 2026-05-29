@@ -13,7 +13,8 @@ from typing import Any
 import numpy as np
 
 from safe_rl.prediction.forecast_feature_augmentor import ForecastFeatureAugmentor
-from safe_rl.risk.merge_local import merge_local_stats, merge_x
+from safe_rl.risk.candidate_risk_ranker import CandidateRiskRanker
+from safe_rl.risk.merge_local import is_candidate_legal, merge_local_stats, merge_x
 from safe_rl.shield.safety_shield import SafetyShield
 from safe_rl.sim.action_space import ACTIONS, decode_action
 from safe_rl.sim.gym_compat import gym, spaces
@@ -38,6 +39,7 @@ class SumoHighwayMergeEnv(gym.Env):
         seed: int | None = None,
         forecast_augmentor: ForecastFeatureAugmentor | None = None,
         shield: SafetyShield | None = None,
+        reward_risk_model: Any | None = None,
         record_trajectory_samples: bool = False,
         sumo_step_delay_ms: float = 0.0,
     ):
@@ -52,6 +54,8 @@ class SumoHighwayMergeEnv(gym.Env):
         self.forecast_enabled = bool(config.forecast_features.enabled or config.rl.use_wcdt_forecast_features)
         self.forecast_augmentor = forecast_augmentor
         self.shield = shield
+        self.reward_risk_model = reward_risk_model
+        self.reward_ranker = CandidateRiskRanker(config, reward_risk_model) if reward_risk_model is not None else None
         self.record_trajectory_samples = record_trajectory_samples
         self.sumo_step_delay_ms = float(sumo_step_delay_ms)
 
@@ -75,6 +79,8 @@ class SumoHighwayMergeEnv(gym.Env):
         self._episode_metrics: list[StepMetrics] = []
         self._ego_speeds: list[float] = []
         self._interventions: list[dict[str, Any]] = []
+        self._reward_debug_records: list[dict[str, Any]] = []
+        self._last_reward_debug: dict[str, Any] = {}
         self._trajectory_frames: list[dict[str, VehicleState]] = []
 
     def _import_traci(self):
@@ -114,6 +120,8 @@ class SumoHighwayMergeEnv(gym.Env):
         self._episode_metrics.clear()
         self._ego_speeds.clear()
         self._interventions.clear()
+        self._reward_debug_records.clear()
+        self._last_reward_debug = {}
         self._trajectory_frames.clear()
 
         for _ in range(max(1, self.history_steps)):
@@ -169,7 +177,7 @@ class SumoHighwayMergeEnv(gym.Env):
 
         terminated, done_reason = self._done(metrics)
         truncated = self._episode_step >= self.episode_steps
-        reward = self._reward(prev_x, ego, metrics, done_reason)
+        reward = self._reward(prev_x, ego, metrics, done_reason, raw_action=raw_action, risk_context=context)
         obs = self._build_observation()
         info = self._info(metrics=metrics, done_reason=done_reason, intervention=intervention)
         self._last_ego_speed = ego.speed if ego else 0.0
@@ -384,9 +392,18 @@ class SumoHighwayMergeEnv(gym.Env):
             return True, "merge_success"
         return False, ""
 
-    def _reward(self, prev_x: float, ego: VehicleState | None, metrics: StepMetrics, done_reason: str) -> float:
+    def _reward(
+        self,
+        prev_x: float,
+        ego: VehicleState | None,
+        metrics: StepMetrics,
+        done_reason: str,
+        raw_action: Any | None = None,
+        risk_context: dict[str, Any] | None = None,
+    ) -> float:
         reward_cfg = self.config.rl.reward
         reward = 0.0
+        self._last_reward_debug = {}
         if ego is not None:
             reward += reward_cfg.progress * max(0.0, ego.x - prev_x)
             reward += reward_cfg.speed * min(ego.speed, 33.33)
@@ -404,8 +421,14 @@ class SumoHighwayMergeEnv(gym.Env):
             reward += reward_cfg.hard_brake
         if metrics.lane_oob:
             reward += reward_cfg.lane_oob
-        if str(self.config.rl.get("reward_profile", "default")) == "safety_forecast":
+        reward_profile = str(self.config.rl.get("reward_profile", "default"))
+        if reward_profile in {"safety_forecast", "shield_guided_forecast"}:
             reward += self._safety_forecast_reward_adjustment(ego, metrics)
+        if reward_profile == "shield_guided_forecast":
+            shield_penalty, reward_debug = self._shield_guided_reward_adjustment(raw_action, risk_context)
+            reward += shield_penalty
+            self._last_reward_debug = reward_debug
+            self._reward_debug_records.append(reward_debug)
         return float(reward)
 
     def _safety_forecast_reward_adjustment(self, ego: VehicleState | None, metrics: StepMetrics) -> float:
@@ -438,6 +461,81 @@ class SumoHighwayMergeEnv(gym.Env):
                 adjustment += float(cfg.get("merge_gap_penalty_weight", -4.0)) * penalty
         return float(adjustment)
 
+    def _shield_guided_reward_adjustment(
+        self,
+        raw_action: Any | None,
+        context: dict[str, Any] | None,
+    ) -> tuple[float, dict[str, Any]]:
+        cfg = self.config.rl.get("shield_guided_reward", {})
+        debug: dict[str, Any] = {
+            "raw_action_risk": None,
+            "best_candidate_risk": None,
+            "risk_margin": None,
+            "would_replace": False,
+            "shield_guided_reward_penalty": 0.0,
+            "available": False,
+        }
+        if raw_action is None or context is None or self.reward_risk_model is None or self.reward_ranker is None:
+            return 0.0, debug
+
+        raw_prediction = self.reward_risk_model.predict(raw_action, context)
+        ranked = self.reward_ranker.rank(raw_action, context)
+        best_action, best_prediction = (raw_action, raw_prediction)
+        if ranked:
+            best_action, best_prediction, _score = min(ranked, key=lambda item: item[1].risk_score)
+
+        raw_risk = float(raw_prediction.risk_score)
+        best_risk = float(best_prediction.risk_score)
+        risk_margin = raw_risk - best_risk
+        raw_risk_threshold = float(cfg.get("raw_risk_threshold", 0.85))
+        risk_margin_threshold = float(cfg.get("risk_margin_threshold", 0.15))
+        uncertainty_threshold = float(cfg.get("uncertainty_threshold", 0.40))
+
+        raw_penalty = max(0.0, raw_risk - raw_risk_threshold) * float(
+            cfg.get("raw_risk_penalty_weight", -3.0)
+        )
+        margin_penalty = max(0.0, risk_margin - risk_margin_threshold) * float(
+            cfg.get("risk_margin_penalty_weight", -4.0)
+        )
+        raw_legal = is_candidate_legal(raw_action, context)
+        shield_shadow_action = raw_action
+        shield_shadow_risk = raw_risk
+        would_replace = False
+        if raw_risk >= raw_risk_threshold:
+            for candidate, prediction, _score in ranked:
+                if candidate.index == raw_action.index:
+                    continue
+                improves_enough = (not raw_legal) or float(prediction.risk_score) <= raw_risk - risk_margin_threshold
+                candidate_safe = (
+                    float(prediction.risk_score) < float(self.config.shield.risk_threshold)
+                    and float(prediction.risk_uncertainty) < uncertainty_threshold
+                )
+                if improves_enough and candidate_safe:
+                    shield_shadow_action = candidate
+                    shield_shadow_risk = float(prediction.risk_score)
+                    would_replace = True
+                    break
+        replace_penalty = float(cfg.get("would_replace_penalty_weight", -2.0)) if would_replace else 0.0
+        total_penalty = float(raw_penalty + margin_penalty + replace_penalty)
+
+        debug = {
+            "raw_action_risk": raw_risk,
+            "best_candidate_risk": best_risk,
+            "risk_margin": float(risk_margin),
+            "would_replace": would_replace,
+            "shield_guided_reward_penalty": total_penalty,
+            "raw_risk_penalty": float(raw_penalty),
+            "risk_margin_penalty": float(margin_penalty),
+            "would_replace_penalty": float(replace_penalty),
+            "best_candidate_action": int(best_action.index),
+            "shield_shadow_action": int(shield_shadow_action.index),
+            "shield_shadow_risk": float(shield_shadow_risk),
+            "raw_candidate_legal": bool(raw_legal),
+            "best_candidate_legal": bool(is_candidate_legal(best_action, context)),
+            "available": True,
+        }
+        return total_penalty, debug
+
     def _info(
         self,
         metrics: StepMetrics | None = None,
@@ -450,6 +548,8 @@ class SumoHighwayMergeEnv(gym.Env):
             "done_reason": done_reason,
             "intervention": intervention,
         }
+        if self._last_reward_debug:
+            info["reward_debug"] = self._last_reward_debug
         if metrics is not None:
             latest = self.history.latest()
             local = merge_local_stats(self._get_ego(), list(latest.values()), self.config)
@@ -521,6 +621,8 @@ class SumoHighwayMergeEnv(gym.Env):
         drac_capped = float(np.percentile(np.minimum(np.asarray(dracs, dtype=np.float32), drac_cap), 99)) if dracs else 0.0
         proxy_collision = min_distance <= float(self.config.risk_module.collision_distance_threshold)
         safety_violation = bool(any(collisions) or proxy_collision or any(near_misses) or ttc_p1 < 0.3)
+        proxy_collision_count = int(bool(proxy_collision))
+        safety_violation_count = int(bool(safety_violation))
         replacement_count = sum(
             1
             for item in self._interventions
@@ -550,6 +652,9 @@ class SumoHighwayMergeEnv(gym.Env):
             "near_miss": any(near_misses),
             "proxy_collision": bool(proxy_collision),
             "safety_violation": safety_violation,
+            "proxy_collision_count": proxy_collision_count,
+            "safety_violation_count": safety_violation_count,
+            "min_distance_le_collision_threshold_count": proxy_collision_count,
             "min_distance": min_distance,
             "ttc_p1": ttc_p1,
             "drac_p99": drac_raw,
@@ -568,6 +673,28 @@ class SumoHighwayMergeEnv(gym.Env):
             "raw_action_histogram": dict(raw_actions),
             "final_action_histogram": dict(final_actions),
             "shield_score_records": score_records,
+            "shield_guided_reward_summary": self._shield_guided_reward_summary(),
+        }
+
+    def _shield_guided_reward_summary(self) -> dict[str, Any]:
+        records = [record for record in self._reward_debug_records if record.get("available")]
+        if not records:
+            return {"available": False, "count": 0}
+        penalties = [float(record.get("shield_guided_reward_penalty", 0.0)) for record in records]
+        raw_risk = [float(record.get("raw_action_risk", 0.0)) for record in records]
+        best_risk = [float(record.get("best_candidate_risk", 0.0)) for record in records]
+        margins = [float(record.get("risk_margin", 0.0)) for record in records]
+        would_replace_count = sum(1 for record in records if bool(record.get("would_replace", False)))
+        return {
+            "available": True,
+            "count": len(records),
+            "would_replace_count": int(would_replace_count),
+            "would_replace_rate": float(would_replace_count / len(records)),
+            "penalty_sum": float(np.sum(penalties)),
+            "penalty_mean": float(np.mean(penalties)),
+            "raw_action_risk_mean": float(np.mean(raw_risk)),
+            "best_candidate_risk_mean": float(np.mean(best_risk)),
+            "risk_margin_mean": float(np.mean(margins)),
         }
 
     def trajectory_window_samples(self) -> tuple[np.ndarray, np.ndarray, np.ndarray]:

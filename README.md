@@ -385,7 +385,7 @@ safe_rl_output/runs/<run_id>/stage5_confirmatory/generated_configs/stage5_confir
 主结果表建议同时报告四类指标：
 
 ```text
-Safety: collision_rate, near_miss_rate, proxy_collision_rate, safety_violation_rate, min_distance_p1, ttc_p1, drac_p99_capped
+Safety: collision_rate, near_miss_rate, proxy_collision_rate, safety_violation_rate, proxy_collision_count, safety_violation_count, min_distance_le_collision_threshold_count, min_distance_p1, ttc_p1, drac_p99_capped
 Task/Efficiency: merge_success_rate, completion_time_mean, completion_time_p95
 Driving Behavior: ego_speed_mean, ego_speed_p10, hard_brake_rate
 Shield: mean_actual_replacements, actual_replacement_rate, fallback_rate
@@ -419,6 +419,16 @@ python -m safe_rl.pipeline.run_full_pipeline --run-id safe_rl_wcdt_v2_safetyppo_
 python -m safe_rl.pipeline.stage5_confirmatory_eval --run-id safe_rl_wcdt_v2_safetyppo_001 --episodes 50
 python -m safe_rl.pipeline.forecast_diagnostics --run-id safe_rl_wcdt_v2_safetyppo_001 --max-samples 512 --low-seed-count 5
 ```
+
+如果 safety-aware PPO 仍没有充分利用 WcDT v2 预测特征，下一步使用 Shield-guided forecast PPO。该 profile 仍不替换训练动作，只把 Risk Module / Shield shadow 判断写入 reward shaping，让 forecast PPO 学会避开会被 Shield 替换的 raw action：
+
+```powershell
+python -m safe_rl.pipeline.run_full_pipeline --run-id safe_rl_wcdt_v2_shieldguided_001 --forecast-sources constant_velocity,wcdt_v2 --forecast-ppo-profile shield_guided --forecast-ppo-timesteps 100000
+python -m safe_rl.pipeline.stage5_confirmatory_eval --run-id safe_rl_wcdt_v2_shieldguided_001 --episodes 50
+python -m safe_rl.pipeline.forecast_diagnostics --run-id safe_rl_wcdt_v2_shieldguided_001 --max-samples 512 --low-seed-count 5
+```
+
+`shield_guided_forecast` 会在 forecast PPO 生成配置中绑定 base run 的 `stage2/risk_module.pt`。baseline PPO 不加载该 Risk Module，仍保持默认 reward。
 
 Stage3 默认启用 safety checkpoint selection。训练结束后会同时输出：
 

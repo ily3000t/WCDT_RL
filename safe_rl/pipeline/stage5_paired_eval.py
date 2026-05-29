@@ -89,6 +89,28 @@ def _paired_delta(a_report: dict | None, b_report: dict | None) -> dict | None:
                 "safety_violation_delta": int(
                     int(bool(item.get("safety_violation", False))) - int(bool(left.get("safety_violation", False)))
                 ),
+                "proxy_collision_count_delta": int(
+                    int(item.get("proxy_collision_count", int(bool(item.get("proxy_collision", False)))))
+                    - int(left.get("proxy_collision_count", int(bool(left.get("proxy_collision", False)))))
+                ),
+                "safety_violation_count_delta": int(
+                    int(item.get("safety_violation_count", int(bool(item.get("safety_violation", False)))))
+                    - int(left.get("safety_violation_count", int(bool(left.get("safety_violation", False)))))
+                ),
+                "min_distance_le_collision_threshold_count_delta": int(
+                    int(
+                        item.get(
+                            "min_distance_le_collision_threshold_count",
+                            item.get("proxy_collision_count", int(bool(item.get("proxy_collision", False)))),
+                        )
+                    )
+                    - int(
+                        left.get(
+                            "min_distance_le_collision_threshold_count",
+                            left.get("proxy_collision_count", int(bool(left.get("proxy_collision", False)))),
+                        )
+                    )
+                ),
                 "completion_time_delta": float(item.get("completion_time", 0.0) - left.get("completion_time", 0.0)),
                 "ego_speed_mean_delta": float(item.get("ego_speed_mean", 0.0) - left.get("ego_speed_mean", 0.0)),
                 "hard_brake_rate_delta": float(item.get("hard_brake_rate", 0.0) - left.get("hard_brake_rate", 0.0)),
@@ -111,6 +133,11 @@ def _paired_delta(a_report: dict | None, b_report: dict | None) -> dict | None:
         "mean_drac_capped_delta": sum(row["drac_capped_delta"] for row in rows) / len(rows),
         "mean_proxy_collision_delta": sum(row["proxy_collision_delta"] for row in rows) / len(rows),
         "mean_safety_violation_delta": sum(row["safety_violation_delta"] for row in rows) / len(rows),
+        "proxy_collision_count_delta": sum(row["proxy_collision_count_delta"] for row in rows),
+        "safety_violation_count_delta": sum(row["safety_violation_count_delta"] for row in rows),
+        "min_distance_le_collision_threshold_count_delta": sum(
+            row["min_distance_le_collision_threshold_count_delta"] for row in rows
+        ),
         "mean_completion_time_delta": sum(row["completion_time_delta"] for row in rows) / len(rows),
         "mean_ego_speed_delta": sum(row["ego_speed_mean_delta"] for row in rows) / len(rows),
         "mean_hard_brake_rate_delta": sum(row["hard_brake_rate_delta"] for row in rows) / len(rows),

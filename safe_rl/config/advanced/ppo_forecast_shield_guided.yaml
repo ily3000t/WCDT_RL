@@ -1,0 +1,19 @@
+forecast_features:
+  enabled: true
+  use_for_ppo_observation: true
+  source: "wcdt_v2"
+  checkpoint: null
+  allow_heuristic_fallback: false
+
+rl:
+  use_wcdt_forecast_features: true
+  reward_profile: "shield_guided_forecast"
+  shield_guided_reward:
+    risk_checkpoint: null
+    raw_risk_threshold: 0.85
+    raw_risk_penalty_weight: -3.0
+    risk_margin_threshold: 0.15
+    risk_margin_penalty_weight: -4.0
+    would_replace_penalty_weight: -2.0
+    uncertainty_threshold: 0.40
+    use_calibrated_risk: false

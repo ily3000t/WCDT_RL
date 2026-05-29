@@ -17,13 +17,39 @@ def _report_safety_violation(report: dict) -> float:
     )
 
 
+def _report_proxy_collision(report: dict) -> float:
+    if "proxy_collision" in report:
+        return float(bool(report.get("proxy_collision", False)))
+    return float(float(report.get("min_distance", 1.0e6)) <= 0.25)
+
+
 def aggregate_episode_reports(reports: list[dict]) -> dict:
     if not reports:
         return {}
     collisions = np.asarray([float(report.get("collision", False)) for report in reports], dtype=np.float32)
     near_misses = np.asarray([float(report.get("near_miss", False)) for report in reports], dtype=np.float32)
-    proxy_collisions = np.asarray([float(report.get("proxy_collision", False)) for report in reports], dtype=np.float32)
+    proxy_collisions = np.asarray([_report_proxy_collision(report) for report in reports], dtype=np.float32)
     safety_violations = np.asarray([_report_safety_violation(report) for report in reports], dtype=np.float32)
+    proxy_collision_counts = np.asarray(
+        [float(report.get("proxy_collision_count", _report_proxy_collision(report))) for report in reports],
+        dtype=np.float32,
+    )
+    safety_violation_counts = np.asarray(
+        [float(report.get("safety_violation_count", _report_safety_violation(report))) for report in reports],
+        dtype=np.float32,
+    )
+    min_distance_collision_counts = np.asarray(
+        [
+            float(
+                report.get(
+                    "min_distance_le_collision_threshold_count",
+                    report.get("proxy_collision_count", _report_proxy_collision(report)),
+                )
+            )
+            for report in reports
+        ],
+        dtype=np.float32,
+    )
     min_distances = np.asarray([float(report.get("min_distance", 0.0)) for report in reports], dtype=np.float32)
     ttc = np.asarray([float(report.get("ttc_p1", 1.0e6)) for report in reports], dtype=np.float32)
     drac_raw = np.asarray(
@@ -52,6 +78,9 @@ def aggregate_episode_reports(reports: list[dict]) -> dict:
         "near_miss_rate": float(np.mean(near_misses)),
         "proxy_collision_rate": float(np.mean(proxy_collisions)),
         "safety_violation_rate": float(np.mean(safety_violations)),
+        "proxy_collision_count": int(np.sum(proxy_collision_counts)),
+        "safety_violation_count": int(np.sum(safety_violation_counts)),
+        "min_distance_le_collision_threshold_count": int(np.sum(min_distance_collision_counts)),
         "min_distance_p1": float(np.percentile(min_distances, 1)),
         "ttc_p1": float(np.percentile(ttc, 1)),
         "drac_p99": float(np.percentile(drac_raw, 99)),

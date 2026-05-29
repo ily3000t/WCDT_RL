@@ -106,6 +106,7 @@ def make_env(
     seed: int,
     shield_enabled: bool | None = None,
     risk_checkpoint: str | None = None,
+    reward_risk_checkpoint: str | None = None,
     record_trajectory_samples: bool = False,
     sumo_step_delay_ms: float = 0.0,
 ) -> SumoHighwayMergeEnv:
@@ -114,12 +115,28 @@ def make_env(
         risk_model = RiskModuleWrapper(cfg, checkpoint=risk_checkpoint)
         shield = SafetyShield(cfg, risk_model)
         shield.enabled = True
+    reward_risk_model = None
+    if str(cfg.rl.get("reward_profile", "default")) == "shield_guided_forecast":
+        reward_cfg = cfg.rl.get("shield_guided_reward", {})
+        configured_checkpoint = reward_risk_checkpoint or reward_cfg.get("risk_checkpoint")
+        if not configured_checkpoint:
+            raise FileNotFoundError(
+                "rl.reward_profile=shield_guided_forecast requires "
+                "rl.shield_guided_reward.risk_checkpoint or make_env(..., reward_risk_checkpoint=...)."
+            )
+        checkpoint_path = _resolve_repo_path(configured_checkpoint)
+        if not checkpoint_path.exists():
+            raise FileNotFoundError(f"shield-guided reward risk checkpoint does not exist: {checkpoint_path}")
+        reward_risk_model = RiskModuleWrapper(cfg, checkpoint=str(checkpoint_path))
+        if bool(reward_cfg.get("use_calibrated_risk", False)):
+            reward_risk_model.apply_temperature = True
     forecast_augmentor = make_forecast_augmentor(cfg)
     return SumoHighwayMergeEnv(
         cfg,
         seed=seed,
         forecast_augmentor=forecast_augmentor,
         shield=shield,
+        reward_risk_model=reward_risk_model,
         record_trajectory_samples=record_trajectory_samples,
         sumo_step_delay_ms=sumo_step_delay_ms,
     )

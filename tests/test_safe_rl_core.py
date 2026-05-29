@@ -412,6 +412,31 @@ def _shield_context_with_ramp_ego():
     return context
 
 
+def test_shield_guided_reward_penalizes_action_shield_would_replace():
+    cfg = load_config()
+    cfg.rl["reward_profile"] = "shield_guided_forecast"
+    cfg.rl["shield_guided_reward"]["raw_risk_threshold"] = 0.85
+    cfg.rl["shield_guided_reward"]["risk_margin_threshold"] = 0.15
+    env = SumoHighwayMergeEnv(cfg, seed=1, reward_risk_model=_StaticRiskModel({4: 0.95, 5: 0.40}))
+    penalty, debug = env._shield_guided_reward_adjustment(decode_action(4), _shield_context())
+    assert penalty < 0.0
+    assert debug["raw_action_risk"] == pytest.approx(0.95)
+    assert debug["best_candidate_risk"] == pytest.approx(0.40)
+    assert debug["risk_margin"] == pytest.approx(0.55)
+    assert debug["would_replace"]
+    assert debug["shield_guided_reward_penalty"] == pytest.approx(penalty)
+
+
+def test_shield_guided_reward_does_not_penalize_safe_raw_action():
+    cfg = load_config()
+    cfg.rl["reward_profile"] = "shield_guided_forecast"
+    env = SumoHighwayMergeEnv(cfg, seed=1, reward_risk_model=_StaticRiskModel({4: 0.50, 5: 0.45}))
+    penalty, debug = env._shield_guided_reward_adjustment(decode_action(4), _shield_context())
+    assert penalty == pytest.approx(0.0)
+    assert debug["raw_action_risk"] == pytest.approx(0.50)
+    assert not debug["would_replace"]
+
+
 def test_shield_keeps_raw_action_below_activation_threshold():
     cfg = _shield_cfg()
     shield = SafetyShield(cfg, _StaticRiskModel({4: 0.50}))
@@ -715,6 +740,9 @@ def test_stage5_metrics_distinguish_shield_calls_from_replacements():
     assert metrics["mean_actual_replacements"] == pytest.approx(1.0)
     assert metrics["proxy_collision_rate"] == pytest.approx(0.5)
     assert metrics["safety_violation_rate"] == pytest.approx(0.5)
+    assert metrics["proxy_collision_count"] == 1
+    assert metrics["safety_violation_count"] == 1
+    assert metrics["min_distance_le_collision_threshold_count"] == 1
     assert metrics["drac_p99_raw"] > 900000.0
     assert metrics["drac_p99_capped"] == pytest.approx(19.81)
     assert metrics["steps_mean"] == pytest.approx(110.0)
@@ -745,6 +773,9 @@ def test_episode_report_includes_efficiency_and_comfort_metrics():
     assert report["drac_p99_capped"] == pytest.approx(report["drac_p99"])
     assert not report["proxy_collision"]
     assert not report["safety_violation"]
+    assert report["proxy_collision_count"] == 0
+    assert report["safety_violation_count"] == 0
+    assert report["min_distance_le_collision_threshold_count"] == 0
 
 
 def test_episode_report_defaults_efficiency_metrics_without_ego_samples():
@@ -758,6 +789,8 @@ def test_episode_report_defaults_efficiency_metrics_without_ego_samples():
     assert report["hard_brake_rate"] == 0.0
     assert report["proxy_collision"] is False
     assert report["safety_violation"] is False
+    assert report["proxy_collision_count"] == 0
+    assert report["safety_violation_count"] == 0
 
 
 def test_safety_forecast_reward_profile_penalizes_tail_risk():
@@ -883,6 +916,8 @@ def test_stage5_shield_sweep_variant_report_includes_efficiency_metrics():
     assert variant["metrics"]["completion_time_mean"] == pytest.approx(9.5)
     assert variant["metrics"]["ego_speed_mean"] == pytest.approx(21.0)
     assert variant["metrics"]["hard_brake_rate"] == pytest.approx(0.1)
+    assert variant["metrics"]["proxy_collision_count"] == 0
+    assert variant["metrics"]["safety_violation_count"] == 0
     assert variant["delta"]["mean_completion_time_delta"] == pytest.approx(-0.5)
 
 
@@ -1010,6 +1045,26 @@ def test_full_pipeline_forecast_ppo_overrides_are_forecast_only(tmp_path):
     assert forecast_cv["rl"]["reward_profile"] == "safety_forecast"
 
 
+def test_full_pipeline_shield_guided_profile_binds_base_risk_module_for_forecast_only(tmp_path):
+    configs = build_generated_configs(
+        "safe_rl_test_run",
+        tmp_path,
+        ppo_timesteps=20000,
+        forecast_ppo_timesteps=100000,
+        forecast_ppo_profile="shield_guided",
+        forecast_sources=["wcdt_v2"],
+    )
+    main = yaml.safe_load(configs["main"].read_text(encoding="utf-8"))
+    forecast = yaml.safe_load(configs["forecast_wcdt_v2_ppo"].read_text(encoding="utf-8"))
+    assert "reward_profile" not in main["rl"]
+    assert "shield_guided_reward" not in main["rl"]
+    assert forecast["rl"]["total_timesteps"] == 100000
+    assert forecast["rl"]["reward_profile"] == "shield_guided_forecast"
+    assert forecast["rl"]["shield_guided_reward"]["risk_checkpoint"] == (
+        "safe_rl_output/runs/safe_rl_test_run/stage2/risk_module.pt"
+    )
+
+
 def _fake_group(
     seed_rewards: list[tuple[int, float]],
     reward: float,
@@ -1037,6 +1092,9 @@ def _fake_group(
                 "drac_p99_capped": drac if drac_capped is None else drac_capped,
                 "proxy_collision": bool(proxy_collision),
                 "safety_violation": bool(safety_violation),
+                "proxy_collision_count": int(bool(proxy_collision)),
+                "safety_violation_count": int(bool(safety_violation)),
+                "min_distance_le_collision_threshold_count": int(bool(proxy_collision)),
                 "completion_time": completion_time,
                 "ego_speed_mean": ego_speed,
                 "hard_brake_rate": hard_brake_rate,
@@ -1056,6 +1114,9 @@ def _fake_group(
             "drac_p99_capped": drac if drac_capped is None else drac_capped,
             "proxy_collision_rate": proxy_collision,
             "safety_violation_rate": safety_violation,
+            "proxy_collision_count": int(bool(proxy_collision)),
+            "safety_violation_count": int(bool(safety_violation)),
+            "min_distance_le_collision_threshold_count": int(bool(proxy_collision)),
             "merge_success_rate": success,
             "completion_time_mean": completion_time,
             "completion_time_p95": completion_time,
@@ -1092,6 +1153,8 @@ def test_stage5_dynamic_paired_delta_and_acceptance_for_optional_forecast_groups
     assert paired["ppo_vs_ppo_shield"]["mean_completion_time_delta"] == pytest.approx(-1.0)
     assert paired["ppo_vs_ppo_shield"]["mean_ego_speed_delta"] == pytest.approx(1.0)
     assert paired["ppo_vs_ppo_shield"]["mean_hard_brake_rate_delta"] == pytest.approx(0.1)
+    assert paired["ppo_vs_ppo_shield"]["proxy_collision_count_delta"] == 0
+    assert paired["ppo_vs_ppo_shield"]["safety_violation_count_delta"] == 0
     acceptance = _build_acceptance(reports)
     assert acceptance["ppo_shield"]["available"]
     assert acceptance["cv_prediction_shield"]["available"]

@@ -89,6 +89,15 @@ def run(cfg):
         "feature_names": list(ForecastFeatureAugmentor.FEATURE_NAMES),
         "source": str(cfg.forecast_features.get("source", "")),
     } if report["forecast_features_enabled"] else None
+    shield_guided_cfg = dict(cfg.rl.get("shield_guided_reward", {}) or {})
+    report["reward_risk_checkpoint"] = (
+        str(shield_guided_cfg.get("risk_checkpoint", ""))
+        if str(cfg.rl.get("reward_profile", "default")) == "shield_guided_forecast"
+        else ""
+    )
+    report["shield_guided_reward_config"] = (
+        shield_guided_cfg if str(cfg.rl.get("reward_profile", "default")) == "shield_guided_forecast" else None
+    )
     report["observation_dim"] = int(observation_shape[0]) if observation_shape else 0
     report["observation_shape"] = observation_shape
     write_report(stage_dir / "stage3_training_report.json", report)
