@@ -1,3 +1,4 @@
+# Legacy WcDT v1 Stage5 example. Prefer stage5_six_groups_cv_wcdt_v2.example.yaml for new experiments.
 stage5:
   episodes_per_group: 20
   seeds: [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20]

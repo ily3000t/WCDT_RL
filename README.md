@@ -206,13 +206,14 @@ Stage3 使用 Stable-Baselines3 的 TensorBoard 记录 PPO reward、episode leng
 safe_rl/config/advanced/ppo_constant_velocity_features.yaml
 ```
 
-如果要训练 `PPO + WcDT forecast features`，使用覆盖配置：
+如果要训练旧版 `PPO + WcDT v1 forecast features`，使用历史兼容覆盖配置：
 
 ```text
 safe_rl/config/advanced/ppo_forecast_features.yaml
+safe_rl/config/advanced/ppo_wcdt_v1_features_legacy.yaml
 ```
 
-然后使用单独 run id 训练。注意：forecast-feature PPO 是 63 维 observation，不能复用 baseline 的 52 维 PPO；如果使用单独 run id，需要把该配置中的 `forecast_features.checkpoint` 指向 baseline run 的 `stage2/wcdt_predictor.pt`。
+`ppo_forecast_features.yaml` 保留是为了旧命令不失效；新主线推荐通过 full runner 生成 CV + WcDT v2 的 forecast PPO 配置。注意：forecast-feature PPO 是 63 维 observation，不能复用 baseline 的 52 维 PPO；如果手动训练 WcDT v1，需要把配置中的 `forecast_features.checkpoint` 指向 baseline run 的 `stage2/wcdt_predictor.pt`。
 
 ```powershell
 $FORECAST_RUN_ID = "safe_rl_highway_merge_forecast_001"
@@ -265,18 +266,18 @@ safe_rl_output/runs/<run_id>/stage5/replay/<group>_seed_<seed>.json
 safe_rl_output/runs/<run_id>/stage5/tensorboard/
 ```
 
-如果要手动比较 baseline、CV forecast 和 WcDT forecast，建议分别训练 baseline PPO、CV forecast PPO、WcDT forecast PPO，然后复制并修改模板中的 `model_path`：
+如果要手动比较 baseline、CV forecast 和 WcDT v2 forecast，建议分别训练 baseline PPO、CV forecast PPO、WcDT v2 forecast PPO，然后复制并修改当前主线模板中的 `model_path`：
 
 ```text
-safe_rl/config/advanced/stage5_four_groups.example.yaml
+safe_rl/config/advanced/stage5_six_groups_cv_wcdt_v2.example.yaml
 ```
 
-模板中的 forecast 组必须显式设置对应 63 维 forecast PPO 的 `model_path`。CV、WcDT v1 和 WcDT v2 虽然 observation 都是 63 维，但 forecast feature 分布不同，应分别训练 PPO。`forecast_source: "wcdt"` 还要设置 `forecast_checkpoint` 指向 Stage2 的 `wcdt_predictor.pt`；`forecast_source: "wcdt_v2"` 指向 `wcdt_v2_predictor.pt`；`forecast_source: "constant_velocity"` 不需要 checkpoint。Stage5 会在评估前校验 PPO model 和环境 observation shape，不匹配会直接失败。
+旧模板 `safe_rl/config/advanced/stage5_four_groups.example.yaml` 是 WcDT v1 legacy 示例，不作为新主实验模板。模板中的 forecast 组必须显式设置对应 63 维 forecast PPO 的 `model_path`。CV、WcDT v1 和 WcDT v2 虽然 observation 都是 63 维，但 forecast feature 分布不同，应分别训练 PPO。`forecast_source: "wcdt"` 还要设置 `forecast_checkpoint` 指向 Stage2 的 `wcdt_predictor.pt`；`forecast_source: "wcdt_v2"` 指向 `wcdt_v2_predictor.pt`；`forecast_source: "constant_velocity"` 不需要 checkpoint。Stage5 会在评估前校验 PPO model 和环境 observation shape，不匹配会直接失败。
 
 命令：
 
 ```powershell
-python -m safe_rl.pipeline.stage5_paired_eval --run-id $RUN_ID --config path\to\your_stage5_four_groups.yaml
+python -m safe_rl.pipeline.stage5_paired_eval --run-id $RUN_ID --config path\to\your_stage5_six_groups.yaml
 ```
 
 ### Stage5 Shield 阈值扫描
@@ -331,7 +332,7 @@ python -m safe_rl.pipeline.stage5_confirmatory_eval --run-id safe_rl_wcdt_v2_002
 python -m safe_rl.pipeline.stage5_shield_sweep --run-id safe_rl_wcdt_v2_002 --include-calibrated
 ```
 
-默认 `--forecast-sources` 仍是 `constant_velocity,wcdt`，用于兼容旧实验。新一轮建议显式使用 `constant_velocity,wcdt_v2`；如果要同时保留 v1 对照，可运行 `constant_velocity,wcdt,wcdt_v2`。如果只想跑其中一个 forecast 分支：
+默认 `--forecast-sources` 是 `constant_velocity,wcdt_v2`。旧 WcDT v1 不再默认运行；如果要保留 v1 对照，需要显式运行 `constant_velocity,wcdt` 或 `constant_velocity,wcdt,wcdt_v2`。如果只想跑其中一个 forecast 分支：
 
 ```powershell
 python -m safe_rl.pipeline.run_full_pipeline --run-id safe_rl_merge_local_cv_001 --forecast-sources constant_velocity
@@ -352,11 +353,20 @@ python -m safe_rl.pipeline.run_full_pipeline --run-id safe_rl_merge_local_001 --
 ```text
 safe_rl_output/runs/<run_id>/generated_configs/
 safe_rl_output/runs/<run_id>/generated_configs/forecast_cv_ppo.yaml
-safe_rl_output/runs/<run_id>/generated_configs/forecast_wcdt_ppo.yaml
 safe_rl_output/runs/<run_id>/generated_configs/forecast_wcdt_v2_ppo.yaml
 safe_rl_output/runs/<run_id>/generated_configs/stage5_multi_groups.yaml
 safe_rl_output/runs/<run_id>/stage5/diagnostics/forecast_diagnostics.json
 ```
+
+只有显式包含 `wcdt` 时才会生成 `forecast_wcdt_ppo.yaml`。当前主线实验可以按三条轴线理解，避免把名字混在一起：
+
+```text
+PPO training reward: default / safety_forecast / shield_guided_forecast
+PPO observation: 52D baseline / 63D CV / 63D WcDT v1 legacy / 63D WcDT v2
+Eval-time Shield: off / on
+```
+
+`safety_forecast` 和 `shield_guided_forecast` 都只是普通 PPO 的 reward profile；`ppo_shield` 是同一个 PPO 在评估时套 eval-time Shield，不是重新训练的模型。
 
 完成 full pipeline 后，推荐用 50 seeds 做最终复验。该命令只复用已有 Stage1/2/3/4 输出，不重训模型：
 
@@ -430,7 +440,7 @@ python -m safe_rl.pipeline.forecast_diagnostics --run-id safe_rl_wcdt_v2_shieldg
 
 `shield_guided_forecast` 会在 forecast PPO 生成配置中绑定 base run 的 `stage2/risk_module.pt`。baseline PPO 不加载该 Risk Module，仍保持默认 reward。
 
-Stage3 默认启用 safety checkpoint selection。训练结束后会同时输出：
+Stage3 默认启用 safety checkpoint selection。这里的 `safety_score` / `checkpoint_selection_score` 只用于在多个 checkpoint 中选择下游使用的 `ppo_model.zip`，不是 PPO 训练 reward。训练 reward 由 `rl.reward_profile` 决定。训练结束后会同时输出：
 
 ```text
 safe_rl_output/runs/<run_id>/stage3/ppo_model_final.zip
@@ -439,7 +449,7 @@ safe_rl_output/runs/<run_id>/stage3/ppo_model.zip
 safe_rl_output/runs/<run_id>/stage3/stage3_checkpoint_selection_report.json
 ```
 
-下游 Stage5 仍读取 `ppo_model.zip`，该路径会保存/复制为 safety score 最好的 checkpoint，避免最后一个 checkpoint 过于激进。
+下游 Stage5 仍读取 `ppo_model.zip`，该路径会保存/复制为 `checkpoint_selection_score` 最好的 checkpoint，避免最后一个 checkpoint 过于激进。默认 `stage3.checkpoint_selection_profile: "safety"` 保持安全优先；如果后续发现 WcDT v2 policy 过度保守，可以显式改为 `"safety_efficiency"`，在安全项基础上轻量加入 `completion_time_mean` 和 `ego_speed_mean`，但它不是当前默认主线。
 
 如果需要手动逐阶段运行，命令如下：
 

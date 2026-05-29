@@ -1,0 +1,11 @@
+# Legacy WcDT v1 forecast-feature PPO overlay.
+# Prefer ppo_forecast_shield_guided.yaml or generated CV + WcDT v2 configs for new experiments.
+forecast_features:
+  enabled: true
+  use_for_ppo_observation: true
+  source: "wcdt"
+  checkpoint: null
+  allow_heuristic_fallback: false
+
+rl:
+  use_wcdt_forecast_features: true

@@ -22,7 +22,7 @@ from safe_rl.utils.progress import stage_log
 
 
 VALID_FORECAST_SOURCES = ("constant_velocity", "wcdt", "wcdt_v2")
-DEFAULT_FORECAST_SOURCES = ("constant_velocity", "wcdt")
+DEFAULT_FORECAST_SOURCES = ("constant_velocity", "wcdt_v2")
 VALID_FORECAST_PPO_PROFILES = ("default", "safety", "shield_guided")
 
 
@@ -364,7 +364,7 @@ def main() -> None:
     parser.add_argument(
         "--forecast-sources",
         default=None,
-        help="Comma-separated forecast sources. Default: constant_velocity,wcdt.",
+        help="Comma-separated forecast sources. Default: constant_velocity,wcdt_v2. Use wcdt explicitly for legacy v1.",
     )
     args = parser.parse_args()
     if args.forecast_source and args.forecast_sources:

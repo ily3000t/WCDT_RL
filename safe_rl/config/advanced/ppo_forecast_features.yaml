@@ -1,3 +1,5 @@
+# Historical compatibility alias for WcDT v1 forecast-feature PPO.
+# Prefer ppo_wcdt_v1_features_legacy.yaml when explicitly running legacy WcDT v1.
 forecast_features:
   enabled: true
   use_for_ppo_observation: true

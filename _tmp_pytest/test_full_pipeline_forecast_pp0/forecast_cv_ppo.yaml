@@ -1,0 +1,12 @@
+run:
+  run_id: safe_rl_test_run_forecast_cv
+forecast_features:
+  enabled: true
+  use_for_ppo_observation: true
+  source: constant_velocity
+  checkpoint: null
+  allow_heuristic_fallback: false
+rl:
+  use_wcdt_forecast_features: true
+  reward_profile: safety_forecast
+  total_timesteps: 100000

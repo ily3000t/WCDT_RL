@@ -62,7 +62,7 @@ from safe_rl.risk.risk_aggregator import aggregate_episode_reports
 from safe_rl.risk.risk_module import RiskPrediction, risk_loss
 from safe_rl.risk.stage1_sampling import configured_sampling_probs, sampling_summary, select_stage1_action
 from safe_rl.rl.evaluation import validate_model_env_observation_shape
-from safe_rl.rl.ppo import _safety_score
+from safe_rl.rl.ppo import _checkpoint_selection_score, _checkpoint_selection_weights, _safety_score
 from safe_rl.shield.safety_shield import SafetyShield
 from safe_rl.sim.action_space import ACTIONS, decode_action
 from safe_rl.sim.history_buffer import HistoryBuffer
@@ -807,17 +807,39 @@ def test_safety_forecast_reward_profile_penalizes_tail_risk():
 
 
 def test_stage3_safety_score_penalizes_proxy_collision_and_capped_drac():
-    score = _safety_score(
-        {
-            "average_reward": 100.0,
-            "min_distance_p1": 2.0,
-            "ttc_p1": 1.0,
-            "drac_p99_capped": 20.0,
-            "proxy_collision_rate": 1.0,
-            "safety_violation_rate": 1.0,
-        }
-    )
+    metrics = {
+        "average_reward": 100.0,
+        "min_distance_p1": 2.0,
+        "ttc_p1": 1.0,
+        "drac_p99_capped": 20.0,
+        "proxy_collision_rate": 1.0,
+        "safety_violation_rate": 1.0,
+    }
+    score = _safety_score(metrics)
     assert score == pytest.approx(-14.0)
+
+    cfg = load_config()
+    cfg.stage3["checkpoint_selection_profile"] = "safety"
+    assert _checkpoint_selection_score(metrics, cfg) == pytest.approx(score)
+
+
+def test_stage3_safety_efficiency_checkpoint_selection_adds_efficiency_terms():
+    cfg = load_config()
+    cfg.stage3["checkpoint_selection_profile"] = "safety_efficiency"
+    metrics = {
+        "average_reward": 100.0,
+        "min_distance_p1": 2.0,
+        "ttc_p1": 1.0,
+        "drac_p99_capped": 20.0,
+        "proxy_collision_rate": 1.0,
+        "safety_violation_rate": 1.0,
+        "completion_time_mean": 10.0,
+        "ego_speed_mean": 20.0,
+    }
+    weights = _checkpoint_selection_weights(cfg)
+    assert weights["completion_time_mean"] == pytest.approx(-2.0)
+    assert weights["ego_speed_mean"] == pytest.approx(0.5)
+    assert _checkpoint_selection_score(metrics, cfg) == pytest.approx(-24.0)
 
 
 def test_stage5_group_shield_overrides_update_shield_config():
@@ -936,8 +958,8 @@ def test_full_pipeline_generated_configs_use_forecast_model_and_checkpoint(tmp_p
         ppo_timesteps=128,
     )
     assert "forecast_cv_ppo" in configs
-    assert "forecast_wcdt_ppo" in configs
-    assert "forecast_wcdt_v2_ppo" not in configs
+    assert "forecast_wcdt_ppo" not in configs
+    assert "forecast_wcdt_v2_ppo" in configs
     stage5 = yaml.safe_load(configs["stage5_multi_groups"].read_text(encoding="utf-8"))
     groups = {item["name"]: item for item in stage5["stage5"]["groups"]}
     assert stage5["stage5"]["episodes_per_group"] == 20
@@ -952,14 +974,15 @@ def test_full_pipeline_generated_configs_use_forecast_model_and_checkpoint(tmp_p
     assert groups["cv_prediction_shield"]["model_path"] == (
         "safe_rl_output/runs/safe_rl_test_run_forecast_cv/stage3/ppo_model.zip"
     )
-    assert groups["ppo_wcdt_features"]["model_path"] == (
-        "safe_rl_output/runs/safe_rl_test_run_forecast_wcdt/stage3/ppo_model.zip"
+    assert "ppo_wcdt_features" not in groups
+    assert groups["ppo_wcdt_v2_features"]["model_path"] == (
+        "safe_rl_output/runs/safe_rl_test_run_forecast_wcdt_v2/stage3/ppo_model.zip"
     )
-    assert groups["ppo_wcdt_features"]["forecast_checkpoint"] == (
-        "safe_rl_output/runs/safe_rl_test_run/stage2/wcdt_predictor.pt"
+    assert groups["ppo_wcdt_v2_features"]["forecast_checkpoint"] == (
+        "safe_rl_output/runs/safe_rl_test_run/stage2/wcdt_v2_predictor.pt"
     )
-    assert groups["wcdt_prediction_shield"]["forecast_checkpoint"] == (
-        "safe_rl_output/runs/safe_rl_test_run/stage2/wcdt_predictor.pt"
+    assert groups["wcdt_v2_prediction_shield"]["forecast_checkpoint"] == (
+        "safe_rl_output/runs/safe_rl_test_run/stage2/wcdt_v2_predictor.pt"
     )
 
     stage2_stage4 = yaml.safe_load(configs["stage2_with_stage4"].read_text(encoding="utf-8"))
@@ -972,11 +995,11 @@ def test_full_pipeline_generated_configs_use_forecast_model_and_checkpoint(tmp_p
     assert forecast_cv["forecast_features"]["allow_heuristic_fallback"] is False
     assert forecast_cv["rl"]["total_timesteps"] == 128
 
-    forecast_wcdt = yaml.safe_load(configs["forecast_wcdt_ppo"].read_text(encoding="utf-8"))
-    assert forecast_wcdt["run"]["run_id"] == "safe_rl_test_run_forecast_wcdt"
-    assert forecast_wcdt["forecast_features"]["source"] == "wcdt"
-    assert forecast_wcdt["forecast_features"]["checkpoint"] == (
-        "safe_rl_output/runs/safe_rl_test_run/stage2/wcdt_predictor.pt"
+    forecast_wcdt_v2 = yaml.safe_load(configs["forecast_wcdt_v2_ppo"].read_text(encoding="utf-8"))
+    assert forecast_wcdt_v2["run"]["run_id"] == "safe_rl_test_run_forecast_wcdt_v2"
+    assert forecast_wcdt_v2["forecast_features"]["source"] == "wcdt_v2"
+    assert forecast_wcdt_v2["forecast_features"]["checkpoint"] == (
+        "safe_rl_output/runs/safe_rl_test_run/stage2/wcdt_v2_predictor.pt"
     )
 
 
@@ -1026,6 +1049,29 @@ def test_full_pipeline_generated_configs_support_single_forecast_source(tmp_path
     assert v2_groups["ppo_wcdt_v2_features"]["forecast_checkpoint"] == (
         "safe_rl_output/runs/safe_rl_test_run/stage2/wcdt_v2_predictor.pt"
     )
+
+
+def test_legacy_wcdt_v1_forecast_config_still_loads():
+    cfg = load_config("safe_rl/config/advanced/ppo_wcdt_v1_features_legacy.yaml")
+    assert cfg.forecast_features.enabled is True
+    assert cfg.forecast_features.source == "wcdt"
+    assert cfg.forecast_features.allow_heuristic_fallback is False
+
+
+def test_stage5_six_group_cv_wcdt_v2_example_uses_current_mainline():
+    path = Path("safe_rl/config/advanced/stage5_six_groups_cv_wcdt_v2.example.yaml")
+    payload = yaml.safe_load(path.read_text(encoding="utf-8"))
+    groups = {item["name"]: item for item in payload["stage5"]["groups"]}
+    assert set(groups) == {
+        "ppo",
+        "ppo_shield",
+        "ppo_cv_features",
+        "cv_prediction_shield",
+        "ppo_wcdt_v2_features",
+        "wcdt_v2_prediction_shield",
+    }
+    assert groups["ppo_wcdt_v2_features"]["model_path"].endswith("_forecast_wcdt_v2/stage3/ppo_model.zip")
+    assert groups["ppo_wcdt_v2_features"]["forecast_checkpoint"].endswith("/stage2/wcdt_v2_predictor.pt")
 
 
 def test_full_pipeline_forecast_ppo_overrides_are_forecast_only(tmp_path):

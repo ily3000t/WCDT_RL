@@ -10,6 +10,23 @@ from safe_rl.sim.sumo_highway_merge_env import SumoHighwayMergeEnv
 from safe_rl.utils.io import write_json
 
 
+DEFAULT_CHECKPOINT_SELECTION_WEIGHTS = {
+    "reward": 1.0,
+    "min_distance_p1": 2.0,
+    "ttc_p1": 2.0,
+    "drac_p99_capped": -2.0,
+    "proxy_collision_rate": -50.0,
+    "safety_violation_rate": -30.0,
+    "completion_time_mean": 0.0,
+    "ego_speed_mean": 0.0,
+}
+
+EFFICIENCY_CHECKPOINT_SELECTION_WEIGHTS = {
+    "completion_time_mean": -2.0,
+    "ego_speed_mean": 0.5,
+}
+
+
 def _require_sb3():
     try:
         from stable_baselines3 import PPO
@@ -23,15 +40,50 @@ def _training_device(config: Any) -> str:
     return "cuda" if requested == "gpu" else requested or "auto"
 
 
+def _checkpoint_selection_profile(config: Any | None = None) -> str:
+    if config is None:
+        return "safety"
+    profile = str(config.stage3.get("checkpoint_selection_profile", "safety")).strip().lower()
+    if profile not in {"safety", "safety_efficiency"}:
+        raise ValueError("stage3.checkpoint_selection_profile must be 'safety' or 'safety_efficiency'")
+    return profile
+
+
+def _checkpoint_selection_weights(config: Any | None = None) -> dict[str, float]:
+    weights = dict(DEFAULT_CHECKPOINT_SELECTION_WEIGHTS)
+    configured: dict[str, Any] = {}
+    if config is not None:
+        configured = dict(config.stage3.get("checkpoint_selection_weights", {}) or {})
+        weights.update({key: float(value) for key, value in configured.items()})
+    if _checkpoint_selection_profile(config) == "safety_efficiency":
+        for key, value in EFFICIENCY_CHECKPOINT_SELECTION_WEIGHTS.items():
+            if float(configured.get(key, 0.0)) == 0.0:
+                weights[key] = float(value)
+    return weights
+
+
+def _checkpoint_selection_score(metrics: dict[str, Any], config: Any | None = None) -> float:
+    weights = _checkpoint_selection_weights(config)
+    metric_values = {
+        "reward": float(metrics.get("average_reward", 0.0)),
+        "min_distance_p1": float(metrics.get("min_distance_p1", 0.0)),
+        "ttc_p1": float(metrics.get("ttc_p1", 0.0)),
+        "drac_p99_capped": float(metrics.get("drac_p99_capped", metrics.get("drac_p99", 0.0))),
+        "proxy_collision_rate": float(metrics.get("proxy_collision_rate", 0.0)),
+        "safety_violation_rate": float(metrics.get("safety_violation_rate", 0.0)),
+        "completion_time_mean": float(metrics.get("completion_time_mean", 0.0)),
+        "ego_speed_mean": float(metrics.get("ego_speed_mean", 0.0)),
+    }
+    return float(sum(float(weights.get(key, 0.0)) * value for key, value in metric_values.items()))
+
+
+def _checkpoint_selection_formula(weights: dict[str, float]) -> str:
+    terms = [f"{weight:g}*{name}" for name, weight in weights.items() if abs(float(weight)) > 1.0e-12]
+    return " + ".join(terms) if terms else "0"
+
+
 def _safety_score(metrics: dict[str, Any]) -> float:
-    return float(
-        float(metrics.get("average_reward", 0.0))
-        + 2.0 * float(metrics.get("min_distance_p1", 0.0))
-        + 2.0 * float(metrics.get("ttc_p1", 0.0))
-        - 2.0 * float(metrics.get("drac_p99_capped", metrics.get("drac_p99", 0.0)))
-        - 50.0 * float(metrics.get("proxy_collision_rate", 0.0))
-        - 30.0 * float(metrics.get("safety_violation_rate", 0.0))
-    )
+    return _checkpoint_selection_score(metrics, None)
 
 
 def _checkpoint_paths(output_path: Path) -> tuple[Path, Path, Path]:
@@ -92,6 +144,8 @@ class _SafetyEvalCallback:
                 self.best_score: float | None = None
                 self.best_record: dict[str, Any] | None = None
                 self._last_eval_step = 0
+                self.selection_profile = _checkpoint_selection_profile(cfg)
+                self.selection_weights = _checkpoint_selection_weights(cfg)
 
             def _on_step(self) -> bool:
                 if self.eval_freq <= 0 or not self.eval_seeds:
@@ -110,14 +164,17 @@ class _SafetyEvalCallback:
                 checkpoint_path = self.checkpoint_dir / f"{self.model_output.stem}_step_{timesteps:08d}.zip"
                 self.model.save(str(checkpoint_path))
                 metrics = _evaluate_model_for_safety(self.model, self.cfg, self.eval_seeds)
-                score = _safety_score(metrics)
+                score = _checkpoint_selection_score(metrics, self.cfg)
                 selected_best = self.best_score is None or score > self.best_score
                 record = {
                     "kind": kind,
                     "timesteps": timesteps,
                     "checkpoint_path": str(checkpoint_path),
                     "metrics": metrics,
+                    "checkpoint_selection_score": score,
                     "safety_score": score,
+                    "checkpoint_selection_profile": self.selection_profile,
+                    "checkpoint_selection_weights": self.selection_weights,
                     "selected_best": bool(selected_best),
                 }
                 if selected_best:
@@ -159,6 +216,9 @@ def train_ppo(
     output_path = Path(output_path)
     output_path.parent.mkdir(parents=True, exist_ok=True)
     final_path, best_path, selection_report_path = _checkpoint_paths(output_path)
+    selection_profile = _checkpoint_selection_profile(config)
+    selection_weights = _checkpoint_selection_weights(config)
+    selection_metric = _checkpoint_selection_formula(selection_weights)
     safety_callback = None
     callback = None
     if bool(config.stage3.get("eval_enabled", False)):
@@ -180,10 +240,9 @@ def train_ppo(
             "best_safety_model_path": str(best_path),
             "best_record": safety_callback.best_record,
             "records": safety_callback.records,
-            "selection_metric": (
-                "average_reward + 2*min_distance_p1 + 2*ttc_p1 - 2*drac_p99_capped "
-                "- 50*proxy_collision_rate - 30*safety_violation_rate"
-            ),
+            "selection_profile": selection_profile,
+            "selection_weights": selection_weights,
+            "selection_metric": selection_metric,
         }
     else:
         shutil.copyfile(final_path, output_path)
@@ -194,7 +253,9 @@ def train_ppo(
             "best_safety_model_path": str(best_path) if best_path.exists() else None,
             "best_record": None,
             "records": getattr(safety_callback, "records", []) if safety_callback is not None else [],
-            "selection_metric": None,
+            "selection_profile": selection_profile,
+            "selection_weights": selection_weights,
+            "selection_metric": selection_metric if bool(config.stage3.get("eval_enabled", False)) else None,
         }
     write_json(selection_report_path, checkpoint_selection)
     report = {
@@ -205,6 +266,9 @@ def train_ppo(
         "checkpoint_selection": checkpoint_selection,
         "total_timesteps": int(config.rl.total_timesteps),
         "reward_profile": str(config.rl.get("reward_profile", "default")),
+        "checkpoint_selection_profile": selection_profile,
+        "checkpoint_selection_weights": selection_weights,
+        "checkpoint_selection_metric": selection_metric,
         "tensorboard": str(tensorboard_dir) if tensorboard_dir else None,
         "device": str(model.device),
     }

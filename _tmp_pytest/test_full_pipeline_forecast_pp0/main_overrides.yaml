@@ -1,0 +1,4 @@
+run:
+  run_id: safe_rl_test_run
+rl:
+  total_timesteps: 20000
