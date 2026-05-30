@@ -11,6 +11,7 @@ from safe_rl.risk.merge_local import (
     nearest_future_gap,
 )
 from safe_rl.sim.metrics import INF_TTC, bbox_gap, drac, merge_gap, relative_ttc
+from safe_rl.sim.scenario_semantics import lane_center
 
 
 class ForecastFeatureAugmentor:
@@ -83,7 +84,7 @@ class ForecastFeatureAugmentor:
                 float(np.max(dracs)),
                 float(np.max(gaps < 0.25)),
                 0.0,
-                float(merge_gap(ego, others)),
+                float(merge_local_stats(ego, vehicles, self.config).target_lane_gap),
                 float(nearest.x - ego.x),
                 float(nearest.y - ego.y),
                 float(top[0]),
@@ -217,9 +218,6 @@ class ForecastFeatureAugmentor:
         return normalized
 
 
-LANE_CENTERS = {0: -8.0, 1: -4.8, 2: -1.6}
-
-
 def _ego_future_xy(ego_rollout: list[Any] | np.ndarray) -> np.ndarray:
     if isinstance(ego_rollout, np.ndarray):
         arr = np.asarray(ego_rollout, dtype=np.float32)
@@ -245,7 +243,7 @@ def forecast_target_lane_gap_from_trajectories(
     horizon = min(int(ego_xy.shape[0]), int(trajectories.shape[1]))
     if horizon <= 0:
         return float(default_gap)
-    target_y = float(LANE_CENTERS.get(merge_target_lane(config), -1.6))
+    target_y = float(lane_center(config, merge_target_lane(config)))
     min_gap = float(default_gap)
     for step_idx in range(horizon):
         ego_x = float(ego_xy[step_idx, 0])

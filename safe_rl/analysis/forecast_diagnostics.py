@@ -16,11 +16,20 @@ from safe_rl.prediction.wcdt_v2_predictor import build_v2_numpy_batch, ensemble_
 from safe_rl.rl.ppo import load_ppo
 from safe_rl.risk.merge_local import merge_target_lane
 from safe_rl.sim.metrics import INF_TTC
+from safe_rl.sim.scenario_semantics import (
+    EDGE_ROLE_AUXILIARY,
+    EDGE_ROLE_RAMP,
+    auxiliary_edges,
+    edge_length,
+    infer_lane_index,
+    ramp_edges,
+    taper_edge,
+)
 from safe_rl.sim.types import VehicleState
 from safe_rl.utils.config import clone_with_overrides
 
 
-LANE_CENTERS = {0: -8.0, 1: -4.8, 2: -1.6}
+LANE_CENTERS = {0: -8.0, 1: -4.8, 2: -1.6, 3: 1.6}
 
 
 def _summary(values: np.ndarray | list[float]) -> dict[str, float | int]:
@@ -47,14 +56,32 @@ def _resolve(path: str | Path) -> Path:
     return path if path.is_absolute() else Path.cwd() / path
 
 
-def _infer_lane_index(y: float) -> int:
-    return min(LANE_CENTERS, key=lambda lane: abs(float(y) - LANE_CENTERS[lane]))
-
-
-def _vector_to_state(vehicle_id: str, vector: np.ndarray) -> VehicleState:
+def _vector_to_state(
+    vehicle_id: str,
+    vector: np.ndarray,
+    cfg: Any,
+    lane_index: int | None = None,
+    edge_role_id: int | None = None,
+) -> VehicleState:
     x, y, heading, speed, accel = [float(item) for item in vector[:5]]
-    lane_index = _infer_lane_index(y)
-    edge_id = "ramp_in" if y > 0.5 and x < 224.0 else ("main_in" if x < 224.0 else "main_out")
+    lane_index = infer_lane_index(cfg, y) if lane_index is None or int(lane_index) < 0 else int(lane_index)
+    aux_edge = taper_edge(cfg)
+    aux_length = edge_length(cfg, aux_edge)
+    if edge_role_id == EDGE_ROLE_RAMP:
+        edge_id = ramp_edges(cfg)[0]
+        lane_pos = max(0.0, x + edge_length(cfg, edge_id))
+    elif edge_role_id == EDGE_ROLE_AUXILIARY:
+        edge_id = auxiliary_edges(cfg)[0]
+        lane_pos = max(0.0, x)
+    elif x < 0.0:
+        edge_id = "main_in"
+        lane_pos = max(0.0, x + edge_length(cfg, edge_id))
+    elif x <= aux_length:
+        edge_id = aux_edge
+        lane_pos = max(0.0, x)
+    else:
+        edge_id = str(cfg.scenario.get("success_edge", "main_out"))
+        lane_pos = max(0.0, x - aux_length)
     return VehicleState(
         vehicle_id=vehicle_id,
         x=x,
@@ -63,27 +90,54 @@ def _vector_to_state(vehicle_id: str, vector: np.ndarray) -> VehicleState:
         speed=speed,
         lane_index=lane_index,
         lane_id=f"{edge_id}_{lane_index}",
-        lane_pos=x,
+        lane_pos=lane_pos,
         edge_id=edge_id,
         accel=accel,
     )
 
 
-def _latest_states(history: np.ndarray, mask: np.ndarray) -> list[VehicleState]:
+def _latest_states(
+    cfg: Any,
+    history: np.ndarray,
+    mask: np.ndarray,
+    lane_indices: np.ndarray | None = None,
+    edge_roles: np.ndarray | None = None,
+) -> list[VehicleState]:
     states: list[VehicleState] = []
     for agent_idx in range(history.shape[0]):
         if float(mask[agent_idx]) <= 0.0:
             continue
         vehicle_id = "ego" if agent_idx == 0 else f"agent_{agent_idx}"
-        states.append(_vector_to_state(vehicle_id, history[agent_idx, -1]))
+        states.append(
+            _vector_to_state(
+                vehicle_id,
+                history[agent_idx, -1],
+                cfg,
+                None if lane_indices is None else int(lane_indices[agent_idx]),
+                None if edge_roles is None else int(edge_roles[agent_idx]),
+            )
+        )
     return states
 
 
-def _cv_feature_matrix(cfg: Any, history: np.ndarray, mask: np.ndarray, indices: np.ndarray) -> np.ndarray:
+def _cv_feature_matrix(
+    cfg: Any,
+    history: np.ndarray,
+    mask: np.ndarray,
+    indices: np.ndarray,
+    lane_indices: np.ndarray | None = None,
+    edge_roles: np.ndarray | None = None,
+) -> np.ndarray:
     augmentor = ForecastFeatureAugmentor(cfg)
     rows = []
     for sample_idx in indices:
-        states = _latest_states(history[sample_idx], mask[sample_idx])
+        states = _latest_states(
+            cfg,
+            history[sample_idx],
+            mask[sample_idx],
+            None if lane_indices is None else lane_indices[sample_idx],
+            None if edge_roles is None else edge_roles[sample_idx],
+        )
         ego = next((state for state in states if state.vehicle_id == "ego"), None)
         rows.append(augmentor.extract({"ego": ego, "vehicles": states, "config": cfg}))
     return np.asarray(rows, dtype=np.float32)
@@ -418,7 +472,7 @@ def _wcdt_diagnostics(
                 if pred_gap < INF_TTC and actual_gap < INF_TTC:
                     target_gap_errors.append(float(pred_gap - actual_gap))
                     target_gap_abs_errors.append(abs(float(pred_gap - actual_gap)))
-                states = _latest_states(history[batch_indices[row]], mask[batch_indices[row]])
+                states = _latest_states(cfg, history[batch_indices[row]], mask[batch_indices[row]])
                 ego = next((state for state in states if state.vehicle_id == "ego"), None)
                 if ego is not None:
                     sample_uncertainty = float(np.mean(uncertainty_np[row][valid_agents]))
@@ -468,6 +522,8 @@ def _wcdt_v2_diagnostics(
     mask: np.ndarray,
     indices: np.ndarray,
     batch_size: int,
+    lane_indices: np.ndarray | None = None,
+    edge_roles: np.ndarray | None = None,
 ) -> tuple[np.ndarray, dict[str, Any]]:
     torch = _require_torch()
     device = _resolve_device(cfg, torch)
@@ -485,7 +541,15 @@ def _wcdt_v2_diagnostics(
 
     for start in range(0, indices.shape[0], batch_size):
         batch_indices = indices[start : start + batch_size]
-        numpy_batch = build_v2_numpy_batch(cfg, history, future, mask, batch_indices)
+        numpy_batch = build_v2_numpy_batch(
+            cfg,
+            history,
+            future,
+            mask,
+            batch_indices,
+            lane_indices=lane_indices,
+            edge_roles=edge_roles,
+        )
         tensor_batch = tensorize_batch(numpy_batch, torch, device)
         pred, uncertainty = ensemble_predict(models, tensor_batch)
         selected = pred.detach().cpu().numpy()
@@ -515,7 +579,14 @@ def _wcdt_v2_diagnostics(
             if pred_gap < INF_TTC and actual_gap < INF_TTC:
                 target_gap_errors.append(float(pred_gap - actual_gap))
                 target_gap_abs_errors.append(abs(float(pred_gap - actual_gap)))
-            states = _latest_states(history[batch_indices[row]], mask[batch_indices[row]])
+            sample_idx = batch_indices[row]
+            states = _latest_states(
+                cfg,
+                history[sample_idx],
+                mask[sample_idx],
+                None if lane_indices is None else lane_indices[sample_idx],
+                None if edge_roles is None else edge_roles[sample_idx],
+            )
             ego = next((state for state in states if state.vehicle_id == "ego"), None)
             if ego is not None:
                 features = _forecast_features_from_prediction(ego, selected[row, valid_agents], sample_uncertainty, cfg)
@@ -938,7 +1009,10 @@ def _load_replay_actions(path: Path) -> list[int] | None:
         return None
     with path.open("r", encoding="utf-8") as file:
         payload = json.load(file)
-    return [int(action) for action in payload.get("actions", [])]
+    actions = payload.get("executed_actions")
+    if actions is None:
+        actions = payload.get("actions", [])
+    return [int(action) for action in actions]
 
 
 def _behavior_pair_diagnostics(
@@ -1052,12 +1126,21 @@ def run_forecast_diagnostics(
     history = data["agent_history"]
     future = data["agent_future"]
     mask = data["agent_mask"]
+    lane_indices = data["agent_lane_index"] if "agent_lane_index" in data else None
+    edge_roles = data["agent_edge_role"] if "agent_edge_role" in data else None
     if history.shape[0] == 0:
         raise ValueError(f"no trajectory samples in {stage1_path}")
     sample_count = min(int(max_samples), int(history.shape[0]))
     rng = np.random.default_rng(int(cfg.run.seed))
     indices = np.sort(rng.choice(history.shape[0], size=sample_count, replace=False))
-    cv_features = _cv_feature_matrix(cfg, history, mask, indices)
+    cv_features = _cv_feature_matrix(
+        cfg,
+        history,
+        mask,
+        indices,
+        lane_indices=lane_indices,
+        edge_roles=edge_roles,
+    )
     cv_prediction = _cv_prediction_diagnostics(cfg, history, future, mask, indices)
     wcdt_features = np.zeros((0, ForecastFeatureAugmentor.feature_dim(cfg)), dtype=np.float32)
     wcdt_report: dict[str, Any] = {"available": False, "checkpoint": str(checkpoint)}
@@ -1084,7 +1167,15 @@ def run_forecast_diagnostics(
             wcdt_report["initial_prediction_report"] = str(initial_report_path)
     if wcdt_v2_checkpoint.exists():
         wcdt_v2_features, wcdt_v2_report = _wcdt_v2_diagnostics(
-            cfg, wcdt_v2_checkpoint, history, future, mask, indices, batch_size
+            cfg,
+            wcdt_v2_checkpoint,
+            history,
+            future,
+            mask,
+            indices,
+            batch_size,
+            lane_indices=lane_indices,
+            edge_roles=edge_roles,
         )
         wcdt_v2_report["available"] = True
     feature_summary = _feature_source_summary(

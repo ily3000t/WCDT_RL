@@ -7,12 +7,16 @@ from typing import Any
 
 import numpy as np
 
-from safe_rl.risk.merge_local import merge_target_lane, merge_x
+from safe_rl.risk.merge_local import merge_x
+from safe_rl.sim.scenario_semantics import (
+    is_auxiliary_edge,
+    is_ramp_edge,
+    is_target_lane_edge,
+    lane_center,
+    merge_target_lane,
+)
 from safe_rl.sim.history_buffer import HistoryBuffer
 from safe_rl.sim.types import VehicleState
-
-
-LANE_CENTERS = {0: -8.0, 1: -4.8, 2: -1.6}
 
 
 class SumoWcDTAdapter:
@@ -87,7 +91,7 @@ class SumoWcDTAdapter:
         if ego is None:
             return ids
         target_lane = merge_target_lane(self.config)
-        target_center = LANE_CENTERS.get(target_lane, -1.6)
+        target_center = lane_center(self.config, target_lane)
         merge_location = merge_x(self.config)
 
         def _priority(vehicle_id: str) -> tuple[float, float, float, str]:
@@ -95,8 +99,11 @@ class SumoWcDTAdapter:
             if state is None:
                 return (9.0, 1.0e6, 1.0e6, vehicle_id)
             dx = float(state.x - ego.x)
-            is_target_lane = state.edge_id in ("main_in", "main_out") and int(state.lane_index) == target_lane
-            is_ramp_local = state.edge_id == "ramp_in" and abs(float(state.lane_pos - ego.lane_pos)) < 80.0
+            is_target_lane = is_target_lane_edge(self.config, state.edge_id) and int(state.lane_index) == target_lane
+            is_ramp_local = (
+                (is_ramp_edge(self.config, state.edge_id) or is_auxiliary_edge(self.config, state.edge_id))
+                and abs(float(state.lane_pos - ego.lane_pos)) < 80.0
+            )
             if is_target_lane and dx >= 0.0:
                 group = 0
             elif is_target_lane and dx < 0.0:

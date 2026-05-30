@@ -19,6 +19,7 @@ from safe_rl.pipeline import (
 )
 from safe_rl.utils.config import REPO_ROOT, load_config, prepare_run_dir
 from safe_rl.utils.progress import stage_log
+from safe_rl.sim.scenario_snapshot import snapshot_scenario
 
 
 VALID_FORECAST_SOURCES = ("constant_velocity", "wcdt", "wcdt_v2")
@@ -163,6 +164,8 @@ def build_generated_configs(
     run_id: str,
     generated_dir: str | Path,
     stage1_episodes: int | None = None,
+    stage4_episodes: int | None = None,
+    stage5_episodes: int | None = None,
     ppo_timesteps: int | None = None,
     forecast_ppo_timesteps: int | None = None,
     forecast_ppo_profile: str = "default",
@@ -175,6 +178,8 @@ def build_generated_configs(
     main_payload: dict[str, Any] = {"run": {"run_id": run_id}}
     if stage1_episodes is not None:
         main_payload["stage1"] = {"episodes": int(stage1_episodes)}
+    if stage4_episodes is not None:
+        main_payload["stage4"] = {"episodes": int(stage4_episodes)}
     if ppo_timesteps is not None:
         main_payload["rl"] = {"total_timesteps": int(ppo_timesteps)}
 
@@ -201,11 +206,12 @@ def build_generated_configs(
     for source in sources:
         groups.extend(_forecast_stage5_groups(run_id, source))
 
+    requested_stage5_episodes = int(stage5_episodes) if stage5_episodes is not None else 20
     stage5_payload: dict[str, Any] = {
         "run": {"run_id": run_id},
         "stage5": {
-            "episodes_per_group": 20,
-            "seeds": list(range(1, 21)),
+            "episodes_per_group": requested_stage5_episodes,
+            "seeds": list(range(1, requested_stage5_episodes + 1)),
             "groups": groups,
         },
     }
@@ -280,6 +286,8 @@ def _print_stage5_summary(run_id: str) -> None:
 def run_full_pipeline(
     run_id: str,
     stage1_episodes: int | None = None,
+    stage4_episodes: int | None = None,
+    stage5_episodes: int | None = None,
     ppo_timesteps: int | None = None,
     forecast_ppo_timesteps: int | None = None,
     forecast_ppo_profile: str = "default",
@@ -295,6 +303,8 @@ def run_full_pipeline(
         run_id,
         generated_dir,
         stage1_episodes=stage1_episodes,
+        stage4_episodes=stage4_episodes,
+        stage5_episodes=stage5_episodes,
         ppo_timesteps=ppo_timesteps,
         forecast_ppo_timesteps=forecast_ppo_timesteps,
         forecast_ppo_profile=forecast_ppo_profile,
@@ -311,6 +321,8 @@ def run_full_pipeline(
     stage_log("full", f"generated_configs={generated_dir}")
 
     _run_subprocess([sys.executable, str(REPO_ROOT / "scenarios" / "highway_merge" / "build_network.py")], "build network")
+    snapshot_manifest = snapshot_scenario(_load_stage_cfg(configs["main"], run_id), run_dir)
+    stage_log("full", f"scenario_snapshot={snapshot_manifest}")
     _sumo_smoke_check(configs["main"], run_id)
 
     stage_log("full", "Stage1 risk probe")
@@ -339,6 +351,8 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="Run the full SAFE_RL Stage1-Stage5 pipeline.")
     parser.add_argument("--run-id", required=True, help="Baseline run id. Forecast run id is '<run-id>_forecast'.")
     parser.add_argument("--stage1-episodes", type=int, default=None, help="Optional override for Stage1 episodes.")
+    parser.add_argument("--stage4-episodes", type=int, default=None, help="Optional override for Stage4 episodes.")
+    parser.add_argument("--stage5-episodes", type=int, default=None, help="Optional override for Stage5 episodes per group.")
     parser.add_argument("--ppo-timesteps", type=int, default=None, help="Optional override for baseline and forecast PPO timesteps.")
     parser.add_argument(
         "--forecast-ppo-timesteps",
@@ -372,6 +386,8 @@ def main() -> None:
     run_full_pipeline(
         args.run_id,
         stage1_episodes=args.stage1_episodes,
+        stage4_episodes=args.stage4_episodes,
+        stage5_episodes=args.stage5_episodes,
         ppo_timesteps=args.ppo_timesteps,
         forecast_ppo_timesteps=args.forecast_ppo_timesteps,
         forecast_ppo_profile=args.forecast_ppo_profile,

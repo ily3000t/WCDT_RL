@@ -5,13 +5,21 @@ from typing import Any
 
 import numpy as np
 
-from safe_rl.risk.merge_local import merge_target_lane, merge_x
+from safe_rl.risk.merge_local import merge_x
+from safe_rl.sim.scenario_semantics import (
+    EDGE_ROLE_AUXILIARY,
+    EDGE_ROLE_RAMP,
+    EDGE_ROLE_TARGET,
+    edge_role,
+    infer_lane_index,
+    lane_center,
+    merge_target_lane,
+)
 from safe_rl.sim.history_buffer import HistoryBuffer
 from safe_rl.sim.types import VehicleState
 
 
-LANE_CENTERS = {0: -8.0, 1: -4.8, 2: -1.6}
-ROLE_COUNT = 5
+ROLE_COUNT = 6
 INPUT_DIM = 14
 
 
@@ -44,10 +52,6 @@ except ImportError:  # pragma: no cover
     _TORCH_MODULE_BASE = object
 
 
-def infer_lane_index(y: float) -> int:
-    return min(LANE_CENTERS, key=lambda lane: abs(float(y) - LANE_CENTERS[lane]))
-
-
 def _constant_velocity_future(last: np.ndarray, horizon: int, dt: float) -> np.ndarray:
     output = np.zeros((horizon, 5), dtype=np.float32)
     x = float(last[0])
@@ -63,35 +67,62 @@ def _constant_velocity_future(last: np.ndarray, horizon: int, dt: float) -> np.n
     return output
 
 
-def _role_for_agent(cfg: Any, ego_latest: np.ndarray, agent_latest: np.ndarray) -> int:
+def _role_for_agent(
+    cfg: Any,
+    ego_latest: np.ndarray,
+    agent_latest: np.ndarray,
+    lane_index: int | None = None,
+    edge_role_id: int | None = None,
+) -> int:
     target_lane = merge_target_lane(cfg)
-    target_center = LANE_CENTERS.get(target_lane, -1.6)
+    target_center = lane_center(cfg, target_lane)
     dx = float(agent_latest[0] - ego_latest[0])
     y = float(agent_latest[1])
-    lane = infer_lane_index(y)
-    is_target_lane = abs(y - target_center) <= 2.0 and lane == target_lane
-    is_ramp_local = y > 0.5 and float(agent_latest[0]) < merge_x(cfg) + 20.0
+    lane = infer_lane_index(cfg, y) if lane_index is None or int(lane_index) < 0 else int(lane_index)
+    is_target_lane = (
+        int(edge_role_id) == EDGE_ROLE_TARGET
+        if edge_role_id is not None and int(edge_role_id) > 0
+        else abs(y - target_center) <= 2.0 and lane == target_lane
+    )
     if is_target_lane and dx >= 0.0:
         return 0
     if is_target_lane and dx < 0.0:
         return 1
-    if is_ramp_local:
+    if edge_role_id == EDGE_ROLE_AUXILIARY:
         return 2
-    if abs(dx) < 30.0:
+    if edge_role_id == EDGE_ROLE_RAMP or (
+        (edge_role_id is None or int(edge_role_id) <= 0)
+        and y > 0.5
+        and float(agent_latest[0]) < merge_x(cfg) + 20.0
+    ):
         return 3
-    return 4
+    if abs(dx) < 30.0:
+        return 4
+    return 5
 
 
-def ordered_merge_local_indices(cfg: Any, sample_history: np.ndarray, sample_mask: np.ndarray) -> list[int]:
+def ordered_merge_local_indices(
+    cfg: Any,
+    sample_history: np.ndarray,
+    sample_mask: np.ndarray,
+    lane_indices: np.ndarray | None = None,
+    edge_roles: np.ndarray | None = None,
+) -> list[int]:
     if sample_history.shape[0] <= 1:
         return []
     ego = sample_history[0, -1]
     target_lane = merge_target_lane(cfg)
-    target_center = LANE_CENTERS.get(target_lane, -1.6)
+    target_center = lane_center(cfg, target_lane)
 
     def _priority(agent_idx: int) -> tuple[float, float, float, int]:
         latest = sample_history[agent_idx, -1]
-        role = _role_for_agent(cfg, ego, latest)
+        role = _role_for_agent(
+            cfg,
+            ego,
+            latest,
+            None if lane_indices is None else int(lane_indices[agent_idx]),
+            None if edge_roles is None else int(edge_roles[agent_idx]),
+        )
         dx = float(latest[0] - ego[0])
         target_lat = abs(float(latest[1]) - target_center)
         distance = abs(dx) + 0.5 * abs(float(latest[1]) - float(ego[1]))
@@ -134,6 +165,8 @@ def build_v2_numpy_batch(
     future: np.ndarray,
     mask: np.ndarray,
     indices: np.ndarray,
+    lane_indices: np.ndarray | None = None,
+    edge_roles: np.ndarray | None = None,
 ) -> dict[str, np.ndarray]:
     sample_indices = np.asarray(indices, dtype=np.int64)
     horizon = int(min(future.shape[2], cfg.prediction.get("wcdt_v2_horizon_steps", cfg.scenario.forecast_horizon_steps)))
@@ -152,10 +185,18 @@ def build_v2_numpy_batch(
     for row, sample_idx in enumerate(sample_indices):
         ego_latest = history[sample_idx, 0, -1]
         ego_future[row] = future[sample_idx, 0, :horizon]
-        ordered = ordered_merge_local_indices(cfg, history[sample_idx], mask[sample_idx])
+        sample_lanes = None if lane_indices is None else lane_indices[sample_idx]
+        sample_roles = None if edge_roles is None else edge_roles[sample_idx]
+        ordered = ordered_merge_local_indices(cfg, history[sample_idx], mask[sample_idx], sample_lanes, sample_roles)
         for actor_row, agent_idx in enumerate(ordered[:max_agents]):
             latest = history[sample_idx, agent_idx, -1]
-            role = _role_for_agent(cfg, ego_latest, latest)
+            role = _role_for_agent(
+                cfg,
+                ego_latest,
+                latest,
+                None if sample_lanes is None else int(sample_lanes[agent_idx]),
+                None if sample_roles is None else int(sample_roles[agent_idx]),
+            )
             features[row, actor_row] = _actor_features(cfg, ego_latest, latest, role)
             baseline[row, actor_row] = _constant_velocity_future(latest, horizon, dt)
             target[row, actor_row] = future[sample_idx, agent_idx, :horizon]
@@ -179,7 +220,25 @@ def build_v2_runtime_batch(cfg: Any, history: HistoryBuffer, ego_id: str) -> dic
     future = np.zeros((1, agent_history.shape[0], horizon, 5), dtype=np.float32)
     full_history = agent_history[None, ...]
     full_mask = agent_mask[None, ...]
-    batch = build_v2_numpy_batch(cfg, full_history, future, full_mask, np.asarray([0], dtype=np.int64))
+    latest = history.latest()
+    ids = history.agent_ids(ego_id)
+    lane_indices = np.full((1, agent_history.shape[0]), -1, dtype=np.int64)
+    edge_roles = np.zeros((1, agent_history.shape[0]), dtype=np.int64)
+    for agent_idx, vehicle_id in enumerate(ids):
+        state = latest.get(vehicle_id)
+        if state is None:
+            continue
+        lane_indices[0, agent_idx] = int(state.lane_index)
+        edge_roles[0, agent_idx] = int(edge_role(cfg, state.edge_id, state.lane_index))
+    batch = build_v2_numpy_batch(
+        cfg,
+        full_history,
+        future,
+        full_mask,
+        np.asarray([0], dtype=np.int64),
+        lane_indices=lane_indices,
+        edge_roles=edge_roles,
+    )
     return {key: value[0:1] if key != "selected_indices" else value[0] for key, value in batch.items()}
 
 

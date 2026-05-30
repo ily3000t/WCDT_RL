@@ -97,6 +97,9 @@ def _paired_delta(a_report: dict | None, b_report: dict | None) -> dict | None:
                     int(item.get("safety_violation_count", int(bool(item.get("safety_violation", False)))))
                     - int(left.get("safety_violation_count", int(bool(left.get("safety_violation", False)))))
                 ),
+                "taper_miss_delta": int(
+                    int(bool(item.get("taper_miss", False))) - int(bool(left.get("taper_miss", False)))
+                ),
                 "min_distance_le_collision_threshold_count_delta": int(
                     int(
                         item.get(
@@ -138,6 +141,8 @@ def _paired_delta(a_report: dict | None, b_report: dict | None) -> dict | None:
         "mean_safety_violation_delta": sum(row["safety_violation_delta"] for row in rows) / len(rows),
         "proxy_collision_count_delta": sum(row["proxy_collision_count_delta"] for row in rows),
         "safety_violation_count_delta": sum(row["safety_violation_count_delta"] for row in rows),
+        "taper_miss_count_delta": sum(row["taper_miss_delta"] for row in rows),
+        "mean_taper_miss_delta": sum(row["taper_miss_delta"] for row in rows) / len(rows),
         "min_distance_le_collision_threshold_count_delta": sum(
             row["min_distance_le_collision_threshold_count_delta"] for row in rows
         ),

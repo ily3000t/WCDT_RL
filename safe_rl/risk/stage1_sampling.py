@@ -26,6 +26,18 @@ KEEP_HOLD = _keep_action(0)
 KEEP_ACCELERATE = _keep_action(1)
 
 
+def _left_action(accel_cmd: int) -> int:
+    for action in ACTIONS:
+        if action.lateral_cmd == -1 and action.accel_cmd == accel_cmd:
+            return int(action.index)
+    return KEEP_HOLD
+
+
+LEFT_DECELERATE = _left_action(-1)
+LEFT_HOLD = _left_action(0)
+LEFT_ACCELERATE = _left_action(1)
+
+
 def configured_sampling_probs(cfg: Any) -> dict[str, float]:
     stage_cfg = cfg.stage1
     raw = stage_cfg.get("sampling_probs", {})
@@ -68,6 +80,16 @@ def _merge_heuristic_action(cfg: Any, context: dict[str, Any]) -> int:
     stats = merge_local_stats(ego, list(context.get("vehicles") or []), cfg)
     if stats.ego_on_ramp and stats.merge_distance > merge_zone_distance(cfg):
         return KEEP_ACCELERATE
+    if stats.ego_on_auxiliary:
+        if stats.target_front_gap < 10.0:
+            return KEEP_DECELERATE
+        if stats.target_rear_gap < 8.0:
+            return KEEP_ACCELERATE
+        if stats.target_lane_gap >= 14.0:
+            return LEFT_ACCELERATE
+        if stats.merge_distance <= merge_zone_distance(cfg):
+            return LEFT_HOLD
+        return KEEP_HOLD
     if not stats.in_merge_zone:
         return KEEP_HOLD
     if stats.target_front_gap < 10.0:
@@ -84,6 +106,11 @@ def _risk_seek_action(cfg: Any, rng: np.random.Generator, context: dict[str, Any
     if ego is None:
         return int(rng.integers(0, len(ACTIONS)))
     stats = merge_local_stats(ego, list(context.get("vehicles") or []), cfg)
+    if stats.ego_on_auxiliary and stats.merge_distance <= merge_zone_distance(cfg):
+        if 6.0 <= stats.target_lane_gap <= 14.0:
+            return int(rng.choice([LEFT_ACCELERATE, LEFT_HOLD, KEEP_ACCELERATE, KEEP_HOLD]))
+        if stats.target_lane_gap < 18.0:
+            return int(rng.choice([LEFT_ACCELERATE, LEFT_HOLD, KEEP_ACCELERATE]))
     if stats.in_merge_zone and stats.target_lane_gap < 18.0:
         return int(rng.choice([KEEP_ACCELERATE, KEEP_ACCELERATE, KEEP_HOLD]))
     if stats.ego_on_ramp and stats.merge_distance <= merge_zone_distance(cfg) * 1.5:

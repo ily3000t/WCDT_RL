@@ -50,6 +50,8 @@ def run(cfg) -> Path:
         "lane_oob_risk": [],
         "candidate_legal": [],
         "traffic_risk": [],
+        "continuous_risk_target": [],
+        "boundary_sample": [],
         "risk_sample_weight": [],
         "episode_id": [],
         "candidate_transition_id": [],
@@ -58,14 +60,23 @@ def run(cfg) -> Path:
         "candidate_target_lane_gap": [],
         "candidate_ramp_local_risk": [],
         "candidate_merge_zone_risk": [],
+        "candidate_taper_miss": [],
+        "candidate_distance_to_taper": [],
+        "candidate_ego_on_auxiliary": [],
         "target_lane_gap": [],
         "ramp_local_risk": [],
         "merge_zone_risk": [],
+        "taper_miss": [],
+        "distance_to_taper": [],
+        "ego_on_auxiliary": [],
+        "curriculum_profiles": [],
         "sampling_modes": [],
     }
     history_samples: list[np.ndarray] = []
     future_samples: list[np.ndarray] = []
     agent_masks: list[np.ndarray] = []
+    agent_lane_indices: list[np.ndarray] = []
+    agent_edge_roles: list[np.ndarray] = []
     reports: list[dict] = []
     events_path = stage_dir / "risk_events.jsonl"
     replay_dir = stage_dir / "replay"
@@ -99,6 +110,10 @@ def run(cfg) -> Path:
                 transitions["target_lane_gap"].append(local.target_lane_gap)
                 transitions["ramp_local_risk"].append(float(local.ramp_local_risk))
                 transitions["merge_zone_risk"].append(float(local.merge_zone_risk))
+                transitions["taper_miss"].append(float(local.taper_miss))
+                transitions["distance_to_taper"].append(float(local.merge_distance))
+                transitions["ego_on_auxiliary"].append(float(local.ego_on_auxiliary))
+                transitions["curriculum_profiles"].append(str(context.get("curriculum_profile", "disabled")))
                 transitions["sampling_modes"].append(sampling_mode)
                 transition_id = len(transitions["executed_actions"]) - 1
                 for sample in candidate_samples:
@@ -109,6 +124,8 @@ def run(cfg) -> Path:
                     transitions["lane_oob_risk"].append(sample.lane_oob)
                     transitions["candidate_legal"].append(float(sample.candidate_legal))
                     transitions["traffic_risk"].append(sample.traffic_risk)
+                    transitions["continuous_risk_target"].append(sample.continuous_risk_target)
+                    transitions["boundary_sample"].append(float(sample.boundary_sample))
                     transitions["risk_sample_weight"].append(candidate_sample_weight(sample))
                     transitions["episode_id"].append(episode)
                     transitions["candidate_transition_id"].append(transition_id)
@@ -116,6 +133,9 @@ def run(cfg) -> Path:
                     transitions["candidate_target_lane_gap"].append(sample.local_stats.target_lane_gap)
                     transitions["candidate_ramp_local_risk"].append(float(sample.local_stats.ramp_local_risk))
                     transitions["candidate_merge_zone_risk"].append(float(sample.local_stats.merge_zone_risk))
+                    transitions["candidate_taper_miss"].append(float(sample.local_stats.taper_miss))
+                    transitions["candidate_distance_to_taper"].append(float(sample.distance_to_taper))
+                    transitions["candidate_ego_on_auxiliary"].append(float(sample.ego_on_auxiliary))
                 executed_sample = candidate_by_action.get(action)
                 executed_candidate_risk = float(executed_sample.overall_risk) if executed_sample is not None else 0.0
                 executed_candidate_legal = (
@@ -177,11 +197,13 @@ def run(cfg) -> Path:
                     notes={"episode_report": episode_report},
                 )
                 stage_log("stage1", f"episode={episode} replay={replay_dir / f'episode_{episode:04d}.json'}")
-            hist, fut, mask = env.trajectory_window_samples()
+            hist, fut, mask, lane_indices, edge_roles = env.trajectory_window_samples()
             if hist.shape[0] > 0:
                 history_samples.append(hist)
                 future_samples.append(fut)
                 agent_masks.append(mask)
+                agent_lane_indices.append(lane_indices)
+                agent_edge_roles.append(edge_roles)
     finally:
         env.close()
 
@@ -192,6 +214,8 @@ def run(cfg) -> Path:
         agent_history=np.concatenate(history_samples, axis=0) if history_samples else np.zeros((0, 1, 1, 5)),
         agent_future=np.concatenate(future_samples, axis=0) if future_samples else np.zeros((0, 1, 1, 5)),
         agent_mask=np.concatenate(agent_masks, axis=0) if agent_masks else np.zeros((0, 1)),
+        agent_lane_index=np.concatenate(agent_lane_indices, axis=0) if agent_lane_indices else np.zeros((0, 1), dtype=np.int64),
+        agent_edge_role=np.concatenate(agent_edge_roles, axis=0) if agent_edge_roles else np.zeros((0, 1), dtype=np.int64),
     )
     audit_report = None
     if bool(cfg.stage1.get("audit_enabled", True)):
@@ -202,6 +226,11 @@ def run(cfg) -> Path:
     lane_oob_risk = np.asarray(transitions["lane_oob_risk"], dtype=np.float32)
     candidate_legal = np.asarray(transitions["candidate_legal"], dtype=np.float32) > 0.5
     legal_risk = traffic_risk[candidate_legal]
+    continuous_risk = np.asarray(transitions["continuous_risk_target"], dtype=np.float32)
+    legal_continuous = continuous_risk[candidate_legal]
+    legal_boundary = legal_continuous[(legal_continuous >= 0.20) & (legal_continuous < 0.80)]
+    coverage = _continuous_risk_coverage(legal_continuous)
+    audit_gate = _stage1_audit_gate(cfg, len(transitions["actions"]), legal_boundary.shape[0], coverage)
     report = {
         "stage": "stage1",
         "run_id": cfg.run.run_id,
@@ -243,6 +272,11 @@ def run(cfg) -> Path:
                 if transitions["candidate_merge_zone_risk"]
                 else 0.0
             ),
+            "candidate_taper_miss_rate": (
+                float(np.mean(np.asarray(transitions["candidate_taper_miss"], dtype=np.float32)))
+                if transitions["candidate_taper_miss"]
+                else 0.0
+            ),
         },
         "risk_labels": {
             "overall_risk_semantics": "traffic_risk_only",
@@ -276,13 +310,74 @@ def run(cfg) -> Path:
                 for index in range(9)
             },
         },
+        "continuous_risk": {
+            **coverage,
+            "summary": _array_summary([float(item) for item in continuous_risk.tolist()]),
+            "legal_summary": _array_summary([float(item) for item in legal_continuous.tolist()]),
+            "distance_to_taper": _array_summary([float(item) for item in transitions["distance_to_taper"]]),
+            "taper_miss_rate": (
+                float(np.mean(np.asarray(transitions["taper_miss"], dtype=np.float32)))
+                if transitions["taper_miss"]
+                else 0.0
+            ),
+            "curriculum_profile_counts": {
+                str(profile): int(sum(1 for item in transitions["curriculum_profiles"] if item == profile))
+                for profile in sorted(set(transitions["curriculum_profiles"]))
+            },
+        },
+        "audit_gate": audit_gate,
         "metrics": aggregate_episode_reports(reports),
     }
     write_report(stage_dir / "stage1_report.json", report)
     tb.close()
     stage_log("stage1", f"buffer={output}")
     stage_log("stage1", f"report={stage_dir / 'stage1_report.json'}")
+    if not bool(audit_gate.get("passed", True)):
+        raise RuntimeError(f"Stage1 audit gate failed: {audit_gate}")
     return output
+
+
+def _continuous_risk_coverage(values: np.ndarray) -> dict:
+    values = np.asarray(values, dtype=np.float32)
+    if values.size == 0:
+        return {
+            "sample_count": 0,
+            "easy_safe_rate": 0.0,
+            "boundary_rate": 0.0,
+            "extreme_risk_rate": 0.0,
+            "boundary_sample_count": 0,
+        }
+    boundary = (values >= 0.20) & (values < 0.80)
+    return {
+        "sample_count": int(values.size),
+        "easy_safe_rate": float(np.mean(values < 0.20)),
+        "boundary_rate": float(np.mean(boundary)),
+        "extreme_risk_rate": float(np.mean(values >= 0.80)),
+        "boundary_sample_count": int(np.sum(boundary)),
+    }
+
+
+def _stage1_audit_gate(cfg, candidate_count: int, legal_boundary_count: int, coverage: dict) -> dict:
+    gate_cfg = cfg.stage1.get("audit_gate", {})
+    enabled = bool(gate_cfg.get("enabled", False))
+    smoke_skip = int(gate_cfg.get("smoke_skip_below_episodes", 0))
+    skipped = int(cfg.stage1.episodes) <= smoke_skip
+    checks = {
+        "candidate_samples": int(candidate_count) >= int(gate_cfg.get("min_candidate_samples", 0)),
+        "legal_boundary_samples": int(legal_boundary_count) >= int(gate_cfg.get("min_legal_boundary_samples", 0)),
+        "boundary_rate": float(coverage.get("boundary_rate", 0.0)) >= float(gate_cfg.get("min_boundary_rate", 0.0)),
+        "easy_safe_non_empty": float(coverage.get("easy_safe_rate", 0.0)) > 0.0,
+        "boundary_non_empty": int(coverage.get("boundary_sample_count", 0)) > 0,
+        "extreme_risk_non_empty": float(coverage.get("extreme_risk_rate", 0.0)) > 0.0,
+    }
+    return {
+        "enabled": enabled,
+        "skipped_for_smoke": skipped,
+        "passed": bool(not enabled or skipped or all(checks.values())),
+        "checks": checks,
+        "candidate_sample_count": int(candidate_count),
+        "legal_boundary_sample_count": int(legal_boundary_count),
+    }
 
 
 def main() -> None:

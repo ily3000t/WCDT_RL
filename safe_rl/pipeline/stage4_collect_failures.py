@@ -6,6 +6,7 @@ from pathlib import Path
 import numpy as np
 
 from safe_rl.pipeline.common import latest_stage_file, load_stage_config, make_env, parse_config_arg, write_report
+from safe_rl.pipeline.stage1_risk_probe import _continuous_risk_coverage
 from safe_rl.risk.merge_local import candidate_action_risk_samples, candidate_sample_weight, merge_local_stats
 from safe_rl.risk.risk_module import RiskModuleWrapper
 from safe_rl.rl.ppo import load_ppo
@@ -172,6 +173,8 @@ def run(cfg) -> Path:
         "lane_oob_risk": [],
         "candidate_legal": [],
         "traffic_risk": [],
+        "continuous_risk_target": [],
+        "boundary_sample": [],
         "risk_sample_weight": [],
         "episode_id": [],
         "candidate_transition_id": [],
@@ -180,9 +183,16 @@ def run(cfg) -> Path:
         "candidate_target_lane_gap": [],
         "candidate_ramp_local_risk": [],
         "candidate_merge_zone_risk": [],
+        "candidate_taper_miss": [],
+        "candidate_distance_to_taper": [],
+        "candidate_ego_on_auxiliary": [],
         "target_lane_gap": [],
         "ramp_local_risk": [],
         "merge_zone_risk": [],
+        "taper_miss": [],
+        "distance_to_taper": [],
+        "ego_on_auxiliary": [],
+        "curriculum_profiles": [],
     }
     reports: list[dict] = []
     shadow_records: list[dict] = []
@@ -243,6 +253,10 @@ def run(cfg) -> Path:
                 transitions["target_lane_gap"].append(local.target_lane_gap)
                 transitions["ramp_local_risk"].append(float(local.ramp_local_risk))
                 transitions["merge_zone_risk"].append(float(local.merge_zone_risk))
+                transitions["taper_miss"].append(float(local.taper_miss))
+                transitions["distance_to_taper"].append(float(local.merge_distance))
+                transitions["ego_on_auxiliary"].append(float(local.ego_on_auxiliary))
+                transitions["curriculum_profiles"].append(str(context.get("curriculum_profile", "disabled")))
                 transition_id = len(transitions["executed_actions"]) - 1
                 for sample in candidate_samples:
                     transitions["actions"].append(sample.action)
@@ -252,6 +266,8 @@ def run(cfg) -> Path:
                     transitions["lane_oob_risk"].append(sample.lane_oob)
                     transitions["candidate_legal"].append(float(sample.candidate_legal))
                     transitions["traffic_risk"].append(sample.traffic_risk)
+                    transitions["continuous_risk_target"].append(sample.continuous_risk_target)
+                    transitions["boundary_sample"].append(float(sample.boundary_sample))
                     transitions["risk_sample_weight"].append(candidate_sample_weight(sample))
                     transitions["episode_id"].append(episode)
                     transitions["candidate_transition_id"].append(transition_id)
@@ -259,6 +275,9 @@ def run(cfg) -> Path:
                     transitions["candidate_target_lane_gap"].append(sample.local_stats.target_lane_gap)
                     transitions["candidate_ramp_local_risk"].append(float(sample.local_stats.ramp_local_risk))
                     transitions["candidate_merge_zone_risk"].append(float(sample.local_stats.merge_zone_risk))
+                    transitions["candidate_taper_miss"].append(float(sample.local_stats.taper_miss))
+                    transitions["candidate_distance_to_taper"].append(float(sample.distance_to_taper))
+                    transitions["candidate_ego_on_auxiliary"].append(float(sample.ego_on_auxiliary))
                 if actual_overall > 0 or executed_candidate_risk > 0 or shadow_record or info.get("intervention"):
                     append_jsonl(
                         events_path,
@@ -321,6 +340,8 @@ def run(cfg) -> Path:
     lane_oob_risk = np.asarray(transitions["lane_oob_risk"], dtype=np.float32)
     candidate_legal = np.asarray(transitions["candidate_legal"], dtype=np.float32) > 0.5
     legal_risk = traffic_risk[candidate_legal]
+    continuous_risk = np.asarray(transitions["continuous_risk_target"], dtype=np.float32)
+    legal_continuous = continuous_risk[candidate_legal]
     report = {
         "stage": "stage4",
         "mode": mode,
@@ -369,6 +390,7 @@ def run(cfg) -> Path:
             "low_ttc": float(np.mean(risk_types[:, 2])) if risk_types.size else 0.0,
             "high_drac": float(np.mean(risk_types[:, 3])) if risk_types.size else 0.0,
             "merge_conflict": float(np.mean(risk_types[:, 4])) if risk_types.size else 0.0,
+            "taper_miss": float(np.mean(risk_types[:, 5])) if risk_types.size and risk_types.shape[1] > 5 else 0.0,
         },
         "candidate_action_risk_rate": {
             str(index): float(np.mean(overall_risk[actions == index])) if np.any(actions == index) else 0.0
@@ -399,6 +421,21 @@ def run(cfg) -> Path:
                 if transitions["candidate_merge_zone_risk"]
                 else 0.0
             ),
+            "candidate_taper_miss_rate": (
+                float(np.mean(np.asarray(transitions["candidate_taper_miss"], dtype=np.float32)))
+                if transitions["candidate_taper_miss"]
+                else 0.0
+            ),
+        },
+        "continuous_risk": {
+            **_continuous_risk_coverage(legal_continuous),
+            "distance_to_taper": _array_summary([float(item) for item in transitions["distance_to_taper"]]),
+            "taper_miss_rate": (
+                float(np.mean(np.asarray(transitions["taper_miss"], dtype=np.float32)))
+                if transitions["taper_miss"]
+                else 0.0
+            ),
+            "curriculum_profile_counts": dict(Counter(str(item) for item in transitions["curriculum_profiles"])),
         },
         "shadow_summary": _shadow_summary(shadow_records),
         "episodes": reports,

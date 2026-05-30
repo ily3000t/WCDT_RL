@@ -52,13 +52,24 @@ def drac(ego: VehicleState, other: VehicleState) -> float:
     return (closing_speed * closing_speed) / (2.0 * gap)
 
 
-def merge_gap(ego: VehicleState, vehicles: Iterable[VehicleState]) -> float:
-    if ego.edge_id != "ramp_in" and ego.edge_id != "main_out":
+def merge_gap(
+    ego: VehicleState,
+    vehicles: Iterable[VehicleState],
+    *,
+    ego_edges: Iterable[str] | None = None,
+    target_edges: Iterable[str] | None = None,
+    target_lane: int | None = None,
+) -> float:
+    configured_ego_edges = set(ego_edges or ("ramp_in", "main_out"))
+    configured_target_edges = set(target_edges or ("main_in", "main_out"))
+    if ego.edge_id not in configured_ego_edges:
         return INF_TTC
     same_target = [
         vehicle
         for vehicle in vehicles
-        if vehicle.vehicle_id != ego.vehicle_id and vehicle.edge_id in ("main_in", "main_out")
+        if vehicle.vehicle_id != ego.vehicle_id
+        and vehicle.edge_id in configured_target_edges
+        and (target_lane is None or int(vehicle.lane_index) == int(target_lane))
     ]
     if not same_target:
         return INF_TTC
@@ -75,6 +86,9 @@ def compute_step_metrics(
     drac_threshold: float = 3.35,
     hard_brake_threshold: float = -3.0,
     lane_oob: bool = False,
+    merge_ego_edges: Iterable[str] | None = None,
+    merge_target_edges: Iterable[str] | None = None,
+    merge_target_lane: int | None = None,
 ) -> StepMetrics:
     if ego is None:
         return StepMetrics(0.0, 0.0, INF_TTC, True, True, True, True, 0.0, lane_oob, False)
@@ -97,7 +111,15 @@ def compute_step_metrics(
         near_miss=bool(min_gap < near_miss_threshold),
         low_ttc=bool(min_ttc < ttc_threshold),
         high_drac=bool(max_drac > drac_threshold),
-        merge_gap=float(merge_gap(ego, others)),
+        merge_gap=float(
+            merge_gap(
+                ego,
+                others,
+                ego_edges=merge_ego_edges,
+                target_edges=merge_target_edges,
+                target_lane=merge_target_lane,
+            )
+        ),
         lane_oob=bool(lane_oob),
         hard_brake=bool(ego.accel < hard_brake_threshold),
     )

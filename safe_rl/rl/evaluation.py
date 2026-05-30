@@ -50,6 +50,7 @@ def evaluate_ppo(
         env = make_env(cfg, seed=seed, shield_enabled=shield_enabled, risk_checkpoint=risk_checkpoint)
         total_reward = 0.0
         actions: list[int] = []
+        executed_actions: list[int] = []
         try:
             obs, _info = env.reset(seed=seed)
             terminated = truncated = False
@@ -57,6 +58,7 @@ def evaluate_ppo(
                 action, _state = model.predict(obs, deterministic=True)
                 actions.append(int(action))
                 obs, reward, terminated, truncated, _info = env.step(int(action))
+                executed_actions.append(int(_info.get("final_action", action)))
                 total_reward += float(reward)
             report = env.episode_report()
             report["episode_reward"] = total_reward
@@ -80,6 +82,7 @@ def evaluate_ppo(
                     episode=episode_idx,
                     seed=int(seed),
                     actions=actions,
+                    executed_actions=executed_actions,
                     shield_enabled=shield_enabled,
                     risk_checkpoint=risk_checkpoint if shield_enabled else None,
                     model_path=str(model_path),

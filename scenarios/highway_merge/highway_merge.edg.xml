@@ -1,6 +1,7 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <edges>
-    <edge id="main_in" from="main_start" to="merge" numLanes="3" speed="33.33" priority="3"/>
-    <edge id="main_out" from="merge" to="main_end" numLanes="3" speed="33.33" priority="3"/>
-    <edge id="ramp_in" from="ramp_start" to="merge" numLanes="1" speed="22.22" priority="2"/>
+    <edge id="main_in" from="main_start" to="aux_start" numLanes="3" speed="33.33" priority="3"/>
+    <edge id="main_aux" from="aux_start" to="taper" numLanes="4" speed="33.33" priority="3"/>
+    <edge id="main_out" from="taper" to="main_end" numLanes="3" speed="33.33" priority="3"/>
+    <edge id="ramp_in" from="ramp_start" to="aux_start" numLanes="1" speed="22.22" priority="2"/>
 </edges>

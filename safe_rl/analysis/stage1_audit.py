@@ -9,7 +9,7 @@ import numpy as np
 from safe_rl.utils.io import write_json
 
 
-RISK_TYPE_NAMES = ["collision", "near_miss", "low_ttc", "high_drac", "merge_conflict"]
+RISK_TYPE_NAMES = ["collision", "near_miss", "low_ttc", "high_drac", "merge_conflict", "taper_miss"]
 
 
 def _quantiles(values: np.ndarray) -> dict[str, float]:
@@ -70,6 +70,13 @@ def audit_stage1_buffer(buffer_path: str | Path, output_dir: str | Path) -> dict
     lane_oob = label_arrays["lane_oob"]
     candidate_legal = label_arrays["candidate_legal"].astype(bool)
     legal_risk = risk[candidate_legal]
+    continuous_risk = (
+        data["continuous_risk_target"].astype(np.float32)
+        if "continuous_risk_target" in data
+        else risk.astype(np.float32)
+    )
+    legal_continuous = continuous_risk[candidate_legal]
+    boundary = (legal_continuous >= 0.20) & (legal_continuous < 0.80)
 
     action_hist = {str(idx): int(np.sum(actions == idx)) for idx in range(9)}
     per_action_risk_rate = {
@@ -122,6 +129,14 @@ def audit_stage1_buffer(buffer_path: str | Path, output_dir: str | Path) -> dict
         "reward": _quantiles(rewards),
         "risk_features": feature_stats,
         "trajectory_sample_count": int(data["agent_history"].shape[0]) if "agent_history" in data else 0,
+        "continuous_risk": {
+            "summary": _quantiles(continuous_risk),
+            "legal_summary": _quantiles(legal_continuous),
+            "easy_safe_rate": float(np.mean(legal_continuous < 0.20)) if legal_continuous.size else 0.0,
+            "boundary_rate": float(np.mean(boundary)) if legal_continuous.size else 0.0,
+            "extreme_risk_rate": float(np.mean(legal_continuous >= 0.80)) if legal_continuous.size else 0.0,
+            "boundary_sample_count": int(np.sum(boundary)),
+        },
     }
     if "executed_actions" in data:
         executed_actions = data["executed_actions"].astype(np.int64)
@@ -148,6 +163,15 @@ def audit_stage1_buffer(buffer_path: str | Path, output_dir: str | Path) -> dict
         report["candidate_ramp_local_risk_rate"] = float(np.mean(data["candidate_ramp_local_risk"].astype(np.float32)))
     if "candidate_merge_zone_risk" in data:
         report["candidate_merge_zone_risk_rate"] = float(np.mean(data["candidate_merge_zone_risk"].astype(np.float32)))
+    if "candidate_taper_miss" in data:
+        report["candidate_taper_miss_rate"] = float(np.mean(data["candidate_taper_miss"].astype(np.float32)))
+    if "distance_to_taper" in data:
+        report["distance_to_taper"] = _quantiles(data["distance_to_taper"].astype(np.float32))
+    if "curriculum_profiles" in data:
+        profiles = data["curriculum_profiles"].astype(str)
+        report["curriculum_profile_counts"] = {
+            profile: int(np.sum(profiles == profile)) for profile in sorted(set(profiles.tolist()))
+        }
 
     write_json(output_dir / "stage1_data_audit.json", report)
     with (output_dir / "stage1_action_histogram.csv").open("w", encoding="utf-8", newline="") as file:
@@ -156,7 +180,7 @@ def audit_stage1_buffer(buffer_path: str | Path, output_dir: str | Path) -> dict
         for action, count in action_hist.items():
             writer.writerow([action, count])
 
-    _try_write_plots(output_dir, actions, risk, rewards)
+    _try_write_plots(output_dir, actions, continuous_risk, rewards)
     return report
 
 

@@ -15,6 +15,10 @@ class SafetyShield:
         self.enabled = bool(config.shield.enabled)
         self.ranker = CandidateRiskRanker(config, risk_model)
         self.fallback_policy = FallbackPolicy()
+        self._emergency_saturated_count = 0
+
+    def reset_episode_state(self) -> None:
+        self._emergency_saturated_count = 0
 
     def select_action(self, raw_action: CandidateAction, context: dict[str, Any]) -> tuple[CandidateAction, dict[str, Any]]:
         raw_prediction = self.ranker.risk_model.predict(raw_action, context)
@@ -22,15 +26,17 @@ class SafetyShield:
         counts = candidate_legality_counts(context)
         ranked = self.ranker.rank(raw_action, context)
         best_candidate = ranked[0] if ranked else None
+        best_prediction = best_candidate[1] if best_candidate is not None else raw_prediction
         activation_threshold = float(
             self.config.shield.get("activation_risk_threshold", self.config.shield.risk_threshold)
         )
         emergency_triggered, emergency_reason = self._emergency_trigger(
             raw_prediction,
-            best_candidate[1] if best_candidate is not None else raw_prediction,
+            best_prediction,
             context,
         )
         if raw_legal and raw_prediction.risk_score < activation_threshold and not emergency_triggered:
+            self._reset_saturated_count()
             return raw_action, self._record(
                 raw_action,
                 raw_action,
@@ -43,8 +49,9 @@ class SafetyShield:
                 counts,
                 best_candidate,
                 emergency_trigger=False,
-            )
+        )
         if raw_legal and raw_prediction.risk_uncertainty >= float(self.config.shield.uncertainty_threshold) and not emergency_triggered:
+            self._reset_saturated_count()
             return raw_action, self._record(
                 raw_action,
                 raw_action,
@@ -65,6 +72,7 @@ class SafetyShield:
                 continue
             improves_enough = (not raw_legal) or prediction.risk_score <= raw_prediction.risk_score - margin
             if improves_enough and self._safe(prediction):
+                self._reset_saturated_count()
                 return candidate, self._record(
                     raw_action,
                     candidate,
@@ -78,6 +86,11 @@ class SafetyShield:
                     best_candidate,
                     emergency_trigger=False,
                 )
+
+        consecutive_triggered, consecutive_reason = self._update_saturated_count(raw_prediction, best_prediction)
+        if consecutive_triggered:
+            emergency_triggered = True
+            emergency_reason = consecutive_reason
 
         if emergency_triggered:
             emergency_action = self._select_emergency_action(context)
@@ -198,6 +211,38 @@ class SafetyShield:
             return True, "saturated_risk_watch_zone"
         return False, ""
 
+    def _required_saturated_steps(self) -> int:
+        return max(1, int(self.config.shield.get("emergency_saturated_consecutive_steps", 2)))
+
+    def _risks_saturated(self, raw_prediction: RiskPrediction, best_prediction: RiskPrediction) -> bool:
+        saturated = float(self.config.shield.get("emergency_saturated_risk_threshold", 0.99))
+        return (
+            float(raw_prediction.risk_score) >= saturated
+            and float(best_prediction.risk_score) >= saturated
+        )
+
+    def _reset_saturated_count(self) -> None:
+        self._emergency_saturated_count = 0
+
+    def _update_saturated_count(
+        self,
+        raw_prediction: RiskPrediction,
+        best_prediction: RiskPrediction,
+    ) -> tuple[bool, str]:
+        if (
+            not bool(self.config.shield.get("emergency_fallback_enabled", True))
+            or not bool(self.config.shield.get("emergency_saturated_consecutive_enabled", False))
+        ):
+            self._reset_saturated_count()
+            return False, ""
+        if not self._risks_saturated(raw_prediction, best_prediction):
+            self._reset_saturated_count()
+            return False, ""
+        self._emergency_saturated_count += 1
+        if self._emergency_saturated_count >= self._required_saturated_steps():
+            return True, "saturated_risk_consecutive"
+        return False, ""
+
     def _select_emergency_action(self, context: dict[str, Any]) -> CandidateAction | None:
         configured = self.config.shield.get("emergency_actions", ["keep_decelerate", "keep_hold"])
         names = [str(name) for name in configured]
@@ -257,4 +302,6 @@ class SafetyShield:
             "emergency_fallback": bool(emergency_fallback),
             "emergency_trigger": bool(emergency_trigger),
             "emergency_reason": str(emergency_reason),
+            "emergency_saturated_count": int(self._emergency_saturated_count),
+            "emergency_saturated_required": int(self._required_saturated_steps()),
         }

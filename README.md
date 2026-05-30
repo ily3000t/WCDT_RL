@@ -140,7 +140,7 @@ Stage1 episodes:  50%|...
 [stage1] buffer=...
 ```
 
-Stage1 默认使用 mixed sampler：少量随机动作、主要 merge heuristic、部分 risk-seek 动作。风险 buffer 会对每个状态展开 9 个候选动作样本，风险标签重点关注 ego 从匝道汇入目标主路 lane 2 的 front/rear gap、ramp 局部 gap、merge-zone risk。审计会统计执行动作分布、候选动作风险分布、per-action risk rate、target-lane gap 分位数、risk type rate、reward 分布和 trajectory sample 数量。
+Stage1 默认使用 mixed sampler：少量随机动作、主要 merge heuristic、部分 risk-seek 动作。当前活动场景是单车道匝道进入 `main_aux lane 3`，再在 taper 前汇入目标主路 `lane 2`。风险 buffer 会对每个状态展开 9 个候选动作样本，风险标签重点关注 lane 2 front/rear gap、辅助车道局部 gap、距离 taper deadline 和 `taper_miss`。审计会统计执行动作分布、候选动作连续风险分布、boundary coverage、per-action risk rate、target-lane gap 分位数、risk type rate、curriculum profile 数量、reward 分布和 trajectory sample 数量。
 
 ### Stage2：WcDT-style Prediction + Risk Module 训练
 
@@ -165,7 +165,7 @@ safe_rl_output/runs/<run_id>/stage2/tensorboard/
 
 Stage2 的 WcDT-style predictor 会从 Stage1 trajectory windows 中划分 train/validation，按 validation `FDE + 0.5 * target_lane_gap_abs_error + 0.5 * future_min_distance_abs_error` 选择 best checkpoint。`wcdt_predictor_best.pt` 保存最佳权重；兼容路径 `wcdt_predictor.pt` 也写入同一 best 权重，避免后续 Stage3/Stage5 加载最后一个退化 epoch。
 
-Stage2 还会训练独立的 `wcdt_v2` residual-over-CV predictor。它不覆盖旧 WcDT，输入更偏 merge-centric：target lane 2 front/rear、ramp front/rear 和 nearest conflict vehicle。默认保存 3-model ensemble，`uncertainty` 来自 ensemble 方差。Risk Module validation 报告新增 legal candidate 上的 `ECE / Brier / NLL / reliability_bins`，并计算可选 temperature scaling 诊断；默认不把 calibration 写入 runtime，只有显式开启配置后 Shield 才使用 calibrated score。
+Stage2 还会训练独立的 `wcdt_v2` residual-over-CV predictor。它不覆盖旧 WcDT，输入更偏 merge-centric：target lane 2 front/rear、auxiliary lane 3 local、ramp local 和 nearest conflict vehicle。默认保存 3-model ensemble，`uncertainty` 来自 ensemble 方差。Risk Module 使用连续风险目标训练 risk head，并保留 6 类硬标签：`collision / near_miss / low_ttc / high_drac / merge_conflict / taper_miss`。validation 报告会输出 legal candidate 上的 boundary `ECE / Brier / NLL / reliability_bins`、中间分数区间占比和 ranking 诊断；默认不把 calibration 写入 runtime，只有显式开启配置后 Shield 才使用 calibrated score。
 
 说明：当前仓库没有预训练 WcDT checkpoint，因此默认从 SUMO 采集数据训练；如有外部权重，可在配置中设置：
 
@@ -305,9 +305,11 @@ shield:
   replacement_margin: 0.15
   allow_fallback: false
   emergency_fallback_enabled: true
+  emergency_saturated_consecutive_enabled: false
+  emergency_saturated_consecutive_steps: 2
 ```
 
-`emergency_fallback` 是独立的极端物理风险兜底，只在 `min_ttc <= 0.30`、`min_distance <= 1.0`，或 raw/best candidate 风险都饱和且进入 watch 区时触发。它优先选择合法的 `keep_decelerate` / `keep_hold`，并单独记录为 `emergency_fallback_count`，不会混入普通 `fallback_count`。
+`emergency_fallback` 是独立的极端物理风险兜底，只在 `min_ttc <= 0.30`、`min_distance <= 1.0`，或 raw/best candidate 风险都饱和且进入物理 watch 区时触发。它优先选择合法的 `keep_decelerate` / `keep_hold`，并单独记录为 `emergency_fallback_count`，不会混入普通 `fallback_count`。连续风险饱和提前触发逻辑仍保留为实验开关，但默认关闭，因为旧简化场景中它会破坏正常策略。
 
 如果只想做诊断，可以额外扫描更激进阈值：
 
@@ -325,7 +327,9 @@ python -m safe_rl.pipeline.stage5_shield_sweep --run-id $RUN_ID --include-calibr
 
 ## 一键顺序运行示例
 
-当前推荐实验顺序只包含三步：full pipeline、50-seed confirmatory、calibrated sweep。100-seed 复验、分层 confirmatory 和提高场景难度放到模型链路完全验证之后再做。
+当前活动 benchmark 已升级为真实辅助车道场景：`main_in(3 lanes) -> main_aux(4 lanes) -> main_out(3 lanes)`，匝道车辆先进入 `main_aux lane 3`，必须在 taper 前汇入相邻 `lane 2`。因此旧 zipper 地图的 run、checkpoint 和 replay 只能作为历史参考，不能与新结果直接横向比较，也不能复用。
+
+当前推荐实验顺序只包含三步：full pipeline、50-seed confirmatory、calibrated sweep。full runner 会在网络构建后把场景 XML、net 和 SUMO 配置复制到 `safe_rl_output/runs/<run_id>/scenario_snapshot/`，replay 同时记录 snapshot manifest 与 hash，保证后续能够定位具体地图版本。
 
 推荐直接使用全流程 runner。它会重建网络、做 SUMO smoke check、依次运行 Stage1/2/3/4、用 Stage4 buffer 重训 Risk Module，然后在同一份 Stage1/Stage4 数据、同一个 Risk Module、同一个 baseline PPO 上分别训练 CV forecast PPO 和 WcDT v2 forecast PPO，并完成多组 Stage5 paired evaluation：
 
@@ -333,6 +337,15 @@ python -m safe_rl.pipeline.stage5_shield_sweep --run-id $RUN_ID --include-calibr
 python -m safe_rl.pipeline.run_full_pipeline --run-id safe_rl_wcdt_v2_002 --forecast-sources constant_velocity,wcdt_v2
 python -m safe_rl.pipeline.stage5_confirmatory_eval --run-id safe_rl_wcdt_v2_002 --episodes 50
 python -m safe_rl.pipeline.stage5_shield_sweep --run-id safe_rl_wcdt_v2_002 --include-calibrated
+```
+
+新辅助车道 benchmark 的正式训练建议使用独立 run id，并提高 Stage1 边界样本覆盖：
+
+```powershell
+python -m safe_rl.pipeline.run_full_pipeline --run-id safe_rl_aux_curriculum_001 --stage1-episodes 1000 --ppo-timesteps 100000 --forecast-ppo-timesteps 100000 --forecast-sources constant_velocity,wcdt_v2 --forecast-ppo-profile shield_guided
+python -m safe_rl.pipeline.stage5_confirmatory_eval --run-id safe_rl_aux_curriculum_001 --episodes 50
+python -m safe_rl.pipeline.forecast_diagnostics --run-id safe_rl_aux_curriculum_001 --max-samples 512 --low-seed-count 5
+python -m safe_rl.pipeline.stage5_shield_sweep --run-id safe_rl_aux_curriculum_001 --include-calibrated
 ```
 
 默认 `--forecast-sources` 是 `constant_velocity,wcdt_v2`。旧 WcDT v1 不再默认运行；如果要保留 v1 对照，需要显式运行 `constant_velocity,wcdt` 或 `constant_velocity,wcdt,wcdt_v2`。如果只想跑其中一个 forecast 分支：
@@ -398,7 +411,7 @@ safe_rl_output/runs/<run_id>/stage5_confirmatory/generated_configs/stage5_confir
 主结果表建议同时报告四类指标：
 
 ```text
-Safety: collision_rate, near_miss_rate, proxy_collision_rate, safety_violation_rate, proxy_collision_count, safety_violation_count, min_distance_le_collision_threshold_count, min_distance_p1, ttc_p1, drac_p99_capped
+Safety: collision_rate, near_miss_rate, proxy_collision_rate, safety_violation_rate, taper_miss_rate, proxy_collision_count, safety_violation_count, taper_miss_count, min_distance_le_collision_threshold_count, min_distance_p1, ttc_p1, drac_p99_capped
 Task/Efficiency: merge_success_rate, completion_time_mean, completion_time_p95
 Driving Behavior: ego_speed_mean, ego_speed_p10, hard_brake_rate
 Shield: mean_actual_replacements, actual_replacement_rate, fallback_rate, emergency_fallback_count, emergency_fallback_rate
@@ -519,7 +532,7 @@ run:
 
 ## SUMO 回放与可视化
 
-Stage1、Stage4、Stage5 会默认写 replay JSON。它记录 seed、action 序列、shield 是否启用、risk checkpoint 和模型路径，用于重新启动 SUMO 回放同一段闭环过程。
+Stage1、Stage4、Stage5 会默认写 replay JSON。它记录 seed、PPO raw action 序列、Stage5 实际执行的 `executed_actions`、shield 是否启用、risk checkpoint、模型路径和场景 snapshot hash，用于重新启动 SUMO 回放同一段闭环过程。回放仍使用 raw actions 并重新运行 Shield；forecast behavior diagnostics 优先比较 `executed_actions`，避免把 Shield replacement 误报为动作一致。
 
 无 GUI 回放：
 
@@ -583,13 +596,19 @@ safe_rl_output/runs/<run_id>/stage1/audit/stage1_risk_distribution.png
 
 ```text
 action histogram
-overall risk rate
-collision / near-miss / low-TTC / high-DRAC / merge-conflict rate
+continuous risk mean / p05 / p50 / p95
+easy-safe / boundary / extreme-risk coverage
+legal boundary sample count
+collision / near-miss / low-TTC / high-DRAC / merge-conflict / taper-miss rate
+distance-to-taper summary
+safe / boundary / hard curriculum profile count
 reward 分位数
 risk feature 分位数
 每个 episode 的 transition 数
 trajectory sample 数
 ```
+
+正式 Stage1 在进入 Stage2 前会执行 audit gate：候选样本数不少于 `100000`、合法 boundary 样本不少于 `10000`、boundary rate 不低于 `0.15`，并且 safe / boundary / extreme 三类都非空。`stage1.episodes <= 20` 的短 smoke 流程会跳过该 gate，仅用于检查链路。
 
 如果只想跳过审计：
 
@@ -618,15 +637,25 @@ python -m compileall safe_rl tests
 python -c "from safe_rl.utils.config import load_config; from safe_rl.sim.sumo_highway_merge_env import SumoHighwayMergeEnv; cfg=load_config(); cfg.scenario['episode_seconds']=1.0; env=SumoHighwayMergeEnv(cfg, seed=1); obs,_=env.reset(seed=1); obs,r,t,tr,info=env.step(4); env.close(); print(obs.shape, r, t, tr)"
 ```
 
+辅助车道场景的短链路 full runner smoke：
+
+```powershell
+python -m safe_rl.pipeline.run_full_pipeline --run-id safe_rl_aux_smoke --stage1-episodes 10 --stage4-episodes 2 --stage5-episodes 2 --ppo-timesteps 128 --forecast-ppo-timesteps 128 --forecast-sources constant_velocity,wcdt_v2 --forecast-ppo-profile shield_guided
+```
+
+该命令会跳过正式 Stage1 audit gate。正式实验必须重新使用足够多的 Stage1 episodes，并检查 audit gate 通过。
+
 ## 关键实现说明
 
-- `ego` 已改为匝道车辆，merge success 定义为进入 `main_out` 并超过配置中的 `success_min_x`。
-- 当前 `highway_merge.rou.xml` 已使用更高难度交通流：合流目标车道 lane 2 为 `1350 veh/h`，lane 1 为 `1150 veh/h`，lane 0 为 `900 veh/h`，匝道为 `650 veh/h`；地图长度和连接关系不变。
+- 当前地图为 `main_in(3 lanes) -> main_aux(4 lanes) -> main_out(3 lanes)`；`ramp_in(1 lane)` 接入 `main_aux lane 3`，该辅助车道在 taper 后消失。
+- `ego` 从匝道出发，merge success 定义为进入 `main_out` 并超过配置中的 `success_min_lane_position=40m`。如果 ego 接近 `main_aux` 末端仍停留在辅助 `lane 3`，episode 以 `taper_miss` 失败结束。
+- ego 使用 `ego_lane_change_mode=512` 禁用 SUMO 自主战略换道，仅保留 TraCI 动作请求与安全约束，避免仿真器绕过 PPO 横向决策完成合流。
+- 当前 `highway_merge.rou.xml` 使用较高流量：合流目标车道 lane 2 为 `1350 veh/h`，lane 1 为 `1150 veh/h`，lane 0 为 `900 veh/h`，匝道为 `650 veh/h`。每个 episode 还会按 SUMO seed 选择 `safe / boundary / hard` curriculum，对 ego、lane 2 gap seeds 和辅助车道周车做可复现的位置与速度扰动。
 - 离散动作空间共 9 个动作：`lateral_cmd {-1,0,+1} x accel_cmd {-1,0,+1}`。
 - PPO observation 默认包含 ego 状态、top-k 周车相对状态、merge 几何；启用 forecast features 后拼接低维预测风险特征。
-- Risk Module 同时使用显式物理风险特征和学习型 MLP 风险头。
+- Risk Module 同时使用显式物理风险特征和学习型 MLP 风险头；risk head 学习连续风险目标，type head 保留 6 类硬事件。`lane_oob` 仍作为 legality hard filter，不混入交通风险。
 - Shield V2 默认只在 raw action 风险高于 `activation_risk_threshold=0.90`、候选动作风险至少降低 `replacement_margin=0.15` 且 uncertainty 低于阈值时替换；`allow_fallback=false`，没有明显更安全候选动作时继续执行 raw action。
-- `emergency_fallback` 不是普通 fallback 的恢复，而是极端物理危险下的低频 backstop；报告中应同时看 `fallback_rate == 0` 和 `emergency_fallback_rate` 是否低频。
+- `emergency_fallback` 不是普通 fallback 的恢复，而是极端物理危险下的低频 backstop；连续风险饱和提前触发默认关闭。报告中应同时看 `fallback_rate == 0` 和 `emergency_fallback_rate` 是否低频。
 
 ## 原始 WcDT 说明
 

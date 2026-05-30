@@ -77,7 +77,7 @@ def _prediction_loss_summary(history: list[float] | None) -> dict | None:
     }
 
 
-LANE_CENTERS = {0: -8.0, 1: -4.8, 2: -1.6}
+LANE_CENTERS = {0: -8.0, 1: -4.8, 2: -1.6, 3: 1.6}
 
 
 def _prediction_val_score(metrics: dict[str, Any], cfg: Any) -> float:
@@ -183,6 +183,8 @@ def _merge_risk_buffers(stage1_data: Any, stage4_data: Any | None) -> dict[str, 
         "lane_oob_risk",
         "candidate_legal",
         "traffic_risk",
+        "continuous_risk_target",
+        "boundary_sample",
         "risk_sample_weight",
         "candidate_transition_id",
         "candidate_raw_action",
@@ -200,10 +202,14 @@ def _has_key(data: Any, key: str) -> bool:
     return key in data.files if hasattr(data, "files") else key in data
 
 
-def _risk_training_arrays(data: Any) -> dict[str, np.ndarray]:
+def _risk_training_arrays(data: Any, risk_type_count: int = 6) -> dict[str, np.ndarray]:
     risk_features = np.asarray(data["risk_features"], dtype=np.float32)
     actions = np.asarray(data["actions"], dtype=np.int64)
     risk_types = np.asarray(data["risk_types"], dtype=np.float32)
+    if risk_types.ndim == 2 and risk_types.shape[1] < int(risk_type_count):
+        padded_types = np.zeros((risk_types.shape[0], int(risk_type_count)), dtype=np.float32)
+        padded_types[:, : risk_types.shape[1]] = risk_types
+        risk_types = padded_types
     if _has_key(data, "traffic_risk"):
         traffic_risk = np.asarray(data["traffic_risk"], dtype=np.float32)
     elif risk_types.ndim == 2 and risk_types.shape[1] > 0:
@@ -224,6 +230,14 @@ def _risk_training_arrays(data: Any) -> dict[str, np.ndarray]:
         sample_weight = np.asarray(data["risk_sample_weight"], dtype=np.float32)
     else:
         sample_weight = candidate_legal.astype(np.float32)
+    if _has_key(data, "continuous_risk_target"):
+        continuous_risk = np.asarray(data["continuous_risk_target"], dtype=np.float32)
+    else:
+        continuous_risk = traffic_risk.astype(np.float32)
+    if _has_key(data, "boundary_sample"):
+        boundary_sample = np.asarray(data["boundary_sample"], dtype=np.float32)
+    else:
+        boundary_sample = ((continuous_risk >= 0.20) & (continuous_risk < 0.80)).astype(np.float32)
     if _has_key(data, "candidate_transition_id"):
         transition_id = np.asarray(data["candidate_transition_id"], dtype=np.int64)
         transition_id_source = "explicit"
@@ -247,6 +261,8 @@ def _risk_training_arrays(data: Any) -> dict[str, np.ndarray]:
         "lane_oob_risk": lane_oob.astype(np.float32),
         "candidate_legal": candidate_legal.astype(np.float32),
         "traffic_risk": traffic_risk.astype(np.float32),
+        "continuous_risk_target": continuous_risk.astype(np.float32),
+        "boundary_sample": boundary_sample.astype(np.float32),
         "risk_sample_weight": sample_weight.astype(np.float32),
         "candidate_transition_id": transition_id.astype(np.int64),
         "candidate_raw_action": raw_actions.astype(np.int64),
@@ -309,6 +325,7 @@ def _risk_data_summary(arrays: dict[str, np.ndarray], sample_weight: np.ndarray)
     actions = arrays["actions"]
     legal = arrays["candidate_legal"] > 0.5
     risk = arrays["traffic_risk"]
+    continuous = arrays["continuous_risk_target"]
     lane_oob = arrays["lane_oob_risk"]
     weighted = sample_weight > 0.0
     return {
@@ -319,6 +336,8 @@ def _risk_data_summary(arrays: dict[str, np.ndarray], sample_weight: np.ndarray)
         "legal_candidate_risk_rate": float(np.mean(risk[legal])) if np.any(legal) else 0.0,
         "weighted_sample_rate": float(np.mean(weighted)) if weighted.size else 0.0,
         "weighted_positive_risk_rate": float(np.mean(risk[weighted])) if np.any(weighted) else 0.0,
+        "continuous_risk": _summary(continuous[legal] if np.any(legal) else continuous),
+        "continuous_risk_coverage": _continuous_risk_coverage(continuous[legal] if np.any(legal) else continuous),
         "traffic_risk_by_action": {
             str(index): float(np.mean(risk[actions == index])) if np.any(actions == index) else 0.0
             for index in range(9)
@@ -336,7 +355,7 @@ def _risk_ranking_summary(arrays: dict[str, np.ndarray], indices: np.ndarray, pr
     if indices.size == 0 or predictions.size == 0:
         return {"available": False, "reason": "no validation samples"}
     actions = arrays["actions"][indices]
-    risk = arrays["traffic_risk"][indices]
+    risk = arrays["continuous_risk_target"][indices]
     legal = arrays["candidate_legal"][indices] > 0.5
     transition_ids = arrays["candidate_transition_id"][indices]
     raw_actions = arrays["candidate_raw_action"][indices]
@@ -425,6 +444,56 @@ def _risk_validation_summary(pred: np.ndarray, target: np.ndarray, sample_weight
             float(np.mean(pred_label[legal_active] == target_label[legal_active])) if np.any(legal_active) else 0.0
         ),
         "mean_abs_calibration_error": float(np.mean(weighted_abs[active])) if np.any(active) else 0.0,
+        "prediction_distribution": _prediction_distribution(pred[active]),
+        "boundary": _boundary_validation_summary(pred[active], target[active]),
+    }
+
+
+def _continuous_risk_coverage(values: np.ndarray) -> dict[str, float | int]:
+    values = np.asarray(values, dtype=np.float32).reshape(-1)
+    if values.size == 0:
+        return {
+            "sample_count": 0,
+            "easy_safe_rate": 0.0,
+            "boundary_rate": 0.0,
+            "extreme_risk_rate": 0.0,
+            "boundary_sample_count": 0,
+        }
+    boundary = (values >= 0.20) & (values < 0.80)
+    return {
+        "sample_count": int(values.size),
+        "easy_safe_rate": float(np.mean(values < 0.20)),
+        "boundary_rate": float(np.mean(boundary)),
+        "extreme_risk_rate": float(np.mean(values >= 0.80)),
+        "boundary_sample_count": int(np.sum(boundary)),
+    }
+
+
+def _prediction_distribution(values: np.ndarray) -> dict[str, float | int]:
+    values = np.asarray(values, dtype=np.float32).reshape(-1)
+    if values.size == 0:
+        return {"sample_count": 0}
+    return {
+        "sample_count": int(values.size),
+        "lt_0_01_rate": float(np.mean(values < 0.01)),
+        "between_0_01_0_99_rate": float(np.mean((values >= 0.01) & (values <= 0.99))),
+        "gt_0_99_rate": float(np.mean(values > 0.99)),
+    }
+
+
+def _boundary_validation_summary(pred: np.ndarray, target: np.ndarray) -> dict[str, float | int]:
+    pred = np.asarray(pred, dtype=np.float32).reshape(-1)
+    target = np.asarray(target, dtype=np.float32).reshape(-1)
+    boundary = (target >= 0.20) & (target < 0.80)
+    if not np.any(boundary):
+        return {"sample_count": 0}
+    pred = np.clip(pred[boundary], 1.0e-6, 1.0 - 1.0e-6)
+    target = target[boundary]
+    return {
+        "sample_count": int(target.size),
+        "ece": float(np.mean(np.abs(pred - target))),
+        "brier": float(np.mean(np.square(pred - target))),
+        "nll": float(np.mean(-(target * np.log(pred) + (1.0 - target) * np.log(1.0 - pred)))),
     }
 
 
@@ -574,7 +643,7 @@ def _train_risk_module(
         return TensorDataset(
             torch.tensor(arrays["risk_features"][indices], dtype=torch.float32),
             torch.tensor(arrays["actions"][indices], dtype=torch.long),
-            torch.tensor(arrays["traffic_risk"][indices], dtype=torch.float32),
+            torch.tensor(arrays["continuous_risk_target"][indices], dtype=torch.float32),
             torch.tensor(arrays["risk_types"][indices], dtype=torch.float32),
             torch.tensor(sample_weight[indices], dtype=torch.float32),
             torch.tensor(arrays["candidate_legal"][indices], dtype=torch.float32),
@@ -594,6 +663,7 @@ def _train_risk_module(
         latent_dim=int(cfg.risk_module.latent_dim),
         action_embedding_dim=int(cfg.risk_module.action_embedding_dim),
         hidden_dim=int(cfg.risk_module.hidden_dim),
+        risk_type_count=int(cfg.risk_module.get("risk_type_count", 6)),
     ).to(device)
     optimizer = torch.optim.Adam(model.parameters(), lr=float(cfg.risk_module.learning_rate))
     weights = dict(cfg.risk_module.loss_weights)
@@ -680,7 +750,7 @@ def _train_risk_module(
             val_pred = model(val_x, val_actions)["risk_score"].detach().cpu().numpy()
         validation_summary = _risk_validation_summary(
             val_pred,
-            arrays["traffic_risk"][val_indices],
+            arrays["continuous_risk_target"][val_indices],
             sample_weight[val_indices],
             arrays["candidate_legal"][val_indices],
         )
@@ -689,14 +759,14 @@ def _train_risk_module(
             calibration_cfg = {}
         raw_calibration = _binary_calibration_summary(
             val_pred,
-            arrays["traffic_risk"][val_indices],
+            arrays["continuous_risk_target"][val_indices],
             sample_weight[val_indices],
             arrays["candidate_legal"][val_indices],
             bin_count=int(calibration_cfg.get("reliability_bins", 10)),
         )
         temperature_report = _temperature_scaling_diagnostics(
             val_pred,
-            arrays["traffic_risk"][val_indices],
+            arrays["continuous_risk_target"][val_indices],
             sample_weight[val_indices],
             arrays["candidate_legal"][val_indices],
             cfg,
@@ -1131,7 +1201,15 @@ def _build_wcdt_v2_loader(
         return None
     if indices.size == 0:
         return None
-    batch = build_v2_numpy_batch(cfg, data["agent_history"], data["agent_future"], data["agent_mask"], indices)
+    batch = build_v2_numpy_batch(
+        cfg,
+        data["agent_history"],
+        data["agent_future"],
+        data["agent_mask"],
+        indices,
+        lane_indices=data["agent_lane_index"] if "agent_lane_index" in data else None,
+        edge_roles=data["agent_edge_role"] if "agent_edge_role" in data else None,
+    )
     dataset = TensorDataset(
         torch.tensor(batch["features"], dtype=torch.float32),
         torch.tensor(batch["baseline"], dtype=torch.float32),

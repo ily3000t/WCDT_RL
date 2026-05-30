@@ -8,6 +8,19 @@ import numpy as np
 
 from safe_rl.sim.action_space import ACTIONS, CandidateAction
 from safe_rl.sim.metrics import INF_TTC, bbox_gap, compute_step_metrics, explicit_risk_features
+from safe_rl.sim.scenario_semantics import (
+    advance_route_state,
+    auxiliary_lane,
+    distance_to_taper,
+    is_auxiliary_edge,
+    is_mainline_edge,
+    is_ramp_edge,
+    is_taper_miss,
+    is_target_lane_edge,
+    merge_target_lane,
+    merge_zone_edges,
+    target_lane_edges,
+)
 from safe_rl.sim.types import StepMetrics, VehicleState
 
 
@@ -16,6 +29,7 @@ class MergeLocalStats:
     merge_distance: float
     in_merge_zone: bool
     ego_on_ramp: bool
+    ego_on_auxiliary: bool
     target_lane_id: int
     target_front_gap: float
     target_rear_gap: float
@@ -26,12 +40,14 @@ class MergeLocalStats:
     ramp_rear_gap: float
     ramp_local_risk: bool
     merge_zone_risk: bool
+    taper_miss: bool
 
     def to_dict(self) -> dict[str, float | bool | int]:
         return {
             "merge_distance": self.merge_distance,
             "in_merge_zone": self.in_merge_zone,
             "ego_on_ramp": self.ego_on_ramp,
+            "ego_on_auxiliary": self.ego_on_auxiliary,
             "target_lane_id": self.target_lane_id,
             "target_front_gap": self.target_front_gap,
             "target_rear_gap": self.target_rear_gap,
@@ -42,6 +58,7 @@ class MergeLocalStats:
             "ramp_rear_gap": self.ramp_rear_gap,
             "ramp_local_risk": self.ramp_local_risk,
             "merge_zone_risk": self.merge_zone_risk,
+            "taper_miss": self.taper_miss,
         }
 
 
@@ -55,14 +72,14 @@ class CandidateRiskSample:
     lane_oob: float
     candidate_legal: bool
     traffic_risk: float
+    continuous_risk_target: float
+    boundary_sample: bool
+    distance_to_taper: float
+    ego_on_auxiliary: bool
 
 
 def merge_x(config: Any) -> float:
     return float(config.scenario.get("merge_x", 220.0))
-
-
-def merge_target_lane(config: Any) -> int:
-    return int(config.scenario.get("merge_target_lane", 2))
 
 
 def merge_conflict_gap(config: Any) -> float:
@@ -98,7 +115,7 @@ def target_lane_neighbors(
         vehicle
         for vehicle in vehicles
         if vehicle.vehicle_id != ego.vehicle_id
-        and vehicle.edge_id in ("main_in", "main_out")
+        and is_target_lane_edge(config, vehicle.edge_id)
         and int(vehicle.lane_index) == lane
     ]
     front_gap = INF_TTC
@@ -123,14 +140,15 @@ def target_lane_neighbors(
     }
 
 
-def ramp_neighbors(ego: VehicleState | None, vehicles: list[VehicleState]) -> dict[str, float]:
+def ramp_neighbors(ego: VehicleState | None, vehicles: list[VehicleState], config: Any) -> dict[str, float]:
     if ego is None:
         return {"front_gap": INF_TTC, "rear_gap": INF_TTC}
     candidates = [
         vehicle
         for vehicle in vehicles
         if vehicle.vehicle_id != ego.vehicle_id
-        and vehicle.edge_id == "ramp_in"
+        and vehicle.edge_id == ego.edge_id
+        and (is_ramp_edge(config, vehicle.edge_id) or is_auxiliary_edge(config, vehicle.edge_id))
         and int(vehicle.lane_index) == int(ego.lane_index)
     ]
     front_gap = INF_TTC
@@ -156,6 +174,7 @@ def merge_local_stats(
             merge_distance=INF_TTC,
             in_merge_zone=False,
             ego_on_ramp=False,
+            ego_on_auxiliary=False,
             target_lane_id=lane,
             target_front_gap=INF_TTC,
             target_rear_gap=INF_TTC,
@@ -166,19 +185,21 @@ def merge_local_stats(
             ramp_rear_gap=INF_TTC,
             ramp_local_risk=False,
             merge_zone_risk=False,
+            taper_miss=False,
         )
     target = target_lane_neighbors(ego, vehicles, config)
-    ramp = ramp_neighbors(ego, vehicles)
-    distance = float(merge_x(config) - ego.x)
+    ramp = ramp_neighbors(ego, vehicles, config)
+    distance = float(distance_to_taper(config, ego))
     zone_distance = merge_zone_distance(config)
-    in_zone = ego.edge_id in ("ramp_in", "main_out") and -10.0 <= distance <= zone_distance
+    in_zone = ego.edge_id in set(merge_zone_edges(config)) and -10.0 <= distance <= zone_distance
     target_gap = min(float(target["front_gap"]), float(target["rear_gap"]))
     ramp_gap = min(float(ramp["front_gap"]), float(ramp["rear_gap"]))
     conflict_gap = merge_conflict_gap(config)
     return MergeLocalStats(
         merge_distance=distance,
         in_merge_zone=bool(in_zone),
-        ego_on_ramp=bool(ego.edge_id == "ramp_in"),
+        ego_on_ramp=bool(is_ramp_edge(config, ego.edge_id)),
+        ego_on_auxiliary=bool(is_auxiliary_edge(config, ego.edge_id)),
         target_lane_id=merge_target_lane(config),
         target_front_gap=float(target["front_gap"]),
         target_rear_gap=float(target["rear_gap"]),
@@ -187,8 +208,12 @@ def merge_local_stats(
         target_lane_gap=float(target_gap),
         ramp_front_gap=float(ramp["front_gap"]),
         ramp_rear_gap=float(ramp["rear_gap"]),
-        ramp_local_risk=bool(ego.edge_id == "ramp_in" and ramp_gap < conflict_gap),
+        ramp_local_risk=bool(
+            (is_ramp_edge(config, ego.edge_id) or is_auxiliary_edge(config, ego.edge_id))
+            and ramp_gap < conflict_gap
+        ),
         merge_zone_risk=bool(in_zone and target_gap < conflict_gap),
+        taper_miss=bool(is_taper_miss(config, ego)),
     )
 
 
@@ -223,7 +248,33 @@ def constant_velocity_rollout(vehicle: VehicleState, horizon_steps: int, dt: flo
     return states
 
 
-def rollout_ego(ego: VehicleState, action: CandidateAction, horizon_steps: int, dt: float) -> list[VehicleState]:
+def route_aware_constant_velocity_rollout(
+    vehicle: VehicleState,
+    horizon_steps: int,
+    dt: float,
+    config: Any,
+) -> tuple[list[VehicleState], bool]:
+    states: list[VehicleState] = []
+    current = vehicle
+    taper_miss = False
+    for _step in range(max(1, horizon_steps)):
+        current, step_taper_miss = advance_route_state(config, current, max(0.0, current.speed) * dt)
+        taper_miss = taper_miss or step_taper_miss
+        states.append(current)
+        if step_taper_miss:
+            break
+    while len(states) < max(1, horizon_steps):
+        states.append(states[-1])
+    return states, taper_miss
+
+
+def rollout_ego(
+    ego: VehicleState,
+    action: CandidateAction,
+    horizon_steps: int,
+    dt: float,
+    config: Any | None = None,
+) -> tuple[list[VehicleState], bool]:
     states: list[VehicleState] = []
     speed = float(ego.speed)
     x = float(ego.x)
@@ -232,13 +283,14 @@ def rollout_ego(ego: VehicleState, action: CandidateAction, horizon_steps: int, 
     lateral_velocity = float(action.lateral_cmd) * 0.6
     acceleration = float(action.accel_cmd) * 1.5
     lane_index = int(ego.lane_index) + int(action.lateral_cmd)
+    current = VehicleState(**{**ego.to_dict(), "lane_index": lane_index})
+    taper_miss = False
     for _step in range(max(1, horizon_steps)):
         speed = max(0.0, speed + acceleration * dt)
         x += speed * math.cos(float(ego.heading)) * dt
         y += speed * math.sin(float(ego.heading)) * dt + lateral_velocity * dt
         lane_pos += speed * dt
-        states.append(
-            VehicleState(
+        next_state = VehicleState(
                 vehicle_id=ego.vehicle_id,
                 x=float(x),
                 y=float(y),
@@ -252,8 +304,25 @@ def rollout_ego(ego: VehicleState, action: CandidateAction, horizon_steps: int, 
                 width=ego.width,
                 accel=acceleration,
             )
-        )
-    return states
+        if config is not None:
+            next_state, step_taper_miss = advance_route_state(
+                config,
+                current,
+                max(0.0, speed) * dt,
+                lane_index=current.lane_index,
+            )
+            next_state.x = float(x)
+            next_state.speed = float(speed)
+            next_state.accel = float(acceleration)
+            taper_miss = taper_miss or step_taper_miss
+        states.append(next_state)
+        current = next_state
+        lane_pos = float(next_state.lane_pos)
+        if taper_miss:
+            break
+    while len(states) < max(1, horizon_steps):
+        states.append(states[-1])
+    return states, taper_miss
 
 
 def _rollout_dt(config: Any) -> float:
@@ -284,6 +353,46 @@ def candidate_sample_weight(sample: CandidateRiskSample) -> float:
     return 1.0 if sample.candidate_legal else 0.0
 
 
+def continuous_risk_target(
+    metrics: StepMetrics,
+    stats: MergeLocalStats,
+    *,
+    taper_miss: bool = False,
+) -> float:
+    distance_severity = float(np.clip((5.0 - metrics.min_distance) / 5.0, 0.0, 1.0))
+    ttc_severity = float(np.clip((2.0 - metrics.min_ttc) / 2.0, 0.0, 1.0))
+    drac_severity = float(np.clip(metrics.max_drac / 20.0, 0.0, 1.0))
+    gap_severity = float(np.clip((12.0 - stats.target_lane_gap) / 12.0, 0.0, 1.0))
+    taper_severity = (
+        float(np.clip((40.0 - stats.merge_distance) / 40.0, 0.0, 1.0))
+        if stats.ego_on_auxiliary
+        else 0.0
+    )
+    score = float(
+        np.clip(
+            0.30 * distance_severity
+            + 0.25 * ttc_severity
+            + 0.15 * drac_severity
+            + 0.20 * gap_severity
+            + 0.10 * taper_severity,
+            0.0,
+            1.0,
+        )
+    )
+    floors = (
+        (metrics.collision, 1.00),
+        (metrics.near_miss, 0.90),
+        (metrics.low_ttc, 0.70),
+        (metrics.high_drac, 0.60),
+        (stats.merge_zone_risk, 0.55),
+        (taper_miss or stats.taper_miss, 0.95),
+    )
+    for active, floor in floors:
+        if active:
+            score = max(score, float(floor))
+    return float(np.clip(score, 0.0, 1.0))
+
+
 def evaluate_candidate_action_risk(action: CandidateAction, context: dict[str, Any]) -> CandidateRiskSample:
     ego = context.get("ego")
     config = context["config"]
@@ -294,20 +403,24 @@ def evaluate_candidate_action_risk(action: CandidateAction, context: dict[str, A
             action=action.index,
             features=np.ones((int(config.risk_module.explicit_feature_dim),), dtype=np.float32),
             overall_risk=1.0,
-            risk_types=np.asarray([0.0, 0.0, 0.0, 0.0, 1.0], dtype=np.float32),
+            risk_types=np.asarray([0.0, 0.0, 0.0, 0.0, 1.0, 0.0], dtype=np.float32),
             local_stats=stats,
             lane_oob=0.0,
             candidate_legal=False,
             traffic_risk=1.0,
+            continuous_risk_target=1.0,
+            boundary_sample=False,
+            distance_to_taper=stats.merge_distance,
+            ego_on_auxiliary=stats.ego_on_auxiliary,
         )
 
     candidate_legal = is_candidate_legal(action, context, missing_ego_is_legal=False)
     lane_oob = not candidate_legal
     horizon_steps = int(config.risk_module.get("collision_horizon_steps", 30))
     dt = _rollout_dt(config)
-    ego_rollout = rollout_ego(ego, action, horizon_steps, dt)
+    ego_rollout, ego_taper_miss = rollout_ego(ego, action, horizon_steps, dt, config)
     other_rollouts = [
-        constant_velocity_rollout(vehicle, horizon_steps, dt)
+        route_aware_constant_velocity_rollout(vehicle, horizon_steps, dt, config)[0]
         for vehicle in vehicles
         if vehicle.vehicle_id != ego.vehicle_id
     ]
@@ -320,6 +433,7 @@ def evaluate_candidate_action_risk(action: CandidateAction, context: dict[str, A
     low_ttc = False
     high_drac = False
     merge_conflict = False
+    taper_miss = bool(ego_taper_miss)
     best_stats = merge_local_stats(ego, vehicles, config)
     best_gap = best_stats.target_lane_gap
 
@@ -333,6 +447,9 @@ def evaluate_candidate_action_risk(action: CandidateAction, context: dict[str, A
             ttc_threshold=float(config.risk_module.ttc_threshold),
             drac_threshold=float(config.risk_module.drac_threshold),
             lane_oob=lane_oob,
+            merge_ego_edges=merge_zone_edges(config),
+            merge_target_edges=target_lane_edges(config),
+            merge_target_lane=merge_target_lane(config),
         )
         stats = merge_local_stats(ego_state, step_vehicles, config)
         if stats.target_lane_gap < best_gap:
@@ -346,6 +463,7 @@ def evaluate_candidate_action_risk(action: CandidateAction, context: dict[str, A
         low_ttc = low_ttc or metrics.low_ttc
         high_drac = high_drac or metrics.high_drac
         merge_conflict = merge_conflict or stats.merge_zone_risk
+        taper_miss = taper_miss or stats.taper_miss
 
     worst = StepMetrics(
         min_distance=float(min_distance),
@@ -366,10 +484,18 @@ def evaluate_candidate_action_risk(action: CandidateAction, context: dict[str, A
         padded[:limit] = features[:limit]
         features = padded
     risk_types = np.asarray(
-        [float(collision), float(near_miss), float(low_ttc), float(high_drac), float(merge_conflict)],
+        [
+            float(collision),
+            float(near_miss),
+            float(low_ttc),
+            float(high_drac),
+            float(merge_conflict),
+            float(taper_miss),
+        ],
         dtype=np.float32,
     )
     traffic_risk = float(np.max(risk_types))
+    continuous_target = continuous_risk_target(worst, best_stats, taper_miss=taper_miss)
     return CandidateRiskSample(
         action=action.index,
         features=features.astype(np.float32),
@@ -379,6 +505,10 @@ def evaluate_candidate_action_risk(action: CandidateAction, context: dict[str, A
         lane_oob=float(lane_oob),
         candidate_legal=bool(candidate_legal),
         traffic_risk=traffic_risk,
+        continuous_risk_target=continuous_target,
+        boundary_sample=bool(0.20 <= continuous_target < 0.80),
+        distance_to_taper=float(best_stats.merge_distance),
+        ego_on_auxiliary=bool(best_stats.ego_on_auxiliary),
     )
 
 

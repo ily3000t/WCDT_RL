@@ -76,6 +76,7 @@ def aggregate_episode_reports(reports: list[dict]) -> dict:
         [float(report.get("emergency_fallback_count", 0)) for report in reports],
         dtype=np.float32,
     )
+    taper_misses = np.asarray([float(bool(report.get("taper_miss", False))) for report in reports], dtype=np.float32)
     return {
         "episodes": len(reports),
         "collision_rate": float(np.mean(collisions)),
@@ -106,4 +107,6 @@ def aggregate_episode_reports(reports: list[dict]) -> dict:
         "emergency_fallback_rate": float(np.mean(emergency_fallbacks > 0)),
         "mean_emergency_fallbacks": float(np.mean(emergency_fallbacks)),
         "emergency_fallback_count": int(np.sum(emergency_fallbacks)),
+        "taper_miss_rate": float(np.mean(taper_misses)) if taper_misses.size else 0.0,
+        "taper_miss_count": int(np.sum(taper_misses)),
     }

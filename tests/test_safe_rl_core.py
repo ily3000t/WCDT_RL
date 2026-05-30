@@ -56,7 +56,13 @@ from safe_rl.prediction.wcdt_v2_predictor import (
     ordered_merge_local_indices,
 )
 from safe_rl.risk.candidate_risk_ranker import CandidateRiskRanker
-from safe_rl.risk.merge_local import candidate_action_risk_samples, is_candidate_legal, target_lane_neighbors
+from safe_rl.risk.merge_local import (
+    candidate_action_risk_samples,
+    continuous_risk_target,
+    is_candidate_legal,
+    route_aware_constant_velocity_rollout,
+    target_lane_neighbors,
+)
 from safe_rl.risk.risk_feature_extractor import extract_candidate_features
 from safe_rl.risk.risk_aggregator import aggregate_episode_reports
 from safe_rl.risk.risk_module import RiskPrediction, risk_loss
@@ -68,6 +74,8 @@ from safe_rl.sim.action_space import ACTIONS, decode_action
 from safe_rl.sim.history_buffer import HistoryBuffer
 from safe_rl.sim.metrics import compute_step_metrics
 from safe_rl.sim.scenario_validation import validate_scenario_geometry
+from safe_rl.sim.scenario_semantics import advance_route_state, is_taper_miss
+from safe_rl.sim.scenario_snapshot import snapshot_scenario
 from safe_rl.sim.sumo_highway_merge_env import SumoHighwayMergeEnv
 from safe_rl.sim.types import StepMetrics, VehicleState
 from safe_rl.utils.config import load_config
@@ -87,12 +95,29 @@ def test_metrics_detect_near_miss():
     assert metrics.near_miss
 
 
+def test_metrics_merge_gap_supports_auxiliary_corridor_and_target_lane_filter():
+    ego = VehicleState("ego", 100.0, 1.6, 0.0, 10.0, 3, "main_aux_3", 100.0, "main_aux")
+    target = VehicleState("target", 112.0, -1.6, 0.0, 10.0, 2, "main_aux_2", 112.0, "main_aux")
+    other_lane = VehicleState("other", 102.0, -4.8, 0.0, 10.0, 1, "main_aux_1", 102.0, "main_aux")
+    metrics = compute_step_metrics(
+        ego,
+        [ego, target, other_lane],
+        collision=False,
+        merge_ego_edges=["ramp_in", "main_aux"],
+        merge_target_edges=["main_in", "main_aux", "main_out"],
+        merge_target_lane=2,
+    )
+    assert metrics.merge_gap == pytest.approx(12.0)
+
+
 def test_scenario_validation_passes():
     cfg = load_config()
     report = validate_scenario_geometry(cfg.scenario.sumocfg)
     assert report["passed"], report["errors"]
     ego = next(item for item in report["seed_positions"] if item["vehicle_id"] == "ego")
     assert ego["first_edge"] == "ramp_in"
+    assert report["edge_lane_counts"] == {"main_aux": 4, "main_in": 3, "main_out": 3, "ramp_in": 1}
+    assert report["routes"]["route_ramp"] == ["ramp_in", "main_aux", "main_out"]
 
 
 def test_ramp_connection_targets_adjacent_main_lane():
@@ -101,16 +126,66 @@ def test_ramp_connection_targets_adjacent_main_lane():
     ramp_connection = next(
         connection
         for connection in root.findall("connection")
-        if connection.attrib.get("from") == "ramp_in" and connection.attrib.get("to") == "main_out"
+        if connection.attrib.get("from") == "ramp_in" and connection.attrib.get("to") == "main_aux"
     )
-    assert ramp_connection.attrib["toLane"] == "2"
+    assert ramp_connection.attrib["toLane"] == "3"
 
 
-def test_merge_junction_uses_zipper_right_of_way():
-    node_file = Path("scenarios/highway_merge/highway_merge.nod.xml")
-    root = ET.parse(node_file).getroot()
-    merge_node = next(node for node in root.findall("node") if node.attrib.get("id") == "merge")
-    assert merge_node.attrib["type"] == "zipper"
+def test_auxiliary_lane_drops_before_main_out():
+    con_file = Path("scenarios/highway_merge/highway_merge.con.xml")
+    root = ET.parse(con_file).getroot()
+    outgoing = [
+        connection
+        for connection in root.findall("connection")
+        if connection.attrib.get("from") == "main_aux" and connection.attrib.get("to") == "main_out"
+    ]
+    assert {connection.attrib["fromLane"] for connection in outgoing} == {"0", "1", "2"}
+
+
+def test_route_aware_rollout_enters_auxiliary_lane_and_detects_taper_miss():
+    cfg = load_config()
+    ramp = VehicleState("ego", -10.0, 1.6, 0.0, 20.0, 0, "ramp_in_0", 185.0, "ramp_in")
+    on_aux, missed = advance_route_state(cfg, ramp, 10.0)
+    assert on_aux.edge_id == "main_aux"
+    assert on_aux.lane_index == 3
+    assert not missed
+
+    near_taper = VehicleState("ego", 215.0, 1.6, 0.0, 20.0, 3, "main_aux_3", 218.0, "main_aux")
+    rollout, missed = route_aware_constant_velocity_rollout(near_taper, 3, 0.1, cfg)
+    assert missed
+    assert rollout[-1].edge_id == "main_aux"
+    assert rollout[-1].lane_index == 3
+
+
+def test_taper_miss_is_separate_from_lane_oob():
+    cfg = load_config()
+    ego = VehicleState("ego", 218.0, 1.6, 0.0, 12.0, 3, "main_aux_3", 218.0, "main_aux")
+    assert is_taper_miss(cfg, ego)
+    context = {"ego": ego, "vehicles": [ego], "config": cfg, "lane_count": 4}
+    keep = next(action for action in ACTIONS if action.name == "keep_hold")
+    assert is_candidate_legal(keep, context)
+
+
+def test_taper_miss_triggers_in_warning_zone_before_auxiliary_lane_end():
+    cfg = load_config()
+    ego = VehicleState("ego", 180.0, 1.6, 0.0, 25.0, 3, "main_aux_3", 180.0, "main_aux")
+    assert is_taper_miss(cfg, ego)
+
+
+def test_continuous_risk_target_increases_for_boundary_and_extreme_states():
+    cfg = load_config()
+    stats = SimpleNamespace(
+        target_lane_gap=20.0,
+        merge_distance=80.0,
+        ego_on_auxiliary=False,
+        merge_zone_risk=False,
+        taper_miss=False,
+    )
+    safe = StepMetrics(20.0, 5.0, 0.0, False, False, False, False, 20.0)
+    boundary = StepMetrics(4.0, 1.5, 2.0, False, False, False, False, 9.0)
+    extreme = StepMetrics(0.2, 0.2, 12.0, False, True, True, True, 3.0)
+    assert continuous_risk_target(safe, stats) < continuous_risk_target(boundary, stats)
+    assert continuous_risk_target(boundary, stats) < continuous_risk_target(extreme, stats)
 
 
 def test_route_file_uses_harder_traffic_distribution():
@@ -135,6 +210,16 @@ def test_route_file_uses_harder_traffic_distribution():
         if vehicle["route"] == "route_main" and vehicle["departLane"] == "2"
     ]
     assert len(target_lane_seeds) >= 3
+
+
+def test_scenario_snapshot_writes_hash_manifest(tmp_path):
+    cfg = load_config()
+    manifest = snapshot_scenario(cfg, tmp_path)
+    payload = json.loads(manifest.read_text(encoding="utf-8"))
+    names = {item["name"] for item in payload["files"]}
+    assert "highway_merge.net.xml" in names
+    assert "highway_merge.rou.xml" in names
+    assert all(len(item["sha256"]) == 64 for item in payload["files"])
 
 
 def test_stage1_mixed_sampler_configures_three_sources():
@@ -483,6 +568,86 @@ def test_shield_emergency_fallback_on_saturated_risk_watch_zone():
     assert record["replacement_reason"] == "emergency_fallback"
     assert record["emergency_reason"] == "saturated_risk_watch_zone"
     assert record["best_candidate_risk"] == pytest.approx(1.0)
+
+
+def test_shield_single_saturated_risk_step_does_not_trigger_consecutive_emergency():
+    cfg = _shield_cfg()
+    cfg.shield["emergency_saturated_consecutive_enabled"] = True
+    shield = SafetyShield(cfg, _StaticRiskModel({index: 1.0 for index in range(9)}))
+    raw = decode_action(4)
+    final, record = shield.select_action(raw, _shield_context(min_distance=5.0, min_ttc=5.0))
+    assert final.index == raw.index
+    assert record["replacement_reason"] == "fallback_disabled"
+    assert record["emergency_saturated_count"] == 1
+    assert record["emergency_saturated_required"] == 2
+    assert not record["emergency_fallback"]
+
+
+def test_shield_consecutive_saturated_emergency_is_disabled_by_default():
+    cfg = _shield_cfg()
+    assert not cfg.shield.emergency_saturated_consecutive_enabled
+    shield = SafetyShield(cfg, _StaticRiskModel({index: 1.0 for index in range(9)}))
+    raw = decode_action(4)
+    shield.select_action(raw, _shield_context(min_distance=5.0, min_ttc=5.0))
+    final, record = shield.select_action(raw, _shield_context(min_distance=5.0, min_ttc=5.0))
+    assert final.index == raw.index
+    assert record["replacement_reason"] == "fallback_disabled"
+    assert record["emergency_saturated_count"] == 0
+
+
+def test_shield_consecutive_saturated_risk_triggers_emergency():
+    cfg = _shield_cfg()
+    cfg.shield["emergency_saturated_consecutive_enabled"] = True
+    shield = SafetyShield(cfg, _StaticRiskModel({index: 1.0 for index in range(9)}))
+    raw = decode_action(4)
+    _first, first_record = shield.select_action(raw, _shield_context(min_distance=5.0, min_ttc=5.0))
+    final, record = shield.select_action(raw, _shield_context(min_distance=5.0, min_ttc=5.0))
+    assert first_record["replacement_reason"] == "fallback_disabled"
+    assert final.name == "keep_decelerate"
+    assert record["replacement_reason"] == "emergency_fallback"
+    assert record["emergency_reason"] == "saturated_risk_consecutive"
+    assert record["emergency_saturated_count"] == 2
+    assert record["emergency_saturated_required"] == 2
+
+
+def test_shield_saturated_counter_resets_when_risk_drops():
+    cfg = _shield_cfg()
+    cfg.shield["emergency_saturated_consecutive_enabled"] = True
+    risk_model = _StaticRiskModel({index: 1.0 for index in range(9)})
+    shield = SafetyShield(cfg, risk_model)
+    raw = decode_action(4)
+    _first, first_record = shield.select_action(raw, _shield_context(min_distance=5.0, min_ttc=5.0))
+    risk_model.scores = {4: 0.95, 5: 0.83}
+    final, record = shield.select_action(raw, _shield_context(min_distance=5.0, min_ttc=5.0))
+    assert first_record["emergency_saturated_count"] == 1
+    assert final.index == raw.index
+    assert record["replacement_reason"] == "fallback_disabled"
+    assert record["emergency_saturated_count"] == 0
+
+
+def test_shield_saturated_counter_resets_after_replacement():
+    cfg = _shield_cfg()
+    cfg.shield["emergency_saturated_consecutive_enabled"] = True
+    risk_model = _StaticRiskModel({index: 1.0 for index in range(9)})
+    shield = SafetyShield(cfg, risk_model)
+    raw = decode_action(4)
+    _first, first_record = shield.select_action(raw, _shield_context(min_distance=5.0, min_ttc=5.0))
+    risk_model.scores = {4: 0.95, 5: 0.40}
+    final, record = shield.select_action(raw, _shield_context(min_distance=5.0, min_ttc=5.0))
+    assert first_record["emergency_saturated_count"] == 1
+    assert final.index == 5
+    assert record["replacement_reason"] == "replacement"
+    assert record["emergency_saturated_count"] == 0
+
+
+def test_shield_reset_episode_state_clears_saturated_counter():
+    cfg = _shield_cfg()
+    cfg.shield["emergency_saturated_consecutive_enabled"] = True
+    shield = SafetyShield(cfg, _StaticRiskModel({index: 1.0 for index in range(9)}))
+    shield.select_action(decode_action(4), _shield_context(min_distance=5.0, min_ttc=5.0))
+    assert shield._emergency_saturated_count == 1
+    shield.reset_episode_state()
+    assert shield._emergency_saturated_count == 0
 
 
 def test_shield_emergency_action_must_be_legal():
@@ -859,6 +1024,8 @@ def test_episode_report_includes_efficiency_and_comfort_metrics():
     assert report["emergency_fallback_count"] == 1
     assert report["emergency_fallback_rate"] == 1.0
     assert report["shield_score_records"][0]["emergency_reason"] == "min_distance"
+    assert report["shield_score_records"][0]["emergency_saturated_count"] == 0
+    assert report["shield_score_records"][0]["emergency_saturated_required"] == 0
 
 
 def test_episode_report_defaults_efficiency_metrics_without_ego_samples():
@@ -875,6 +1042,45 @@ def test_episode_report_defaults_efficiency_metrics_without_ego_samples():
     assert report["proxy_collision_count"] == 0
     assert report["safety_violation_count"] == 0
     assert report["emergency_fallback_count"] == 0
+
+
+def test_env_reset_resets_shield_episode_state(monkeypatch):
+    class DummyShield:
+        def __init__(self):
+            self.calls = 0
+
+        def reset_episode_state(self):
+            self.calls += 1
+
+    cfg = load_config()
+    shield = DummyShield()
+    env = SumoHighwayMergeEnv(cfg, seed=1, shield=shield)
+    ego = VehicleState("ego", 0.0, 0.0, 0.0, 12.0, 0, "ramp_0", 10.0, "ramp_in")
+    monkeypatch.setattr(env, "_close_sumo", lambda: None)
+    monkeypatch.setattr(env, "_start_sumo", lambda: None)
+    monkeypatch.setattr(env, "_simulation_step", lambda: None)
+    monkeypatch.setattr(env, "_collect_states", lambda: [ego])
+    env.reset(seed=1)
+    assert shield.calls == 1
+
+
+def test_env_configures_ego_lane_change_mode_for_policy_control():
+    class DummyVehicleApi:
+        def __init__(self):
+            self.calls = []
+
+        def getIDList(self):
+            return ["ego"]
+
+        def setLaneChangeMode(self, vehicle_id, mode):
+            self.calls.append((vehicle_id, mode))
+
+    cfg = load_config()
+    env = SumoHighwayMergeEnv(cfg, seed=1)
+    vehicle_api = DummyVehicleApi()
+    env._traci = SimpleNamespace(vehicle=vehicle_api)
+    env._configure_ego_control()
+    assert vehicle_api.calls == [("ego", 512)]
 
 
 def test_safety_forecast_reward_profile_penalizes_tail_risk():
@@ -1139,6 +1345,22 @@ def test_full_pipeline_generated_configs_support_single_forecast_source(tmp_path
     )
 
 
+def test_full_pipeline_generated_configs_support_smoke_episode_overrides(tmp_path):
+    configs = build_generated_configs(
+        "safe_rl_smoke",
+        tmp_path,
+        stage1_episodes=2,
+        stage4_episodes=2,
+        stage5_episodes=2,
+    )
+    main = yaml.safe_load(configs["main"].read_text(encoding="utf-8"))
+    stage5 = yaml.safe_load(configs["stage5_multi_groups"].read_text(encoding="utf-8"))
+    assert main["stage1"]["episodes"] == 2
+    assert main["stage4"]["episodes"] == 2
+    assert stage5["stage5"]["episodes_per_group"] == 2
+    assert stage5["stage5"]["seeds"] == [1, 2]
+
+
 def test_legacy_wcdt_v1_forecast_config_still_loads():
     cfg = load_config("safe_rl/config/advanced/ppo_wcdt_v1_features_legacy.yaml")
     assert cfg.forecast_features.enabled is True
@@ -1320,7 +1542,10 @@ def test_forecast_behavior_diagnostics_supports_cv_vs_wcdt_v2(tmp_path, monkeypa
     replay_dir = tmp_path / "safe_rl_output" / "runs" / "safe_rl_behavior_test" / "stage5" / "replay"
     replay_dir.mkdir(parents=True)
     (replay_dir / "ppo_cv_features_seed_1.json").write_text(json.dumps({"actions": [4, 4, 5]}), encoding="utf-8")
-    (replay_dir / "ppo_wcdt_v2_features_seed_1.json").write_text(json.dumps({"actions": [4, 5, 5]}), encoding="utf-8")
+    (replay_dir / "ppo_wcdt_v2_features_seed_1.json").write_text(
+        json.dumps({"actions": [4, 4, 5], "executed_actions": [4, 5, 5]}),
+        encoding="utf-8",
+    )
     report = {
         "groups": {
             "ppo_cv_features": {"episodes": [{"seed": 1}]},

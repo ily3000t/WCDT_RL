@@ -5,6 +5,28 @@
   "passed": true,
   "errors": [],
   "warnings": [],
+  "edge_lane_counts": {
+    "main_aux": 4,
+    "main_in": 3,
+    "main_out": 3,
+    "ramp_in": 1
+  },
+  "routes": {
+    "route_main": [
+      "main_in",
+      "main_aux",
+      "main_out"
+    ],
+    "route_ramp": [
+      "ramp_in",
+      "main_aux",
+      "main_out"
+    ],
+    "route_aux": [
+      "main_aux",
+      "main_out"
+    ]
+  },
   "seed_positions": [
     {
       "vehicle_id": "ego",
@@ -13,8 +35,8 @@
       "first_edge": "ramp_in",
       "depart_time": 0.0,
       "depart_lane": 0,
-      "depart_pos": 25.0,
-      "edge_length": 158.35,
+      "depart_pos": 20.0,
+      "edge_length": 181.02,
       "vehicle_length": 4.8,
       "min_gap": 2.5
     },
@@ -25,8 +47,8 @@
       "first_edge": "main_in",
       "depart_time": 0.0,
       "depart_lane": 2,
-      "depart_pos": 150.0,
-      "edge_length": 206.89,
+      "depart_pos": 240.0,
+      "edge_length": 289.08,
       "vehicle_length": 4.8,
       "min_gap": 2.5
     },
@@ -37,8 +59,8 @@
       "first_edge": "main_in",
       "depart_time": 0.0,
       "depart_lane": 2,
-      "depart_pos": 118.0,
-      "edge_length": 206.89,
+      "depart_pos": 205.0,
+      "edge_length": 289.08,
       "vehicle_length": 4.8,
       "min_gap": 2.5
     },
@@ -49,8 +71,8 @@
       "first_edge": "main_in",
       "depart_time": 0.0,
       "depart_lane": 2,
-      "depart_pos": 82.0,
-      "edge_length": 206.89,
+      "depart_pos": 166.0,
+      "edge_length": 289.08,
       "vehicle_length": 4.8,
       "min_gap": 2.5
     },
@@ -61,8 +83,8 @@
       "first_edge": "main_in",
       "depart_time": 0.0,
       "depart_lane": 1,
-      "depart_pos": 140.0,
-      "edge_length": 206.89,
+      "depart_pos": 230.0,
+      "edge_length": 289.08,
       "vehicle_length": 4.8,
       "min_gap": 2.5
     },
@@ -73,8 +95,8 @@
       "first_edge": "main_in",
       "depart_time": 0.0,
       "depart_lane": 1,
-      "depart_pos": 90.0,
-      "edge_length": 206.89,
+      "depart_pos": 170.0,
+      "edge_length": 289.08,
       "vehicle_length": 4.8,
       "min_gap": 2.5
     },
@@ -85,8 +107,8 @@
       "first_edge": "main_in",
       "depart_time": 0.0,
       "depart_lane": 0,
-      "depart_pos": 110.0,
-      "edge_length": 206.89,
+      "depart_pos": 200.0,
+      "edge_length": 289.08,
       "vehicle_length": 4.8,
       "min_gap": 2.5
     },
@@ -97,8 +119,8 @@
       "first_edge": "ramp_in",
       "depart_time": 0.0,
       "depart_lane": 0,
-      "depart_pos": 92.0,
-      "edge_length": 158.35,
+      "depart_pos": 105.0,
+      "edge_length": 181.02,
       "vehicle_length": 4.8,
       "min_gap": 2.5
     },
@@ -109,8 +131,32 @@
       "first_edge": "ramp_in",
       "depart_time": 0.0,
       "depart_lane": 0,
-      "depart_pos": 4.0,
-      "edge_length": 158.35,
+      "depart_pos": 2.0,
+      "edge_length": 181.02,
+      "vehicle_length": 4.8,
+      "min_gap": 2.5
+    },
+    {
+      "vehicle_id": "auxiliary_front_seed",
+      "type_id": "car_ramp",
+      "route_id": "route_aux",
+      "first_edge": "main_aux",
+      "depart_time": 0.0,
+      "depart_lane": 3,
+      "depart_pos": 92.0,
+      "edge_length": 214.5,
+      "vehicle_length": 4.8,
+      "min_gap": 2.5
+    },
+    {
+      "vehicle_id": "auxiliary_rear_seed",
+      "type_id": "car_ramp",
+      "route_id": "route_aux",
+      "first_edge": "main_aux",
+      "depart_time": 0.0,
+      "depart_lane": 3,
+      "depart_pos": 34.0,
+      "edge_length": 214.5,
       "vehicle_length": 4.8,
       "min_gap": 2.5
     }

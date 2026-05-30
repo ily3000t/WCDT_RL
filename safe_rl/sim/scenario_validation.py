@@ -74,6 +74,17 @@ def validate_scenario_geometry(cfg_file: str | Path) -> dict[str, Any]:
     errors: list[str] = []
     warnings: list[str] = []
     seed_positions: list[dict[str, Any]] = []
+    edge_lane_counts = {edge_id: len(lanes) for edge_id, lanes in edges.items()}
+
+    if "main_aux" in edges:
+        expected_lane_counts = {"main_in": 3, "main_aux": 4, "main_out": 3, "ramp_in": 1}
+        for edge_id, expected in expected_lane_counts.items():
+            actual = edge_lane_counts.get(edge_id)
+            if actual != expected:
+                errors.append(f"edge {edge_id} expected {expected} lanes, got {actual}")
+        route_ramp = routes.get("route_ramp", [])
+        if route_ramp != ["ramp_in", "main_aux", "main_out"]:
+            errors.append(f"route_ramp expected ramp_in main_aux main_out, got {' '.join(route_ramp)}")
 
     for vehicle in route_root.findall("vehicle"):
         vehicle_id = vehicle.attrib.get("id", "")
@@ -131,6 +142,8 @@ def validate_scenario_geometry(cfg_file: str | Path) -> dict[str, Any]:
         "passed": not errors,
         "errors": errors,
         "warnings": warnings,
+        "edge_lane_counts": edge_lane_counts,
+        "routes": routes,
         "seed_positions": seed_positions,
     }
 

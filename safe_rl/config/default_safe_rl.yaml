@@ -19,6 +19,7 @@ scenario:
   net_file: "scenarios/highway_merge/highway_merge.net.xml"
   route_file: "scenarios/highway_merge/highway_merge.rou.xml"
   ego_id: "ego"
+  ego_lane_change_mode: 512
   sumo_binary: "sumo"
   sumo_start_retries: 5
   sumo_start_retry_delay: 0.25
@@ -28,8 +29,27 @@ scenario:
   top_k_neighbors: 5
   history_steps: 11
   forecast_horizon_steps: 30
+  ramp_edges: ["ramp_in"]
+  auxiliary_edges: ["main_aux"]
+  mainline_edges: ["main_in", "main_aux", "main_out"]
+  target_lane_edges: ["main_in", "main_aux", "main_out"]
+  merge_zone_edges: ["ramp_in", "main_aux"]
+  auxiliary_lane: 3
+  taper_edge: "main_aux"
+  taper_warning_distance: 40.0
+  taper_miss_distance: 40.0
   success_edge: "main_out"
-  success_min_x: 250.0
+  success_min_lane_position: 40.0
+  edge_lengths:
+    main_in: 300.0
+    ramp_in: 191.4
+    main_aux: 220.0
+    main_out: 240.0
+  lane_centers:
+    0: -8.0
+    1: -4.8
+    2: -1.6
+    3: 1.6
   merge_x: 220.0
   merge_target_lane: 2
   merge_zone_distance: 80.0
@@ -111,6 +131,7 @@ risk_module:
   hidden_dim: 128
   explicit_feature_dim: 8
   action_embedding_dim: 4
+  risk_type_count: 6
   collision_horizon_steps: 30
   collision_distance_threshold: 0.25
   near_miss_distance_threshold: 0.75
@@ -181,6 +202,8 @@ shield:
   emergency_watch_min_ttc: 0.75
   emergency_watch_min_distance: 2.0
   emergency_saturated_risk_threshold: 0.99
+  emergency_saturated_consecutive_enabled: false
+  emergency_saturated_consecutive_steps: 2
   emergency_actions: ["keep_decelerate", "keep_hold"]
   prefer_closest_safe_action: true
   filter_illegal_candidates: true
@@ -201,7 +224,28 @@ stage1:
   random_action_probability: 1.0
   output_name: "risk_probe_buffer.npz"
   audit_enabled: true
+  audit_gate:
+    enabled: true
+    smoke_skip_below_episodes: 20
+    min_candidate_samples: 100000
+    min_legal_boundary_samples: 10000
+    min_boundary_rate: 0.15
   replay_enabled: true
+  curriculum:
+    enabled: true
+    profiles:
+      safe:
+        probability: 0.20
+        position_jitter: 4.0
+        speed_jitter: 1.0
+      boundary:
+        probability: 0.60
+        position_jitter: 10.0
+        speed_jitter: 2.0
+      hard:
+        probability: 0.20
+        position_jitter: 14.0
+        speed_jitter: 3.0
 
 stage2:
   input_stage1: null

@@ -36,6 +36,7 @@ if torch is not None:
             latent_dim: int = 256,
             action_embedding_dim: int = 4,
             hidden_dim: int = 128,
+            risk_type_count: int = 6,
         ):
             super().__init__()
             self.action_embedding = nn.Embedding(9, action_embedding_dim)
@@ -47,7 +48,7 @@ if torch is not None:
                 nn.ReLU(inplace=True),
             )
             self.risk_head = nn.Linear(hidden_dim, 1)
-            self.type_head = nn.Linear(hidden_dim, 5)
+            self.type_head = nn.Linear(hidden_dim, int(risk_type_count))
             self.uncertainty_head = nn.Linear(hidden_dim, 1)
 
         def forward(self, explicit_features, action_index, latent=None, uncertainty=None):
@@ -107,13 +108,14 @@ class RiskModuleWrapper:
         if torch is None:
             raise ImportError("Loading learned risk checkpoints requires torch.")
         payload = torch.load(checkpoint, map_location="cpu")
+        state = payload["model_state_dict"] if isinstance(payload, dict) and "model_state_dict" in payload else payload
         model = RiskModule(
             explicit_dim=int(self.config.risk_module.explicit_feature_dim),
             latent_dim=int(self.config.risk_module.latent_dim),
             action_embedding_dim=int(self.config.risk_module.action_embedding_dim),
             hidden_dim=int(self.config.risk_module.hidden_dim),
+            risk_type_count=int(state.get("type_head.weight", torch.empty((6, 0))).shape[0]),
         )
-        state = payload["model_state_dict"] if isinstance(payload, dict) and "model_state_dict" in payload else payload
         model.load_state_dict(state)
         model.eval()
         self.model = model
@@ -175,8 +177,11 @@ def risk_loss(output: dict[str, Any], labels: dict[str, Any], weights: dict[str,
         F.binary_cross_entropy(output["risk_score"], target, reduction="none"),
         sample_weight,
     )
+    type_logits = output["risk_type_logits"]
+    type_targets = labels["risk_types"].float()
+    type_dim = min(int(type_logits.shape[-1]), int(type_targets.shape[-1]))
     type_loss = _weighted_mean(
-        F.binary_cross_entropy_with_logits(output["risk_type_logits"], labels["risk_types"].float(), reduction="none"),
+        F.binary_cross_entropy_with_logits(type_logits[..., :type_dim], type_targets[..., :type_dim], reduction="none"),
         sample_weight,
     )
     calib = _weighted_mean(
