@@ -5,13 +5,12 @@ from typing import Any
 import numpy as np
 
 from safe_rl.risk.merge_local import (
-    constant_velocity_rollout,
     merge_local_stats,
-    merge_target_lane,
     nearest_future_gap,
+    route_aware_constant_velocity_rollout,
 )
-from safe_rl.sim.metrics import INF_TTC, bbox_gap, drac, merge_gap, relative_ttc
-from safe_rl.sim.scenario_semantics import lane_center
+from safe_rl.sim.metrics import INF_TTC, bbox_gap, drac, relative_ttc
+from safe_rl.sim.scenario_semantics import is_target_lane, target_lane_center_at_x
 
 
 class ForecastFeatureAugmentor:
@@ -100,8 +99,11 @@ class ForecastFeatureAugmentor:
             return np.asarray([50.0, INF_TTC, 0.0, 0.0, 0.0, 50.0, 0.0, 0.0, 0.0, 0.0, 0.0], dtype=np.float32)
         horizon = int(self.config.forecast_features.get("horizon_steps", self.config.scenario.forecast_horizon_steps))
         dt = float(self.config.scenario.step_length)
-        ego_rollout = constant_velocity_rollout(ego, horizon, dt)
-        other_rollouts = [constant_velocity_rollout(other, horizon, dt) for other in others]
+        ego_rollout = route_aware_constant_velocity_rollout(ego, horizon, dt, self.config)[0]
+        other_rollouts = [
+            route_aware_constant_velocity_rollout(other, horizon, dt, self.config)[0]
+            for other in others
+        ]
         min_distance, min_ttc, max_drac, nearest_dx, nearest_dy = nearest_future_gap(ego_rollout, other_rollouts, dt)
         top_risks = []
         for rollout in other_rollouts:
@@ -114,7 +116,8 @@ class ForecastFeatureAugmentor:
             step_vehicles = [
                 rollout[step_idx]
                 for rollout in other_rollouts
-                if step_idx < len(rollout) and int(rollout[step_idx].lane_index) == merge_target_lane(self.config)
+                if step_idx < len(rollout)
+                and is_target_lane(self.config, rollout[step_idx].edge_id, rollout[step_idx].lane_index)
             ]
             stats = merge_local_stats(ego_state, step_vehicles, self.config)
             target_lane_gap = min(target_lane_gap, stats.target_lane_gap)
@@ -158,7 +161,7 @@ class ForecastFeatureAugmentor:
         top_risks: list[float] = []
         dt = float(self.config.scenario.step_length)
         horizon = int(min(trajectories.shape[-2], self.config.forecast_features.get("horizon_steps", trajectories.shape[-2])))
-        ego_rollout = constant_velocity_rollout(ego, horizon, dt)
+        ego_rollout = route_aware_constant_velocity_rollout(ego, horizon, dt, self.config)[0]
         target_lane_gap = forecast_target_lane_gap_from_trajectories(ego_rollout, trajectories, self.config)
         for traj in trajectories:
             agent_min = 50.0
@@ -243,7 +246,6 @@ def forecast_target_lane_gap_from_trajectories(
     horizon = min(int(ego_xy.shape[0]), int(trajectories.shape[1]))
     if horizon <= 0:
         return float(default_gap)
-    target_y = float(lane_center(config, merge_target_lane(config)))
     min_gap = float(default_gap)
     for step_idx in range(horizon):
         ego_x = float(ego_xy[step_idx, 0])
@@ -253,6 +255,7 @@ def forecast_target_lane_gap_from_trajectories(
         for traj in trajectories:
             x = float(traj[step_idx, 0])
             y = float(traj[step_idx, 1])
+            target_y = target_lane_center_at_x(config, x)
             if abs(y - target_y) > 2.0:
                 continue
             saw_target_lane_vehicle = True

@@ -7,6 +7,16 @@ from typing import Any
 import numpy as np
 
 from safe_rl.pipeline.common import latest_stage_file, load_stage_config, parse_config_arg, write_report
+from safe_rl.prediction.forecast_feature_augmentor import forecast_target_lane_gap_from_trajectories
+from safe_rl.sim.scenario_semantics import (
+    EDGE_ROLE_AUXILIARY,
+    EDGE_ROLE_RAMP,
+    EDGE_ROLE_TARGET,
+    distance_to_taper_for_position,
+    infer_lane_index,
+    is_ramp_side_y,
+    target_lane_center_at_x,
+)
 from safe_rl.utils.config import prepare_run_dir
 from safe_rl.utils.progress import TensorboardLogger, progress_iter, stage_log
 
@@ -77,9 +87,6 @@ def _prediction_loss_summary(history: list[float] | None) -> dict | None:
     }
 
 
-LANE_CENTERS = {0: -8.0, 1: -4.8, 2: -1.6, 3: 1.6}
-
-
 def _prediction_val_score(metrics: dict[str, Any], cfg: Any) -> float:
     fde = float(metrics.get("fde", {}).get("mean", 0.0))
     gap = float(metrics.get("target_lane_gap_abs_error", {}).get("mean", 0.0))
@@ -121,26 +128,35 @@ def _correlation(a_values: list[float], b_values: list[float]) -> float:
     return float(np.corrcoef(a, b)[0, 1])
 
 
-def _infer_lane_index(y: float) -> int:
-    return min(LANE_CENTERS, key=lambda lane: abs(float(y) - LANE_CENTERS[lane]))
-
-
-def _ordered_prediction_indices(cfg: Any, sample_history: np.ndarray, sample_mask: np.ndarray) -> list[int]:
+def _ordered_prediction_indices(
+    cfg: Any,
+    sample_history: np.ndarray,
+    sample_mask: np.ndarray,
+    lane_indices: np.ndarray | None = None,
+    edge_roles: np.ndarray | None = None,
+) -> list[int]:
     if sample_history.shape[0] <= 1:
         return []
     ego = sample_history[0, -1]
     ego_x = float(ego[0])
-    merge_x = float(cfg.scenario.get("merge_x", 220.0))
-    target_lane = int(cfg.scenario.get("merge_target_lane", 2))
-
     def _priority(agent_idx: int) -> tuple[float, float, float, int]:
         latest = sample_history[agent_idx, -1]
         x = float(latest[0])
         y = float(latest[1])
         dx = x - ego_x
-        lane = _infer_lane_index(y)
-        is_ramp_local = y > 0.5 and x < merge_x + 20.0
-        is_target_lane = (not is_ramp_local) and lane == target_lane
+        lane = infer_lane_index(cfg, y) if lane_indices is None else int(lane_indices[agent_idx])
+        role = 0 if edge_roles is None else int(edge_roles[agent_idx])
+        target_center = target_lane_center_at_x(cfg, x)
+        is_ramp_local = (
+            role in (EDGE_ROLE_RAMP, EDGE_ROLE_AUXILIARY)
+            if role > 0
+            else is_ramp_side_y(cfg, y) and distance_to_taper_for_position(cfg, x, y, lane) > 0.0
+        )
+        is_target_lane = (
+            role == EDGE_ROLE_TARGET
+            if role > 0
+            else (not is_ramp_local) and abs(y - target_center) <= 2.0
+        )
         if is_target_lane and dx >= 0.0:
             group = 0
         elif is_target_lane and dx < 0.0:
@@ -151,7 +167,7 @@ def _ordered_prediction_indices(cfg: Any, sample_history: np.ndarray, sample_mas
             group = 3
         else:
             group = 4
-        return (float(group), abs(dx), abs(y - LANE_CENTERS.get(target_lane, -1.6)), int(agent_idx))
+        return (float(group), abs(dx), abs(y - target_center), int(agent_idx))
 
     valid = [idx for idx in range(1, sample_history.shape[0]) if float(sample_mask[idx]) > 0.0]
     return sorted(valid, key=_priority)
@@ -843,7 +859,13 @@ def _build_wcdt_batch(
     other_mask = np.zeros((sample_indices.shape[0], max_other), dtype=np.float32)
 
     for output_idx, sample_idx in enumerate(sample_indices):
-        ordered_agents = _ordered_prediction_indices(cfg, history[sample_idx], mask[sample_idx])
+        ordered_agents = _ordered_prediction_indices(
+            cfg,
+            history[sample_idx],
+            mask[sample_idx],
+            None if "agent_lane_index" not in data else data["agent_lane_index"][sample_idx],
+            None if "agent_edge_role" not in data else data["agent_edge_role"][sample_idx],
+        )
         pred_agents = ordered_agents[:max_pred]
         leftover = [agent_idx for agent_idx in ordered_agents if agent_idx not in set(pred_agents)]
         leftover.sort(
@@ -951,20 +973,12 @@ def _future_min_distance(ego_future: np.ndarray, other_future: np.ndarray, other
 
 
 def _target_lane_gap(ego_future: np.ndarray, other_future: np.ndarray, other_mask: np.ndarray, cfg: Any) -> float:
-    target_y = LANE_CENTERS.get(int(cfg.scenario.get("merge_target_lane", 2)), -1.6)
-    min_gap = 1.0e6
-    horizon = min(ego_future.shape[0], other_future.shape[1])
-    for step_idx in range(horizon):
-        ego_x = float(ego_future[step_idx, 0])
-        for agent_idx in range(other_future.shape[0]):
-            if float(other_mask[agent_idx]) <= 0.0:
-                continue
-            x = float(other_future[agent_idx, step_idx, 0])
-            y = float(other_future[agent_idx, step_idx, 1])
-            if abs(y - target_y) > 2.0:
-                continue
-            min_gap = min(min_gap, max(0.0, abs(x - ego_x) - 4.8))
-    return float(min_gap)
+    return forecast_target_lane_gap_from_trajectories(
+        ego_future,
+        other_future[np.asarray(other_mask) > 0.0],
+        cfg,
+        default_gap=1.0e6,
+    )
 
 
 def _wcdt_validation_metrics(cfg: Any, model: Any, loader: Any, device: Any, pin_memory: bool) -> dict[str, Any]:

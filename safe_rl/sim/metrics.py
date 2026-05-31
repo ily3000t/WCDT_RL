@@ -59,6 +59,7 @@ def merge_gap(
     ego_edges: Iterable[str] | None = None,
     target_edges: Iterable[str] | None = None,
     target_lane: int | None = None,
+    target_lanes: dict[str, int] | None = None,
 ) -> float:
     configured_ego_edges = set(ego_edges or ("ramp_in", "main_out"))
     configured_target_edges = set(target_edges or ("main_in", "main_out"))
@@ -69,7 +70,11 @@ def merge_gap(
         for vehicle in vehicles
         if vehicle.vehicle_id != ego.vehicle_id
         and vehicle.edge_id in configured_target_edges
-        and (target_lane is None or int(vehicle.lane_index) == int(target_lane))
+        and (
+            int(vehicle.lane_index) == int(target_lanes[vehicle.edge_id])
+            if target_lanes is not None and vehicle.edge_id in target_lanes
+            else target_lane is None or int(vehicle.lane_index) == int(target_lane)
+        )
     ]
     if not same_target:
         return INF_TTC
@@ -89,6 +94,7 @@ def compute_step_metrics(
     merge_ego_edges: Iterable[str] | None = None,
     merge_target_edges: Iterable[str] | None = None,
     merge_target_lane: int | None = None,
+    merge_target_lanes: dict[str, int] | None = None,
 ) -> StepMetrics:
     if ego is None:
         return StepMetrics(0.0, 0.0, INF_TTC, True, True, True, True, 0.0, lane_oob, False)
@@ -118,6 +124,7 @@ def compute_step_metrics(
                 ego_edges=merge_ego_edges,
                 target_edges=merge_target_edges,
                 target_lane=merge_target_lane,
+                target_lanes=merge_target_lanes,
             )
         ),
         lane_oob=bool(lane_oob),

@@ -4,5 +4,5 @@
     <node id="aux_start" x="0.0" y="0.0" type="priority"/>
     <node id="taper" x="220.0" y="0.0" type="priority"/>
     <node id="main_end" x="460.0" y="0.0" type="priority"/>
-    <node id="ramp_start" x="-180.0" y="65.0" type="priority"/>
+    <node id="ramp_start" x="-180.0" y="-65.0" type="priority"/>
 </nodes>

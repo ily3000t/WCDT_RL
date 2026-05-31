@@ -14,11 +14,13 @@ from safe_rl.prediction.forecast_feature_augmentor import (
     forecast_target_lane_gap_from_trajectories,
 )
 from safe_rl.analysis.forecast_diagnostics import (
+    _constant_velocity_future as diagnostics_constant_velocity_future,
     _feature_source_summary,
     _forecast_behavior_diagnostics,
     _forecast_conclusion,
     _forecast_features_from_prediction,
     _policy_feature_sensitivity_from_actions,
+    _vector_to_state,
 )
 from safe_rl.pipeline.run_full_pipeline import build_generated_configs, resolve_forecast_sources
 from safe_rl.pipeline.common import write_report
@@ -32,6 +34,7 @@ from safe_rl.pipeline.stage2_train_prediction_risk import (
     _split_risk_indices,
     _temperature_scaled_probabilities,
     _temperature_scaling_diagnostics,
+    _target_lane_gap as stage2_target_lane_gap,
 )
 from safe_rl.pipeline.stage5_paired_eval import _build_acceptance, _build_paired_delta, _group_overrides, _select_eval_seeds
 from safe_rl.pipeline.stage5_confirmatory_eval import (
@@ -65,8 +68,8 @@ from safe_rl.risk.merge_local import (
 )
 from safe_rl.risk.risk_feature_extractor import extract_candidate_features
 from safe_rl.risk.risk_aggregator import aggregate_episode_reports
-from safe_rl.risk.risk_module import RiskPrediction, risk_loss
-from safe_rl.risk.stage1_sampling import configured_sampling_probs, sampling_summary, select_stage1_action
+from safe_rl.risk.risk_module import RiskModuleWrapper, RiskPrediction, risk_loss
+from safe_rl.risk.stage1_sampling import _merge_heuristic_action, configured_sampling_probs, sampling_summary, select_stage1_action
 from safe_rl.rl.evaluation import validate_model_env_observation_shape
 from safe_rl.rl.ppo import _checkpoint_selection_score, _checkpoint_selection_weights, _safety_score
 from safe_rl.shield.safety_shield import SafetyShield
@@ -74,7 +77,19 @@ from safe_rl.sim.action_space import ACTIONS, decode_action
 from safe_rl.sim.history_buffer import HistoryBuffer
 from safe_rl.sim.metrics import compute_step_metrics
 from safe_rl.sim.scenario_validation import validate_scenario_geometry
-from safe_rl.sim.scenario_semantics import advance_route_state, is_taper_miss
+from safe_rl.sim.scenario_semantics import (
+    EDGE_ROLE_AUXILIARY,
+    EDGE_ROLE_MAINLINE,
+    EDGE_ROLE_RAMP,
+    EDGE_ROLE_TARGET,
+    advance_route_state,
+    edge_length,
+    is_taper_miss,
+    lane_center,
+    lane_center_at_x,
+    target_lane_center_at_x,
+    target_lane_index,
+)
 from safe_rl.sim.scenario_snapshot import snapshot_scenario
 from safe_rl.sim.sumo_highway_merge_env import SumoHighwayMergeEnv
 from safe_rl.sim.types import StepMetrics, VehicleState
@@ -85,6 +100,8 @@ from safe_rl.utils.io import write_json
 def test_action_space_has_nine_actions():
     assert len(ACTIONS) == 9
     assert decode_action(4).name == "keep_hold"
+    assert decode_action(0).name == "right_decelerate"
+    assert decode_action(6).name == "left_decelerate"
 
 
 def test_metrics_detect_near_miss():
@@ -96,16 +113,16 @@ def test_metrics_detect_near_miss():
 
 
 def test_metrics_merge_gap_supports_auxiliary_corridor_and_target_lane_filter():
-    ego = VehicleState("ego", 100.0, 1.6, 0.0, 10.0, 3, "main_aux_3", 100.0, "main_aux")
-    target = VehicleState("target", 112.0, -1.6, 0.0, 10.0, 2, "main_aux_2", 112.0, "main_aux")
-    other_lane = VehicleState("other", 102.0, -4.8, 0.0, 10.0, 1, "main_aux_1", 102.0, "main_aux")
+    ego = VehicleState("ego", 100.0, 53.8, 0.0, 10.0, 0, "main_aux_0", 100.0, "main_aux")
+    target = VehicleState("target", 112.0, 57.0, 0.0, 10.0, 1, "main_aux_1", 112.0, "main_aux")
+    other_lane = VehicleState("other", 102.0, 60.2, 0.0, 10.0, 2, "main_aux_2", 102.0, "main_aux")
     metrics = compute_step_metrics(
         ego,
         [ego, target, other_lane],
         collision=False,
         merge_ego_edges=["ramp_in", "main_aux"],
         merge_target_edges=["main_in", "main_aux", "main_out"],
-        merge_target_lane=2,
+        merge_target_lane=1,
     )
     assert metrics.merge_gap == pytest.approx(12.0)
 
@@ -118,6 +135,13 @@ def test_scenario_validation_passes():
     assert ego["first_edge"] == "ramp_in"
     assert report["edge_lane_counts"] == {"main_aux": 4, "main_in": 3, "main_out": 3, "ramp_in": 1}
     assert report["routes"]["route_ramp"] == ["ramp_in", "main_aux", "main_out"]
+    assert {"from": "ramp_in", "to": "main_aux", "from_lane": 0, "to_lane": 0} in report["connections"]
+    assert not report["warnings"]
+    assert all(item["lateral_shift"] <= 0.5 for item in report["through_lane_lateral_shift"])
+    assert report["merge_side_consistency"]["ramp_connects_to_auxiliary_lane"]
+    assert report["target_seed_lane_consistency"]["target_seeds_consistent"]
+    assert report["auxiliary_drop_lane"]["drops_before_main_out"]
+    assert report["ramp_entry_angle"] <= 10.0
 
 
 def test_ramp_connection_targets_adjacent_main_lane():
@@ -128,7 +152,7 @@ def test_ramp_connection_targets_adjacent_main_lane():
         for connection in root.findall("connection")
         if connection.attrib.get("from") == "ramp_in" and connection.attrib.get("to") == "main_aux"
     )
-    assert ramp_connection.attrib["toLane"] == "3"
+    assert ramp_connection.attrib["toLane"] == "0"
 
 
 def test_auxiliary_lane_drops_before_main_out():
@@ -139,27 +163,96 @@ def test_auxiliary_lane_drops_before_main_out():
         for connection in root.findall("connection")
         if connection.attrib.get("from") == "main_aux" and connection.attrib.get("to") == "main_out"
     ]
-    assert {connection.attrib["fromLane"] for connection in outgoing} == {"0", "1", "2"}
+    assert {connection.attrib["fromLane"] for connection in outgoing} == {"1", "2", "3"}
+
+
+def test_scenario_semantics_use_generated_net_lane_geometry():
+    cfg = load_config()
+    assert edge_length(cfg, "main_aux", 0) == pytest.approx(214.50)
+    assert lane_center(cfg, 0, "main_aux", 100.0) == pytest.approx(53.8)
+    assert lane_center(cfg, 1, "main_aux", 100.0) == pytest.approx(57.0)
+    assert lane_center(cfg, 0, "main_out", 100.0) == pytest.approx(57.0)
+    assert target_lane_center_at_x(cfg, 400.0) == pytest.approx(57.0)
+
+
+def test_target_lane_mapping_tracks_same_physical_lane_across_edges():
+    cfg = load_config()
+    assert target_lane_index(cfg, "main_in") == 0
+    assert target_lane_index(cfg, "main_aux") == 1
+    assert target_lane_index(cfg, "main_out") == 0
+
+
+def test_route_aware_rollout_maps_through_lanes_across_edges():
+    cfg = load_config()
+    before_aux = VehicleState("main", 297.0, 57.0, 0.0, 20.0, 0, "main_in_0", edge_length(cfg, "main_in", 0) - 1.0, "main_in")
+    on_aux, missed = advance_route_state(cfg, before_aux, 2.0)
+    assert not missed
+    assert on_aux.edge_id == "main_aux"
+    assert on_aux.lane_index == 1
+
+    before_out = VehicleState("main", 515.0, 57.0, 0.0, 20.0, 1, "main_aux_1", edge_length(cfg, "main_aux", 1) - 1.0, "main_aux")
+    on_out, missed = advance_route_state(cfg, before_out, 2.0)
+    assert not missed
+    assert on_out.edge_id == "main_out"
+    assert on_out.lane_index == 0
+
+
+def test_forecast_gap_uses_aux_corridor_target_lane_not_auxiliary_lane():
+    cfg = load_config()
+    ego_rollout = np.asarray([[390.0, 53.8], [400.0, 53.8]], dtype=np.float32)
+    trajectories = np.asarray(
+        [
+            [[405.0, 57.0], [415.0, 57.0]],
+            [[392.0, 53.8], [402.0, 53.8]],
+        ],
+        dtype=np.float32,
+    )
+    assert forecast_target_lane_gap_from_trajectories(ego_rollout, trajectories, cfg) == pytest.approx(10.2)
+
+
+def test_stage2_target_lane_gap_uses_aux_corridor_target_lane_not_auxiliary_lane():
+    cfg = load_config()
+    ego_rollout = np.asarray([[390.0, 53.8], [400.0, 53.8]], dtype=np.float32)
+    trajectories = np.asarray(
+        [
+            [[405.0, 57.0], [415.0, 57.0]],
+            [[392.0, 53.8], [402.0, 53.8]],
+        ],
+        dtype=np.float32,
+    )
+    assert stage2_target_lane_gap(ego_rollout, trajectories, np.ones((2,), dtype=np.float32), cfg) == pytest.approx(10.2)
 
 
 def test_route_aware_rollout_enters_auxiliary_lane_and_detects_taper_miss():
     cfg = load_config()
-    ramp = VehicleState("ego", -10.0, 1.6, 0.0, 20.0, 0, "ramp_in_0", 185.0, "ramp_in")
+    ramp = VehicleState("ego", 290.0, 53.8, 0.0, 20.0, 0, "ramp_in_0", edge_length(cfg, "ramp_in", 0) - 5.0, "ramp_in")
     on_aux, missed = advance_route_state(cfg, ramp, 10.0)
     assert on_aux.edge_id == "main_aux"
-    assert on_aux.lane_index == 3
+    assert on_aux.lane_index == 0
     assert not missed
 
-    near_taper = VehicleState("ego", 215.0, 1.6, 0.0, 20.0, 3, "main_aux_3", 218.0, "main_aux")
+    near_taper = VehicleState("ego", 514.0, 53.8, 0.0, 20.0, 0, "main_aux_0", edge_length(cfg, "main_aux", 0) - 2.0, "main_aux")
     rollout, missed = route_aware_constant_velocity_rollout(near_taper, 3, 0.1, cfg)
     assert missed
     assert rollout[-1].edge_id == "main_aux"
-    assert rollout[-1].lane_index == 3
+    assert rollout[-1].lane_index == 0
+
+
+def test_route_aware_rollout_projects_cross_edge_position_from_net_geometry():
+    cfg = load_config()
+    ramp = VehicleState("ego", 290.0, 53.8, 0.0, 20.0, 0, "ramp_in_0", edge_length(cfg, "ramp_in", 0) - 5.0, "ramp_in")
+    on_aux, missed = advance_route_state(cfg, ramp, 10.0)
+    assert not missed
+    assert on_aux.edge_id == "main_aux"
+    assert on_aux.lane_index == 0
+    assert on_aux.lane_pos == pytest.approx(5.0, abs=0.05)
+    assert on_aux.x == pytest.approx(306.50, abs=0.10)
+    assert on_aux.y == pytest.approx(53.8)
 
 
 def test_taper_miss_is_separate_from_lane_oob():
     cfg = load_config()
-    ego = VehicleState("ego", 218.0, 1.6, 0.0, 12.0, 3, "main_aux_3", 218.0, "main_aux")
+    ego = VehicleState("ego", 514.0, 53.8, 0.0, 12.0, 0, "main_aux_0", edge_length(cfg, "main_aux", 0) - 2.0, "main_aux")
     assert is_taper_miss(cfg, ego)
     context = {"ego": ego, "vehicles": [ego], "config": cfg, "lane_count": 4}
     keep = next(action for action in ACTIONS if action.name == "keep_hold")
@@ -168,7 +261,7 @@ def test_taper_miss_is_separate_from_lane_oob():
 
 def test_taper_miss_triggers_in_warning_zone_before_auxiliary_lane_end():
     cfg = load_config()
-    ego = VehicleState("ego", 180.0, 1.6, 0.0, 25.0, 3, "main_aux_3", 180.0, "main_aux")
+    ego = VehicleState("ego", 500.0, 53.8, 0.0, 25.0, 0, "main_aux_0", edge_length(cfg, "main_aux", 0) - 20.0, "main_aux")
     assert is_taper_miss(cfg, ego)
 
 
@@ -196,18 +289,18 @@ def test_route_file_uses_harder_traffic_distribution():
     assert float(vtypes["car_ramp"]["sigma"]) == pytest.approx(0.50)
 
     flows = {item.attrib["id"]: item.attrib for item in root.findall("flow")}
-    assert int(flows["main_flow_left"]["vehsPerHour"]) == 1350
+    assert int(flows["main_flow_left"]["vehsPerHour"]) == 900
     assert int(flows["main_flow_mid"]["vehsPerHour"]) == 1150
-    assert int(flows["main_flow_right"]["vehsPerHour"]) == 900
+    assert int(flows["main_flow_right"]["vehsPerHour"]) == 1350
     assert int(flows["ramp_flow"]["vehsPerHour"]) == 650
-    assert flows["main_flow_left"]["departLane"] == "2"
+    assert flows["main_flow_right"]["departLane"] == "0"
 
     vehicles = {item.attrib["id"]: item.attrib for item in root.findall("vehicle")}
     assert vehicles["ego"]["route"] == "route_ramp"
     target_lane_seeds = [
         vehicle
         for vehicle in vehicles.values()
-        if vehicle["route"] == "route_main" and vehicle["departLane"] == "2"
+        if vehicle["route"] == "route_main" and vehicle["departLane"] == "0"
     ]
     assert len(target_lane_seeds) >= 3
 
@@ -234,12 +327,20 @@ def test_stage1_mixed_sampler_configures_three_sources():
     assert summary["proportions"]["risk_seek"] == pytest.approx(0.25)
 
 
-def test_target_lane_front_rear_gap_uses_lane_2_only():
+def test_stage1_merge_heuristic_uses_configured_right_onramp_direction():
     cfg = load_config()
-    ego = VehicleState("ego", 200.0, 0.0, 0.0, 20.0, 0, "ramp_0", 100.0, "ramp_in")
-    front = VehicleState("front", 215.0, 0.0, 0.0, 18.0, 2, "main_2", 215.0, "main_in")
-    rear = VehicleState("rear", 190.0, 0.0, 0.0, 22.0, 2, "main_2", 190.0, "main_in")
-    other_lane = VehicleState("other", 202.0, 0.0, 0.0, 18.0, 1, "main_1", 202.0, "main_in")
+    ego = VehicleState("ego", 400.0, 53.8, 0.0, 20.0, 0, "main_aux_0", 100.0, "main_aux")
+    action = decode_action(_merge_heuristic_action(cfg, {"ego": ego, "vehicles": [ego]}))
+    assert action.lateral_cmd == 1
+    assert action.name == "left_accelerate"
+
+
+def test_target_lane_front_rear_gap_uses_edge_specific_target_lane():
+    cfg = load_config()
+    ego = VehicleState("ego", 200.0, 20.0, 0.0, 20.0, 0, "ramp_0", 100.0, "ramp_in")
+    front = VehicleState("front", 215.0, 57.0, 0.0, 18.0, 0, "main_0", 215.0, "main_in")
+    rear = VehicleState("rear", 190.0, 57.0, 0.0, 22.0, 0, "main_0", 190.0, "main_in")
+    other_lane = VehicleState("other", 202.0, 60.2, 0.0, 18.0, 1, "main_1", 202.0, "main_in")
     gaps = target_lane_neighbors(ego, [ego, front, rear, other_lane], cfg)
     assert gaps["front_gap"] == pytest.approx(10.2)
     assert gaps["rear_gap"] == pytest.approx(5.2)
@@ -285,6 +386,15 @@ def test_extract_candidate_features_reflects_candidate_action():
     assert not np.allclose(keep, lateral_oob)
 
 
+def test_heuristic_risk_fallback_matches_configured_type_count_and_taper_miss():
+    cfg = load_config()
+    ego = VehicleState("ego", 500.0, 53.8, 0.0, 10.0, 0, "main_aux_0", 190.0, "main_aux")
+    context = {"ego": ego, "vehicles": [ego], "lane_count": 4, "config": cfg}
+    prediction = RiskModuleWrapper(cfg).predict(decode_action(4), context)
+    assert prediction.risk_type_logits.shape == (cfg.risk_module.risk_type_count,)
+    assert prediction.risk_type_logits[5] == pytest.approx(1.0)
+
+
 def test_constant_velocity_forecast_runs_without_checkpoint():
     cfg = load_config()
     cfg.forecast_features["enabled"] = True
@@ -299,11 +409,11 @@ def test_constant_velocity_forecast_runs_without_checkpoint():
 
 def test_wcdt_forecast_merge_gap_uses_target_lane_gap_not_min_distance():
     cfg = load_config()
-    ego = VehicleState("ego", 0.0, -1.6, 0.0, 0.0, 2, "main_2", 0.0, "main_in")
+    ego = VehicleState("ego", 0.0, 57.0, 0.0, 0.0, 0, "main_0", 0.0, "main_in")
     trajectories = np.zeros((3, 4, 5), dtype=np.float32)
-    trajectories[0, :, :2] = np.asarray([20.0, -1.6], dtype=np.float32)
-    trajectories[1, :, :2] = np.asarray([-12.0, -1.6], dtype=np.float32)
-    trajectories[2, :, :2] = np.asarray([2.0, -8.0], dtype=np.float32)
+    trajectories[0, :, :2] = np.asarray([20.0, 57.0], dtype=np.float32)
+    trajectories[1, :, :2] = np.asarray([-12.0, 57.0], dtype=np.float32)
+    trajectories[2, :, :2] = np.asarray([2.0, 63.4], dtype=np.float32)
     features = ForecastFeatureAugmentor(cfg)._from_prediction(
         ego,
         [],
@@ -324,11 +434,11 @@ def test_wcdt_forecast_merge_gap_uses_target_lane_gap_not_min_distance():
 
 def test_forecast_diagnostics_prediction_features_match_runtime_gap_semantics():
     cfg = load_config()
-    ego = VehicleState("ego", 0.0, -1.6, 0.0, 0.0, 2, "main_2", 0.0, "main_in")
+    ego = VehicleState("ego", 0.0, 57.0, 0.0, 0.0, 0, "main_0", 0.0, "main_in")
     trajectories = np.zeros((3, 4, 5), dtype=np.float32)
-    trajectories[0, :, :2] = np.asarray([20.0, -1.6], dtype=np.float32)
-    trajectories[1, :, :2] = np.asarray([-12.0, -1.6], dtype=np.float32)
-    trajectories[2, :, :2] = np.asarray([2.0, -8.0], dtype=np.float32)
+    trajectories[0, :, :2] = np.asarray([20.0, 57.0], dtype=np.float32)
+    trajectories[1, :, :2] = np.asarray([-12.0, 57.0], dtype=np.float32)
+    trajectories[2, :, :2] = np.asarray([2.0, 63.4], dtype=np.float32)
     runtime = ForecastFeatureAugmentor(cfg)._from_prediction(
         ego,
         [],
@@ -340,6 +450,33 @@ def test_forecast_diagnostics_prediction_features_match_runtime_gap_semantics():
     assert forecast_target_lane_gap_from_trajectories(np.zeros((4, 2), dtype=np.float32), trajectories, cfg) == pytest.approx(
         diagnostics[5]
     )
+
+
+def test_forecast_diagnostics_vector_to_state_uses_generated_auxiliary_geometry():
+    cfg = load_config()
+    state = _vector_to_state(
+        "aux",
+        np.asarray([310.48, 53.8, 0.0, 10.0, 0.0], dtype=np.float32),
+        cfg,
+        lane_index=0,
+        edge_role_id=EDGE_ROLE_AUXILIARY,
+    )
+    assert state.edge_id == "main_aux"
+    assert state.lane_pos == pytest.approx(8.98, abs=0.10)
+
+
+def test_forecast_diagnostics_cv_rollout_projects_ramp_vehicle_to_auxiliary_lane():
+    cfg = load_config()
+    rollout = diagnostics_constant_velocity_future(
+        np.asarray([298.0, 53.8, 0.0, 20.0, 0.0], dtype=np.float32),
+        1,
+        0.5,
+        cfg,
+        lane_index=0,
+        edge_role_id=EDGE_ROLE_RAMP,
+    )
+    assert rollout[0, 0] > 301.0
+    assert rollout[0, 1] == pytest.approx(53.8)
 
 
 def test_forecast_feature_summary_reports_gap_min_distance_equal_rate():
@@ -786,35 +923,64 @@ def test_stage2_wcdt_prediction_order_prioritizes_merge_local_agents():
     mask = np.ones((6,), dtype=np.float32)
     history[:, :, 3] = 20.0
     history[0, :, 0] = 200.0
-    history[0, :, 1] = 0.0
+    history[0, :, 1] = 20.0
     history[1, :, 0] = 212.0
-    history[1, :, 1] = -1.6
+    history[1, :, 1] = 57.0
     history[2, :, 0] = 190.0
-    history[2, :, 1] = -1.6
+    history[2, :, 1] = 57.0
     history[3, :, 0] = 205.0
-    history[3, :, 1] = 2.0
+    history[3, :, 1] = 20.0
     history[4, :, 0] = 201.0
-    history[4, :, 1] = -8.0
+    history[4, :, 1] = 60.2
     history[5, :, 0] = 260.0
-    history[5, :, 1] = -4.8
+    history[5, :, 1] = 63.4
     ordered = _ordered_prediction_indices(cfg, history, mask)
     assert ordered[:3] == [1, 2, 3]
+
+
+def test_stage2_legacy_wcdt_order_uses_serialized_edge_roles_for_auxiliary_lane():
+    cfg = load_config()
+    history = np.zeros((4, cfg.scenario.history_steps, 5), dtype=np.float32)
+    mask = np.ones((4,), dtype=np.float32)
+    history[:, :, 3] = 20.0
+    history[0, :, :2] = [400.0, 53.8]
+    history[1, :, :2] = [414.0, 57.0]
+    history[2, :, :2] = [402.0, 53.8]
+    history[3, :, :2] = [401.0, 60.2]
+    lane_indices = np.asarray([0, 1, 0, 2], dtype=np.int64)
+    edge_roles = np.asarray([EDGE_ROLE_AUXILIARY, EDGE_ROLE_TARGET, EDGE_ROLE_AUXILIARY, EDGE_ROLE_MAINLINE])
+    ordered = _ordered_prediction_indices(cfg, history, mask, lane_indices, edge_roles)
+    assert ordered == [1, 2, 3]
 
 
 def test_runtime_wcdt_adapter_prioritizes_target_lane_front_rear_and_ramp():
     cfg = load_config()
     history = HistoryBuffer(cfg.scenario.history_steps, max_agents=6)
     states = [
-        VehicleState("ego", 200.0, 2.0, 0.0, 20.0, 0, "ramp_0", 100.0, "ramp_in"),
-        VehicleState("target_front", 214.0, -1.6, 0.0, 20.0, 2, "main_2", 214.0, "main_in"),
-        VehicleState("target_rear", 190.0, -1.6, 0.0, 20.0, 2, "main_2", 190.0, "main_in"),
-        VehicleState("ramp_front", 208.0, 2.0, 0.0, 18.0, 0, "ramp_0", 108.0, "ramp_in"),
-        VehicleState("other_lane", 202.0, -8.0, 0.0, 20.0, 0, "main_0", 202.0, "main_in"),
+        VehicleState("ego", 200.0, 20.0, 0.0, 20.0, 0, "ramp_0", 100.0, "ramp_in"),
+        VehicleState("target_front", 214.0, 57.0, 0.0, 20.0, 0, "main_0", 214.0, "main_in"),
+        VehicleState("target_rear", 190.0, 57.0, 0.0, 20.0, 0, "main_0", 190.0, "main_in"),
+        VehicleState("ramp_front", 208.0, 20.0, 0.0, 18.0, 0, "ramp_0", 108.0, "ramp_in"),
+        VehicleState("other_lane", 202.0, 60.2, 0.0, 20.0, 1, "main_1", 202.0, "main_in"),
     ]
     for _ in range(cfg.scenario.history_steps):
         history.append(states)
     ordered = SumoWcDTAdapter(cfg)._ordered_agent_ids(history, "ego")
     assert ordered[:3] == ["target_front", "target_rear", "ramp_front"]
+
+
+def test_runtime_wcdt_adapter_keeps_auxiliary_neighbor_local_past_merge_x_fallback():
+    cfg = load_config()
+    history = HistoryBuffer(cfg.scenario.history_steps, max_agents=4)
+    states = [
+        VehicleState("ego", 400.0, 53.8, 0.0, 20.0, 0, "main_aux_0", 90.0, "main_aux"),
+        VehicleState("aux_front", 600.0, 53.8, 0.0, 18.0, 0, "main_aux_0", 110.0, "main_aux"),
+        VehicleState("other_lane", 402.0, 60.2, 0.0, 20.0, 2, "main_aux_2", 92.0, "main_aux"),
+    ]
+    for _ in range(cfg.scenario.history_steps):
+        history.append(states)
+    ordered = SumoWcDTAdapter(cfg)._ordered_agent_ids(history, "ego")
+    assert ordered[0] == "aux_front"
 
 
 def test_wcdt_v2_actor_selection_prioritizes_merge_local_agents():
@@ -823,17 +989,17 @@ def test_wcdt_v2_actor_selection_prioritizes_merge_local_agents():
     mask = np.ones((6,), dtype=np.float32)
     history[:, :, 3] = 20.0
     history[0, :, 0] = 200.0
-    history[0, :, 1] = 2.0
+    history[0, :, 1] = 20.0
     history[1, :, 0] = 214.0
-    history[1, :, 1] = -1.6
+    history[1, :, 1] = 57.0
     history[2, :, 0] = 190.0
-    history[2, :, 1] = -1.6
+    history[2, :, 1] = 57.0
     history[3, :, 0] = 208.0
-    history[3, :, 1] = 2.0
+    history[3, :, 1] = 20.0
     history[4, :, 0] = 202.0
-    history[4, :, 1] = -8.0
+    history[4, :, 1] = 60.2
     history[5, :, 0] = 260.0
-    history[5, :, 1] = -4.8
+    history[5, :, 1] = 63.4
     ordered = ordered_merge_local_indices(cfg, history, mask)
     assert ordered[:3] == [1, 2, 3]
 
@@ -846,15 +1012,15 @@ def test_wcdt_v2_batch_has_fixed_shape_and_cv_baseline():
     mask = np.ones((2, 5), dtype=np.float32)
     history[..., 3] = 10.0
     history[:, 0, :, 0] = 200.0
-    history[:, 0, :, 1] = 2.0
+    history[:, 0, :, 1] = 20.0
     history[:, 1, :, 0] = 212.0
-    history[:, 1, :, 1] = -1.6
+    history[:, 1, :, 1] = 57.0
     history[:, 2, :, 0] = 190.0
-    history[:, 2, :, 1] = -1.6
+    history[:, 2, :, 1] = 57.0
     history[:, 3, :, 0] = 208.0
-    history[:, 3, :, 1] = 2.0
+    history[:, 3, :, 1] = 20.0
     history[:, 4, :, 0] = 240.0
-    history[:, 4, :, 1] = -8.0
+    history[:, 4, :, 1] = 60.2
     batch = build_v2_numpy_batch(cfg, history, future, mask, np.asarray([0, 1], dtype=np.int64))
     assert batch["features"].shape == (2, 3, WCDT_V2_INPUT_DIM)
     assert batch["baseline"].shape == (2, 3, cfg.scenario.forecast_horizon_steps, 5)

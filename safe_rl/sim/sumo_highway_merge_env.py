@@ -21,16 +21,16 @@ from safe_rl.sim.gym_compat import gym, spaces
 from safe_rl.sim.history_buffer import HistoryBuffer
 from safe_rl.sim.metrics import INF_TTC, compute_step_metrics, explicit_risk_features
 from safe_rl.sim.scenario_semantics import (
-    auxiliary_lane,
     distance_to_taper,
     edge_role,
     is_auxiliary_edge,
     is_ramp_edge,
     is_taper_miss,
-    is_target_lane_edge,
+    is_target_lane,
     merge_target_lane,
     merge_zone_edges,
     target_lane_edges,
+    target_lane_mapping,
 )
 from safe_rl.sim.types import StepMetrics, VehicleState
 
@@ -196,6 +196,7 @@ class SumoHighwayMergeEnv(gym.Env):
             merge_ego_edges=merge_zone_edges(self.config),
             merge_target_edges=target_lane_edges(self.config),
             merge_target_lane=merge_target_lane(self.config),
+            merge_target_lanes=target_lane_mapping(self.config),
         )
         self._episode_metrics.append(metrics)
         if ego is not None:
@@ -457,7 +458,7 @@ class SumoHighwayMergeEnv(gym.Env):
                     state.length / 10.0,
                     state.width / 4.0,
                     float(is_ramp_edge(self.config, state.edge_id)),
-                    float(is_target_lane_edge(self.config, state.edge_id) or is_auxiliary_edge(self.config, state.edge_id)),
+                    float(is_target_lane(self.config, state.edge_id, state.lane_index) or is_auxiliary_edge(self.config, state.edge_id)),
                 ]
             )
         while len(neighbor_features) < self.top_k * 8:
@@ -716,6 +717,7 @@ class SumoHighwayMergeEnv(gym.Env):
                 merge_ego_edges=merge_zone_edges(self.config),
                 merge_target_edges=target_lane_edges(self.config),
                 merge_target_lane=merge_target_lane(self.config),
+                merge_target_lanes=target_lane_mapping(self.config),
             ) if ego is not None else None,
             "merge_local": local,
             "curriculum_profile": self._curriculum_profile,

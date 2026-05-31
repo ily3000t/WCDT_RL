@@ -14,22 +14,22 @@ from safe_rl.prediction.forecast_feature_augmentor import (
 from safe_rl.prediction.sumo_wcdt_adapter import SumoWcDTAdapter
 from safe_rl.prediction.wcdt_v2_predictor import build_v2_numpy_batch, ensemble_predict, load_v2_ensemble, tensorize_batch
 from safe_rl.rl.ppo import load_ppo
-from safe_rl.risk.merge_local import merge_target_lane
+from safe_rl.risk.merge_local import route_aware_constant_velocity_rollout
 from safe_rl.sim.metrics import INF_TTC
 from safe_rl.sim.scenario_semantics import (
     EDGE_ROLE_AUXILIARY,
+    EDGE_ROLE_MAINLINE,
     EDGE_ROLE_RAMP,
+    EDGE_ROLE_TARGET,
     auxiliary_edges,
-    edge_length,
     infer_lane_index,
+    infer_route_position,
+    mainline_edges,
     ramp_edges,
     taper_edge,
 )
 from safe_rl.sim.types import VehicleState
 from safe_rl.utils.config import clone_with_overrides
-
-
-LANE_CENTERS = {0: -8.0, 1: -4.8, 2: -1.6, 3: 1.6}
 
 
 def _summary(values: np.ndarray | list[float]) -> dict[str, float | int]:
@@ -65,23 +65,17 @@ def _vector_to_state(
 ) -> VehicleState:
     x, y, heading, speed, accel = [float(item) for item in vector[:5]]
     lane_index = infer_lane_index(cfg, y) if lane_index is None or int(lane_index) < 0 else int(lane_index)
-    aux_edge = taper_edge(cfg)
-    aux_length = edge_length(cfg, aux_edge)
+    candidate_edges = None
     if edge_role_id == EDGE_ROLE_RAMP:
-        edge_id = ramp_edges(cfg)[0]
-        lane_pos = max(0.0, x + edge_length(cfg, edge_id))
+        candidate_edges = ramp_edges(cfg)
     elif edge_role_id == EDGE_ROLE_AUXILIARY:
-        edge_id = auxiliary_edges(cfg)[0]
+        candidate_edges = auxiliary_edges(cfg)
+    elif edge_role_id in (EDGE_ROLE_MAINLINE, EDGE_ROLE_TARGET):
+        candidate_edges = mainline_edges(cfg)
+    edge_id, lane_pos = infer_route_position(cfg, x, y, lane_index, edge_ids=candidate_edges)
+    if edge_id is None:
+        edge_id = taper_edge(cfg)
         lane_pos = max(0.0, x)
-    elif x < 0.0:
-        edge_id = "main_in"
-        lane_pos = max(0.0, x + edge_length(cfg, edge_id))
-    elif x <= aux_length:
-        edge_id = aux_edge
-        lane_pos = max(0.0, x)
-    else:
-        edge_id = str(cfg.scenario.get("success_edge", "main_out"))
-        lane_pos = max(0.0, x - aux_length)
     return VehicleState(
         vehicle_id=vehicle_id,
         x=x,
@@ -143,19 +137,17 @@ def _cv_feature_matrix(
     return np.asarray(rows, dtype=np.float32)
 
 
-def _constant_velocity_future(last: np.ndarray, horizon: int, dt: float) -> np.ndarray:
-    output = np.zeros((horizon, 5), dtype=np.float32)
-    x = float(last[0])
-    y = float(last[1])
-    heading = float(last[2])
-    speed = max(0.0, float(last[3]))
-    vx = speed * np.cos(heading)
-    vy = speed * np.sin(heading)
-    for step_idx in range(horizon):
-        x += vx * dt
-        y += vy * dt
-        output[step_idx] = [x, y, heading, speed, 0.0]
-    return output
+def _constant_velocity_future(
+    last: np.ndarray,
+    horizon: int,
+    dt: float,
+    cfg: Any,
+    lane_index: int | None = None,
+    edge_role_id: int | None = None,
+) -> np.ndarray:
+    state = _vector_to_state("_cv", last, cfg, lane_index, edge_role_id)
+    rollout = route_aware_constant_velocity_rollout(state, horizon, dt, cfg)[0]
+    return np.asarray([item.as_vector() for item in rollout], dtype=np.float32)
 
 
 def _cv_prediction_diagnostics(
@@ -164,6 +156,8 @@ def _cv_prediction_diagnostics(
     future: np.ndarray,
     mask: np.ndarray,
     indices: np.ndarray,
+    lane_indices: np.ndarray | None = None,
+    edge_roles: np.ndarray | None = None,
 ) -> dict[str, Any]:
     horizon = int(min(future.shape[2], cfg.forecast_features.get("horizon_steps", cfg.scenario.forecast_horizon_steps)))
     dt = float(cfg.scenario.step_length)
@@ -179,7 +173,14 @@ def _cv_prediction_diagnostics(
         for agent_idx in range(history.shape[1]):
             if float(mask[sample_idx, agent_idx]) <= 0.0:
                 continue
-            pred_future[agent_idx] = _constant_velocity_future(history[sample_idx, agent_idx, -1], horizon, dt)
+            pred_future[agent_idx] = _constant_velocity_future(
+                history[sample_idx, agent_idx, -1],
+                horizon,
+                dt,
+                cfg,
+                None if lane_indices is None else int(lane_indices[sample_idx, agent_idx]),
+                None if edge_roles is None else int(edge_roles[sample_idx, agent_idx]),
+            )
         valid_agents = mask[sample_idx] > 0.0
         if np.sum(valid_agents) <= 1:
             continue
@@ -323,19 +324,12 @@ def _future_min_distance(ego_future: np.ndarray, other_future: np.ndarray, other
 
 
 def _target_lane_gap(ego_future: np.ndarray, other_future: np.ndarray, other_mask: np.ndarray, cfg: Any) -> float:
-    target_y = LANE_CENTERS.get(merge_target_lane(cfg), -1.6)
-    min_gap = INF_TTC
-    for step_idx in range(ego_future.shape[0]):
-        ego_x = float(ego_future[step_idx, 0])
-        for agent_idx in range(other_future.shape[0]):
-            if float(other_mask[agent_idx]) <= 0.0:
-                continue
-            x = float(other_future[agent_idx, step_idx, 0])
-            y = float(other_future[agent_idx, step_idx, 1])
-            if abs(y - target_y) > 2.0:
-                continue
-            min_gap = min(min_gap, max(0.0, abs(x - ego_x) - 4.8))
-    return float(min_gap)
+    return forecast_target_lane_gap_from_trajectories(
+        ego_future,
+        other_future[np.asarray(other_mask) > 0.0],
+        cfg,
+        default_gap=INF_TTC,
+    )
 
 
 def _forecast_features_from_prediction(
@@ -352,15 +346,8 @@ def _forecast_features_from_prediction(
     top_risks: list[float] = []
     dt = float(cfg.scenario.step_length)
     horizon = trajectories.shape[1]
-    ego_x = float(ego_state.x)
-    ego_y = float(ego_state.y)
-    ego_speed = float(ego_state.speed)
-    ego_heading = float(ego_state.heading)
-    ego_future = np.zeros((horizon, 2), dtype=np.float32)
-    for step_idx in range(horizon):
-        ego_x += ego_speed * np.cos(ego_heading) * dt
-        ego_y += ego_speed * np.sin(ego_heading) * dt
-        ego_future[step_idx] = [ego_x, ego_y]
+    ego_rollout = route_aware_constant_velocity_rollout(ego_state, horizon, dt, cfg)[0]
+    ego_future = np.asarray([[state.x, state.y] for state in ego_rollout], dtype=np.float32)
     target_lane_gap = forecast_target_lane_gap_from_trajectories(ego_future, trajectories, cfg)
     for traj in trajectories:
         previous_distance = INF_TTC
@@ -423,6 +410,8 @@ def _wcdt_diagnostics(
     mask: np.ndarray,
     indices: np.ndarray,
     batch_size: int,
+    lane_indices: np.ndarray | None = None,
+    edge_roles: np.ndarray | None = None,
 ) -> tuple[np.ndarray, dict[str, Any]]:
     torch = _require_torch()
     device = _resolve_device(cfg, torch)
@@ -472,7 +461,14 @@ def _wcdt_diagnostics(
                 if pred_gap < INF_TTC and actual_gap < INF_TTC:
                     target_gap_errors.append(float(pred_gap - actual_gap))
                     target_gap_abs_errors.append(abs(float(pred_gap - actual_gap)))
-                states = _latest_states(cfg, history[batch_indices[row]], mask[batch_indices[row]])
+                sample_idx = batch_indices[row]
+                states = _latest_states(
+                    cfg,
+                    history[sample_idx],
+                    mask[sample_idx],
+                    None if lane_indices is None else lane_indices[sample_idx],
+                    None if edge_roles is None else edge_roles[sample_idx],
+                )
                 ego = next((state for state in states if state.vehicle_id == "ego"), None)
                 if ego is not None:
                     sample_uncertainty = float(np.mean(uncertainty_np[row][valid_agents]))
@@ -1141,13 +1137,31 @@ def run_forecast_diagnostics(
         lane_indices=lane_indices,
         edge_roles=edge_roles,
     )
-    cv_prediction = _cv_prediction_diagnostics(cfg, history, future, mask, indices)
+    cv_prediction = _cv_prediction_diagnostics(
+        cfg,
+        history,
+        future,
+        mask,
+        indices,
+        lane_indices=lane_indices,
+        edge_roles=edge_roles,
+    )
     wcdt_features = np.zeros((0, ForecastFeatureAugmentor.feature_dim(cfg)), dtype=np.float32)
     wcdt_report: dict[str, Any] = {"available": False, "checkpoint": str(checkpoint)}
     wcdt_v2_features = np.zeros((0, ForecastFeatureAugmentor.feature_dim(cfg)), dtype=np.float32)
     wcdt_v2_report: dict[str, Any] = {"available": False, "checkpoint": str(wcdt_v2_checkpoint)}
     if checkpoint.exists():
-        wcdt_features, wcdt_report = _wcdt_diagnostics(cfg, checkpoint, history, future, mask, indices, batch_size)
+        wcdt_features, wcdt_report = _wcdt_diagnostics(
+            cfg,
+            checkpoint,
+            history,
+            future,
+            mask,
+            indices,
+            batch_size,
+            lane_indices=lane_indices,
+            edge_roles=edge_roles,
+        )
         wcdt_report["available"] = True
         initial_report_path = base_run / "stage2" / "stage2_initial_prediction_report.json"
         if not initial_report_path.exists() and wcdt_report.get("checkpoint_loss_history"):

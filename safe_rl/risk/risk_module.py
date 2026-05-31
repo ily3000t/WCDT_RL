@@ -6,6 +6,7 @@ from typing import Any
 
 import numpy as np
 
+from safe_rl.risk.merge_local import evaluate_candidate_action_risk
 from safe_rl.risk.risk_feature_extractor import extract_candidate_features
 from safe_rl.sim.action_space import CandidateAction
 
@@ -82,13 +83,19 @@ class HeuristicRiskEstimator:
         self.config = config
 
     def predict(self, action: CandidateAction, context: dict[str, Any]) -> RiskPrediction:
-        features = extract_candidate_features(action, context)
+        candidate = evaluate_candidate_action_risk(action, context)
+        features = candidate.features
         weights = np.asarray([0.30, 0.25, 0.20, 0.50, 0.15, 0.80, 0.05, 0.25], dtype=np.float32)
         score = float(np.clip(np.dot(features, weights), 0.0, 1.0))
         uncertainty = float(0.1 + 0.2 * features[-1])
+        type_logits = np.zeros((int(self.config.risk_module.get("risk_type_count", 6)),), dtype=np.float32)
+        legacy_type_logits = features[[3, 7, 1, 2, 4]].astype(np.float32)
+        type_logits[: min(type_logits.shape[0], legacy_type_logits.shape[0])] = legacy_type_logits[: type_logits.shape[0]]
+        if type_logits.shape[0] > 5:
+            type_logits[5] = float(candidate.risk_types[5])
         return RiskPrediction(
             risk_score=score,
-            risk_type_logits=features[[3, 7, 1, 2, 4]].astype(np.float32),
+            risk_type_logits=type_logits,
             risk_uncertainty=uncertainty,
             explicit_features=features,
         )

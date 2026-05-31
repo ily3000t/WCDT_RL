@@ -3,5 +3,6 @@
     <edge id="main_in" from="main_start" to="aux_start" numLanes="3" speed="33.33" priority="3"/>
     <edge id="main_aux" from="aux_start" to="taper" numLanes="4" speed="33.33" priority="3"/>
     <edge id="main_out" from="taper" to="main_end" numLanes="3" speed="33.33" priority="3"/>
-    <edge id="ramp_in" from="ramp_start" to="aux_start" numLanes="1" speed="22.22" priority="2"/>
+    <edge id="ramp_in" from="ramp_start" to="aux_start" numLanes="1" speed="22.22" priority="2"
+          shape="-180,-65 -145,-65 -110,-60 -80,-45 -55,-25 -40,-14 -30,-10 -20,-9.6 -10,-9.6 -3,-9.6"/>
 </edges>

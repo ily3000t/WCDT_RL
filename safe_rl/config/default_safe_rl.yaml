@@ -34,24 +34,31 @@ scenario:
   mainline_edges: ["main_in", "main_aux", "main_out"]
   target_lane_edges: ["main_in", "main_aux", "main_out"]
   merge_zone_edges: ["ramp_in", "main_aux"]
-  auxiliary_lane: 3
+  merge_side: "right"
+  auxiliary_lane: 0
+  auxiliary_lane_by_edge:
+    main_aux: 0
+  target_lane_by_edge:
+    main_in: 0
+    main_aux: 1
+    main_out: 0
   taper_edge: "main_aux"
   taper_warning_distance: 40.0
   taper_miss_distance: 40.0
   success_edge: "main_out"
   success_min_lane_position: 40.0
   edge_lengths:
-    main_in: 300.0
-    ramp_in: 191.4
-    main_aux: 220.0
-    main_out: 240.0
+    main_in: 298.50
+    ramp_in: 193.79
+    main_aux: 214.50
+    main_out: 236.00
   lane_centers:
-    0: -8.0
-    1: -4.8
-    2: -1.6
-    3: 1.6
-  merge_x: 220.0
-  merge_target_lane: 2
+    0: 53.8
+    1: 57.0
+    2: 60.2
+    3: 63.4
+  merge_x: 516.0
+  merge_target_lane: 1
   merge_zone_distance: 80.0
   merge_conflict_gap: 8.0
 
@@ -91,7 +98,7 @@ prediction:
 forecast_features:
   enabled: false
   use_for_ppo_observation: false
-  source: "wcdt"
+  source: "wcdt_v2"
   checkpoint: null
   allow_heuristic_fallback: false
   freeze_predictor: true

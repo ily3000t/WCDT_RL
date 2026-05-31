@@ -7,13 +7,14 @@ from typing import Any
 
 import numpy as np
 
-from safe_rl.risk.merge_local import merge_x
 from safe_rl.sim.scenario_semantics import (
+    auxiliary_lane_index,
+    distance_to_taper,
     is_auxiliary_edge,
     is_ramp_edge,
-    is_target_lane_edge,
+    is_target_lane,
     lane_center,
-    merge_target_lane,
+    target_lane_index,
 )
 from safe_rl.sim.history_buffer import HistoryBuffer
 from safe_rl.sim.types import VehicleState
@@ -90,30 +91,34 @@ class SumoWcDTAdapter:
         ids = [vehicle_id for vehicle_id in history.agent_ids(ego_id) if vehicle_id != ego_id]
         if ego is None:
             return ids
-        target_lane = merge_target_lane(self.config)
-        target_center = lane_center(self.config, target_lane)
-        merge_location = merge_x(self.config)
-
         def _priority(vehicle_id: str) -> tuple[float, float, float, str]:
             state = latest.get(vehicle_id)
             if state is None:
                 return (9.0, 1.0e6, 1.0e6, vehicle_id)
             dx = float(state.x - ego.x)
-            is_target_lane = is_target_lane_edge(self.config, state.edge_id) and int(state.lane_index) == target_lane
+            target_lane = target_lane_index(self.config, state.edge_id)
+            state_is_target_lane = is_target_lane(self.config, state.edge_id, state.lane_index)
             is_ramp_local = (
-                (is_ramp_edge(self.config, state.edge_id) or is_auxiliary_edge(self.config, state.edge_id))
+                (
+                    is_ramp_edge(self.config, state.edge_id)
+                    or (
+                        is_auxiliary_edge(self.config, state.edge_id)
+                        and int(state.lane_index) == auxiliary_lane_index(self.config, state.edge_id)
+                    )
+                )
                 and abs(float(state.lane_pos - ego.lane_pos)) < 80.0
             )
-            if is_target_lane and dx >= 0.0:
+            if state_is_target_lane and dx >= 0.0:
                 group = 0
-            elif is_target_lane and dx < 0.0:
+            elif state_is_target_lane and dx < 0.0:
                 group = 1
-            elif is_target_lane:
+            elif state_is_target_lane:
                 group = 2
-            elif is_ramp_local and state.x < merge_location + 20.0:
+            elif is_ramp_local and distance_to_taper(self.config, state) > 0.0:
                 group = 3
             else:
                 group = 4
+            target_center = lane_center(self.config, target_lane, state.edge_id, state.lane_pos)
             return (float(group), abs(dx), abs(float(state.y) - target_center), vehicle_id)
 
         return sorted(ids, key=_priority)

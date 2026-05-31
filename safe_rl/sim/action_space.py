@@ -20,7 +20,7 @@ def _build_actions() -> tuple[CandidateAction, ...]:
     index = 0
     for lateral in (-1, 0, 1):
         for accel in (-1, 0, 1):
-            lat_name = {-1: "left", 0: "keep", 1: "right"}[lateral]
+            lat_name = {-1: "right", 0: "keep", 1: "left"}[lateral]
             acc_name = {-1: "decelerate", 0: "hold", 1: "accelerate"}[accel]
             actions.append(CandidateAction(index, lateral, accel, f"{lat_name}_{acc_name}"))
             index += 1

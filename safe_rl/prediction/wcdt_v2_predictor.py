@@ -5,15 +5,17 @@ from typing import Any
 
 import numpy as np
 
-from safe_rl.risk.merge_local import merge_x
+from safe_rl.risk.merge_local import route_aware_constant_velocity_rollout
 from safe_rl.sim.scenario_semantics import (
     EDGE_ROLE_AUXILIARY,
     EDGE_ROLE_RAMP,
     EDGE_ROLE_TARGET,
+    distance_to_taper_for_position,
     edge_role,
     infer_lane_index,
-    lane_center,
-    merge_target_lane,
+    infer_route_position,
+    is_ramp_side_y,
+    target_lane_center_at_x,
 )
 from safe_rl.sim.history_buffer import HistoryBuffer
 from safe_rl.sim.types import VehicleState
@@ -52,7 +54,31 @@ except ImportError:  # pragma: no cover
     _TORCH_MODULE_BASE = object
 
 
-def _constant_velocity_future(last: np.ndarray, horizon: int, dt: float) -> np.ndarray:
+def _constant_velocity_future(
+    last: np.ndarray,
+    horizon: int,
+    dt: float,
+    cfg: Any | None = None,
+    lane_index: int | None = None,
+) -> np.ndarray:
+    if cfg is not None:
+        lane = infer_lane_index(cfg, float(last[1])) if lane_index is None or int(lane_index) < 0 else int(lane_index)
+        edge_id, lane_pos = infer_route_position(cfg, float(last[0]), float(last[1]), lane)
+        if edge_id is not None:
+            state = VehicleState(
+                vehicle_id="_wcdt_v2",
+                x=float(last[0]),
+                y=float(last[1]),
+                heading=float(last[2]),
+                speed=max(0.0, float(last[3])),
+                lane_index=lane,
+                lane_id=f"{edge_id}_{lane}",
+                lane_pos=float(lane_pos),
+                edge_id=str(edge_id),
+                accel=float(last[4]),
+            )
+            rollout = route_aware_constant_velocity_rollout(state, horizon, dt, cfg)[0]
+            return np.asarray([item.as_vector() for item in rollout], dtype=np.float32)
     output = np.zeros((horizon, 5), dtype=np.float32)
     x = float(last[0])
     y = float(last[1])
@@ -74,15 +100,14 @@ def _role_for_agent(
     lane_index: int | None = None,
     edge_role_id: int | None = None,
 ) -> int:
-    target_lane = merge_target_lane(cfg)
-    target_center = lane_center(cfg, target_lane)
     dx = float(agent_latest[0] - ego_latest[0])
     y = float(agent_latest[1])
+    target_center = target_lane_center_at_x(cfg, float(agent_latest[0]))
     lane = infer_lane_index(cfg, y) if lane_index is None or int(lane_index) < 0 else int(lane_index)
     is_target_lane = (
         int(edge_role_id) == EDGE_ROLE_TARGET
         if edge_role_id is not None and int(edge_role_id) > 0
-        else abs(y - target_center) <= 2.0 and lane == target_lane
+        else abs(y - target_center) <= 2.0
     )
     if is_target_lane and dx >= 0.0:
         return 0
@@ -92,8 +117,8 @@ def _role_for_agent(
         return 2
     if edge_role_id == EDGE_ROLE_RAMP or (
         (edge_role_id is None or int(edge_role_id) <= 0)
-        and y > 0.5
-        and float(agent_latest[0]) < merge_x(cfg) + 20.0
+        and is_ramp_side_y(cfg, y)
+        and distance_to_taper_for_position(cfg, float(agent_latest[0]), y, lane) > 0.0
     ):
         return 3
     if abs(dx) < 30.0:
@@ -111,8 +136,6 @@ def ordered_merge_local_indices(
     if sample_history.shape[0] <= 1:
         return []
     ego = sample_history[0, -1]
-    target_lane = merge_target_lane(cfg)
-    target_center = lane_center(cfg, target_lane)
 
     def _priority(agent_idx: int) -> tuple[float, float, float, int]:
         latest = sample_history[agent_idx, -1]
@@ -124,6 +147,7 @@ def ordered_merge_local_indices(
             None if edge_roles is None else int(edge_roles[agent_idx]),
         )
         dx = float(latest[0] - ego[0])
+        target_center = target_lane_center_at_x(cfg, float(latest[0]))
         target_lat = abs(float(latest[1]) - target_center)
         distance = abs(dx) + 0.5 * abs(float(latest[1]) - float(ego[1]))
         return (float(role), distance, target_lat, int(agent_idx))
@@ -132,7 +156,13 @@ def ordered_merge_local_indices(
     return sorted(valid, key=_priority)
 
 
-def _actor_features(cfg: Any, ego_latest: np.ndarray, agent_latest: np.ndarray, role: int) -> np.ndarray:
+def _actor_features(
+    cfg: Any,
+    ego_latest: np.ndarray,
+    agent_latest: np.ndarray,
+    role: int,
+    ego_lane_index: int | None = None,
+) -> np.ndarray:
     ego_speed = max(0.0, float(ego_latest[3]))
     agent_speed = max(0.0, float(agent_latest[3]))
     heading = float(agent_latest[2])
@@ -141,7 +171,14 @@ def _actor_features(cfg: Any, ego_latest: np.ndarray, agent_latest: np.ndarray, 
     role_onehot[min(max(role, 0), ROLE_COUNT - 1)] = 1.0
     dx = float(agent_latest[0] - ego_latest[0])
     dy = float(agent_latest[1] - ego_latest[1])
-    merge_distance = float(merge_x(cfg) - ego_latest[0])
+    merge_distance = float(
+        distance_to_taper_for_position(
+            cfg,
+            float(ego_latest[0]),
+            float(ego_latest[1]),
+            ego_lane_index,
+        )
+    )
     return np.asarray(
         [
             dx / 100.0,
@@ -197,8 +234,20 @@ def build_v2_numpy_batch(
                 None if sample_lanes is None else int(sample_lanes[agent_idx]),
                 None if sample_roles is None else int(sample_roles[agent_idx]),
             )
-            features[row, actor_row] = _actor_features(cfg, ego_latest, latest, role)
-            baseline[row, actor_row] = _constant_velocity_future(latest, horizon, dt)
+            features[row, actor_row] = _actor_features(
+                cfg,
+                ego_latest,
+                latest,
+                role,
+                None if sample_lanes is None else int(sample_lanes[0]),
+            )
+            baseline[row, actor_row] = _constant_velocity_future(
+                latest,
+                horizon,
+                dt,
+                cfg,
+                None if sample_lanes is None else int(sample_lanes[agent_idx]),
+            )
             target[row, actor_row] = future[sample_idx, agent_idx, :horizon]
             actor_mask[row, actor_row] = mask[sample_idx, agent_idx]
             role_ids[row, actor_row] = role
@@ -340,7 +389,7 @@ def ensemble_predict(models: list[Any], tensor_batch: dict[str, Any]):
             predictions.append(model(tensor_batch["features"], tensor_batch["baseline"]))
     stacked = torch.stack(predictions, dim=0)
     mean = stacked.mean(dim=0)
-    uncertainty = torch.linalg.norm(stacked[..., :2].std(dim=0), dim=-1).mean(dim=(-1, -2))
+    uncertainty = torch.linalg.norm(stacked[..., :2].std(dim=0, unbiased=False), dim=-1).mean(dim=(-1, -2))
     return mean, uncertainty
 
 
