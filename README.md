@@ -165,7 +165,7 @@ safe_rl_output/runs/<run_id>/stage2/tensorboard/
 
 Stage2 会根据 full runner 的 forecast sources 选择 predictor。当前默认只训练 WcDT v2；旧 WcDT v1 仅在显式包含 `wcdt` 时训练。WcDT v1 会从 Stage1 trajectory windows 中划分 train/validation，按 validation `FDE + 0.5 * target_lane_gap_abs_error + 0.5 * future_min_distance_abs_error` 选择 best checkpoint。`wcdt_predictor_best.pt` 保存最佳权重；兼容路径 `wcdt_predictor.pt` 也写入同一 best 权重，避免后续 Stage3/Stage5 加载最后一个退化 epoch。
 
-Stage2 还会训练独立的 `wcdt_v2` residual-over-CV predictor。它不覆盖旧 WcDT，输入更偏 merge-centric：目标主路 front/rear、`main_aux lane 0` local、ramp local 和 nearest conflict vehicle。默认保存 3-model ensemble，`uncertainty` 来自 ensemble 方差。Risk Module 使用连续风险目标训练 risk head，并保留 6 类硬标签：`collision / near_miss / low_ttc / high_drac / merge_conflict / taper_miss`。validation 报告会输出 legal candidate 上的 boundary `ECE / Brier / NLL / reliability_bins`、中间分数区间占比和 ranking 诊断；默认不把 calibration 写入 runtime，只有显式开启配置后 Shield 才使用 calibrated score。
+Stage2 还会训练独立的 `wcdt_v2` residual-over-CV predictor。它不覆盖旧 WcDT，输入更偏 merge-centric：目标主路 front/rear、`main_aux lane 0` local、ramp local 和 nearest conflict vehicle。默认保存 3-model ensemble，`uncertainty` 来自 ensemble 方差。当前 `merge_safety_v2` loss 会分别监督 `ADE / FDE / future minD / target front gap / target rear gap / front-rear ordering / smoothness`，其中 future minD 使用完整预测时域内的最小净距离误差，不再使用逐时刻距离误差均值。每个 ensemble member 会在终端和 TensorBoard 输出每轮训练 loss 与 validation 指标；默认最多训练 30 epochs，并在 validation score 连续 10 轮无明显改善时 early stop。Risk Module 使用连续风险目标训练 risk head，并保留 6 类硬标签：`collision / near_miss / low_ttc / high_drac / merge_conflict / taper_miss`。validation 报告会输出 legal candidate 上的 boundary `ECE / Brier / NLL / reliability_bins`、中间分数区间占比和 ranking 诊断；默认不把 calibration 写入 runtime，只有显式开启配置后 Shield 才使用 calibrated score。
 
 WcDT v1 和 v2 使用独立 batch size：默认分别为 `16` 和 `32`。初始 Stage2 会额外保留 `risk_module_initial.pt` 与 `stage2_initial_training_report.json`；Stage4 后重训 Risk Module 时继续更新最终 `risk_module.pt`，不会覆盖初始快照。
 
@@ -344,10 +344,10 @@ python -m safe_rl.pipeline.stage5_shield_sweep --run-id safe_rl_wcdt_v2_002 --in
 新辅助车道 benchmark 的正式训练建议使用独立 run id，并提高 Stage1 边界样本覆盖：
 
 ```powershell
-python -m safe_rl.pipeline.run_full_pipeline --run-id safe_rl_right_onramp_curriculum_001 --run-mode new --stage1-episodes 1000 --ppo-timesteps 100000 --forecast-ppo-timesteps 100000 --forecast-sources constant_velocity,wcdt_v2 --forecast-ppo-profile shield_guided
-python -m safe_rl.pipeline.stage5_confirmatory_eval --run-id safe_rl_right_onramp_curriculum_001 --episodes 50
-python -m safe_rl.pipeline.forecast_diagnostics --run-id safe_rl_right_onramp_curriculum_001 --max-samples 512 --low-seed-count 5
-python -m safe_rl.pipeline.stage5_shield_sweep --run-id safe_rl_right_onramp_curriculum_001 --include-calibrated
+python -m safe_rl.pipeline.run_full_pipeline --run-id safe_rl_right_onramp_v2fixed_001 --run-mode new --stage1-episodes 1000 --ppo-timesteps 100000 --forecast-ppo-timesteps 100000 --forecast-sources constant_velocity,wcdt_v2 --forecast-ppo-profile shield_guided
+python -m safe_rl.pipeline.stage5_confirmatory_eval --run-id safe_rl_right_onramp_v2fixed_001 --episodes 50
+python -m safe_rl.pipeline.forecast_diagnostics --run-id safe_rl_right_onramp_v2fixed_001 --max-samples 512 --low-seed-count 5
+python -m safe_rl.pipeline.stage5_shield_sweep --run-id safe_rl_right_onramp_v2fixed_001 --include-calibrated
 ```
 
 ### Full runner 运行模式
@@ -355,13 +355,13 @@ python -m safe_rl.pipeline.stage5_shield_sweep --run-id safe_rl_right_onramp_cur
 Full runner 会在 `<run_id>/pipeline_state.json` 中记录任务状态、调用参数、场景 hash 和关键产物 hash。中断后使用相同 run id 续跑，不需要重新输入首次运行的训练参数：
 
 ```powershell
-python -m safe_rl.pipeline.run_full_pipeline --run-id safe_rl_right_onramp_curriculum_001 --run-mode resume
+python -m safe_rl.pipeline.run_full_pipeline --run-id safe_rl_right_onramp_v2fixed_001 --run-mode resume
 ```
 
 如需明确删除 base run 和对应 forecast 子 run 并从头运行，必须显式使用 `overwrite`：
 
 ```powershell
-python -m safe_rl.pipeline.run_full_pipeline --run-id safe_rl_right_onramp_curriculum_001 --run-mode overwrite --stage1-episodes 1000 --ppo-timesteps 100000 --forecast-ppo-timesteps 100000 --forecast-sources constant_velocity,wcdt_v2 --forecast-ppo-profile shield_guided
+python -m safe_rl.pipeline.run_full_pipeline --run-id safe_rl_right_onramp_v2fixed_001 --run-mode overwrite --stage1-episodes 1000 --ppo-timesteps 100000 --forecast-ppo-timesteps 100000 --forecast-sources constant_velocity,wcdt_v2 --forecast-ppo-profile shield_guided
 ```
 
 `resume` 会校验默认配置、场景 snapshot、当前场景文件和已完成任务产物；任何 hash 漂移都会拒绝静默续跑。各 Stage 的独立命令仍保留，仅建议用于调试和定向重跑。
@@ -563,7 +563,7 @@ python -m safe_rl.tools.replay_episode --replay safe_rl_output\runs\$RUN_ID\stag
 使用 SUMO-GUI 可视化回放：
 
 ```powershell
-python -m safe_rl.tools.replay_episode --replay safe_rl_output\runs\safe_rl_right_onramp_curriculum_001\stage1\replay\episode_0000.json --gui --delay-ms 200
+python -m safe_rl.tools.replay_episode --replay safe_rl_output\runs\safe_rl_right_onramp_v2fixed_001\stage1\replay\episode_0000.json --gui --delay-ms 200
 ```
 
 Stage5 实验结果回放示例：

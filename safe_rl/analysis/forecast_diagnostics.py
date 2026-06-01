@@ -150,6 +150,26 @@ def _constant_velocity_future(
     return np.asarray([item.as_vector() for item in rollout], dtype=np.float32)
 
 
+def _target_role_gap_abs_errors(
+    ego_future: np.ndarray,
+    pred_future: np.ndarray,
+    actual_future: np.ndarray,
+    mask: np.ndarray,
+    role_ids: np.ndarray,
+) -> dict[str, float | None]:
+    result: dict[str, float | None] = {}
+    ego_x = np.asarray(ego_future, dtype=np.float32)[:, 0]
+    for name, role_id in (("target_lane_front_gap_abs_error", 0), ("target_lane_rear_gap_abs_error", 1)):
+        role_indices = np.where((np.asarray(mask) > 0.0) & (np.asarray(role_ids) == role_id))[0]
+        if role_indices.size == 0:
+            result[name] = None
+            continue
+        pred_gap = np.asarray(pred_future, dtype=np.float32)[role_indices, :, 0] - ego_x[None, :]
+        actual_gap = np.asarray(actual_future, dtype=np.float32)[role_indices, :, 0] - ego_x[None, :]
+        result[name] = float(np.mean(np.abs(pred_gap - actual_gap)))
+    return result
+
+
 def _cv_prediction_diagnostics(
     cfg: Any,
     history: np.ndarray,
@@ -167,6 +187,8 @@ def _cv_prediction_diagnostics(
     min_distance_abs_errors: list[float] = []
     target_gap_errors: list[float] = []
     target_gap_abs_errors: list[float] = []
+    target_front_gap_abs_errors: list[float] = []
+    target_rear_gap_abs_errors: list[float] = []
     for sample_idx in indices:
         actual_future = future[sample_idx, :, :horizon]
         pred_future = np.zeros_like(actual_future)
@@ -203,6 +225,27 @@ def _cv_prediction_diagnostics(
         if pred_gap < INF_TTC and actual_gap < INF_TTC:
             target_gap_errors.append(float(pred_gap - actual_gap))
             target_gap_abs_errors.append(abs(float(pred_gap - actual_gap)))
+    selected_batch = build_v2_numpy_batch(
+        cfg,
+        history,
+        future,
+        mask,
+        indices,
+        lane_indices=lane_indices,
+        edge_roles=edge_roles,
+    )
+    for row in range(selected_batch["baseline"].shape[0]):
+        role_gap_errors = _target_role_gap_abs_errors(
+            selected_batch["ego_future"][row],
+            selected_batch["baseline"][row],
+            selected_batch["target"][row],
+            selected_batch["mask"][row],
+            selected_batch["role_ids"][row],
+        )
+        if role_gap_errors["target_lane_front_gap_abs_error"] is not None:
+            target_front_gap_abs_errors.append(float(role_gap_errors["target_lane_front_gap_abs_error"]))
+        if role_gap_errors["target_lane_rear_gap_abs_error"] is not None:
+            target_rear_gap_abs_errors.append(float(role_gap_errors["target_lane_rear_gap_abs_error"]))
     return {
         "sample_count": int(len(ade)),
         "ade": _summary(ade),
@@ -211,6 +254,8 @@ def _cv_prediction_diagnostics(
         "future_min_distance_abs_error": _summary(min_distance_abs_errors),
         "target_lane_gap_error": _summary(target_gap_errors),
         "target_lane_gap_abs_error": _summary(target_gap_abs_errors),
+        "target_lane_front_gap_abs_error": _summary(target_front_gap_abs_errors),
+        "target_lane_rear_gap_abs_error": _summary(target_rear_gap_abs_errors),
     }
 
 
@@ -532,8 +577,11 @@ def _wcdt_v2_diagnostics(
     min_distance_abs_errors: list[float] = []
     target_gap_errors: list[float] = []
     target_gap_abs_errors: list[float] = []
+    target_front_gap_abs_errors: list[float] = []
+    target_rear_gap_abs_errors: list[float] = []
     uncertainty_values: list[float] = []
     uncertainty_fde_values: list[float] = []
+    uncertainty_min_distance_error_values: list[float] = []
 
     for start in range(0, indices.shape[0], batch_size):
         batch_indices = indices[start : start + batch_size]
@@ -569,7 +617,20 @@ def _wcdt_v2_diagnostics(
             pred_min_distance = _future_min_distance(ego_future[row], selected[row], pred_mask[row])
             actual_min_distance = _future_min_distance(ego_future[row], actual_future[row], pred_mask[row])
             min_distance_errors.append(float(pred_min_distance - actual_min_distance))
-            min_distance_abs_errors.append(abs(float(pred_min_distance - actual_min_distance)))
+            min_distance_abs_error = abs(float(pred_min_distance - actual_min_distance))
+            min_distance_abs_errors.append(min_distance_abs_error)
+            uncertainty_min_distance_error_values.append(min_distance_abs_error)
+            role_gap_errors = _target_role_gap_abs_errors(
+                ego_future[row],
+                selected[row],
+                actual_future[row],
+                pred_mask[row],
+                numpy_batch["role_ids"][row],
+            )
+            if role_gap_errors["target_lane_front_gap_abs_error"] is not None:
+                target_front_gap_abs_errors.append(float(role_gap_errors["target_lane_front_gap_abs_error"]))
+            if role_gap_errors["target_lane_rear_gap_abs_error"] is not None:
+                target_rear_gap_abs_errors.append(float(role_gap_errors["target_lane_rear_gap_abs_error"]))
             pred_gap = _target_lane_gap(ego_future[row], selected[row], pred_mask[row], cfg)
             actual_gap = _target_lane_gap(ego_future[row], actual_future[row], pred_mask[row], cfg)
             if pred_gap < INF_TTC and actual_gap < INF_TTC:
@@ -590,10 +651,19 @@ def _wcdt_v2_diagnostics(
                     features = augmentor._normalize(features)
                 feature_rows.append(features)
 
+    architecture_version = payload.get("architecture_version") if isinstance(payload, dict) else None
+    loss_version = payload.get("loss_version") if isinstance(payload, dict) else None
+    member_histories = payload.get("member_histories", []) if isinstance(payload, dict) else []
     report = {
         "device": str(device),
         "checkpoint": str(checkpoint),
         "ensemble_size": int(payload.get("ensemble_size", len(models))) if isinstance(payload, dict) else len(models),
+        "architecture_version": architecture_version,
+        "loss_version": loss_version,
+        "legacy_checkpoint_metadata": not bool(architecture_version and loss_version),
+        "early_stopped_member_count": int(
+            sum(bool(item.get("stopped_early", False)) for item in member_histories if isinstance(item, dict))
+        ),
         "sample_count": int(len(feature_rows)),
         "ade": _summary(ade),
         "fde": _summary(fde),
@@ -601,10 +671,17 @@ def _wcdt_v2_diagnostics(
         "future_min_distance_abs_error": _summary(min_distance_abs_errors),
         "target_lane_gap_error": _summary(target_gap_errors),
         "target_lane_gap_abs_error": _summary(target_gap_abs_errors),
+        "target_lane_front_gap_abs_error": _summary(target_front_gap_abs_errors),
+        "target_lane_rear_gap_abs_error": _summary(target_rear_gap_abs_errors),
         "uncertainty": _summary(uncertainty_values),
         "uncertainty_fde_correlation": _correlation(uncertainty_values, uncertainty_fde_values),
+        "uncertainty_future_min_distance_abs_error_correlation": _correlation(
+            uncertainty_values,
+            uncertainty_min_distance_error_values,
+        ),
         "cv_baseline_validation": payload.get("cv_baseline_validation") if isinstance(payload, dict) else None,
         "ensemble_validation": payload.get("ensemble_validation") if isinstance(payload, dict) else None,
+        "wcdt_v2_vs_cv_summary": payload.get("wcdt_v2_vs_cv_summary") if isinstance(payload, dict) else None,
     }
     return np.asarray(feature_rows, dtype=np.float32), report
 
@@ -640,17 +717,37 @@ def _forecast_conclusion(report: dict[str, Any]) -> dict[str, Any]:
     uncertainty_pass = bool(wcdt.get("available", False) and uncertainty_std >= 0.02 and abs(confidence_corr) >= 0.10)
     wcdt_v2_fde = float(wcdt_v2.get("fde", {}).get("mean", 1.0e6))
     wcdt_v2_min_distance_error = float(wcdt_v2.get("future_min_distance_abs_error", {}).get("mean", 1.0e6))
+    cv_v2_baseline = wcdt_v2.get("cv_baseline_validation")
+    if not isinstance(cv_v2_baseline, dict):
+        cv_v2_baseline = {}
+
+    def _cv_role_gap_mean(name: str) -> float:
+        diagnostics_summary = cv.get(name, {})
+        if isinstance(diagnostics_summary, dict) and "mean" in diagnostics_summary:
+            return float(diagnostics_summary["mean"])
+        checkpoint_summary = cv_v2_baseline.get(name, {})
+        return float(checkpoint_summary.get("mean", 1.0e6)) if isinstance(checkpoint_summary, dict) else 1.0e6
+
+    cv_front_gap_error = _cv_role_gap_mean("target_lane_front_gap_abs_error")
+    cv_rear_gap_error = _cv_role_gap_mean("target_lane_rear_gap_abs_error")
+    wcdt_v2_front_gap_error = float(wcdt_v2.get("target_lane_front_gap_abs_error", {}).get("mean", 1.0e6))
+    wcdt_v2_rear_gap_error = float(wcdt_v2.get("target_lane_rear_gap_abs_error", {}).get("mean", 1.0e6))
     wcdt_v2_quality_pass = bool(
         wcdt_v2.get("available", False)
         and wcdt_v2_fde <= cv_fde
         and wcdt_v2_min_distance_error <= cv_min_distance_error
+        and wcdt_v2_front_gap_error <= cv_front_gap_error
+        and wcdt_v2_rear_gap_error <= cv_rear_gap_error
     )
     wcdt_v2_uncertainty_std = float(wcdt_v2.get("uncertainty", {}).get("std", 0.0))
     wcdt_v2_uncertainty_corr = float(wcdt_v2.get("uncertainty_fde_correlation", 0.0))
+    wcdt_v2_uncertainty_min_distance_corr = float(
+        wcdt_v2.get("uncertainty_future_min_distance_abs_error_correlation", 0.0)
+    )
     wcdt_v2_uncertainty_pass = bool(
         wcdt_v2.get("available", False)
         and wcdt_v2_uncertainty_std > 0.02
-        and wcdt_v2_uncertainty_corr > 0.0
+        and (wcdt_v2_uncertainty_corr > 0.0 or wcdt_v2_uncertainty_min_distance_corr > 0.0)
     )
     sensitivity = report.get("policy_feature_sensitivity", {})
     wcdt_v2_sensitivity = sensitivity.get("groups", {}).get("ppo_wcdt_v2_features", {})
@@ -681,8 +778,13 @@ def _forecast_conclusion(report: dict[str, Any]) -> dict[str, Any]:
             "wcdt_confidence_fde_correlation": confidence_corr,
             "wcdt_v2_fde_mean": wcdt_v2_fde,
             "wcdt_v2_future_min_distance_abs_error_mean": wcdt_v2_min_distance_error,
+            "cv_target_lane_front_gap_abs_error_mean": cv_front_gap_error,
+            "cv_target_lane_rear_gap_abs_error_mean": cv_rear_gap_error,
+            "wcdt_v2_target_lane_front_gap_abs_error_mean": wcdt_v2_front_gap_error,
+            "wcdt_v2_target_lane_rear_gap_abs_error_mean": wcdt_v2_rear_gap_error,
             "wcdt_v2_uncertainty_std": wcdt_v2_uncertainty_std,
             "wcdt_v2_uncertainty_fde_correlation": wcdt_v2_uncertainty_corr,
+            "wcdt_v2_uncertainty_future_min_distance_abs_error_correlation": wcdt_v2_uncertainty_min_distance_corr,
             "wcdt_v2_original_vs_zeroed_action_agreement_rate": wcdt_v2_sensitivity.get(
                 "original_vs_zeroed_action_agreement_rate"
             ),

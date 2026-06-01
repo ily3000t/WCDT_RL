@@ -89,9 +89,16 @@ prediction:
   wcdt_v2_loss_weights:
     ade: 1.0
     fde: 0.5
-    target_lane_gap: 0.25
-    future_min_distance: 0.25
+    future_min_distance: 0.75
+    target_lane_front_gap: 0.40
+    target_lane_rear_gap: 0.40
     ordering: 0.1
+    smoothness: 0.05
+  wcdt_v2_early_stopping:
+    enabled: true
+    patience: 10
+    min_delta: 0.0001
+    warmup_epochs: 5
   max_pred_num: 8
   max_other_num: 6
   max_traffic_light: 8

@@ -924,6 +924,72 @@ def _wcdt_v2_batch_size(cfg: Any) -> int:
     return int(cfg.prediction.get("wcdt_v2_batch_size", cfg.prediction.batch_size))
 
 
+def _wcdt_v2_early_stopping_config(cfg: Any, *, has_validation: bool) -> dict[str, Any]:
+    configured = dict(cfg.prediction.get("wcdt_v2_early_stopping", {}) or {})
+    return {
+        "enabled": bool(configured.get("enabled", True)) and bool(has_validation),
+        "patience": max(1, int(configured.get("patience", 10))),
+        "min_delta": max(0.0, float(configured.get("min_delta", 0.0001))),
+        "warmup_epochs": max(0, int(configured.get("warmup_epochs", 5))),
+        "disabled_reason": None if has_validation else "validation_unavailable",
+    }
+
+
+def _wcdt_v2_early_stopping_step(
+    *,
+    best_score: float | None,
+    score: float,
+    epoch: int,
+    stale_epochs: int,
+    config: dict[str, Any],
+) -> tuple[bool, int, bool]:
+    min_delta = float(config.get("min_delta", 0.0)) if bool(config.get("enabled", False)) else 0.0
+    improved = best_score is None or float(score) < float(best_score) - min_delta
+    stale_epochs = 0 if improved else int(stale_epochs) + 1
+    should_stop = bool(
+        config.get("enabled", False)
+        and int(epoch) >= int(config.get("warmup_epochs", 0))
+        and stale_epochs >= int(config.get("patience", 10))
+    )
+    return bool(improved), int(stale_epochs), should_stop
+
+
+def _wcdt_v2_vs_cv_summary(cv_metrics: dict[str, Any] | None, v2_metrics: dict[str, Any] | None) -> dict[str, Any]:
+    if not isinstance(cv_metrics, dict) or not isinstance(v2_metrics, dict):
+        return {"available": False}
+
+    def _stat(metrics: dict[str, Any], name: str, stat: str = "mean") -> float | None:
+        summary = metrics.get(name, {})
+        return float(summary[stat]) if isinstance(summary, dict) and stat in summary else None
+
+    metric_names = (
+        "ade",
+        "fde",
+        "future_min_distance_abs_error",
+        "target_lane_gap_abs_error",
+        "target_lane_front_gap_abs_error",
+        "target_lane_rear_gap_abs_error",
+    )
+    comparisons = {}
+    for name in metric_names:
+        cv_value = _stat(cv_metrics, name)
+        v2_value = _stat(v2_metrics, name)
+        comparisons[name] = {
+            "cv": cv_value,
+            "wcdt_v2": v2_value,
+            "delta": float(v2_value - cv_value) if cv_value is not None and v2_value is not None else None,
+        }
+    return {
+        "available": True,
+        "metrics": comparisons,
+        "uncertainty_std": _stat(v2_metrics, "uncertainty", "std"),
+        "uncertainty_fde_correlation": float(v2_metrics.get("uncertainty_fde_correlation", 0.0)),
+        "uncertainty_future_min_distance_abs_error_correlation": float(
+            v2_metrics.get("uncertainty_future_min_distance_abs_error_correlation", 0.0)
+        ),
+    }
+
+
 def _wcdt_data_dict(cfg: Any, pred_his, pred_future, pred_mask, pred_feat, other_his, other_feat, other_mask, lane_list, device):
     return {
         "predicted_feature": pred_feat,
@@ -979,6 +1045,26 @@ def _future_min_distance(ego_future: np.ndarray, other_future: np.ndarray, other
         distances = np.linalg.norm(other_future[agent_idx, :horizon, :2] - ego_future[:horizon, :2], axis=-1) - 3.0
         min_distance = min(min_distance, float(np.min(np.maximum(0.0, distances))))
     return float(min_distance)
+
+
+def _target_role_gap_abs_errors(
+    ego_future: np.ndarray,
+    pred_future: np.ndarray,
+    actual_future: np.ndarray,
+    other_mask: np.ndarray,
+    role_ids: np.ndarray,
+) -> dict[str, float | None]:
+    horizon = min(ego_future.shape[0], pred_future.shape[1], actual_future.shape[1])
+    output: dict[str, float | None] = {}
+    for name, role_id in (("target_lane_front_gap_abs_error", 0), ("target_lane_rear_gap_abs_error", 1)):
+        selected = (np.asarray(other_mask) > 0.0) & (np.asarray(role_ids) == role_id)
+        if not np.any(selected):
+            output[name] = None
+            continue
+        pred_dx = pred_future[selected, :horizon, 0] - ego_future[None, :horizon, 0]
+        actual_dx = actual_future[selected, :horizon, 0] - ego_future[None, :horizon, 0]
+        output[name] = float(np.mean(np.abs(pred_dx - actual_dx)))
+    return output
 
 
 def _target_lane_gap(ego_future: np.ndarray, other_future: np.ndarray, other_mask: np.ndarray, cfg: Any) -> float:
@@ -1254,9 +1340,13 @@ def _wcdt_v2_validation_metrics(cfg: Any, models: list[Any], loader: Any, device
     future_min_distance_abs_errors: list[float] = []
     target_gap_errors: list[float] = []
     target_gap_abs_errors: list[float] = []
+    target_front_gap_abs_errors: list[float] = []
+    target_rear_gap_abs_errors: list[float] = []
     uncertainty_values: list[float] = []
     uncertainty_fde_values: list[float] = []
+    uncertainty_min_distance_error_values: list[float] = []
     val_losses: list[float] = []
+    component_losses: dict[str, list[float]] = {}
     for model in models:
         model.eval()
     with torch.no_grad():
@@ -1270,7 +1360,7 @@ def _wcdt_v2_validation_metrics(cfg: Any, models: list[Any], loader: Any, device
                 "ego_future": ego_future.to(device, non_blocking=pin_memory),
             }
             pred, uncertainty = ensemble_predict(models, batch)
-            loss = v2_loss(
+            loss, components = v2_loss(
                 pred,
                 batch["target"],
                 batch["mask"],
@@ -1279,11 +1369,14 @@ def _wcdt_v2_validation_metrics(cfg: Any, models: list[Any], loader: Any, device
                 dict(cfg.prediction.get("wcdt_v2_loss_weights", {})),
             )
             val_losses.append(float(loss.detach().cpu()))
+            for name, value in components.items():
+                component_losses.setdefault(name, []).append(float(value.detach().cpu()))
             pred_np = pred.detach().cpu().numpy()
             target_np = batch["target"].detach().cpu().numpy()
             mask_np = batch["mask"].detach().cpu().numpy()
             ego_np = batch["ego_future"].detach().cpu().numpy()
             uncertainty_np = uncertainty.detach().cpu().numpy()
+            role_ids_np = batch["role_ids"].detach().cpu().numpy()
             for row in range(pred_np.shape[0]):
                 valid = mask_np[row] > 0.0
                 if not np.any(valid):
@@ -1299,7 +1392,20 @@ def _wcdt_v2_validation_metrics(cfg: Any, models: list[Any], loader: Any, device
                 pred_min = _future_min_distance(ego_np[row], pred_np[row], mask_np[row])
                 actual_min = _future_min_distance(ego_np[row], target_np[row], mask_np[row])
                 future_min_distance_errors.append(float(pred_min - actual_min))
-                future_min_distance_abs_errors.append(abs(float(pred_min - actual_min)))
+                min_distance_abs_error = abs(float(pred_min - actual_min))
+                future_min_distance_abs_errors.append(min_distance_abs_error)
+                uncertainty_min_distance_error_values.append(min_distance_abs_error)
+                role_gap_errors = _target_role_gap_abs_errors(
+                    ego_np[row],
+                    pred_np[row],
+                    target_np[row],
+                    mask_np[row],
+                    role_ids_np[row],
+                )
+                if role_gap_errors["target_lane_front_gap_abs_error"] is not None:
+                    target_front_gap_abs_errors.append(float(role_gap_errors["target_lane_front_gap_abs_error"]))
+                if role_gap_errors["target_lane_rear_gap_abs_error"] is not None:
+                    target_rear_gap_abs_errors.append(float(role_gap_errors["target_lane_rear_gap_abs_error"]))
                 pred_gap = _target_lane_gap(ego_np[row], pred_np[row], mask_np[row], cfg)
                 actual_gap = _target_lane_gap(ego_np[row], target_np[row], mask_np[row], cfg)
                 if pred_gap < 1.0e6 and actual_gap < 1.0e6:
@@ -1313,8 +1419,15 @@ def _wcdt_v2_validation_metrics(cfg: Any, models: list[Any], loader: Any, device
         "future_min_distance_abs_error": _summary(future_min_distance_abs_errors),
         "target_lane_gap_error": _summary(target_gap_errors),
         "target_lane_gap_abs_error": _summary(target_gap_abs_errors),
+        "target_lane_front_gap_abs_error": _summary(target_front_gap_abs_errors),
+        "target_lane_rear_gap_abs_error": _summary(target_rear_gap_abs_errors),
         "uncertainty": _summary(uncertainty_values),
         "uncertainty_fde_correlation": _correlation(uncertainty_values, uncertainty_fde_values),
+        "uncertainty_future_min_distance_abs_error_correlation": _correlation(
+            uncertainty_values,
+            uncertainty_min_distance_error_values,
+        ),
+        "loss_components": {name: _summary(values) for name, values in component_losses.items()},
     }
 
 
@@ -1329,11 +1442,14 @@ def _wcdt_v2_cv_baseline_metrics(cfg: Any, loader: Any, device: Any, pin_memory:
     fde: list[float] = []
     future_min_distance_abs_errors: list[float] = []
     target_gap_abs_errors: list[float] = []
-    for features, baseline, target, mask, _role_ids, ego_future in loader:
+    target_front_gap_abs_errors: list[float] = []
+    target_rear_gap_abs_errors: list[float] = []
+    for features, baseline, target, mask, role_ids, ego_future in loader:
         pred_np = baseline.numpy()
         target_np = target.numpy()
         mask_np = mask.numpy()
         ego_np = ego_future.numpy()
+        role_ids_np = role_ids.numpy()
         for row in range(pred_np.shape[0]):
             valid = mask_np[row] > 0.0
             if not np.any(valid):
@@ -1344,6 +1460,17 @@ def _wcdt_v2_cv_baseline_metrics(cfg: Any, loader: Any, device: Any, pin_memory:
             pred_min = _future_min_distance(ego_np[row], pred_np[row], mask_np[row])
             actual_min = _future_min_distance(ego_np[row], target_np[row], mask_np[row])
             future_min_distance_abs_errors.append(abs(float(pred_min - actual_min)))
+            role_gap_errors = _target_role_gap_abs_errors(
+                ego_np[row],
+                pred_np[row],
+                target_np[row],
+                mask_np[row],
+                role_ids_np[row],
+            )
+            if role_gap_errors["target_lane_front_gap_abs_error"] is not None:
+                target_front_gap_abs_errors.append(float(role_gap_errors["target_lane_front_gap_abs_error"]))
+            if role_gap_errors["target_lane_rear_gap_abs_error"] is not None:
+                target_rear_gap_abs_errors.append(float(role_gap_errors["target_lane_rear_gap_abs_error"]))
             pred_gap = _target_lane_gap(ego_np[row], pred_np[row], mask_np[row], cfg)
             actual_gap = _target_lane_gap(ego_np[row], target_np[row], mask_np[row], cfg)
             if pred_gap < 1.0e6 and actual_gap < 1.0e6:
@@ -1353,6 +1480,8 @@ def _wcdt_v2_cv_baseline_metrics(cfg: Any, loader: Any, device: Any, pin_memory:
         "fde": _summary(fde),
         "future_min_distance_abs_error": _summary(future_min_distance_abs_errors),
         "target_lane_gap_abs_error": _summary(target_gap_abs_errors),
+        "target_lane_front_gap_abs_error": _summary(target_front_gap_abs_errors),
+        "target_lane_rear_gap_abs_error": _summary(target_rear_gap_abs_errors),
     }
 
 
@@ -1374,13 +1503,20 @@ def _train_wcdt_v2_predictor(
     if train_loader is None:
         return {"wcdt_v2_prediction_skipped": True, "wcdt_v2_prediction_skip_reason": "no trajectory samples"}
     torch, _DataLoader, _TensorDataset = _require_torch()
-    from safe_rl.prediction.wcdt_v2_predictor import INPUT_DIM, WcDTV2ResidualPredictor, v2_loss
+    from safe_rl.prediction.wcdt_v2_predictor import (
+        ARCHITECTURE_VERSION,
+        INPUT_DIM,
+        LOSS_VERSION,
+        WcDTV2ResidualPredictor,
+        v2_loss,
+    )
 
     ensemble_size = int(cfg.prediction.get("wcdt_v2_ensemble_size", 3))
     hidden_dim = int(cfg.prediction.get("wcdt_v2_hidden_dim", 128))
     horizon = int(cfg.prediction.get("wcdt_v2_horizon_steps", cfg.scenario.forecast_horizon_steps))
     epochs = int(cfg.prediction.get("wcdt_v2_epochs", cfg.prediction.epochs))
     loss_weights = dict(cfg.prediction.get("wcdt_v2_loss_weights", {}))
+    early_stopping = _wcdt_v2_early_stopping_config(cfg, has_validation=val_loader is not None)
     model_states: list[dict[str, Any]] = []
     member_histories: list[dict[str, Any]] = []
     validation_history: list[dict[str, Any]] = []
@@ -1396,12 +1532,17 @@ def _train_wcdt_v2_predictor(
         model = WcDTV2ResidualPredictor(INPUT_DIM, horizon, hidden_dim).to(device)
         optimizer = torch.optim.Adam(model.parameters(), lr=float(cfg.prediction.get("wcdt_v2_learning_rate", cfg.prediction.learning_rate)))
         losses: list[float] = []
+        loss_component_history: list[dict[str, float]] = []
         best_state: dict[str, Any] | None = None
         best_score: float | None = None
         best_epoch = 0
+        stale_epochs = 0
+        stopped_early = False
+        early_stopping_reason: str | None = None
         member_validation: list[dict[str, Any]] = []
         for epoch in progress_iter(range(epochs), desc=f"Stage2 WcDT v2 member {member_idx + 1}/{ensemble_size}"):
             epoch_losses = []
+            epoch_components: dict[str, list[float]] = {}
             model.train()
             for features, baseline, target, mask, role_ids, ego_future in train_loader:
                 features = features.to(device, non_blocking=pin_memory)
@@ -1411,13 +1552,20 @@ def _train_wcdt_v2_predictor(
                 role_ids = role_ids.to(device, non_blocking=pin_memory)
                 ego_future = ego_future.to(device, non_blocking=pin_memory)
                 pred = model(features, baseline)
-                loss = v2_loss(pred, target, mask, ego_future, role_ids, loss_weights)
+                loss, components = v2_loss(pred, target, mask, ego_future, role_ids, loss_weights)
                 optimizer.zero_grad()
                 loss.backward()
                 optimizer.step()
                 epoch_losses.append(float(loss.detach().cpu()))
+                for name, value in components.items():
+                    epoch_components.setdefault(name, []).append(float(value.detach().cpu()))
             epoch_loss = float(np.mean(epoch_losses)) if epoch_losses else 0.0
             losses.append(epoch_loss)
+            component_summary = {
+                name: float(np.mean(values)) if values else 0.0
+                for name, values in epoch_components.items()
+            }
+            loss_component_history.append(component_summary)
             val_score = epoch_loss
             validation_metrics: dict[str, Any] | None = None
             if val_loader is not None:
@@ -1429,10 +1577,48 @@ def _train_wcdt_v2_predictor(
                 member_validation.append(validation_metrics)
                 tb.scalar(f"stage2/wcdt_v2_member_{member_idx}/val_score", val_score, epoch)
             tb.scalar(f"stage2/wcdt_v2_member_{member_idx}/loss", epoch_loss, epoch)
-            if best_score is None or val_score < best_score:
+            for name, value in component_summary.items():
+                tb.scalar(f"stage2/wcdt_v2_member_{member_idx}/loss_{name}", value, epoch)
+            improved, stale_epochs, should_stop = _wcdt_v2_early_stopping_step(
+                best_score=best_score,
+                score=val_score,
+                epoch=epoch + 1,
+                stale_epochs=stale_epochs,
+                config=early_stopping,
+            )
+            if improved:
                 best_score = float(val_score)
                 best_epoch = int(epoch + 1)
                 best_state = _cpu_state_dict(model)
+            if validation_metrics is not None:
+                stage_log(
+                    "stage2",
+                    f"wcdt_v2 member={member_idx + 1}/{ensemble_size} epoch={epoch + 1}/{epochs} "
+                    f"loss={epoch_loss:.6f} val_score={val_score:.6f} "
+                    f"ade={float(validation_metrics['ade'].get('mean', 0.0)):.3f} "
+                    f"fde={float(validation_metrics['fde'].get('mean', 0.0)):.3f} "
+                    f"minD={float(validation_metrics['future_min_distance_abs_error'].get('mean', 0.0)):.3f} "
+                    f"front_gap={float(validation_metrics['target_lane_front_gap_abs_error'].get('mean', 0.0)):.3f} "
+                    f"rear_gap={float(validation_metrics['target_lane_rear_gap_abs_error'].get('mean', 0.0)):.3f}",
+                )
+            else:
+                stage_log(
+                    "stage2",
+                    f"wcdt_v2 member={member_idx + 1}/{ensemble_size} epoch={epoch + 1}/{epochs} "
+                    f"loss={epoch_loss:.6f}",
+                )
+            if should_stop:
+                stopped_early = True
+                early_stopping_reason = (
+                    f"no val_score improvement >= {early_stopping['min_delta']} "
+                    f"for {early_stopping['patience']} epochs"
+                )
+                stage_log(
+                    "stage2",
+                    f"wcdt_v2 member={member_idx + 1}/{ensemble_size} early_stop epoch={epoch + 1} "
+                    f"best_epoch={best_epoch} best_val_score={float(best_score):.6f}",
+                )
+                break
         if best_state is None:
             best_state = _cpu_state_dict(model)
         model_states.append(best_state)
@@ -1440,9 +1626,13 @@ def _train_wcdt_v2_predictor(
             {
                 "member": int(member_idx),
                 "loss_history": losses,
+                "loss_component_history": loss_component_history,
                 "validation_history": member_validation,
+                "trained_epochs": int(len(losses)),
                 "best_epoch": int(best_epoch),
                 "best_val_score": float(best_score if best_score is not None else (losses[-1] if losses else 0.0)),
+                "stopped_early": bool(stopped_early),
+                "early_stopping_reason": early_stopping_reason,
             }
         )
     ensemble_models = []
@@ -1459,6 +1649,7 @@ def _train_wcdt_v2_predictor(
     if val_loader is not None:
         ensemble_validation["val_score"] = _prediction_val_score(ensemble_validation, cfg)
         validation_history.append(ensemble_validation)
+    vs_cv_summary = _wcdt_v2_vs_cv_summary(cv_baseline, ensemble_validation)
     checkpoint = stage_dir / "wcdt_v2_predictor.pt"
     best_checkpoint = stage_dir / "wcdt_v2_predictor_best.pt"
     payload = {
@@ -1467,10 +1658,16 @@ def _train_wcdt_v2_predictor(
         "validation_history": validation_history,
         "ensemble_validation": ensemble_validation,
         "cv_baseline_validation": cv_baseline,
+        "wcdt_v2_vs_cv_summary": vs_cv_summary,
+        "architecture_version": ARCHITECTURE_VERSION,
+        "loss_version": LOSS_VERSION,
         "horizon_steps": int(horizon),
+        "history_steps": int(cfg.scenario.history_steps),
         "input_dim": int(INPUT_DIM),
         "hidden_dim": int(hidden_dim),
         "ensemble_size": int(ensemble_size),
+        "loss_weights": loss_weights,
+        "early_stopping_config": early_stopping,
         "best_metric": "ensemble_val_score",
         "best_val_score": float(ensemble_validation.get("val_score", 0.0)) if isinstance(ensemble_validation, dict) else 0.0,
         "train_sample_count": int(train_indices.shape[0]),
@@ -1482,9 +1679,17 @@ def _train_wcdt_v2_predictor(
         "wcdt_v2_prediction_checkpoint": str(checkpoint),
         "wcdt_v2_prediction_best_checkpoint": str(best_checkpoint),
         "wcdt_v2_member_histories": member_histories,
+        "wcdt_v2_loss_component_history": [
+            {"member": int(item["member"]), "history": item["loss_component_history"]}
+            for item in member_histories
+        ],
         "wcdt_v2_prediction_validation_history": validation_history,
         "wcdt_v2_prediction_cv_baseline_validation": cv_baseline,
         "wcdt_v2_prediction_ensemble_validation": ensemble_validation,
+        "wcdt_v2_vs_cv_summary": vs_cv_summary,
+        "wcdt_v2_architecture_version": ARCHITECTURE_VERSION,
+        "wcdt_v2_loss_version": LOSS_VERSION,
+        "wcdt_v2_early_stopping_config": early_stopping,
         "wcdt_v2_prediction_best_val_score": float(payload["best_val_score"]),
     }
 
@@ -1571,6 +1776,12 @@ def run(cfg) -> Path:
                 "wcdt_v2_prediction_validation_history": report.get("wcdt_v2_prediction_validation_history", []),
                 "wcdt_v2_prediction_cv_baseline_validation": report.get("wcdt_v2_prediction_cv_baseline_validation"),
                 "wcdt_v2_prediction_ensemble_validation": report.get("wcdt_v2_prediction_ensemble_validation"),
+                "wcdt_v2_member_histories": report.get("wcdt_v2_member_histories", []),
+                "wcdt_v2_loss_component_history": report.get("wcdt_v2_loss_component_history", []),
+                "wcdt_v2_vs_cv_summary": report.get("wcdt_v2_vs_cv_summary"),
+                "wcdt_v2_architecture_version": report.get("wcdt_v2_architecture_version"),
+                "wcdt_v2_loss_version": report.get("wcdt_v2_loss_version"),
+                "wcdt_v2_early_stopping_config": report.get("wcdt_v2_early_stopping_config"),
                 "wcdt_v2_prediction_best_val_score": report.get("wcdt_v2_prediction_best_val_score"),
                 "device": str(device),
             }

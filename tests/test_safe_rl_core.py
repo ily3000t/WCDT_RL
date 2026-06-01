@@ -50,6 +50,8 @@ from safe_rl.pipeline.stage2_train_prediction_risk import (
     _target_lane_gap as stage2_target_lane_gap,
     _wcdt_v1_batch_size,
     _wcdt_v2_batch_size,
+    _wcdt_v2_early_stopping_config,
+    _wcdt_v2_early_stopping_step,
 )
 from safe_rl.pipeline.stage5_paired_eval import _build_acceptance, _build_paired_delta, _group_overrides, _select_eval_seeds
 from safe_rl.pipeline.stage5_confirmatory_eval import (
@@ -70,8 +72,11 @@ from safe_rl.pipeline.stage5_shield_sweep import (
 from safe_rl.prediction.sumo_wcdt_adapter import SumoWcDTAdapter
 from safe_rl.prediction.wcdt_v2_predictor import (
     INPUT_DIM as WCDT_V2_INPUT_DIM,
+    WcDTV2ResidualPredictor,
     build_v2_numpy_batch,
+    load_v2_ensemble,
     ordered_merge_local_indices,
+    v2_loss,
 )
 from safe_rl.risk.candidate_risk_ranker import CandidateRiskRanker
 from safe_rl.risk.merge_local import (
@@ -596,6 +601,37 @@ def test_forecast_conclusion_rejects_wcdt_with_worse_fde_and_flat_uncertainty():
     assert not conclusion["wcdt_v2_recommended_for_stage5"]
 
 
+def test_forecast_conclusion_requires_wcdt_v2_front_rear_gap_quality():
+    report = {
+        "cv_prediction": {
+            "ade": {"mean": 2.0},
+            "fde": {"mean": 4.0},
+            "future_min_distance_abs_error": {"mean": 2.0},
+            "target_lane_front_gap_abs_error": {"mean": 2.0},
+            "target_lane_rear_gap_abs_error": {"mean": 2.0},
+        },
+        "wcdt_v2_prediction": {
+            "available": True,
+            "fde": {"mean": 3.0},
+            "future_min_distance_abs_error": {"mean": 1.0},
+            "target_lane_front_gap_abs_error": {"mean": 1.0},
+            "target_lane_rear_gap_abs_error": {"mean": 1.0},
+            "uncertainty": {"std": 0.10},
+            "uncertainty_fde_correlation": 0.0,
+            "uncertainty_future_min_distance_abs_error_correlation": 0.20,
+        },
+    }
+    conclusion = _forecast_conclusion(report)
+    assert conclusion["wcdt_v2_prediction_quality_pass"]
+    assert conclusion["wcdt_v2_uncertainty_quality_pass"]
+    assert conclusion["wcdt_v2_recommended_for_stage5"]
+
+    report["wcdt_v2_prediction"]["target_lane_rear_gap_abs_error"]["mean"] = 3.0
+    conclusion = _forecast_conclusion(report)
+    assert not conclusion["wcdt_v2_prediction_quality_pass"]
+    assert not conclusion["wcdt_v2_recommended_for_stage5"]
+
+
 class _StaticRiskModel:
     def __init__(self, scores: dict[int, float], uncertainty: float = 0.1):
         self.scores = scores
@@ -1044,6 +1080,87 @@ def test_wcdt_v2_batch_has_fixed_shape_and_cv_baseline():
     assert np.all(np.isfinite(batch["features"]))
     assert batch["selected_indices"][0].tolist() == [1, 2, 3]
     assert batch["baseline"][0, 0, 0, 0] > history[0, 1, -1, 0]
+
+
+def test_wcdt_v2_loss_uses_future_minimum_distance_not_mean_gap_error():
+    torch = pytest.importorskip("torch")
+    target = torch.tensor([[[[5.0, 0.0], [5.0, 0.0], [5.0, 0.0]]]], dtype=torch.float32)
+    pred = torch.tensor([[[[8.0, 0.0], [5.0, 0.0], [5.0, 0.0]]]], dtype=torch.float32)
+    mask = torch.ones((1, 1), dtype=torch.float32)
+    ego_future = torch.zeros((1, 3, 2), dtype=torch.float32)
+    role_ids = torch.zeros((1, 1), dtype=torch.long)
+    _total, components = v2_loss(pred, target, mask, ego_future, role_ids)
+    assert components["ade"].item() > 0.0
+    assert components["future_min_distance"].item() == pytest.approx(0.0)
+
+
+def test_wcdt_v2_loss_role_gap_and_smoothness_components_are_safe():
+    torch = pytest.importorskip("torch")
+    ego_future = torch.zeros((1, 4, 2), dtype=torch.float32)
+    target = torch.tensor(
+        [[[[5.0, 0.0], [6.0, 0.0], [7.0, 0.0], [8.0, 0.0]]]],
+        dtype=torch.float32,
+    )
+    smooth = target.clone()
+    jitter = target.clone()
+    jitter[0, 0, 2, 0] += 4.0
+    mask = torch.ones((1, 1), dtype=torch.float32)
+    front_role = torch.zeros((1, 1), dtype=torch.long)
+    _total, smooth_components = v2_loss(smooth, target, mask, ego_future, front_role)
+    _total, jitter_components = v2_loss(jitter, target, mask, ego_future, front_role)
+    assert smooth_components["target_lane_rear_gap"].item() == pytest.approx(0.0)
+    assert jitter_components["target_lane_front_gap"].item() > 0.0
+    assert jitter_components["smoothness"].item() > smooth_components["smoothness"].item()
+
+
+def test_wcdt_v2_early_stopping_and_validation_unavailable_behavior():
+    cfg = load_config()
+    disabled = _wcdt_v2_early_stopping_config(cfg, has_validation=False)
+    assert not disabled["enabled"]
+    assert disabled["disabled_reason"] == "validation_unavailable"
+
+    enabled = _wcdt_v2_early_stopping_config(cfg, has_validation=True)
+    stale = 0
+    best = 1.0
+    for epoch in range(1, 11):
+        improved, stale, should_stop = _wcdt_v2_early_stopping_step(
+            best_score=best,
+            score=1.0,
+            epoch=epoch,
+            stale_epochs=stale,
+            config=enabled,
+        )
+        assert not improved
+    assert should_stop
+    improved, stale, should_stop = _wcdt_v2_early_stopping_step(
+        best_score=best,
+        score=0.5,
+        epoch=11,
+        stale_epochs=stale,
+        config=enabled,
+    )
+    assert improved
+    assert stale == 0
+    assert not should_stop
+
+
+def test_wcdt_v2_old_checkpoint_without_metadata_still_loads(tmp_path):
+    torch = pytest.importorskip("torch")
+    cfg = load_config()
+    model = WcDTV2ResidualPredictor(WCDT_V2_INPUT_DIM, horizon_steps=3, hidden_dim=8)
+    checkpoint = tmp_path / "legacy_wcdt_v2.pt"
+    torch.save(
+        {
+            "model_state_dict": model.state_dict(),
+            "horizon_steps": 3,
+            "hidden_dim": 8,
+        },
+        checkpoint,
+    )
+    models, payload, _device = load_v2_ensemble(cfg, checkpoint, torch.device("cpu"))
+    assert len(models) == 1
+    assert "architecture_version" not in payload
+    assert "loss_version" not in payload
 
 
 def test_risk_loss_ignores_zero_weight_samples():
