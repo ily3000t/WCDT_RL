@@ -1,11 +1,15 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
+import re
+import shutil
 import subprocess
 import sys
+from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 import yaml
 
@@ -17,14 +21,353 @@ from safe_rl.pipeline import (
     stage4_collect_failures,
     stage5_paired_eval,
 )
-from safe_rl.utils.config import REPO_ROOT, load_config, prepare_run_dir
+from safe_rl.utils.config import DEFAULT_CONFIG_PATH, REPO_ROOT, load_config
 from safe_rl.utils.progress import stage_log
-from safe_rl.sim.scenario_snapshot import snapshot_scenario
+from safe_rl.sim.scenario_snapshot import SCENARIO_SUFFIXES, snapshot_scenario
 
 
 VALID_FORECAST_SOURCES = ("constant_velocity", "wcdt", "wcdt_v2")
 DEFAULT_FORECAST_SOURCES = ("constant_velocity", "wcdt_v2")
 VALID_FORECAST_PPO_PROFILES = ("default", "safety", "shield_guided")
+VALID_RUN_MODES = ("new", "resume", "overwrite")
+RUN_ID_PATTERN = re.compile(r"^[A-Za-z0-9._-]+$")
+PIPELINE_STATE_SCHEMA_VERSION = 1
+PIPELINE_TASK_ORDER = (
+    "network_snapshot",
+    "stage1",
+    "stage2_initial",
+    "stage3_baseline",
+    "stage4",
+    "stage2_with_stage4",
+    "stage3_forecast_cv",
+    "stage3_forecast_wcdt",
+    "stage3_forecast_wcdt_v2",
+    "stage5",
+    "diagnostics",
+)
+
+
+def _utc_now() -> str:
+    return datetime.now(timezone.utc).isoformat()
+
+
+def _sha256(path: str | Path) -> str:
+    digest = hashlib.sha256()
+    with Path(path).open("rb") as file:
+        for chunk in iter(lambda: file.read(65536), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _atomic_write_json(path: str | Path, payload: dict[str, Any]) -> Path:
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_suffix(f"{path.suffix}.tmp")
+    with temporary.open("w", encoding="utf-8") as file:
+        json.dump(payload, file, ensure_ascii=False, indent=2, allow_nan=False)
+    temporary.replace(path)
+    return path
+
+
+def _validate_run_id(run_id: str) -> str:
+    run_id = str(run_id).strip()
+    if not run_id or not RUN_ID_PATTERN.fullmatch(run_id):
+        raise ValueError("run_id may contain only letters, digits, '.', '_' and '-'")
+    if run_id in {".", ".."}:
+        raise ValueError("run_id must identify a managed run directory")
+    return run_id
+
+
+def _output_root(cfg: Any) -> Path:
+    root = Path(cfg.run.output_root)
+    if not root.is_absolute():
+        root = REPO_ROOT / root
+    return root.resolve()
+
+
+def _managed_run_dirs(output_root: str | Path, run_id: str) -> list[Path]:
+    output_root = Path(output_root).resolve()
+    run_id = _validate_run_id(run_id)
+    names = [run_id, *[f"{run_id}_forecast_{_source_suffix(source)}" for source in VALID_FORECAST_SOURCES]]
+    managed: list[Path] = []
+    for name in names:
+        candidate = (output_root / name).resolve()
+        if candidate.parent != output_root:
+            raise ValueError(f"refusing unmanaged run directory: {candidate}")
+        managed.append(candidate)
+    return managed
+
+
+def _existing_managed_run_dirs(output_root: str | Path, run_id: str) -> list[Path]:
+    return [path for path in _managed_run_dirs(output_root, run_id) if path.exists()]
+
+
+def _remove_managed_run_dirs(output_root: str | Path, run_id: str) -> None:
+    for path in _managed_run_dirs(output_root, run_id):
+        if path.exists():
+            shutil.rmtree(path)
+
+
+def _prepare_new_run_dir(output_root: str | Path, run_id: str, run_mode: str) -> Path:
+    output_root = Path(output_root).resolve()
+    existing = _existing_managed_run_dirs(output_root, run_id)
+    if run_mode == "new" and existing:
+        raise FileExistsError(f"run directories already exist; use --run-mode resume or overwrite: {existing}")
+    if run_mode == "overwrite":
+        _remove_managed_run_dirs(output_root, run_id)
+    run_dir = output_root / _validate_run_id(run_id)
+    run_dir.mkdir(parents=True, exist_ok=False)
+    return run_dir
+
+
+def _scenario_source_sha256(cfg: Any) -> str:
+    source = Path(cfg.scenario.root).resolve()
+    digest = hashlib.sha256()
+    for path in sorted(source.iterdir(), key=lambda item: item.name):
+        if not path.is_file() or not path.name.endswith(SCENARIO_SUFFIXES):
+            continue
+        digest.update(path.name.encode("utf-8"))
+        digest.update(_sha256(path).encode("ascii"))
+    return digest.hexdigest()
+
+
+def _predictor_training_flags(sources: list[str] | tuple[str, ...]) -> dict[str, bool]:
+    source_set = set(sources)
+    train_v1 = "wcdt" in source_set
+    train_v2 = "wcdt_v2" in source_set
+    return {
+        "train_enabled": bool(train_v1 or train_v2),
+        "wcdt_v1_train_enabled": bool(train_v1),
+        "wcdt_v2_train_enabled": bool(train_v2),
+    }
+
+
+def _task_enabled(task_name: str, sources: list[str] | tuple[str, ...]) -> bool:
+    if task_name == "stage3_forecast_cv":
+        return "constant_velocity" in sources
+    if task_name == "stage3_forecast_wcdt":
+        return "wcdt" in sources
+    if task_name == "stage3_forecast_wcdt_v2":
+        return "wcdt_v2" in sources
+    return True
+
+
+def _normalize_invocation(
+    *,
+    stage1_episodes: int | None,
+    stage4_episodes: int | None,
+    stage5_episodes: int | None,
+    ppo_timesteps: int | None,
+    forecast_ppo_timesteps: int | None,
+    forecast_ppo_profile: str | None,
+    forecast_sources: list[str],
+) -> dict[str, Any]:
+    profile = str(forecast_ppo_profile or "default").strip().lower()
+    if profile not in VALID_FORECAST_PPO_PROFILES:
+        raise ValueError(f"forecast PPO profile must be one of {VALID_FORECAST_PPO_PROFILES}; got {profile!r}")
+    return {
+        "stage1_episodes": int(stage1_episodes) if stage1_episodes is not None else None,
+        "stage4_episodes": int(stage4_episodes) if stage4_episodes is not None else None,
+        "stage5_episodes": int(stage5_episodes) if stage5_episodes is not None else None,
+        "ppo_timesteps": int(ppo_timesteps) if ppo_timesteps is not None else None,
+        "forecast_ppo_timesteps": int(forecast_ppo_timesteps) if forecast_ppo_timesteps is not None else None,
+        "forecast_ppo_profile": profile,
+        "forecast_sources": list(forecast_sources),
+    }
+
+
+def _new_pipeline_state(run_id: str, invocation: dict[str, Any]) -> dict[str, Any]:
+    sources = list(invocation["forecast_sources"])
+    tasks = {}
+    for task_name in PIPELINE_TASK_ORDER:
+        enabled = _task_enabled(task_name, sources)
+        tasks[task_name] = {
+            "enabled": enabled,
+            "status": "pending" if enabled else "completed",
+            "started_at": None,
+            "completed_at": None,
+            "required_outputs": [],
+            "output_hashes": {},
+        }
+    return {
+        "schema_version": PIPELINE_STATE_SCHEMA_VERSION,
+        "run_id": run_id,
+        "normalized_invocation": invocation,
+        "forecast_sources": sources,
+        "default_config_sha256": _sha256(DEFAULT_CONFIG_PATH),
+        "scenario_snapshot_sha256": None,
+        "scenario_source_sha256": None,
+        "tasks": tasks,
+    }
+
+
+def _load_pipeline_state(path: str | Path) -> dict[str, Any]:
+    path = Path(path)
+    if not path.exists():
+        raise FileNotFoundError(f"resume requires pipeline state: {path}")
+    with path.open("r", encoding="utf-8") as file:
+        state = json.load(file)
+    if int(state.get("schema_version", -1)) != PIPELINE_STATE_SCHEMA_VERSION:
+        raise ValueError(f"unsupported pipeline state schema: {state.get('schema_version')}")
+    return state
+
+
+def _resume_invocation(
+    state: dict[str, Any],
+    *,
+    stage1_episodes: int | None,
+    stage4_episodes: int | None,
+    stage5_episodes: int | None,
+    ppo_timesteps: int | None,
+    forecast_ppo_timesteps: int | None,
+    forecast_ppo_profile: str | None,
+    forecast_sources: str | list[str] | tuple[str, ...] | None,
+    forecast_source: str | None,
+) -> dict[str, Any]:
+    saved = dict(state["normalized_invocation"])
+    explicit_sources = forecast_sources is not None or forecast_source is not None
+    sources = (
+        resolve_forecast_sources(forecast_sources=forecast_sources, forecast_source=forecast_source)
+        if explicit_sources
+        else list(saved["forecast_sources"])
+    )
+    requested = {
+        "stage1_episodes": stage1_episodes,
+        "stage4_episodes": stage4_episodes,
+        "stage5_episodes": stage5_episodes,
+        "ppo_timesteps": ppo_timesteps,
+        "forecast_ppo_timesteps": forecast_ppo_timesteps,
+        "forecast_ppo_profile": forecast_ppo_profile,
+        "forecast_sources": sources if explicit_sources else None,
+    }
+    for key, value in requested.items():
+        if value is not None and value != saved.get(key):
+            raise ValueError(f"resume argument mismatch for {key}: saved={saved.get(key)!r}, requested={value!r}")
+    return saved
+
+
+def _task_output_paths(run_dir: Path, cfg: Any, sources: list[str], task_name: str) -> list[Path]:
+    stage3_model = str(cfg.stage3.model_name)
+    paths: dict[str, list[Path]] = {
+        "network_snapshot": [run_dir / "scenario_snapshot" / "manifest.json"],
+        "stage1": [run_dir / "stage1" / str(cfg.stage1.output_name), run_dir / "stage1" / "stage1_report.json"],
+        "stage2_initial": [
+            run_dir / "stage2" / "risk_module_initial.pt",
+            run_dir / "stage2" / "stage2_initial_training_report.json",
+        ],
+        "stage3_baseline": [
+            run_dir / "stage3" / stage3_model,
+            run_dir / "stage3" / "stage3_training_report.json",
+            run_dir / "stage3" / "stage3_checkpoint_selection_report.json",
+        ],
+        "stage4": [run_dir / "stage4" / "on_policy_failure_buffer.npz", run_dir / "stage4" / "stage4_report.json"],
+        "stage2_with_stage4": [run_dir / "stage2" / "risk_module.pt", run_dir / "stage2" / "stage2_training_report.json"],
+        "stage5": [
+            run_dir / "stage5" / "formal_paired_eval_report.json",
+            run_dir / "stage5" / "shield_off_metrics.json",
+            run_dir / "stage5" / "shield_on_metrics.json",
+        ],
+        "diagnostics": [run_dir / "stage5" / "diagnostics" / "forecast_diagnostics.json"],
+    }
+    if "wcdt" in sources:
+        paths["stage2_initial"].extend(
+            [run_dir / "stage2" / "wcdt_predictor.pt", run_dir / "stage2" / "wcdt_predictor_best.pt"]
+        )
+    if "wcdt_v2" in sources:
+        paths["stage2_initial"].extend(
+            [run_dir / "stage2" / "wcdt_v2_predictor.pt", run_dir / "stage2" / "wcdt_v2_predictor_best.pt"]
+        )
+    for source in VALID_FORECAST_SOURCES:
+        forecast_run_dir = run_dir.parent / _forecast_run_id(run_dir.name, source)
+        paths[f"stage3_forecast_{_source_suffix(source)}"] = [
+            forecast_run_dir / "stage3" / stage3_model,
+            forecast_run_dir / "stage3" / "stage3_training_report.json",
+            forecast_run_dir / "stage3" / "stage3_checkpoint_selection_report.json",
+        ]
+    return paths[task_name]
+
+
+def _validate_completed_outputs(state: dict[str, Any]) -> None:
+    for task_name in PIPELINE_TASK_ORDER:
+        task = state["tasks"][task_name]
+        if not bool(task.get("enabled", True)) or task.get("status") != "completed":
+            continue
+        for value in task.get("required_outputs", []):
+            path = Path(value)
+            if not path.exists():
+                raise FileNotFoundError(f"completed task {task_name} is missing output: {path}")
+            expected = task.get("output_hashes", {}).get(str(path))
+            actual = _sha256(path)
+            if expected != actual:
+                raise ValueError(f"completed task {task_name} output hash changed: {path}")
+
+
+def _validate_resume_state(state: dict[str, Any], cfg: Any) -> None:
+    if state.get("default_config_sha256") != _sha256(DEFAULT_CONFIG_PATH):
+        raise ValueError("default config changed since the run started; use a new run id or --run-mode overwrite")
+    snapshot_hash = state.get("scenario_snapshot_sha256")
+    source_hash = state.get("scenario_source_sha256")
+    if snapshot_hash:
+        manifest = _output_root(cfg) / str(state["run_id"]) / "scenario_snapshot" / "manifest.json"
+        if not manifest.exists() or _sha256(manifest) != snapshot_hash:
+            raise ValueError("scenario snapshot changed since the run started")
+    if source_hash and _scenario_source_sha256(cfg) != source_hash:
+        raise ValueError("scenario source changed since the run started; use a new run id or --run-mode overwrite")
+    _validate_completed_outputs(state)
+
+
+def _reset_unfinished_tasks(state: dict[str, Any]) -> None:
+    reset = False
+    for task_name in PIPELINE_TASK_ORDER:
+        task = state["tasks"][task_name]
+        if not bool(task.get("enabled", True)):
+            continue
+        if task.get("status") != "completed":
+            reset = True
+        if reset:
+            task.update(
+                {
+                    "status": "pending",
+                    "started_at": None,
+                    "completed_at": None,
+                    "required_outputs": [],
+                    "output_hashes": {},
+                }
+            )
+
+
+def _run_pipeline_task(
+    state_path: Path,
+    state: dict[str, Any],
+    task_name: str,
+    required_outputs: list[Path],
+    action: Callable[[], None],
+) -> bool:
+    task = state["tasks"][task_name]
+    if not bool(task.get("enabled", True)):
+        return False
+    if task.get("status") == "completed":
+        stage_log("full", f"resume skip completed task={task_name}")
+        return False
+    task.update(
+        {
+            "status": "running",
+            "started_at": _utc_now(),
+            "completed_at": None,
+            "required_outputs": [str(path.resolve()) for path in required_outputs],
+            "output_hashes": {},
+        }
+    )
+    _atomic_write_json(state_path, state)
+    action()
+    missing = [path for path in required_outputs if not path.exists()]
+    if missing:
+        raise FileNotFoundError(f"task {task_name} did not produce required outputs: {missing}")
+    task["status"] = "completed"
+    task["completed_at"] = _utc_now()
+    task["output_hashes"] = {str(path.resolve()): _sha256(path) for path in required_outputs}
+    _atomic_write_json(state_path, state)
+    return True
 
 
 def _relative_run_path(run_id: str, stage: str, name: str) -> str:
@@ -175,7 +518,10 @@ def build_generated_configs(
     generated_dir = Path(generated_dir)
     sources = resolve_forecast_sources(forecast_sources=forecast_sources, forecast_source=forecast_source)
 
-    main_payload: dict[str, Any] = {"run": {"run_id": run_id}}
+    main_payload: dict[str, Any] = {
+        "run": {"run_id": run_id},
+        "prediction": _predictor_training_flags(sources),
+    }
     if stage1_episodes is not None:
         main_payload["stage1"] = {"episodes": int(stage1_episodes)}
     if stage4_episodes is not None:
@@ -285,71 +631,173 @@ def _print_stage5_summary(run_id: str) -> None:
 
 def run_full_pipeline(
     run_id: str,
+    run_mode: str = "new",
     stage1_episodes: int | None = None,
     stage4_episodes: int | None = None,
     stage5_episodes: int | None = None,
     ppo_timesteps: int | None = None,
     forecast_ppo_timesteps: int | None = None,
-    forecast_ppo_profile: str = "default",
+    forecast_ppo_profile: str | None = None,
     forecast_sources: str | list[str] | tuple[str, ...] | None = None,
     forecast_source: str | None = None,
 ) -> Path:
-    sources = resolve_forecast_sources(forecast_sources=forecast_sources, forecast_source=forecast_source)
+    run_id = _validate_run_id(run_id)
+    run_mode = str(run_mode).strip().lower()
+    if run_mode not in VALID_RUN_MODES:
+        raise ValueError(f"run mode must be one of {VALID_RUN_MODES}; got {run_mode!r}")
     bootstrap_cfg = load_config()
     bootstrap_cfg.run["run_id"] = run_id
-    run_dir = prepare_run_dir(bootstrap_cfg)
+    output_root = _output_root(bootstrap_cfg)
+    run_dir = output_root / run_id
+    state_path = run_dir / "pipeline_state.json"
+    if run_mode == "resume":
+        state = _load_pipeline_state(state_path)
+        if state.get("run_id") != run_id:
+            raise ValueError(f"pipeline state run_id mismatch: {state.get('run_id')!r}")
+        invocation = _resume_invocation(
+            state,
+            stage1_episodes=stage1_episodes,
+            stage4_episodes=stage4_episodes,
+            stage5_episodes=stage5_episodes,
+            ppo_timesteps=ppo_timesteps,
+            forecast_ppo_timesteps=forecast_ppo_timesteps,
+            forecast_ppo_profile=forecast_ppo_profile,
+            forecast_sources=forecast_sources,
+            forecast_source=forecast_source,
+        )
+        _validate_resume_state(state, bootstrap_cfg)
+        _reset_unfinished_tasks(state)
+        _atomic_write_json(state_path, state)
+    else:
+        sources = resolve_forecast_sources(forecast_sources=forecast_sources, forecast_source=forecast_source)
+        invocation = _normalize_invocation(
+            stage1_episodes=stage1_episodes,
+            stage4_episodes=stage4_episodes,
+            stage5_episodes=stage5_episodes,
+            ppo_timesteps=ppo_timesteps,
+            forecast_ppo_timesteps=forecast_ppo_timesteps,
+            forecast_ppo_profile=forecast_ppo_profile,
+            forecast_sources=sources,
+        )
+        run_dir = _prepare_new_run_dir(output_root, run_id, run_mode)
+        state = _new_pipeline_state(run_id, invocation)
+        _atomic_write_json(state_path, state)
+    sources = list(invocation["forecast_sources"])
     generated_dir = run_dir / "generated_configs"
     configs = build_generated_configs(
         run_id,
         generated_dir,
-        stage1_episodes=stage1_episodes,
-        stage4_episodes=stage4_episodes,
-        stage5_episodes=stage5_episodes,
-        ppo_timesteps=ppo_timesteps,
-        forecast_ppo_timesteps=forecast_ppo_timesteps,
-        forecast_ppo_profile=forecast_ppo_profile,
+        stage1_episodes=invocation["stage1_episodes"],
+        stage4_episodes=invocation["stage4_episodes"],
+        stage5_episodes=invocation["stage5_episodes"],
+        ppo_timesteps=invocation["ppo_timesteps"],
+        forecast_ppo_timesteps=invocation["forecast_ppo_timesteps"],
+        forecast_ppo_profile=invocation["forecast_ppo_profile"],
         forecast_sources=sources,
     )
+    main_cfg = _load_stage_cfg(configs["main"], run_id)
 
     stage_log("full", f"run_id={run_id}")
+    stage_log("full", f"run_mode={run_mode}")
     stage_log("full", f"forecast_sources={sources}")
-    stage_log("full", f"forecast_ppo_profile={forecast_ppo_profile}")
-    if forecast_ppo_timesteps is not None:
-        stage_log("full", f"forecast_ppo_timesteps={forecast_ppo_timesteps}")
+    stage_log("full", f"forecast_ppo_profile={invocation['forecast_ppo_profile']}")
+    if invocation["forecast_ppo_timesteps"] is not None:
+        stage_log("full", f"forecast_ppo_timesteps={invocation['forecast_ppo_timesteps']}")
     for source in sources:
         stage_log("full", f"forecast_run_id[{source}]={_forecast_run_id(run_id, source)}")
     stage_log("full", f"generated_configs={generated_dir}")
 
-    _run_subprocess([sys.executable, str(REPO_ROOT / "scenarios" / "highway_merge" / "build_network.py")], "build network")
-    snapshot_manifest = snapshot_scenario(_load_stage_cfg(configs["main"], run_id), run_dir)
-    stage_log("full", f"scenario_snapshot={snapshot_manifest}")
+    def _build_network_snapshot() -> None:
+        _run_subprocess(
+            [sys.executable, str(REPO_ROOT / "scenarios" / "highway_merge" / "build_network.py")],
+            "build network",
+        )
+        snapshot_manifest = snapshot_scenario(main_cfg, run_dir)
+        state["scenario_snapshot_sha256"] = _sha256(snapshot_manifest)
+        state["scenario_source_sha256"] = _scenario_source_sha256(main_cfg)
+        stage_log("full", f"scenario_snapshot={snapshot_manifest}")
+
+    _run_pipeline_task(
+        state_path,
+        state,
+        "network_snapshot",
+        _task_output_paths(run_dir, main_cfg, sources, "network_snapshot"),
+        _build_network_snapshot,
+    )
     _sumo_smoke_check(configs["main"], run_id)
 
-    stage_log("full", "Stage1 risk probe")
-    stage1_risk_probe.run(_load_stage_cfg(configs["main"], run_id))
-    stage_log("full", "Stage2 initial prediction + risk")
-    stage2_train_prediction_risk.run(_load_stage_cfg(configs["main"], run_id))
-    stage_log("full", "Stage3 baseline PPO")
-    stage3_train_ppo.run(_load_stage_cfg(configs["main"], run_id))
-    stage_log("full", "Stage4 shadow collection")
-    stage4_collect_failures.run(_load_stage_cfg(configs["main"], run_id))
-    stage_log("full", "Stage2 risk retraining with Stage4 buffer")
-    stage2_train_prediction_risk.run(_load_stage_cfg(configs["stage2_with_stage4"], run_id))
+    tasks: list[tuple[str, str, Callable[[], None]]] = [
+        ("stage1", "Stage1 risk probe", lambda: stage1_risk_probe.run(_load_stage_cfg(configs["main"], run_id))),
+        (
+            "stage2_initial",
+            "Stage2 initial prediction + risk",
+            lambda: stage2_train_prediction_risk.run(_load_stage_cfg(configs["main"], run_id)),
+        ),
+        (
+            "stage3_baseline",
+            "Stage3 baseline PPO",
+            lambda: stage3_train_ppo.run(_load_stage_cfg(configs["main"], run_id)),
+        ),
+        (
+            "stage4",
+            "Stage4 shadow collection",
+            lambda: stage4_collect_failures.run(_load_stage_cfg(configs["main"], run_id)),
+        ),
+        (
+            "stage2_with_stage4",
+            "Stage2 risk retraining with Stage4 buffer",
+            lambda: stage2_train_prediction_risk.run(_load_stage_cfg(configs["stage2_with_stage4"], run_id)),
+        ),
+    ]
+    for task_name, label, action in tasks:
+        stage_log("full", label)
+        _run_pipeline_task(state_path, state, task_name, _task_output_paths(run_dir, main_cfg, sources, task_name), action)
     for source in sources:
         forecast_run_id = _forecast_run_id(run_id, source)
         stage_log("full", f"Stage3 forecast PPO ({source})")
-        stage3_train_ppo.run(_load_stage_cfg(configs[f"forecast_{_source_suffix(source)}_ppo"], forecast_run_id))
+        task_name = f"stage3_forecast_{_source_suffix(source)}"
+        _run_pipeline_task(
+            state_path,
+            state,
+            task_name,
+            _task_output_paths(run_dir, main_cfg, sources, task_name),
+            lambda source=source, forecast_run_id=forecast_run_id: stage3_train_ppo.run(
+                _load_stage_cfg(configs[f"forecast_{_source_suffix(source)}_ppo"], forecast_run_id)
+            ),
+        )
     stage_log("full", "Stage5 multi-group paired evaluation")
-    stage5_paired_eval.run(_load_stage_cfg(configs["stage5_multi_groups"], run_id))
+    _run_pipeline_task(
+        state_path,
+        state,
+        "stage5",
+        _task_output_paths(run_dir, main_cfg, sources, "stage5"),
+        lambda: stage5_paired_eval.run(_load_stage_cfg(configs["stage5_multi_groups"], run_id)),
+    )
     stage_log("full", "Forecast diagnostics")
-    forecast_diagnostics.run_forecast_diagnostics(_load_stage_cfg(configs["main"], run_id))
+    _run_pipeline_task(
+        state_path,
+        state,
+        "diagnostics",
+        _task_output_paths(run_dir, main_cfg, sources, "diagnostics"),
+        lambda: forecast_diagnostics.run_forecast_diagnostics(_load_stage_cfg(configs["main"], run_id)),
+    )
     _print_stage5_summary(run_id)
     return run_dir
 
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="Run the full SAFE_RL Stage1-Stage5 pipeline.")
-    parser.add_argument("--run-id", required=True, help="Baseline run id. Forecast run id is '<run-id>_forecast'.")
+    parser.add_argument(
+        "--run-id",
+        required=True,
+        help="Baseline run id. Forecast run ids use '<run-id>_forecast_cv|wcdt|wcdt_v2'.",
+    )
+    parser.add_argument(
+        "--run-mode",
+        choices=list(VALID_RUN_MODES),
+        default="new",
+        help="Run directory handling: new refuses existing runs, resume continues verified state, overwrite recreates runs.",
+    )
     parser.add_argument("--stage1-episodes", type=int, default=None, help="Optional override for Stage1 episodes.")
     parser.add_argument("--stage4-episodes", type=int, default=None, help="Optional override for Stage4 episodes.")
     parser.add_argument("--stage5-episodes", type=int, default=None, help="Optional override for Stage5 episodes per group.")
@@ -363,7 +811,7 @@ def main() -> None:
     parser.add_argument(
         "--forecast-ppo-profile",
         choices=list(VALID_FORECAST_PPO_PROFILES),
-        default="default",
+        default=None,
         help=(
             "Forecast PPO reward profile. 'safety' writes rl.reward_profile=safety_forecast; "
             "'shield_guided' writes rl.reward_profile=shield_guided_forecast and binds the base risk module."
@@ -385,6 +833,7 @@ def main() -> None:
         parser.error("Use either --forecast-source or --forecast-sources, not both.")
     run_full_pipeline(
         args.run_id,
+        run_mode=args.run_mode,
         stage1_episodes=args.stage1_episodes,
         stage4_episodes=args.stage4_episodes,
         stage5_episodes=args.stage5_episodes,

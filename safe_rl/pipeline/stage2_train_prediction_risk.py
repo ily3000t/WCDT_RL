@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from collections import Counter
+import shutil
 from pathlib import Path
 from typing import Any
 
@@ -912,7 +913,15 @@ def _build_wcdt_batch(
         torch.tensor(lane_batch, dtype=torch.float32),
     )
     loader_kwargs = _loader_kwargs(cfg, device or torch.device("cpu"))
-    return DataLoader(dataset, batch_size=int(cfg.prediction.batch_size), shuffle=shuffle, **loader_kwargs)
+    return DataLoader(dataset, batch_size=_wcdt_v1_batch_size(cfg), shuffle=shuffle, **loader_kwargs)
+
+
+def _wcdt_v1_batch_size(cfg: Any) -> int:
+    return int(cfg.prediction.get("wcdt_v1_batch_size", cfg.prediction.batch_size))
+
+
+def _wcdt_v2_batch_size(cfg: Any) -> int:
+    return int(cfg.prediction.get("wcdt_v2_batch_size", cfg.prediction.batch_size))
 
 
 def _wcdt_data_dict(cfg: Any, pred_his, pred_future, pred_mask, pred_feat, other_his, other_feat, other_mask, lane_list, device):
@@ -1102,7 +1111,7 @@ def _train_wcdt_predictor(
     stage_log(
         "stage2",
         f"WcDT predictor train_samples={train_indices.shape[0]}, val_samples={val_indices.shape[0]}, "
-        f"batches={len(loader)}, batch_size={cfg.prediction.batch_size}, pin_memory={pin_memory}",
+        f"batches={len(loader)}, batch_size={_wcdt_v1_batch_size(cfg)}, pin_memory={pin_memory}",
     )
     for epoch in progress_iter(range(int(cfg.prediction.epochs)), desc="Stage2 prediction epochs"):
         losses = []
@@ -1232,7 +1241,7 @@ def _build_wcdt_v2_loader(
         torch.tensor(batch["role_ids"], dtype=torch.long),
         torch.tensor(batch["ego_future"], dtype=torch.float32),
     )
-    return DataLoader(dataset, batch_size=int(cfg.prediction.batch_size), shuffle=shuffle, **_loader_kwargs(cfg, device))
+    return DataLoader(dataset, batch_size=_wcdt_v2_batch_size(cfg), shuffle=shuffle, **_loader_kwargs(cfg, device))
 
 
 def _wcdt_v2_validation_metrics(cfg: Any, models: list[Any], loader: Any, device: Any, pin_memory: bool) -> dict[str, Any]:
@@ -1380,7 +1389,7 @@ def _train_wcdt_v2_predictor(
     stage_log(
         "stage2",
         f"WcDT v2 train_samples={train_indices.shape[0]}, val_samples={val_indices.shape[0]}, "
-        f"ensemble={ensemble_size}, epochs={epochs}, batch_size={cfg.prediction.batch_size}",
+        f"ensemble={ensemble_size}, epochs={epochs}, batch_size={_wcdt_v2_batch_size(cfg)}",
     )
     for member_idx in range(ensemble_size):
         torch.manual_seed(int(cfg.run.seed) + 1000 + member_idx)
@@ -1532,13 +1541,19 @@ def run(cfg) -> Path:
         "risk_transition_count": int(risk_data["actions"].shape[0]),
         "tensorboard": str(stage_dir / "tensorboard"),
         "device": str(device),
+        "prediction_train_enabled": bool(cfg.prediction.get("train_enabled", True)),
+        "wcdt_v1_train_enabled": bool(cfg.prediction.get("wcdt_v1_train_enabled", False)),
+        "wcdt_v2_train_enabled": bool(cfg.prediction.get("wcdt_v2_train_enabled", True)),
+        "wcdt_v1_batch_size": _wcdt_v1_batch_size(cfg),
+        "wcdt_v2_batch_size": _wcdt_v2_batch_size(cfg),
     }
     report.update(_train_risk_module(cfg, risk_data, stage_dir, tb, device))
-    if bool(cfg.prediction.train_enabled):
-        report.update(_train_wcdt_predictor(cfg, data, stage_dir, tb, device))
+    if bool(cfg.prediction.get("train_enabled", True)):
+        if bool(cfg.prediction.get("wcdt_v1_train_enabled", False)):
+            report.update(_train_wcdt_predictor(cfg, data, stage_dir, tb, device))
         if bool(cfg.prediction.get("wcdt_v2_train_enabled", True)):
             report.update(_train_wcdt_v2_predictor(cfg, data, stage_dir, tb, device))
-        if report.get("prediction_checkpoint"):
+        if report.get("prediction_checkpoint") or report.get("wcdt_v2_prediction_checkpoint"):
             initial_prediction_report = {
                 "stage": "stage2_initial_prediction",
                 "run_id": cfg.run.run_id,
@@ -1563,6 +1578,14 @@ def run(cfg) -> Path:
             report["initial_prediction_report"] = str(initial_prediction_report_path)
     elif initial_prediction_report_path.exists():
         report["initial_prediction_report"] = str(initial_prediction_report_path)
+    if stage4_data is None:
+        risk_checkpoint = Path(str(report["risk_checkpoint"]))
+        initial_risk_checkpoint = stage_dir / "risk_module_initial.pt"
+        shutil.copy2(risk_checkpoint, initial_risk_checkpoint)
+        report["risk_initial_checkpoint"] = str(initial_risk_checkpoint)
+        initial_training_report_path = stage_dir / "stage2_initial_training_report.json"
+        write_report(initial_training_report_path, report)
+        report["initial_training_report"] = str(initial_training_report_path)
     write_report(stage_dir / "stage2_training_report.json", report)
     tb.close()
     stage_log("stage2", f"report={stage_dir / 'stage2_training_report.json'}")

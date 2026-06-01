@@ -22,7 +22,20 @@ from safe_rl.analysis.forecast_diagnostics import (
     _policy_feature_sensitivity_from_actions,
     _vector_to_state,
 )
-from safe_rl.pipeline.run_full_pipeline import build_generated_configs, resolve_forecast_sources
+from safe_rl.pipeline.run_full_pipeline import (
+    _managed_run_dirs,
+    _new_pipeline_state,
+    _predictor_training_flags,
+    _prepare_new_run_dir,
+    _remove_managed_run_dirs,
+    _reset_unfinished_tasks,
+    _resume_invocation,
+    _run_pipeline_task,
+    _validate_completed_outputs,
+    _validate_run_id,
+    build_generated_configs,
+    resolve_forecast_sources,
+)
 from safe_rl.pipeline.common import write_report
 from safe_rl.pipeline.stage2_train_prediction_risk import (
     _binary_calibration_summary,
@@ -35,6 +48,8 @@ from safe_rl.pipeline.stage2_train_prediction_risk import (
     _temperature_scaled_probabilities,
     _temperature_scaling_diagnostics,
     _target_lane_gap as stage2_target_lane_gap,
+    _wcdt_v1_batch_size,
+    _wcdt_v2_batch_size,
 )
 from safe_rl.pipeline.stage5_paired_eval import _build_acceptance, _build_paired_delta, _group_overrides, _select_eval_seeds
 from safe_rl.pipeline.stage5_confirmatory_eval import (
@@ -1444,6 +1459,12 @@ def test_full_pipeline_generated_configs_use_forecast_model_and_checkpoint(tmp_p
     assert groups["wcdt_v2_prediction_shield"]["forecast_checkpoint"] == (
         "safe_rl_output/runs/safe_rl_test_run/stage2/wcdt_v2_predictor.pt"
     )
+    main = yaml.safe_load(configs["main"].read_text(encoding="utf-8"))
+    assert main["prediction"] == {
+        "train_enabled": True,
+        "wcdt_v1_train_enabled": False,
+        "wcdt_v2_train_enabled": True,
+    }
 
     stage2_stage4 = yaml.safe_load(configs["stage2_with_stage4"].read_text(encoding="utf-8"))
     assert stage2_stage4["prediction"]["train_enabled"] is False
@@ -1470,11 +1491,17 @@ def test_full_pipeline_generated_configs_support_single_forecast_source(tmp_path
         forecast_sources=["constant_velocity"],
     )
     cv_stage5 = yaml.safe_load(cv_configs["stage5_multi_groups"].read_text(encoding="utf-8"))
+    cv_main = yaml.safe_load(cv_configs["main"].read_text(encoding="utf-8"))
     cv_groups = {item["name"]: item for item in cv_stage5["stage5"]["groups"]}
     assert "ppo_cv_features" in cv_groups
     assert "ppo_wcdt_features" not in cv_groups
     assert "forecast_cv_ppo" in cv_configs
     assert "forecast_wcdt_ppo" not in cv_configs
+    assert cv_main["prediction"] == {
+        "train_enabled": False,
+        "wcdt_v1_train_enabled": False,
+        "wcdt_v2_train_enabled": False,
+    }
 
     wcdt_configs = build_generated_configs(
         "safe_rl_test_run",
@@ -1484,6 +1511,7 @@ def test_full_pipeline_generated_configs_support_single_forecast_source(tmp_path
         forecast_sources=["wcdt"],
     )
     wcdt_stage5 = yaml.safe_load(wcdt_configs["stage5_multi_groups"].read_text(encoding="utf-8"))
+    wcdt_main = yaml.safe_load(wcdt_configs["main"].read_text(encoding="utf-8"))
     wcdt_groups = {item["name"]: item for item in wcdt_stage5["stage5"]["groups"]}
     assert "ppo_cv_features" not in wcdt_groups
     assert "ppo_wcdt_features" in wcdt_groups
@@ -1492,6 +1520,11 @@ def test_full_pipeline_generated_configs_support_single_forecast_source(tmp_path
     assert wcdt_groups["ppo_wcdt_features"]["forecast_checkpoint"] == (
         "safe_rl_output/runs/safe_rl_test_run/stage2/wcdt_predictor.pt"
     )
+    assert wcdt_main["prediction"] == {
+        "train_enabled": True,
+        "wcdt_v1_train_enabled": True,
+        "wcdt_v2_train_enabled": False,
+    }
 
     v2_configs = build_generated_configs(
         "safe_rl_test_run",
@@ -1499,6 +1532,7 @@ def test_full_pipeline_generated_configs_support_single_forecast_source(tmp_path
         forecast_sources=["wcdt_v2"],
     )
     v2_stage5 = yaml.safe_load(v2_configs["stage5_multi_groups"].read_text(encoding="utf-8"))
+    v2_main = yaml.safe_load(v2_configs["main"].read_text(encoding="utf-8"))
     v2_groups = {item["name"]: item for item in v2_stage5["stage5"]["groups"]}
     assert "ppo_wcdt_v2_features" in v2_groups
     assert "wcdt_v2_prediction_shield" in v2_groups
@@ -1509,6 +1543,176 @@ def test_full_pipeline_generated_configs_support_single_forecast_source(tmp_path
     assert v2_groups["ppo_wcdt_v2_features"]["forecast_checkpoint"] == (
         "safe_rl_output/runs/safe_rl_test_run/stage2/wcdt_v2_predictor.pt"
     )
+    assert v2_main["prediction"] == {
+        "train_enabled": True,
+        "wcdt_v1_train_enabled": False,
+        "wcdt_v2_train_enabled": True,
+    }
+
+
+def test_full_pipeline_generated_configs_enable_both_predictors_for_v1_v2_comparison(tmp_path):
+    configs = build_generated_configs(
+        "safe_rl_test_run",
+        tmp_path,
+        forecast_sources=["constant_velocity", "wcdt", "wcdt_v2"],
+    )
+    main = yaml.safe_load(configs["main"].read_text(encoding="utf-8"))
+    assert main["prediction"] == {
+        "train_enabled": True,
+        "wcdt_v1_train_enabled": True,
+        "wcdt_v2_train_enabled": True,
+    }
+
+
+def test_wcdt_predictors_use_independent_batch_sizes():
+    cfg = load_config()
+    assert _wcdt_v1_batch_size(cfg) == 16
+    assert _wcdt_v2_batch_size(cfg) == 32
+    del cfg.prediction["wcdt_v1_batch_size"]
+    del cfg.prediction["wcdt_v2_batch_size"]
+    assert _wcdt_v1_batch_size(cfg) == int(cfg.prediction.batch_size)
+    assert _wcdt_v2_batch_size(cfg) == int(cfg.prediction.batch_size)
+
+
+def test_runner_run_id_validation_and_managed_cleanup(tmp_path):
+    assert _validate_run_id("safe_rl.test-001") == "safe_rl.test-001"
+    with pytest.raises(ValueError):
+        _validate_run_id("../escape")
+    paths = _managed_run_dirs(tmp_path, "safe_rl_test")
+    assert {path.name for path in paths} == {
+        "safe_rl_test",
+        "safe_rl_test_forecast_cv",
+        "safe_rl_test_forecast_wcdt",
+        "safe_rl_test_forecast_wcdt_v2",
+    }
+    for path in paths:
+        path.mkdir()
+        (path / "sentinel.txt").write_text("managed", encoding="utf-8")
+    outside = tmp_path.parent / "outside-sentinel"
+    outside.mkdir(exist_ok=True)
+    _remove_managed_run_dirs(tmp_path, "safe_rl_test")
+    assert not any(path.exists() for path in paths)
+    assert outside.exists()
+
+
+def test_runner_new_refuses_existing_and_overwrite_recreates_managed_dirs(tmp_path):
+    existing = tmp_path / "safe_rl_test_forecast_wcdt_v2"
+    existing.mkdir()
+    with pytest.raises(FileExistsError):
+        _prepare_new_run_dir(tmp_path, "safe_rl_test", "new")
+    run_dir = _prepare_new_run_dir(tmp_path, "safe_rl_test", "overwrite")
+    assert run_dir.exists()
+    assert not existing.exists()
+
+
+def test_runner_pipeline_task_records_outputs_and_skips_completed(tmp_path):
+    invocation = {
+        "stage1_episodes": None,
+        "stage4_episodes": None,
+        "stage5_episodes": None,
+        "ppo_timesteps": None,
+        "forecast_ppo_timesteps": None,
+        "forecast_ppo_profile": "default",
+        "forecast_sources": ["constant_velocity"],
+    }
+    state = _new_pipeline_state("safe_rl_test", invocation)
+    state_path = tmp_path / "pipeline_state.json"
+    artifact = tmp_path / "artifact.txt"
+    calls = []
+
+    def write_artifact():
+        calls.append("called")
+        artifact.write_text("done", encoding="utf-8")
+
+    assert _run_pipeline_task(state_path, state, "stage1", [artifact], write_artifact) is True
+    assert state["tasks"]["stage1"]["status"] == "completed"
+    assert state_path.exists()
+    assert _run_pipeline_task(state_path, state, "stage1", [artifact], write_artifact) is False
+    assert calls == ["called"]
+
+
+def test_runner_resume_reuses_saved_invocation_and_rejects_conflicts():
+    invocation = {
+        "stage1_episodes": 1000,
+        "stage4_episodes": None,
+        "stage5_episodes": None,
+        "ppo_timesteps": 100000,
+        "forecast_ppo_timesteps": 100000,
+        "forecast_ppo_profile": "shield_guided",
+        "forecast_sources": ["constant_velocity", "wcdt_v2"],
+    }
+    state = _new_pipeline_state("safe_rl_test", invocation)
+    resumed = _resume_invocation(
+        state,
+        stage1_episodes=None,
+        stage4_episodes=None,
+        stage5_episodes=None,
+        ppo_timesteps=None,
+        forecast_ppo_timesteps=None,
+        forecast_ppo_profile=None,
+        forecast_sources=None,
+        forecast_source=None,
+    )
+    assert resumed == invocation
+    with pytest.raises(ValueError, match="ppo_timesteps"):
+        _resume_invocation(
+            state,
+            stage1_episodes=None,
+            stage4_episodes=None,
+            stage5_episodes=None,
+            ppo_timesteps=20000,
+            forecast_ppo_timesteps=None,
+            forecast_ppo_profile=None,
+            forecast_sources=None,
+            forecast_source=None,
+        )
+
+
+def test_runner_resume_resets_first_unfinished_task_and_downstream():
+    invocation = {
+        "stage1_episodes": 2,
+        "stage4_episodes": 1,
+        "stage5_episodes": 1,
+        "ppo_timesteps": 128,
+        "forecast_ppo_timesteps": 128,
+        "forecast_ppo_profile": "shield_guided",
+        "forecast_sources": ["constant_velocity", "wcdt_v2"],
+    }
+    state = _new_pipeline_state("safe_rl_test", invocation)
+    for name in ("network_snapshot", "stage1", "stage2_initial"):
+        state["tasks"][name]["status"] = "completed"
+    state["tasks"]["stage3_baseline"]["status"] = "running"
+    state["tasks"]["stage4"]["status"] = "completed"
+    _reset_unfinished_tasks(state)
+    assert state["tasks"]["stage2_initial"]["status"] == "completed"
+    assert state["tasks"]["stage3_baseline"]["status"] == "pending"
+    assert state["tasks"]["stage4"]["status"] == "pending"
+    assert state["tasks"]["stage3_forecast_wcdt"]["enabled"] is False
+
+
+def test_runner_resume_validates_completed_artifact_hash(tmp_path):
+    artifact = tmp_path / "artifact.txt"
+    artifact.write_text("before", encoding="utf-8")
+    invocation = {
+        "stage1_episodes": None,
+        "stage4_episodes": None,
+        "stage5_episodes": None,
+        "ppo_timesteps": None,
+        "forecast_ppo_timesteps": None,
+        "forecast_ppo_profile": "default",
+        "forecast_sources": ["constant_velocity"],
+    }
+    state = _new_pipeline_state("safe_rl_test", invocation)
+    task = state["tasks"]["stage1"]
+    task["status"] = "completed"
+    task["required_outputs"] = [str(artifact)]
+    import hashlib
+
+    task["output_hashes"] = {str(artifact): hashlib.sha256(b"before").hexdigest()}
+    _validate_completed_outputs(state)
+    artifact.write_text("after", encoding="utf-8")
+    with pytest.raises(ValueError, match="hash changed"):
+        _validate_completed_outputs(state)
 
 
 def test_full_pipeline_generated_configs_support_smoke_episode_overrides(tmp_path):

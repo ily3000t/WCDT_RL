@@ -70,8 +70,11 @@ prediction:
   horizon_steps: 30
   num_modes: 10
   train_enabled: true
+  wcdt_v1_train_enabled: false
   epochs: 50
   batch_size: 16
+  wcdt_v1_batch_size: 16
+  wcdt_v2_batch_size: 32
   learning_rate: 0.0001
   validation_split: 0.15
   target_lane_gap_metric_weight: 0.5

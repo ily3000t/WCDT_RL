@@ -163,9 +163,11 @@ safe_rl_output/runs/<run_id>/stage2/stage2_training_report.json
 safe_rl_output/runs/<run_id>/stage2/tensorboard/
 ```
 
-Stage2 的 WcDT-style predictor 会从 Stage1 trajectory windows 中划分 train/validation，按 validation `FDE + 0.5 * target_lane_gap_abs_error + 0.5 * future_min_distance_abs_error` 选择 best checkpoint。`wcdt_predictor_best.pt` 保存最佳权重；兼容路径 `wcdt_predictor.pt` 也写入同一 best 权重，避免后续 Stage3/Stage5 加载最后一个退化 epoch。
+Stage2 会根据 full runner 的 forecast sources 选择 predictor。当前默认只训练 WcDT v2；旧 WcDT v1 仅在显式包含 `wcdt` 时训练。WcDT v1 会从 Stage1 trajectory windows 中划分 train/validation，按 validation `FDE + 0.5 * target_lane_gap_abs_error + 0.5 * future_min_distance_abs_error` 选择 best checkpoint。`wcdt_predictor_best.pt` 保存最佳权重；兼容路径 `wcdt_predictor.pt` 也写入同一 best 权重，避免后续 Stage3/Stage5 加载最后一个退化 epoch。
 
 Stage2 还会训练独立的 `wcdt_v2` residual-over-CV predictor。它不覆盖旧 WcDT，输入更偏 merge-centric：目标主路 front/rear、`main_aux lane 0` local、ramp local 和 nearest conflict vehicle。默认保存 3-model ensemble，`uncertainty` 来自 ensemble 方差。Risk Module 使用连续风险目标训练 risk head，并保留 6 类硬标签：`collision / near_miss / low_ttc / high_drac / merge_conflict / taper_miss`。validation 报告会输出 legal candidate 上的 boundary `ECE / Brier / NLL / reliability_bins`、中间分数区间占比和 ranking 诊断；默认不把 calibration 写入 runtime，只有显式开启配置后 Shield 才使用 calibrated score。
+
+WcDT v1 和 v2 使用独立 batch size：默认分别为 `16` 和 `32`。初始 Stage2 会额外保留 `risk_module_initial.pt` 与 `stage2_initial_training_report.json`；Stage4 后重训 Risk Module 时继续更新最终 `risk_module.pt`，不会覆盖初始快照。
 
 说明：当前仓库没有预训练 WcDT checkpoint，因此默认从 SUMO 采集数据训练；如有外部权重，可在配置中设置：
 
@@ -331,10 +333,10 @@ python -m safe_rl.pipeline.stage5_shield_sweep --run-id $RUN_ID --include-calibr
 
 当前推荐实验顺序只包含三步：full pipeline、50-seed confirmatory、calibrated sweep。full runner 会在网络构建后把场景 XML、net 和 SUMO 配置复制到 `safe_rl_output/runs/<run_id>/scenario_snapshot/`，replay 同时记录 snapshot manifest 与 hash，保证后续能够定位具体地图版本。
 
-推荐直接使用全流程 runner。它会重建网络、做 SUMO smoke check、依次运行 Stage1/2/3/4、用 Stage4 buffer 重训 Risk Module，然后在同一份 Stage1/Stage4 数据、同一个 Risk Module、同一个 baseline PPO 上分别训练 CV forecast PPO 和 WcDT v2 forecast PPO，并完成多组 Stage5 paired evaluation：
+推荐直接使用全流程 runner。它会重建网络、做 SUMO smoke check、依次运行 Stage1/2/3/4、用 Stage4 buffer 重训 Risk Module，然后在同一份 Stage1/Stage4 数据、同一个 Risk Module、同一个 baseline PPO 上分别训练 CV forecast PPO 和 WcDT v2 forecast PPO，并完成多组 Stage5 paired evaluation。默认 `--run-mode new` 会拒绝覆盖已有 run：
 
 ```powershell
-python -m safe_rl.pipeline.run_full_pipeline --run-id safe_rl_wcdt_v2_002 --forecast-sources constant_velocity,wcdt_v2
+python -m safe_rl.pipeline.run_full_pipeline --run-id safe_rl_wcdt_v2_002 --run-mode new --forecast-sources constant_velocity,wcdt_v2
 python -m safe_rl.pipeline.stage5_confirmatory_eval --run-id safe_rl_wcdt_v2_002 --episodes 50
 python -m safe_rl.pipeline.stage5_shield_sweep --run-id safe_rl_wcdt_v2_002 --include-calibrated
 ```
@@ -342,18 +344,36 @@ python -m safe_rl.pipeline.stage5_shield_sweep --run-id safe_rl_wcdt_v2_002 --in
 新辅助车道 benchmark 的正式训练建议使用独立 run id，并提高 Stage1 边界样本覆盖：
 
 ```powershell
-python -m safe_rl.pipeline.run_full_pipeline --run-id safe_rl_right_onramp_curriculum_001 --stage1-episodes 1000 --ppo-timesteps 100000 --forecast-ppo-timesteps 100000 --forecast-sources constant_velocity,wcdt_v2 --forecast-ppo-profile shield_guided
+python -m safe_rl.pipeline.run_full_pipeline --run-id safe_rl_right_onramp_curriculum_001 --run-mode new --stage1-episodes 1000 --ppo-timesteps 100000 --forecast-ppo-timesteps 100000 --forecast-sources constant_velocity,wcdt_v2 --forecast-ppo-profile shield_guided
 python -m safe_rl.pipeline.stage5_confirmatory_eval --run-id safe_rl_right_onramp_curriculum_001 --episodes 50
 python -m safe_rl.pipeline.forecast_diagnostics --run-id safe_rl_right_onramp_curriculum_001 --max-samples 512 --low-seed-count 5
 python -m safe_rl.pipeline.stage5_shield_sweep --run-id safe_rl_right_onramp_curriculum_001 --include-calibrated
 ```
 
-默认 `--forecast-sources` 是 `constant_velocity,wcdt_v2`。旧 WcDT v1 不再默认运行；如果要保留 v1 对照，需要显式运行 `constant_velocity,wcdt` 或 `constant_velocity,wcdt,wcdt_v2`。如果只想跑其中一个 forecast 分支：
+### Full runner 运行模式
+
+Full runner 会在 `<run_id>/pipeline_state.json` 中记录任务状态、调用参数、场景 hash 和关键产物 hash。中断后使用相同 run id 续跑，不需要重新输入首次运行的训练参数：
 
 ```powershell
-python -m safe_rl.pipeline.run_full_pipeline --run-id safe_rl_merge_local_cv_001 --forecast-sources constant_velocity
-python -m safe_rl.pipeline.run_full_pipeline --run-id safe_rl_merge_local_wcdt_001 --forecast-sources wcdt
-python -m safe_rl.pipeline.run_full_pipeline --run-id safe_rl_merge_local_wcdt_v2_001 --forecast-sources wcdt_v2
+python -m safe_rl.pipeline.run_full_pipeline --run-id safe_rl_right_onramp_curriculum_001 --run-mode resume
+```
+
+如需明确删除 base run 和对应 forecast 子 run 并从头运行，必须显式使用 `overwrite`：
+
+```powershell
+python -m safe_rl.pipeline.run_full_pipeline --run-id safe_rl_right_onramp_curriculum_001 --run-mode overwrite --stage1-episodes 1000 --ppo-timesteps 100000 --forecast-ppo-timesteps 100000 --forecast-sources constant_velocity,wcdt_v2 --forecast-ppo-profile shield_guided
+```
+
+`resume` 会校验默认配置、场景 snapshot、当前场景文件和已完成任务产物；任何 hash 漂移都会拒绝静默续跑。各 Stage 的独立命令仍保留，仅建议用于调试和定向重跑。
+
+### Predictor 分支与 legacy 兼容
+
+默认 `--forecast-sources` 是 `constant_velocity,wcdt_v2`。初始 Stage2 只训练 WcDT v2 predictor，不再训练旧 WcDT v1；v1 仅在显式包含 `wcdt` 时启用。如果要保留 v1 对照，需要显式运行 `constant_velocity,wcdt` 或 `constant_velocity,wcdt,wcdt_v2`。如果只想跑其中一个 forecast 分支：
+
+```powershell
+python -m safe_rl.pipeline.run_full_pipeline --run-id safe_rl_merge_local_cv_001 --run-mode new --forecast-sources constant_velocity
+python -m safe_rl.pipeline.run_full_pipeline --run-id safe_rl_merge_local_wcdt_001 --run-mode new --forecast-sources wcdt
+python -m safe_rl.pipeline.run_full_pipeline --run-id safe_rl_merge_local_wcdt_v2_001 --run-mode new --forecast-sources wcdt_v2
 ```
 
 旧参数 `--forecast-source wcdt` 仍可用于单分支兼容，但不要和 `--forecast-sources` 同时使用。
@@ -361,7 +381,7 @@ python -m safe_rl.pipeline.run_full_pipeline --run-id safe_rl_merge_local_wcdt_v
 如需覆盖采样轮数和 PPO 训练步数：
 
 ```powershell
-python -m safe_rl.pipeline.run_full_pipeline --run-id safe_rl_merge_local_001 --stage1-episodes 500 --ppo-timesteps 20000 --forecast-sources constant_velocity,wcdt_v2
+python -m safe_rl.pipeline.run_full_pipeline --run-id safe_rl_merge_local_001 --run-mode new --stage1-episodes 500 --ppo-timesteps 20000 --forecast-sources constant_velocity,wcdt_v2
 ```
 
 生成的临时配置会写入：
@@ -424,7 +444,7 @@ Shield: mean_actual_replacements, actual_replacement_rate, fallback_rate, emerge
 Forecast feature 利用率诊断建议按以下顺序运行。该流程不改变 63 维 observation，只修正 `forecast_merge_gap` 的语义并检查 PPO 是否真的使用 forecast 维度：
 
 ```powershell
-python -m safe_rl.pipeline.run_full_pipeline --run-id safe_rl_wcdt_v2_featurefix_001 --forecast-sources constant_velocity,wcdt_v2
+python -m safe_rl.pipeline.run_full_pipeline --run-id safe_rl_wcdt_v2_featurefix_001 --run-mode new --forecast-sources constant_velocity,wcdt_v2
 python -m safe_rl.pipeline.stage5_confirmatory_eval --run-id safe_rl_wcdt_v2_featurefix_001 --episodes 50
 python -m safe_rl.pipeline.forecast_diagnostics --run-id safe_rl_wcdt_v2_featurefix_001 --max-samples 512 --low-seed-count 5
 ```
@@ -434,14 +454,14 @@ python -m safe_rl.pipeline.forecast_diagnostics --run-id safe_rl_wcdt_v2_feature
 如果 20k PPO 下 WcDT v2 policy 收益仍有限，再跑长训练对照：
 
 ```powershell
-python -m safe_rl.pipeline.run_full_pipeline --run-id safe_rl_wcdt_v2_longppo_001 --forecast-sources constant_velocity,wcdt_v2 --ppo-timesteps 100000
+python -m safe_rl.pipeline.run_full_pipeline --run-id safe_rl_wcdt_v2_longppo_001 --run-mode new --forecast-sources constant_velocity,wcdt_v2 --ppo-timesteps 100000
 python -m safe_rl.pipeline.stage5_confirmatory_eval --run-id safe_rl_wcdt_v2_longppo_001 --episodes 50
 ```
 
 如果长训练后 forecast PPO 变激进、尾部安全不稳定，使用 safety-aware forecast PPO。该配置只作用于 forecast PPO，baseline PPO 仍使用默认 reward：
 
 ```powershell
-python -m safe_rl.pipeline.run_full_pipeline --run-id safe_rl_wcdt_v2_safetyppo_001 --forecast-sources constant_velocity,wcdt_v2 --forecast-ppo-profile safety --forecast-ppo-timesteps 100000
+python -m safe_rl.pipeline.run_full_pipeline --run-id safe_rl_wcdt_v2_safetyppo_001 --run-mode new --forecast-sources constant_velocity,wcdt_v2 --forecast-ppo-profile safety --forecast-ppo-timesteps 100000
 python -m safe_rl.pipeline.stage5_confirmatory_eval --run-id safe_rl_wcdt_v2_safetyppo_001 --episodes 50
 python -m safe_rl.pipeline.forecast_diagnostics --run-id safe_rl_wcdt_v2_safetyppo_001 --max-samples 512 --low-seed-count 5
 ```
@@ -449,7 +469,7 @@ python -m safe_rl.pipeline.forecast_diagnostics --run-id safe_rl_wcdt_v2_safetyp
 如果 safety-aware PPO 仍没有充分利用 WcDT v2 预测特征，下一步使用 Shield-guided forecast PPO。该 profile 仍不替换训练动作，只把 Risk Module / Shield shadow 判断写入 reward shaping，让 forecast PPO 学会避开会被 Shield 替换的 raw action：
 
 ```powershell
-python -m safe_rl.pipeline.run_full_pipeline --run-id safe_rl_wcdt_v2_shieldguided_001 --forecast-sources constant_velocity,wcdt_v2 --forecast-ppo-profile shield_guided --forecast-ppo-timesteps 100000
+python -m safe_rl.pipeline.run_full_pipeline --run-id safe_rl_wcdt_v2_shieldguided_001 --run-mode new --forecast-sources constant_velocity,wcdt_v2 --forecast-ppo-profile shield_guided --forecast-ppo-timesteps 100000
 python -m safe_rl.pipeline.stage5_confirmatory_eval --run-id safe_rl_wcdt_v2_shieldguided_001 --episodes 50
 python -m safe_rl.pipeline.forecast_diagnostics --run-id safe_rl_wcdt_v2_shieldguided_001 --max-samples 512 --low-seed-count 5
 ```
@@ -640,7 +660,7 @@ python -c "from safe_rl.utils.config import load_config; from safe_rl.sim.sumo_h
 辅助车道场景的短链路 full runner smoke：
 
 ```powershell
-python -m safe_rl.pipeline.run_full_pipeline --run-id safe_rl_right_onramp_smoke --stage1-episodes 10 --stage4-episodes 2 --stage5-episodes 2 --ppo-timesteps 128 --forecast-ppo-timesteps 128 --forecast-sources constant_velocity,wcdt_v2 --forecast-ppo-profile shield_guided
+python -m safe_rl.pipeline.run_full_pipeline --run-id safe_rl_right_onramp_smoke --run-mode new --stage1-episodes 10 --stage4-episodes 2 --stage5-episodes 2 --ppo-timesteps 128 --forecast-ppo-timesteps 128 --forecast-sources constant_velocity,wcdt_v2 --forecast-ppo-profile shield_guided
 ```
 
 该命令会跳过正式 Stage1 audit gate。正式实验必须重新使用足够多的 Stage1 episodes，并检查 audit gate 通过。
