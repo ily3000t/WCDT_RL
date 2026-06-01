@@ -25,6 +25,7 @@ from safe_rl.analysis.forecast_diagnostics import (
 from safe_rl.pipeline.run_full_pipeline import (
     _managed_run_dirs,
     _new_pipeline_state,
+    _load_pipeline_state,
     _predictor_training_flags,
     _prepare_new_run_dir,
     _remove_managed_run_dirs,
@@ -52,6 +53,8 @@ from safe_rl.pipeline.stage2_train_prediction_risk import (
     _wcdt_v2_batch_size,
     _wcdt_v2_early_stopping_config,
     _wcdt_v2_early_stopping_step,
+    _wcdt_v3_batch_size,
+    _wcdt_v3_early_stopping_config,
 )
 from safe_rl.pipeline.stage5_paired_eval import _build_acceptance, _build_paired_delta, _group_overrides, _select_eval_seeds
 from safe_rl.pipeline.stage5_confirmatory_eval import (
@@ -77,6 +80,15 @@ from safe_rl.prediction.wcdt_v2_predictor import (
     load_v2_ensemble,
     ordered_merge_local_indices,
     v2_loss,
+)
+from safe_rl.prediction.wcdt_v3_predictor import (
+    HISTORY_INPUT_DIM as WCDT_V3_HISTORY_INPUT_DIM,
+    WcDTV3TemporalInteractionPredictor,
+    _predict_model as predict_v3_model,
+    build_v3_numpy_batch,
+    load_v3_ensemble,
+    tensorize_v3_batch,
+    v3_loss,
 )
 from safe_rl.risk.candidate_risk_ranker import CandidateRiskRanker
 from safe_rl.risk.merge_local import (
@@ -632,6 +644,40 @@ def test_forecast_conclusion_requires_wcdt_v2_front_rear_gap_quality():
     assert not conclusion["wcdt_v2_recommended_for_stage5"]
 
 
+def test_forecast_conclusion_marks_v3_candidate_only_when_it_beats_v2():
+    report = {
+        "cv_prediction": {
+            "ade": {"mean": 5.0},
+            "fde": {"mean": 6.0},
+            "future_min_distance_abs_error": {"mean": 3.0},
+            "target_lane_front_gap_abs_error": {"mean": 3.0},
+            "target_lane_rear_gap_abs_error": {"mean": 3.0},
+        },
+        "wcdt_v2_prediction": {
+            "available": True,
+            "fde": {"mean": 4.0},
+            "future_min_distance_abs_error": {"mean": 2.0},
+            "target_lane_front_gap_abs_error": {"mean": 2.0},
+            "target_lane_rear_gap_abs_error": {"mean": 2.0},
+            "uncertainty": {"std": 0.1},
+            "uncertainty_fde_correlation": 0.2,
+        },
+        "wcdt_v3_prediction": {
+            "available": True,
+            "fde": {"mean": 3.5},
+            "future_min_distance_abs_error": {"mean": 1.5},
+            "target_lane_front_gap_abs_error": {"mean": 1.5},
+            "target_lane_rear_gap_abs_error": {"mean": 1.5},
+            "uncertainty": {"std": 0.1},
+            "uncertainty_fde_correlation": 0.2,
+        },
+    }
+    conclusion = _forecast_conclusion(report)
+    assert conclusion["wcdt_v3_prediction_quality_pass"]
+    assert conclusion["wcdt_v3_uncertainty_quality_pass"]
+    assert conclusion["wcdt_v3_candidate_for_promotion"]
+
+
 class _StaticRiskModel:
     def __init__(self, scores: dict[int, float], uncertainty: float = 0.1):
         self.scores = scores
@@ -1113,6 +1159,110 @@ def test_wcdt_v2_loss_role_gap_and_smoothness_components_are_safe():
     assert jitter_components["smoothness"].item() > smooth_components["smoothness"].item()
 
 
+def _wcdt_v3_test_batch():
+    cfg = load_config()
+    cfg.prediction["wcdt_v3_max_agents"] = 3
+    history = np.zeros((1, 5, cfg.scenario.history_steps, 5), dtype=np.float32)
+    future = np.zeros((1, 5, cfg.scenario.forecast_horizon_steps, 5), dtype=np.float32)
+    mask = np.ones((1, 5), dtype=np.float32)
+    history[..., 3] = 10.0
+    history[0, 0, :, 0] = np.linspace(190.0, 200.0, cfg.scenario.history_steps)
+    history[0, 0, :, 1] = 20.0
+    history[0, 1, :, 0] = np.linspace(202.0, 212.0, cfg.scenario.history_steps)
+    history[0, 1, :, 1] = 57.0
+    history[0, 2, :, 0] = np.linspace(180.0, 190.0, cfg.scenario.history_steps)
+    history[0, 2, :, 1] = 57.0
+    history[0, 3, :, 0] = np.linspace(198.0, 208.0, cfg.scenario.history_steps)
+    history[0, 3, :, 1] = 20.0
+    history[0, 4, :, 0] = np.linspace(230.0, 240.0, cfg.scenario.history_steps)
+    history[0, 4, :, 1] = 60.2
+    batch = build_v3_numpy_batch(cfg, history, future, mask, np.asarray([0], dtype=np.int64))
+    return cfg, history, future, mask, batch
+
+
+def test_wcdt_v3_batch_uses_full_history_with_fixed_shape():
+    cfg, _history, _future, _mask, batch = _wcdt_v3_test_batch()
+    assert batch["history_features"].shape == (1, 3, cfg.scenario.history_steps, WCDT_V3_HISTORY_INPUT_DIM)
+    assert batch["baseline"].shape == (1, 3, cfg.scenario.forecast_horizon_steps, 5)
+    assert batch["target"].shape == (1, 3, cfg.scenario.forecast_horizon_steps, 5)
+    assert np.all(np.isfinite(batch["history_features"]))
+    assert batch["selected_indices"][0].tolist() == [1, 2, 3]
+
+
+def test_wcdt_v3_changes_output_when_history_changes_but_last_frame_is_fixed():
+    torch = pytest.importorskip("torch")
+    cfg, history, future, mask, batch = _wcdt_v3_test_batch()
+    changed_history = history.copy()
+    changed_history[0, 1, 1:-1, 0] += 8.0
+    changed = build_v3_numpy_batch(cfg, changed_history, future, mask, np.asarray([0], dtype=np.int64))
+    model = WcDTV3TemporalInteractionPredictor(
+        history_steps=int(cfg.scenario.history_steps),
+        horizon_steps=int(cfg.scenario.forecast_horizon_steps),
+        hidden_dim=32,
+        temporal_layers=1,
+        actor_attention_layers=1,
+        num_heads=4,
+        dropout=0.0,
+    ).eval()
+    original_tensor = tensorize_v3_batch(batch, torch, torch.device("cpu"))
+    changed_tensor = tensorize_v3_batch(changed, torch, torch.device("cpu"))
+    with torch.no_grad():
+        original = predict_v3_model(model, original_tensor)
+        modified = predict_v3_model(model, changed_tensor)
+    assert not torch.allclose(original, modified)
+
+
+def test_wcdt_v3_actor_attention_and_padding_are_stable():
+    torch = pytest.importorskip("torch")
+    cfg, _history, _future, _mask, batch = _wcdt_v3_test_batch()
+    model = WcDTV3TemporalInteractionPredictor(
+        history_steps=int(cfg.scenario.history_steps),
+        horizon_steps=int(cfg.scenario.forecast_horizon_steps),
+        hidden_dim=32,
+        temporal_layers=1,
+        actor_attention_layers=1,
+        num_heads=4,
+        dropout=0.0,
+    ).eval()
+    original_tensor = tensorize_v3_batch(batch, torch, torch.device("cpu"))
+    modified_tensor = {key: value.clone() for key, value in original_tensor.items()}
+    modified_tensor["history_features"][:, 1, :, 0] += 7.0
+    with torch.no_grad():
+        original = predict_v3_model(model, original_tensor)
+        modified = predict_v3_model(model, modified_tensor)
+    assert not torch.allclose(original[:, 0], modified[:, 0])
+
+    empty_tensor = {key: value.clone() for key, value in original_tensor.items()}
+    empty_tensor["mask"].zero_()
+    with torch.no_grad():
+        empty = predict_v3_model(model, empty_tensor)
+    assert torch.all(torch.isfinite(empty))
+    assert torch.count_nonzero(empty) == 0
+
+
+def test_wcdt_v2_and_v3_share_merge_safety_loss():
+    torch = pytest.importorskip("torch")
+    target = torch.tensor([[[[5.0, 0.0], [6.0, 0.0], [7.0, 0.0]]]], dtype=torch.float32)
+    pred = target.clone()
+    pred[0, 0, 1, 0] += 1.5
+    mask = torch.ones((1, 1), dtype=torch.float32)
+    ego_future = torch.zeros((1, 3, 2), dtype=torch.float32)
+    role_ids = torch.zeros((1, 1), dtype=torch.long)
+    v2_total, v2_components = v2_loss(pred, target, mask, ego_future, role_ids)
+    v3_total, v3_components = v3_loss(pred, target, mask, ego_future, role_ids)
+    assert torch.allclose(v2_total, v3_total)
+    assert set(v2_components) == set(v3_components)
+
+
+def test_wcdt_v3_rejects_wrong_architecture_checkpoint(tmp_path):
+    torch = pytest.importorskip("torch")
+    cfg = load_config()
+    checkpoint = tmp_path / "wrong_wcdt_v3.pt"
+    torch.save({"architecture_version": "wrong_architecture", "model_state_dicts": []}, checkpoint)
+    with pytest.raises(ValueError, match="architecture_version"):
+        load_v3_ensemble(cfg, checkpoint, torch.device("cpu"))
+
+
 def test_wcdt_v2_early_stopping_and_validation_unavailable_behavior():
     cfg = load_config()
     disabled = _wcdt_v2_early_stopping_config(cfg, has_validation=False)
@@ -1142,6 +1292,16 @@ def test_wcdt_v2_early_stopping_and_validation_unavailable_behavior():
     assert improved
     assert stale == 0
     assert not should_stop
+
+
+def test_wcdt_v3_early_stopping_disables_without_validation():
+    cfg = load_config()
+    disabled = _wcdt_v3_early_stopping_config(cfg, has_validation=False)
+    assert not disabled["enabled"]
+    assert disabled["disabled_reason"] == "validation_unavailable"
+    enabled = _wcdt_v3_early_stopping_config(cfg, has_validation=True)
+    assert enabled["enabled"]
+    assert enabled["patience"] == 10
 
 
 def test_wcdt_v2_old_checkpoint_without_metadata_still_loads(tmp_path):
@@ -1537,6 +1697,11 @@ def test_stage5_shield_sweep_variant_report_includes_efficiency_metrics():
 
 def test_forecast_source_parser_rejects_conflicting_legacy_and_multi_args():
     assert resolve_forecast_sources("constant_velocity,wcdt,wcdt_v2") == ["constant_velocity", "wcdt", "wcdt_v2"]
+    assert resolve_forecast_sources("constant_velocity,wcdt_v2,wcdt_v3") == [
+        "constant_velocity",
+        "wcdt_v2",
+        "wcdt_v3",
+    ]
     assert resolve_forecast_sources(forecast_source="wcdt") == ["wcdt"]
     with pytest.raises(ValueError, match="either"):
         resolve_forecast_sources("wcdt", forecast_source="constant_velocity")
@@ -1581,6 +1746,7 @@ def test_full_pipeline_generated_configs_use_forecast_model_and_checkpoint(tmp_p
         "train_enabled": True,
         "wcdt_v1_train_enabled": False,
         "wcdt_v2_train_enabled": True,
+        "wcdt_v3_train_enabled": False,
     }
 
     stage2_stage4 = yaml.safe_load(configs["stage2_with_stage4"].read_text(encoding="utf-8"))
@@ -1618,6 +1784,7 @@ def test_full_pipeline_generated_configs_support_single_forecast_source(tmp_path
         "train_enabled": False,
         "wcdt_v1_train_enabled": False,
         "wcdt_v2_train_enabled": False,
+        "wcdt_v3_train_enabled": False,
     }
 
     wcdt_configs = build_generated_configs(
@@ -1641,6 +1808,7 @@ def test_full_pipeline_generated_configs_support_single_forecast_source(tmp_path
         "train_enabled": True,
         "wcdt_v1_train_enabled": True,
         "wcdt_v2_train_enabled": False,
+        "wcdt_v3_train_enabled": False,
     }
 
     v2_configs = build_generated_configs(
@@ -1664,6 +1832,7 @@ def test_full_pipeline_generated_configs_support_single_forecast_source(tmp_path
         "train_enabled": True,
         "wcdt_v1_train_enabled": False,
         "wcdt_v2_train_enabled": True,
+        "wcdt_v3_train_enabled": False,
     }
 
 
@@ -1678,17 +1847,43 @@ def test_full_pipeline_generated_configs_enable_both_predictors_for_v1_v2_compar
         "train_enabled": True,
         "wcdt_v1_train_enabled": True,
         "wcdt_v2_train_enabled": True,
+        "wcdt_v3_train_enabled": False,
     }
+
+
+def test_full_pipeline_generated_configs_enable_explicit_v3_ablation(tmp_path):
+    configs = build_generated_configs(
+        "safe_rl_test_run",
+        tmp_path,
+        forecast_sources=["constant_velocity", "wcdt_v2", "wcdt_v3"],
+    )
+    main = yaml.safe_load(configs["main"].read_text(encoding="utf-8"))
+    assert main["prediction"] == {
+        "train_enabled": True,
+        "wcdt_v1_train_enabled": False,
+        "wcdt_v2_train_enabled": True,
+        "wcdt_v3_train_enabled": True,
+    }
+    assert "forecast_wcdt_v3_ppo" in configs
+    stage5 = yaml.safe_load(configs["stage5_multi_groups"].read_text(encoding="utf-8"))
+    groups = {item["name"]: item for item in stage5["stage5"]["groups"]}
+    assert len(groups) == 8
+    assert groups["ppo_wcdt_v3_features"]["model_path"].endswith("_forecast_wcdt_v3/stage3/ppo_model.zip")
+    assert groups["ppo_wcdt_v3_features"]["forecast_checkpoint"].endswith("/stage2/wcdt_v3_predictor.pt")
+    assert groups["wcdt_v3_prediction_shield"]["forecast_source"] == "wcdt_v3"
 
 
 def test_wcdt_predictors_use_independent_batch_sizes():
     cfg = load_config()
     assert _wcdt_v1_batch_size(cfg) == 16
     assert _wcdt_v2_batch_size(cfg) == 32
+    assert _wcdt_v3_batch_size(cfg) == 16
     del cfg.prediction["wcdt_v1_batch_size"]
     del cfg.prediction["wcdt_v2_batch_size"]
+    del cfg.prediction["wcdt_v3_batch_size"]
     assert _wcdt_v1_batch_size(cfg) == int(cfg.prediction.batch_size)
     assert _wcdt_v2_batch_size(cfg) == int(cfg.prediction.batch_size)
+    assert _wcdt_v3_batch_size(cfg) == int(cfg.prediction.batch_size)
 
 
 def test_runner_run_id_validation_and_managed_cleanup(tmp_path):
@@ -1701,6 +1896,7 @@ def test_runner_run_id_validation_and_managed_cleanup(tmp_path):
         "safe_rl_test_forecast_cv",
         "safe_rl_test_forecast_wcdt",
         "safe_rl_test_forecast_wcdt_v2",
+        "safe_rl_test_forecast_wcdt_v3",
     }
     for path in paths:
         path.mkdir()
@@ -1720,6 +1916,24 @@ def test_runner_new_refuses_existing_and_overwrite_recreates_managed_dirs(tmp_pa
     run_dir = _prepare_new_run_dir(tmp_path, "safe_rl_test", "overwrite")
     assert run_dir.exists()
     assert not existing.exists()
+
+
+def test_runner_loads_schema_v1_state_with_disabled_v3_task(tmp_path):
+    state_path = tmp_path / "pipeline_state.json"
+    state_path.write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "run_id": "safe_rl_old_state",
+                "tasks": {},
+            }
+        ),
+        encoding="utf-8",
+    )
+    state = _load_pipeline_state(state_path)
+    assert state["schema_version"] == 2
+    assert not state["tasks"]["stage3_forecast_wcdt_v3"]["enabled"]
+    assert state["tasks"]["stage3_forecast_wcdt_v3"]["status"] == "completed"
 
 
 def test_runner_pipeline_task_records_outputs_and_skips_completed(tmp_path):
@@ -1987,6 +2201,8 @@ def test_stage5_dynamic_paired_delta_and_acceptance_for_optional_forecast_groups
         "wcdt_prediction_shield": _fake_group([(1, 99.0)], 99.0),
         "ppo_wcdt_v2_features": _fake_group([(1, 100.0)], 100.0),
         "wcdt_v2_prediction_shield": _fake_group([(1, 101.0)], 101.0),
+        "ppo_wcdt_v3_features": _fake_group([(1, 101.0)], 101.0),
+        "wcdt_v3_prediction_shield": _fake_group([(1, 102.0)], 102.0),
     }
     paired = _build_paired_delta(reports)
     assert set(paired) >= {
@@ -1997,6 +2213,8 @@ def test_stage5_dynamic_paired_delta_and_acceptance_for_optional_forecast_groups
         "ppo_vs_ppo_cv_features",
         "ppo_cv_features_vs_ppo_wcdt_features",
         "ppo_cv_features_vs_ppo_wcdt_v2_features",
+        "ppo_cv_features_vs_ppo_wcdt_v3_features",
+        "ppo_wcdt_v2_features_vs_ppo_wcdt_v3_features",
     }
     assert paired["ppo_vs_ppo_shield"]["mean_completion_time_delta"] == pytest.approx(-1.0)
     assert paired["ppo_vs_ppo_shield"]["mean_ego_speed_delta"] == pytest.approx(1.0)
@@ -2009,9 +2227,11 @@ def test_stage5_dynamic_paired_delta_and_acceptance_for_optional_forecast_groups
     assert acceptance["cv_prediction_shield"]["available"]
     assert acceptance["wcdt_prediction_shield"]["available"]
     assert acceptance["wcdt_v2_prediction_shield"]["available"]
+    assert acceptance["wcdt_v3_prediction_shield"]["available"]
     assert acceptance["forecast_cv_vs_baseline"]["available"]
     assert acceptance["forecast_wcdt_vs_cv"]["available"]
     assert acceptance["forecast_wcdt_v2_vs_cv"]["available"]
+    assert acceptance["forecast_wcdt_v3_vs_cv"]["available"]
 
     single = {
         "ppo": reports["ppo"],
@@ -2066,6 +2286,20 @@ def test_confirmatory_payload_generates_fifty_seed_six_group_config():
     assert groups["ppo_wcdt_v2_features"]["forecast_checkpoint"] == (
         "safe_rl_output/runs/safe_rl_test_run/stage2/wcdt_v2_predictor.pt"
     )
+
+
+def test_confirmatory_payload_supports_optional_v3_ablation_groups():
+    payload = build_confirmatory_payload(
+        "safe_rl_test_run",
+        episodes=5,
+        forecast_sources=["constant_velocity", "wcdt_v2", "wcdt_v3"],
+    )
+    groups = {item["name"]: item for item in payload["stage5"]["groups"]}
+    assert len(groups) == 8
+    assert groups["ppo_wcdt_v3_features"]["forecast_checkpoint"] == (
+        "safe_rl_output/runs/safe_rl_test_run/stage2/wcdt_v3_predictor.pt"
+    )
+    assert groups["wcdt_v3_prediction_shield"]["forecast_source"] == "wcdt_v3"
 
 
 def test_confirmatory_input_validation_reports_missing_checkpoints():

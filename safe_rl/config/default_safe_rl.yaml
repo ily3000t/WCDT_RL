@@ -99,6 +99,23 @@ prediction:
     patience: 10
     min_delta: 0.0001
     warmup_epochs: 5
+  wcdt_v3_train_enabled: false
+  wcdt_v3_batch_size: 16
+  wcdt_v3_ensemble_size: 3
+  wcdt_v3_epochs: 30
+  wcdt_v3_learning_rate: 0.0003
+  wcdt_v3_hidden_dim: 128
+  wcdt_v3_temporal_layers: 2
+  wcdt_v3_actor_attention_layers: 2
+  wcdt_v3_num_heads: 4
+  wcdt_v3_dropout: 0.1
+  wcdt_v3_horizon_steps: 30
+  wcdt_v3_max_agents: 5
+  wcdt_v3_early_stopping:
+    enabled: true
+    patience: 10
+    min_delta: 0.0001
+    warmup_epochs: 5
   max_pred_num: 8
   max_other_num: 6
   max_traffic_light: 8

@@ -8,7 +8,11 @@ from typing import Any
 import yaml
 
 from safe_rl.pipeline.common import run_root, write_report
-from safe_rl.pipeline.run_full_pipeline import _forecast_stage5_groups, _relative_run_path
+from safe_rl.pipeline.run_full_pipeline import (
+    _forecast_stage5_groups,
+    _relative_run_path,
+    resolve_forecast_sources,
+)
 from safe_rl.pipeline.stage5_paired_eval import (
     _build_acceptance,
     _build_paired_delta,
@@ -82,6 +86,20 @@ MODEL_ROLE_EXPLANATIONS: dict[str, dict[str, str | bool]] = {
         "shield_enabled": True,
         "meaning": "WcDT v2 forecast-feature PPO with Shield enabled.",
     },
+    "ppo_wcdt_v3_features": {
+        "role": "candidate_prediction_branch",
+        "observation": "63D forecast-augmented observation",
+        "forecast_source": "wcdt_v3",
+        "shield_enabled": False,
+        "meaning": "Candidate WcDT v3 temporal-interaction forecast-feature PPO branch.",
+    },
+    "wcdt_v3_prediction_shield": {
+        "role": "candidate_prediction_branch_with_shield",
+        "observation": "63D forecast-augmented observation",
+        "forecast_source": "wcdt_v3",
+        "shield_enabled": True,
+        "meaning": "Candidate WcDT v3 temporal-interaction forecast-feature PPO with Shield enabled.",
+    },
 }
 
 REPORTING_RECOMMENDATION: list[dict[str, str]] = [
@@ -100,6 +118,10 @@ REPORTING_RECOMMENDATION: list[dict[str, str]] = [
     {
         "comparison": "legacy_wcdt_v1",
         "purpose": "Keep old WcDT v1 groups in ablation/diagnostic tables only.",
+    },
+    {
+        "comparison": "ppo_wcdt_v2_features_vs_ppo_wcdt_v3_features",
+        "purpose": "Report the optional WcDT v3 temporal-interaction ablation when that branch is enabled.",
     },
     {
         "comparison": "main_result_table",
@@ -139,6 +161,16 @@ def _base_groups(run_id: str) -> list[dict[str, Any]]:
             "model_path": _relative_run_path(run_id, "stage3", "ppo_model.zip"),
         },
     ]
+
+
+def _forecast_sources_for_run(run_id: str) -> list[str]:
+    state_path = REPO_ROOT / "safe_rl_output" / "runs" / run_id / "pipeline_state.json"
+    if not state_path.exists():
+        return list(DEFAULT_FORECAST_SOURCES)
+    with state_path.open("r", encoding="utf-8") as file:
+        state = json.load(file)
+    sources = state.get("forecast_sources") or state.get("normalized_invocation", {}).get("forecast_sources")
+    return resolve_forecast_sources(forecast_sources=sources or DEFAULT_FORECAST_SOURCES)
 
 
 def build_confirmatory_payload(
@@ -261,6 +293,39 @@ def _wcdt_v2_shield_summary(group_reports: dict[str, dict]) -> dict[str, Any]:
     }
 
 
+def _wcdt_v3_candidate_summary(group_reports: dict[str, dict]) -> dict[str, Any]:
+    v2 = group_reports.get("ppo_wcdt_v2_features")
+    v3 = group_reports.get("ppo_wcdt_v3_features")
+    checks = {
+        "reward_not_degraded_vs_v2": _metric(v3, "average_reward") >= _metric(v2, "average_reward") - 5.0,
+        "safety_violation_not_worse_than_v2": _metric(v3, "safety_violation_rate")
+        <= _metric(v2, "safety_violation_rate"),
+        "proxy_collision_zero": _metric(v3, "proxy_collision_rate") == 0.0,
+        "merge_success_not_worse_than_v2": _metric(v3, "merge_success_rate")
+        >= _metric(v2, "merge_success_rate"),
+    }
+    return {
+        "available": bool(v2 and v3),
+        "checks": checks,
+        "stage5_candidate_pass": bool(v2 and v3 and all(checks.values())),
+        "acceptance": _forecast_acceptance(v2, v3),
+    }
+
+
+def _wcdt_v3_shield_summary(group_reports: dict[str, dict]) -> dict[str, Any]:
+    base = group_reports.get("ppo_wcdt_v3_features")
+    shielded = group_reports.get("wcdt_v3_prediction_shield")
+    acceptance = _shield_acceptance(base, shielded)
+    return {
+        "available": bool(base and shielded),
+        "shield_regression": bool(acceptance.get("shield_regression", False)),
+        "mean_actual_replacements": _metric(shielded, "mean_actual_replacements", 0.0),
+        "mean_emergency_fallbacks": _metric(shielded, "mean_emergency_fallbacks", 0.0),
+        "emergency_fallback_rate": _metric(shielded, "emergency_fallback_rate", 0.0),
+        "acceptance": acceptance,
+    }
+
+
 def _forecast_policy_utilization_summary(
     group_reports: dict[str, dict],
     diagnostics: dict[str, Any] | None = None,
@@ -321,6 +386,15 @@ def build_confirmatory_summary(
     mainline = _mainline_shield_summary(group_reports)
     wcdt_v2 = _wcdt_v2_forecast_summary(group_reports)
     wcdt_v2_shield = _wcdt_v2_shield_summary(group_reports)
+    wcdt_v3 = _wcdt_v3_candidate_summary(group_reports)
+    wcdt_v3_shield = _wcdt_v3_shield_summary(group_reports)
+    forecast_conclusion = (diagnostics or {}).get("forecast_conclusion", {})
+    wcdt_v3["prediction_candidate_for_promotion"] = bool(
+        forecast_conclusion.get("wcdt_v3_candidate_for_promotion", False)
+    )
+    wcdt_v3["candidate_for_promotion"] = bool(
+        wcdt_v3.get("stage5_candidate_pass") and wcdt_v3.get("prediction_candidate_for_promotion")
+    )
     return {
         "final_result_summary": FINAL_RESULT_SUMMARY,
         "model_role_explanations": MODEL_ROLE_EXPLANATIONS,
@@ -334,6 +408,8 @@ def build_confirmatory_summary(
         "ppo_shield_mainline": mainline,
         "wcdt_v2_forecast_mainline": wcdt_v2,
         "wcdt_v2_shield": wcdt_v2_shield,
+        "wcdt_v3_candidate": wcdt_v3,
+        "wcdt_v3_shield": wcdt_v3_shield,
         "forecast_policy_utilization_summary": _forecast_policy_utilization_summary(group_reports, diagnostics),
         "overall_pass": bool(mainline.get("pass") and wcdt_v2.get("pass")),
         "paired_delta": paired_delta,
@@ -343,7 +419,7 @@ def build_confirmatory_summary(
 
 def run(cfg, episodes: int = 50) -> Path:
     run_id = str(cfg.run.run_id)
-    payload = build_confirmatory_payload(run_id, episodes=episodes)
+    payload = build_confirmatory_payload(run_id, episodes=episodes, forecast_sources=_forecast_sources_for_run(run_id))
     validate_confirmatory_inputs(payload)
     stage_dir = run_root(cfg) / "stage5_confirmatory"
     stage_dir.mkdir(parents=True, exist_ok=True)

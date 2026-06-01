@@ -225,6 +225,7 @@ def _build_paired_delta(group_reports: dict) -> dict:
         ("ppo_cv_features", "cv_prediction_shield"),
         ("ppo_wcdt_features", "wcdt_prediction_shield"),
         ("ppo_wcdt_v2_features", "wcdt_v2_prediction_shield"),
+        ("ppo_wcdt_v3_features", "wcdt_v3_prediction_shield"),
     ):
         _add_delta(
             paired_delta,
@@ -250,6 +251,18 @@ def _build_paired_delta(group_reports: dict) -> dict:
         "ppo_wcdt_features_vs_ppo_wcdt_v2_features",
         group_reports.get("ppo_wcdt_features"),
         group_reports.get("ppo_wcdt_v2_features"),
+    )
+    _add_delta(
+        paired_delta,
+        "ppo_cv_features_vs_ppo_wcdt_v3_features",
+        group_reports.get("ppo_cv_features"),
+        group_reports.get("ppo_wcdt_v3_features"),
+    )
+    _add_delta(
+        paired_delta,
+        "ppo_wcdt_v2_features_vs_ppo_wcdt_v3_features",
+        group_reports.get("ppo_wcdt_v2_features"),
+        group_reports.get("ppo_wcdt_v3_features"),
     )
     legacy_forecast = _forecast_baseline_group(group_reports)
     if "full_prediction_shield" in group_reports and legacy_forecast:
@@ -281,6 +294,11 @@ def _build_acceptance(group_reports: dict) -> dict:
             group_reports.get("ppo_wcdt_v2_features"),
             group_reports.get("wcdt_v2_prediction_shield"),
         )
+    if "wcdt_v3_prediction_shield" in group_reports:
+        acceptance["wcdt_v3_prediction_shield"] = _shield_acceptance(
+            group_reports.get("ppo_wcdt_v3_features"),
+            group_reports.get("wcdt_v3_prediction_shield"),
+        )
     if "ppo_cv_features" in group_reports:
         acceptance["forecast_cv_vs_baseline"] = _forecast_acceptance(
             group_reports.get("ppo"),
@@ -295,6 +313,11 @@ def _build_acceptance(group_reports: dict) -> dict:
         acceptance["forecast_wcdt_v2_vs_cv"] = _forecast_acceptance(
             group_reports.get("ppo_cv_features"),
             group_reports.get("ppo_wcdt_v2_features"),
+        )
+    if "ppo_wcdt_v3_features" in group_reports and "ppo_cv_features" in group_reports:
+        acceptance["forecast_wcdt_v3_vs_cv"] = _forecast_acceptance(
+            group_reports.get("ppo_cv_features"),
+            group_reports.get("ppo_wcdt_v3_features"),
         )
     legacy_forecast = _forecast_baseline_group(group_reports)
     if "full_prediction_shield" in group_reports and legacy_forecast:

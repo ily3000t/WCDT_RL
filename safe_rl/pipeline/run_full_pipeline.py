@@ -26,12 +26,12 @@ from safe_rl.utils.progress import stage_log
 from safe_rl.sim.scenario_snapshot import SCENARIO_SUFFIXES, snapshot_scenario
 
 
-VALID_FORECAST_SOURCES = ("constant_velocity", "wcdt", "wcdt_v2")
+VALID_FORECAST_SOURCES = ("constant_velocity", "wcdt", "wcdt_v2", "wcdt_v3")
 DEFAULT_FORECAST_SOURCES = ("constant_velocity", "wcdt_v2")
 VALID_FORECAST_PPO_PROFILES = ("default", "safety", "shield_guided")
 VALID_RUN_MODES = ("new", "resume", "overwrite")
 RUN_ID_PATTERN = re.compile(r"^[A-Za-z0-9._-]+$")
-PIPELINE_STATE_SCHEMA_VERSION = 1
+PIPELINE_STATE_SCHEMA_VERSION = 2
 PIPELINE_TASK_ORDER = (
     "network_snapshot",
     "stage1",
@@ -42,6 +42,7 @@ PIPELINE_TASK_ORDER = (
     "stage3_forecast_cv",
     "stage3_forecast_wcdt",
     "stage3_forecast_wcdt_v2",
+    "stage3_forecast_wcdt_v3",
     "stage5",
     "diagnostics",
 )
@@ -135,10 +136,12 @@ def _predictor_training_flags(sources: list[str] | tuple[str, ...]) -> dict[str,
     source_set = set(sources)
     train_v1 = "wcdt" in source_set
     train_v2 = "wcdt_v2" in source_set
+    train_v3 = "wcdt_v3" in source_set
     return {
-        "train_enabled": bool(train_v1 or train_v2),
+        "train_enabled": bool(train_v1 or train_v2 or train_v3),
         "wcdt_v1_train_enabled": bool(train_v1),
         "wcdt_v2_train_enabled": bool(train_v2),
+        "wcdt_v3_train_enabled": bool(train_v3),
     }
 
 
@@ -149,6 +152,8 @@ def _task_enabled(task_name: str, sources: list[str] | tuple[str, ...]) -> bool:
         return "wcdt" in sources
     if task_name == "stage3_forecast_wcdt_v2":
         return "wcdt_v2" in sources
+    if task_name == "stage3_forecast_wcdt_v3":
+        return "wcdt_v3" in sources
     return True
 
 
@@ -207,7 +212,21 @@ def _load_pipeline_state(path: str | Path) -> dict[str, Any]:
         raise FileNotFoundError(f"resume requires pipeline state: {path}")
     with path.open("r", encoding="utf-8") as file:
         state = json.load(file)
-    if int(state.get("schema_version", -1)) != PIPELINE_STATE_SCHEMA_VERSION:
+    schema_version = int(state.get("schema_version", -1))
+    if schema_version == 1:
+        state.setdefault("tasks", {}).setdefault(
+            "stage3_forecast_wcdt_v3",
+            {
+                "enabled": False,
+                "status": "completed",
+                "started_at": None,
+                "completed_at": None,
+                "required_outputs": [],
+                "output_hashes": {},
+            },
+        )
+        state["schema_version"] = PIPELINE_STATE_SCHEMA_VERSION
+    elif schema_version != PIPELINE_STATE_SCHEMA_VERSION:
         raise ValueError(f"unsupported pipeline state schema: {state.get('schema_version')}")
     return state
 
@@ -276,6 +295,10 @@ def _task_output_paths(run_dir: Path, cfg: Any, sources: list[str], task_name: s
     if "wcdt_v2" in sources:
         paths["stage2_initial"].extend(
             [run_dir / "stage2" / "wcdt_v2_predictor.pt", run_dir / "stage2" / "wcdt_v2_predictor_best.pt"]
+        )
+    if "wcdt_v3" in sources:
+        paths["stage2_initial"].extend(
+            [run_dir / "stage2" / "wcdt_v3_predictor.pt", run_dir / "stage2" / "wcdt_v3_predictor_best.pt"]
         )
     for source in VALID_FORECAST_SOURCES:
         forecast_run_dir = run_dir.parent / _forecast_run_id(run_dir.name, source)
@@ -386,6 +409,8 @@ def _source_suffix(source: str) -> str:
         return "cv"
     if source == "wcdt_v2":
         return "wcdt_v2"
+    if source == "wcdt_v3":
+        return "wcdt_v3"
     return "wcdt"
 
 
@@ -423,6 +448,8 @@ def _forecast_group_name(source: str) -> str:
         return "ppo_wcdt_features"
     if source == "wcdt_v2":
         return "ppo_wcdt_v2_features"
+    if source == "wcdt_v3":
+        return "ppo_wcdt_v3_features"
     return "ppo_cv_features"
 
 
@@ -431,6 +458,8 @@ def _forecast_shield_group_name(source: str) -> str:
         return "wcdt_prediction_shield"
     if source == "wcdt_v2":
         return "wcdt_v2_prediction_shield"
+    if source == "wcdt_v3":
+        return "wcdt_v3_prediction_shield"
     return "cv_prediction_shield"
 
 
@@ -439,6 +468,8 @@ def _forecast_checkpoint_name(source: str) -> str | None:
         return "wcdt_predictor.pt"
     if source == "wcdt_v2":
         return "wcdt_v2_predictor.pt"
+    if source == "wcdt_v3":
+        return "wcdt_v3_predictor.pt"
     return None
 
 
@@ -790,7 +821,7 @@ def main() -> None:
     parser.add_argument(
         "--run-id",
         required=True,
-        help="Baseline run id. Forecast run ids use '<run-id>_forecast_cv|wcdt|wcdt_v2'.",
+        help="Baseline run id. Forecast run ids use '<run-id>_forecast_cv|wcdt|wcdt_v2|wcdt_v3'.",
     )
     parser.add_argument(
         "--run-mode",

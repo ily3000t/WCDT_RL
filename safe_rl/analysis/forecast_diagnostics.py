@@ -13,6 +13,12 @@ from safe_rl.prediction.forecast_feature_augmentor import (
 )
 from safe_rl.prediction.sumo_wcdt_adapter import SumoWcDTAdapter
 from safe_rl.prediction.wcdt_v2_predictor import build_v2_numpy_batch, ensemble_predict, load_v2_ensemble, tensorize_batch
+from safe_rl.prediction.wcdt_v3_predictor import (
+    build_v3_numpy_batch,
+    ensemble_predict_v3,
+    load_v3_ensemble,
+    tensorize_v3_batch,
+)
 from safe_rl.rl.ppo import load_ppo
 from safe_rl.risk.merge_local import route_aware_constant_velocity_rollout
 from safe_rl.sim.metrics import INF_TTC
@@ -555,7 +561,7 @@ def _wcdt_diagnostics(
     return np.asarray(feature_rows, dtype=np.float32), report
 
 
-def _wcdt_v2_diagnostics(
+def _residual_ensemble_diagnostics(
     cfg: Any,
     checkpoint: Path,
     history: np.ndarray,
@@ -565,10 +571,16 @@ def _wcdt_v2_diagnostics(
     batch_size: int,
     lane_indices: np.ndarray | None = None,
     edge_roles: np.ndarray | None = None,
+    *,
+    build_batch: Any,
+    tensorize: Any,
+    ensemble_fn: Any,
+    load_ensemble: Any,
+    comparison_summary_key: str,
 ) -> tuple[np.ndarray, dict[str, Any]]:
     torch = _require_torch()
     device = _resolve_device(cfg, torch)
-    models, payload, device = load_v2_ensemble(cfg, checkpoint, device)
+    models, payload, device = load_ensemble(cfg, checkpoint, device)
     augmentor = ForecastFeatureAugmentor(cfg)
     feature_rows: list[np.ndarray] = []
     ade: list[float] = []
@@ -585,7 +597,7 @@ def _wcdt_v2_diagnostics(
 
     for start in range(0, indices.shape[0], batch_size):
         batch_indices = indices[start : start + batch_size]
-        numpy_batch = build_v2_numpy_batch(
+        numpy_batch = build_batch(
             cfg,
             history,
             future,
@@ -594,8 +606,8 @@ def _wcdt_v2_diagnostics(
             lane_indices=lane_indices,
             edge_roles=edge_roles,
         )
-        tensor_batch = tensorize_batch(numpy_batch, torch, device)
-        pred, uncertainty = ensemble_predict(models, tensor_batch)
+        tensor_batch = tensorize(numpy_batch, torch, device)
+        pred, uncertainty = ensemble_fn(models, tensor_batch)
         selected = pred.detach().cpu().numpy()
         actual_future = numpy_batch["target"]
         pred_mask = numpy_batch["mask"]
@@ -681,9 +693,67 @@ def _wcdt_v2_diagnostics(
         ),
         "cv_baseline_validation": payload.get("cv_baseline_validation") if isinstance(payload, dict) else None,
         "ensemble_validation": payload.get("ensemble_validation") if isinstance(payload, dict) else None,
-        "wcdt_v2_vs_cv_summary": payload.get("wcdt_v2_vs_cv_summary") if isinstance(payload, dict) else None,
+        comparison_summary_key: payload.get(comparison_summary_key) if isinstance(payload, dict) else None,
     }
     return np.asarray(feature_rows, dtype=np.float32), report
+
+
+def _wcdt_v2_diagnostics(
+    cfg: Any,
+    checkpoint: Path,
+    history: np.ndarray,
+    future: np.ndarray,
+    mask: np.ndarray,
+    indices: np.ndarray,
+    batch_size: int,
+    lane_indices: np.ndarray | None = None,
+    edge_roles: np.ndarray | None = None,
+) -> tuple[np.ndarray, dict[str, Any]]:
+    return _residual_ensemble_diagnostics(
+        cfg,
+        checkpoint,
+        history,
+        future,
+        mask,
+        indices,
+        batch_size,
+        lane_indices,
+        edge_roles,
+        build_batch=build_v2_numpy_batch,
+        tensorize=tensorize_batch,
+        ensemble_fn=ensemble_predict,
+        load_ensemble=load_v2_ensemble,
+        comparison_summary_key="wcdt_v2_vs_cv_summary",
+    )
+
+
+def _wcdt_v3_diagnostics(
+    cfg: Any,
+    checkpoint: Path,
+    history: np.ndarray,
+    future: np.ndarray,
+    mask: np.ndarray,
+    indices: np.ndarray,
+    batch_size: int,
+    lane_indices: np.ndarray | None = None,
+    edge_roles: np.ndarray | None = None,
+) -> tuple[np.ndarray, dict[str, Any]]:
+    return _residual_ensemble_diagnostics(
+        cfg,
+        checkpoint,
+        history,
+        future,
+        mask,
+        indices,
+        batch_size,
+        lane_indices,
+        edge_roles,
+        build_batch=build_v3_numpy_batch,
+        tensorize=tensorize_v3_batch,
+        ensemble_fn=ensemble_predict_v3,
+        load_ensemble=load_v3_ensemble,
+        comparison_summary_key="wcdt_v3_vs_cv_summary",
+    )
 
 
 def _correlation(a_values: list[float], b_values: list[float]) -> float:
@@ -701,6 +771,7 @@ def _forecast_conclusion(report: dict[str, Any]) -> dict[str, Any]:
     cv = report.get("cv_prediction", {})
     wcdt = report.get("wcdt_prediction", {})
     wcdt_v2 = report.get("wcdt_v2_prediction", {})
+    wcdt_v3 = report.get("wcdt_v3_prediction", {})
     behavior = report.get("forecast_behavior", {})
     cv_ade = float(cv.get("ade", {}).get("mean", 0.0))
     cv_fde = float(cv.get("fde", {}).get("mean", 0.0))
@@ -758,6 +829,27 @@ def _forecast_conclusion(report: dict[str, Any]) -> dict[str, Any]:
         and wcdt_v2_sensitivity.get("available", False)
         and not wcdt_v2_action_sensitive
     )
+    wcdt_v3_fde = float(wcdt_v3.get("fde", {}).get("mean", 1.0e6))
+    wcdt_v3_min_distance_error = float(wcdt_v3.get("future_min_distance_abs_error", {}).get("mean", 1.0e6))
+    wcdt_v3_front_gap_error = float(wcdt_v3.get("target_lane_front_gap_abs_error", {}).get("mean", 1.0e6))
+    wcdt_v3_rear_gap_error = float(wcdt_v3.get("target_lane_rear_gap_abs_error", {}).get("mean", 1.0e6))
+    wcdt_v3_uncertainty_std = float(wcdt_v3.get("uncertainty", {}).get("std", 0.0))
+    wcdt_v3_uncertainty_fde_corr = float(wcdt_v3.get("uncertainty_fde_correlation", 0.0))
+    wcdt_v3_uncertainty_min_distance_corr = float(
+        wcdt_v3.get("uncertainty_future_min_distance_abs_error_correlation", 0.0)
+    )
+    wcdt_v3_prediction_pass = bool(
+        wcdt_v3.get("available", False)
+        and wcdt_v3_fde <= wcdt_v2_fde
+        and wcdt_v3_min_distance_error < wcdt_v2_min_distance_error
+        and wcdt_v3_front_gap_error < wcdt_v2_front_gap_error
+        and wcdt_v3_rear_gap_error < wcdt_v2_rear_gap_error
+    )
+    wcdt_v3_uncertainty_pass = bool(
+        wcdt_v3.get("available", False)
+        and wcdt_v3_uncertainty_std > 0.02
+        and (wcdt_v3_uncertainty_fde_corr > 0.0 or wcdt_v3_uncertainty_min_distance_corr > 0.0)
+    )
     return {
         "cv_vs_wcdt_action_agreement": float(behavior.get("step_action_agreement_rate", 0.0)),
         "wcdt_prediction_quality_pass": quality_pass,
@@ -767,6 +859,9 @@ def _forecast_conclusion(report: dict[str, Any]) -> dict[str, Any]:
         "wcdt_v2_uncertainty_quality_pass": wcdt_v2_uncertainty_pass,
         "wcdt_v2_recommended_for_stage5": bool(wcdt_v2_quality_pass and wcdt_v2_uncertainty_pass),
         "wcdt_v2_policy_feature_sensitive": wcdt_v2_action_sensitive,
+        "wcdt_v3_prediction_quality_pass": wcdt_v3_prediction_pass,
+        "wcdt_v3_uncertainty_quality_pass": wcdt_v3_uncertainty_pass,
+        "wcdt_v3_candidate_for_promotion": bool(wcdt_v3_prediction_pass and wcdt_v3_uncertainty_pass),
         "forecast_policy_underutilized": forecast_policy_underutilized,
         "decision_basis": {
             "cv_ade_mean": cv_ade,
@@ -791,11 +886,24 @@ def _forecast_conclusion(report: dict[str, Any]) -> dict[str, Any]:
             "wcdt_v2_original_vs_shuffled_action_agreement_rate": wcdt_v2_sensitivity.get(
                 "original_vs_shuffled_action_agreement_rate"
             ),
+            "wcdt_v3_fde_mean": wcdt_v3_fde,
+            "wcdt_v3_future_min_distance_abs_error_mean": wcdt_v3_min_distance_error,
+            "wcdt_v3_target_lane_front_gap_abs_error_mean": wcdt_v3_front_gap_error,
+            "wcdt_v3_target_lane_rear_gap_abs_error_mean": wcdt_v3_rear_gap_error,
+            "wcdt_v3_uncertainty_std": wcdt_v3_uncertainty_std,
+            "wcdt_v3_uncertainty_fde_correlation": wcdt_v3_uncertainty_fde_corr,
+            "wcdt_v3_uncertainty_future_min_distance_abs_error_correlation": wcdt_v3_uncertainty_min_distance_corr,
         },
     }
 
 
-def _feature_distribution_report(cv_features: np.ndarray, wcdt_features: np.ndarray) -> dict[str, Any]:
+def _feature_distribution_report(
+    cv_features: np.ndarray,
+    wcdt_features: np.ndarray,
+    *,
+    left_label: str = "cv",
+    right_label: str = "wcdt",
+) -> dict[str, Any]:
     names = ForecastFeatureAugmentor.FEATURE_NAMES
     report: dict[str, Any] = {}
     count = min(cv_features.shape[0], wcdt_features.shape[0])
@@ -803,9 +911,9 @@ def _feature_distribution_report(cv_features: np.ndarray, wcdt_features: np.ndar
     wcdt_features = wcdt_features[:count]
     for idx, name in enumerate(names):
         report[name] = {
-            "cv": _summary(cv_features[:, idx]),
-            "wcdt": _summary(wcdt_features[:, idx]),
-            "wcdt_minus_cv": _summary(wcdt_features[:, idx] - cv_features[:, idx]),
+            left_label: _summary(cv_features[:, idx]),
+            right_label: _summary(wcdt_features[:, idx]),
+            f"{right_label}_minus_{left_label}": _summary(wcdt_features[:, idx] - cv_features[:, idx]),
         }
     return report
 
@@ -839,7 +947,7 @@ def _feature_source_summary(features_by_source: dict[str, np.ndarray]) -> dict[s
         }
         equal_rate = float(np.mean(np.isclose(features[:, min_idx], features[:, gap_idx], atol=1.0e-6)))
         equal_rates[source] = equal_rate
-        if source in {"wcdt", "wcdt_v2"} and equal_rate > 0.95:
+        if source in {"wcdt", "wcdt_v2", "wcdt_v3"} and equal_rate > 0.95:
             warnings.append(
                 f"{source}: forecast_merge_gap equals forecast_min_distance for {equal_rate:.2%} of samples"
             )
@@ -1000,6 +1108,11 @@ def _forecast_policy_specs(base_run_id: str) -> dict[str, dict[str, str]]:
             "source": "wcdt_v2",
             "model_path": str(base / f"{base_run_id}_forecast_wcdt_v2" / "stage3" / "ppo_model.zip"),
             "checkpoint": str(base / base_run_id / "stage2" / "wcdt_v2_predictor.pt"),
+        },
+        "ppo_wcdt_v3_features": {
+            "source": "wcdt_v3",
+            "model_path": str(base / f"{base_run_id}_forecast_wcdt_v3" / "stage3" / "ppo_model.zip"),
+            "checkpoint": str(base / base_run_id / "stage2" / "wcdt_v3_predictor.pt"),
         },
     }
 
@@ -1185,6 +1298,9 @@ def _forecast_behavior_diagnostics(base_run_id: str, stage5_report: dict[str, An
         ("ppo_cv_features", "ppo_wcdt_features"),
         ("ppo_cv_features", "ppo_wcdt_v2_features"),
         ("ppo_wcdt_v2_features", "wcdt_v2_prediction_shield"),
+        ("ppo_cv_features", "ppo_wcdt_v3_features"),
+        ("ppo_wcdt_v2_features", "ppo_wcdt_v3_features"),
+        ("ppo_wcdt_v3_features", "wcdt_v3_prediction_shield"),
     ]
     comparisons = {
         f"{left}_vs_{right}": _behavior_pair_diagnostics(base_run_id, stage5_report, left, right)
@@ -1192,9 +1308,13 @@ def _forecast_behavior_diagnostics(base_run_id: str, stage5_report: dict[str, An
     }
     available = {name: item for name, item in comparisons.items() if item.get("available")}
     primary_key = (
-        "ppo_cv_features_vs_ppo_wcdt_v2_features"
-        if comparisons.get("ppo_cv_features_vs_ppo_wcdt_v2_features", {}).get("available")
-        else "ppo_cv_features_vs_ppo_wcdt_features"
+        "ppo_cv_features_vs_ppo_wcdt_v3_features"
+        if comparisons.get("ppo_cv_features_vs_ppo_wcdt_v3_features", {}).get("available")
+        else (
+            "ppo_cv_features_vs_ppo_wcdt_v2_features"
+            if comparisons.get("ppo_cv_features_vs_ppo_wcdt_v2_features", {}).get("available")
+            else "ppo_cv_features_vs_ppo_wcdt_features"
+        )
     )
     primary = comparisons.get(primary_key, {})
     return {
@@ -1217,6 +1337,7 @@ def run_forecast_diagnostics(
     stage1_path = stage_file(cfg, "stage1", str(cfg.stage1.output_name))
     checkpoint = stage_file(cfg, "stage2", "wcdt_predictor.pt")
     wcdt_v2_checkpoint = stage_file(cfg, "stage2", "wcdt_v2_predictor.pt")
+    wcdt_v3_checkpoint = stage_file(cfg, "stage2", "wcdt_v3_predictor.pt")
     stage5_path = stage_file(cfg, "stage5", "formal_paired_eval_report.json")
     output_dir = base_run / "stage5" / "diagnostics"
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -1252,6 +1373,8 @@ def run_forecast_diagnostics(
     wcdt_report: dict[str, Any] = {"available": False, "checkpoint": str(checkpoint)}
     wcdt_v2_features = np.zeros((0, ForecastFeatureAugmentor.feature_dim(cfg)), dtype=np.float32)
     wcdt_v2_report: dict[str, Any] = {"available": False, "checkpoint": str(wcdt_v2_checkpoint)}
+    wcdt_v3_features = np.zeros((0, ForecastFeatureAugmentor.feature_dim(cfg)), dtype=np.float32)
+    wcdt_v3_report: dict[str, Any] = {"available": False, "checkpoint": str(wcdt_v3_checkpoint)}
     if checkpoint.exists():
         wcdt_features, wcdt_report = _wcdt_diagnostics(
             cfg,
@@ -1294,11 +1417,25 @@ def run_forecast_diagnostics(
             edge_roles=edge_roles,
         )
         wcdt_v2_report["available"] = True
+    if wcdt_v3_checkpoint.exists():
+        wcdt_v3_features, wcdt_v3_report = _wcdt_v3_diagnostics(
+            cfg,
+            wcdt_v3_checkpoint,
+            history,
+            future,
+            mask,
+            indices,
+            batch_size,
+            lane_indices=lane_indices,
+            edge_roles=edge_roles,
+        )
+        wcdt_v3_report["available"] = True
     feature_summary = _feature_source_summary(
         {
             "constant_velocity": cv_features,
             "wcdt": wcdt_features,
             "wcdt_v2": wcdt_v2_features,
+            "wcdt_v3": wcdt_v3_features,
         }
     )
     report: dict[str, Any] = {
@@ -1320,11 +1457,25 @@ def run_forecast_diagnostics(
         "cv_prediction": cv_prediction,
         "wcdt_prediction": wcdt_report,
         "wcdt_v2_prediction": wcdt_v2_report,
+        "wcdt_v3_prediction": wcdt_v3_report,
     }
     if wcdt_features.shape[0] > 0:
         report["cv_vs_wcdt_feature_distribution"] = _feature_distribution_report(cv_features, wcdt_features)
     if wcdt_v2_features.shape[0] > 0:
         report["cv_vs_wcdt_v2_feature_distribution"] = _feature_distribution_report(cv_features, wcdt_v2_features)
+    if wcdt_v3_features.shape[0] > 0:
+        report["cv_vs_wcdt_v3_feature_distribution"] = _feature_distribution_report(
+            cv_features,
+            wcdt_v3_features,
+            right_label="wcdt_v3",
+        )
+    if wcdt_v2_features.shape[0] > 0 and wcdt_v3_features.shape[0] > 0:
+        report["wcdt_v2_vs_wcdt_v3_feature_distribution"] = _feature_distribution_report(
+            wcdt_v2_features,
+            wcdt_v3_features,
+            left_label="wcdt_v2",
+            right_label="wcdt_v3",
+        )
     if stage5_path.exists():
         with stage5_path.open("r", encoding="utf-8") as file:
             stage5_report = json.load(file)
@@ -1342,8 +1493,16 @@ def run_forecast_diagnostics(
             group_name="ppo_wcdt_v2_features",
             compare_group_name="wcdt_v2_prediction_shield",
         )
+        low_v3_rows = _low_min_distance_replays(
+            str(cfg.run.run_id),
+            stage5_report,
+            int(low_seed_count),
+            group_name="ppo_wcdt_v3_features",
+            compare_group_name="wcdt_v3_prediction_shield",
+        )
         report["low_min_distance_ppo_cv_features"] = low_rows
         report["low_min_distance_ppo_wcdt_v2_features"] = low_v2_rows
+        report["low_min_distance_ppo_wcdt_v3_features"] = low_v3_rows
         report["forecast_behavior"] = _forecast_behavior_diagnostics(str(cfg.run.run_id), stage5_report)
         report["policy_feature_sensitivity"] = _policy_feature_sensitivity(
             cfg,
@@ -1360,6 +1519,11 @@ def run_forecast_diagnostics(
             output_dir / "replay_low_min_distance_ppo_wcdt_v2_features.ps1",
             low_v2_rows,
             title="Low-min-distance ppo_wcdt_v2_features replay commands",
+        )
+        _write_replay_commands(
+            output_dir / "replay_low_min_distance_ppo_wcdt_v3_features.ps1",
+            low_v3_rows,
+            title="Low-min-distance ppo_wcdt_v3_features replay commands",
         )
     else:
         report["policy_feature_sensitivity"] = {

@@ -62,7 +62,11 @@ def _resolve_repo_path(path: str | Path) -> Path:
 
 
 def _forecast_checkpoint_name(source: str) -> str:
-    return "wcdt_v2_predictor.pt" if source == "wcdt_v2" else "wcdt_predictor.pt"
+    if source == "wcdt_v2":
+        return "wcdt_v2_predictor.pt"
+    if source == "wcdt_v3":
+        return "wcdt_v3_predictor.pt"
+    return "wcdt_predictor.pt"
 
 
 def _forecast_checkpoint_path(cfg: ConfigDict, source: str = "wcdt") -> Path:
@@ -96,6 +100,10 @@ def make_forecast_augmentor(cfg: ConfigDict) -> ForecastFeatureAugmentor | None:
         from safe_rl.prediction.wcdt_v2_predictor import WcDTV2Predictor
 
         return ForecastFeatureAugmentor(cfg, predictor=WcDTV2Predictor(cfg, checkpoint))
+    if source == "wcdt_v3":
+        from safe_rl.prediction.wcdt_v3_predictor import WcDTV3Predictor
+
+        return ForecastFeatureAugmentor(cfg, predictor=WcDTV3Predictor(cfg, checkpoint))
     if source == "wcdt":
         return ForecastFeatureAugmentor(cfg, predictor=WcDTPredictor(cfg, checkpoint))
     return ForecastFeatureAugmentor(cfg)

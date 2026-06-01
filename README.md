@@ -157,6 +157,8 @@ safe_rl_output/runs/<run_id>/stage2/wcdt_predictor.pt
 safe_rl_output/runs/<run_id>/stage2/wcdt_predictor_best.pt
 safe_rl_output/runs/<run_id>/stage2/wcdt_v2_predictor.pt
 safe_rl_output/runs/<run_id>/stage2/wcdt_v2_predictor_best.pt
+safe_rl_output/runs/<run_id>/stage2/wcdt_v3_predictor.pt
+safe_rl_output/runs/<run_id>/stage2/wcdt_v3_predictor_best.pt
 safe_rl_output/runs/<run_id>/stage2/risk_module.pt
 safe_rl_output/runs/<run_id>/stage2/stage2_initial_prediction_report.json
 safe_rl_output/runs/<run_id>/stage2/stage2_training_report.json
@@ -166,6 +168,8 @@ safe_rl_output/runs/<run_id>/stage2/tensorboard/
 Stage2 会根据 full runner 的 forecast sources 选择 predictor。当前默认只训练 WcDT v2；旧 WcDT v1 仅在显式包含 `wcdt` 时训练。WcDT v1 会从 Stage1 trajectory windows 中划分 train/validation，按 validation `FDE + 0.5 * target_lane_gap_abs_error + 0.5 * future_min_distance_abs_error` 选择 best checkpoint。`wcdt_predictor_best.pt` 保存最佳权重；兼容路径 `wcdt_predictor.pt` 也写入同一 best 权重，避免后续 Stage3/Stage5 加载最后一个退化 epoch。
 
 Stage2 还会训练独立的 `wcdt_v2` residual-over-CV predictor。它不覆盖旧 WcDT，输入更偏 merge-centric：目标主路 front/rear、`main_aux lane 0` local、ramp local 和 nearest conflict vehicle。默认保存 3-model ensemble，`uncertainty` 来自 ensemble 方差。当前 `merge_safety_v2` loss 会分别监督 `ADE / FDE / future minD / target front gap / target rear gap / front-rear ordering / smoothness`，其中 future minD 使用完整预测时域内的最小净距离误差，不再使用逐时刻距离误差均值。每个 ensemble member 会在终端和 TensorBoard 输出每轮训练 loss 与 validation 指标；默认最多训练 30 epochs，并在 validation score 连续 10 轮无明显改善时 early stop。Risk Module 使用连续风险目标训练 risk head，并保留 6 类硬标签：`collision / near_miss / low_ttc / high_drac / merge_conflict / taper_miss`。validation 报告会输出 legal candidate 上的 boundary `ECE / Brier / NLL / reliability_bins`、中间分数区间占比和 ranking 诊断；默认不把 calibration 写入 runtime，只有显式开启配置后 Shield 才使用 calibrated score。
+
+`wcdt_v3` 是显式启用的时序交互消融分支，不替换默认 v2。它继续使用 route-aware CV residual 和 3-model ensemble，但加入历史轨迹 Transformer、车辆角色 embedding 和 actor self-attention，用于判断合流交互建模是否优于 v2 的单帧 MLP。v2 与 v3 共用 `merge_safety_v2` loss，保证结构消融口径一致。
 
 WcDT v1 和 v2 使用独立 batch size：默认分别为 `16` 和 `32`。初始 Stage2 会额外保留 `risk_module_initial.pt` 与 `stage2_initial_training_report.json`；Stage4 后重训 Risk Module 时继续更新最终 `risk_module.pt`，不会覆盖初始快照。
 
@@ -368,15 +372,42 @@ python -m safe_rl.pipeline.run_full_pipeline --run-id safe_rl_right_onramp_v2fix
 
 ### Predictor 分支与 legacy 兼容
 
-默认 `--forecast-sources` 是 `constant_velocity,wcdt_v2`。初始 Stage2 只训练 WcDT v2 predictor，不再训练旧 WcDT v1；v1 仅在显式包含 `wcdt` 时启用。如果要保留 v1 对照，需要显式运行 `constant_velocity,wcdt` 或 `constant_velocity,wcdt,wcdt_v2`。如果只想跑其中一个 forecast 分支：
+默认 `--forecast-sources` 是 `constant_velocity,wcdt_v2`。初始 Stage2 只训练 WcDT v2 predictor，不再训练旧 WcDT v1；v1 仅在显式包含 `wcdt` 时启用。WcDT v3 同样只在显式包含 `wcdt_v3` 时启用。如果要保留 v1 对照，需要显式运行 `constant_velocity,wcdt` 或 `constant_velocity,wcdt,wcdt_v2`。如果只想跑其中一个 forecast 分支：
 
 ```powershell
 python -m safe_rl.pipeline.run_full_pipeline --run-id safe_rl_merge_local_cv_001 --run-mode new --forecast-sources constant_velocity
 python -m safe_rl.pipeline.run_full_pipeline --run-id safe_rl_merge_local_wcdt_001 --run-mode new --forecast-sources wcdt
 python -m safe_rl.pipeline.run_full_pipeline --run-id safe_rl_merge_local_wcdt_v2_001 --run-mode new --forecast-sources wcdt_v2
+python -m safe_rl.pipeline.run_full_pipeline --run-id safe_rl_merge_local_wcdt_v3_001 --run-mode new --forecast-sources wcdt_v3
 ```
 
 旧参数 `--forecast-source wcdt` 仍可用于单分支兼容，但不要和 `--forecast-sources` 同时使用。
+
+### WcDT v3 时序交互消融
+
+WcDT v3 不进入默认主线。需要一次性比较 CV、v2-fixed 和 v3 时，显式启用三个 source。Stage1、Risk Module、baseline PPO、Stage4 数据和 Stage5 seeds 仍只生成一次：
+
+```powershell
+E:\Programs\EnvAnaconda3\envs\pytorch\python.exe -m safe_rl.pipeline.run_full_pipeline `
+  --run-id safe_rl_right_onramp_v3_ablation_001 `
+  --run-mode new `
+  --stage1-episodes 1000 `
+  --ppo-timesteps 100000 `
+  --forecast-ppo-timesteps 100000 `
+  --forecast-sources constant_velocity,wcdt_v2,wcdt_v3 `
+  --forecast-ppo-profile shield_guided
+
+E:\Programs\EnvAnaconda3\envs\pytorch\python.exe -m safe_rl.pipeline.stage5_confirmatory_eval `
+  --run-id safe_rl_right_onramp_v3_ablation_001 `
+  --episodes 50
+
+E:\Programs\EnvAnaconda3\envs\pytorch\python.exe -m safe_rl.pipeline.forecast_diagnostics `
+  --run-id safe_rl_right_onramp_v3_ablation_001 `
+  --max-samples 512 `
+  --low-seed-count 5
+```
+
+显式启用 v3 后，Stage5 会增加 `ppo_wcdt_v3_features` 和 `wcdt_v3_prediction_shield`，形成八组消融。diagnostics 会输出 CV vs v3、v2 vs v3 的预测误差、feature distribution、policy sensitivity 和低 minD 回放命令。只有预测层和策略层都通过验收后，v3 才能从 candidate 分支提升为推荐主线。
 
 如需覆盖采样轮数和 PPO 训练步数：
 
@@ -398,7 +429,7 @@ safe_rl_output/runs/<run_id>/stage5/diagnostics/forecast_diagnostics.json
 
 ```text
 PPO training reward: default / safety_forecast / shield_guided_forecast
-PPO observation: 52D baseline / 63D CV / 63D WcDT v1 legacy / 63D WcDT v2
+PPO observation: 52D baseline / 63D CV / 63D WcDT v1 legacy / 63D WcDT v2 / 63D WcDT v3 ablation
 Eval-time Shield: off / on
 ```
 

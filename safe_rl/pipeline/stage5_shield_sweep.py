@@ -66,6 +66,8 @@ def _forecast_run_id(run_id: str, source: str) -> str:
         suffix = "cv"
     elif source == "wcdt_v2":
         suffix = "wcdt_v2"
+    elif source == "wcdt_v3":
+        suffix = "wcdt_v3"
     else:
         suffix = "wcdt"
     return f"{run_id}_forecast_{suffix}"
@@ -112,6 +114,7 @@ def build_sweep_groups(
         ("constant_velocity", "ppo_cv_features", "cv_prediction_shield"),
         ("wcdt", "ppo_wcdt_features", "wcdt_prediction_shield"),
         ("wcdt_v2", "ppo_wcdt_v2_features", "wcdt_v2_prediction_shield"),
+        ("wcdt_v3", "ppo_wcdt_v3_features", "wcdt_v3_prediction_shield"),
     ):
         if not _forecast_model_exists(run_id, source):
             continue
@@ -123,8 +126,8 @@ def build_sweep_groups(
             "model_path": _run_path(forecast_run, "stage3", "ppo_model.zip"),
             "forecast_source": source,
         }
-        if source in ("wcdt", "wcdt_v2"):
-            checkpoint_name = "wcdt_v2_predictor.pt" if source == "wcdt_v2" else "wcdt_predictor.pt"
+        if source in ("wcdt", "wcdt_v2", "wcdt_v3"):
+            checkpoint_name = f"{source}_predictor.pt" if source != "wcdt" else "wcdt_predictor.pt"
             base["forecast_checkpoint"] = _run_path(run_id, "stage2", checkpoint_name)
         groups.append(base)
         for variant in variants:
@@ -136,8 +139,8 @@ def build_sweep_groups(
                 "forecast_source": source,
                 "shield_overrides": {**variant, "allow_fallback": False},
             }
-            if source in ("wcdt", "wcdt_v2"):
-                checkpoint_name = "wcdt_v2_predictor.pt" if source == "wcdt_v2" else "wcdt_predictor.pt"
+            if source in ("wcdt", "wcdt_v2", "wcdt_v3"):
+                checkpoint_name = f"{source}_predictor.pt" if source != "wcdt" else "wcdt_predictor.pt"
                 shield_group["forecast_checkpoint"] = _run_path(run_id, "stage2", checkpoint_name)
             groups.append(shield_group)
             if include_calibrated:
@@ -165,6 +168,8 @@ def _base_group_for(name: str) -> str | None:
         return "ppo_wcdt_features"
     if name.startswith("wcdt_v2_prediction_shield"):
         return "ppo_wcdt_v2_features"
+    if name.startswith("wcdt_v3_prediction_shield"):
+        return "ppo_wcdt_v3_features"
     return None
 
 
