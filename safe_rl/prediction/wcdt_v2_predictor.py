@@ -42,7 +42,8 @@ def _require_torch():
 
 
 def _resolve_device(config: Any, torch: Any):
-    requested = str(config.get("training", {}).get("device", "auto")).strip().lower()
+    training = config.get("training", {})
+    requested = str(training.get("forecast_runtime_device", training.get("device", "auto"))).strip().lower()
     if requested in ("auto", ""):
         if torch.cuda.is_available():
             return torch.device("cuda:0")
@@ -211,6 +212,10 @@ def build_v2_numpy_batch(
     indices: np.ndarray,
     lane_indices: np.ndarray | None = None,
     edge_roles: np.ndarray | None = None,
+    future_valid_mask: np.ndarray | None = None,
+    history_valid_mask: np.ndarray | None = None,
+    history_lane_indices: np.ndarray | None = None,
+    history_edge_roles: np.ndarray | None = None,
 ) -> dict[str, np.ndarray]:
     sample_indices = np.asarray(indices, dtype=np.int64)
     horizon = int(min(future.shape[2], cfg.prediction.get("wcdt_v2_horizon_steps", cfg.scenario.forecast_horizon_steps)))
@@ -224,11 +229,15 @@ def build_v2_numpy_batch(
     actor_mask = np.zeros((batch, max_agents), dtype=np.float32)
     role_ids = np.full((batch, max_agents), ROLE_COUNT - 1, dtype=np.int64)
     ego_future = np.zeros((batch, horizon, 5), dtype=np.float32)
+    selected_future_valid_mask = np.zeros((batch, max_agents, horizon), dtype=np.float32)
+    ego_future_valid_mask = np.ones((batch, horizon), dtype=np.float32)
     selected_indices = np.full((batch, max_agents), -1, dtype=np.int64)
 
     for row, sample_idx in enumerate(sample_indices):
         ego_latest = history[sample_idx, 0, -1]
         ego_future[row] = future[sample_idx, 0, :horizon]
+        if future_valid_mask is not None:
+            ego_future_valid_mask[row] = future_valid_mask[sample_idx, 0, :horizon]
         sample_lanes = None if lane_indices is None else lane_indices[sample_idx]
         sample_roles = None if edge_roles is None else edge_roles[sample_idx]
         ordered = ordered_merge_local_indices(cfg, history[sample_idx], mask[sample_idx], sample_lanes, sample_roles)
@@ -257,6 +266,11 @@ def build_v2_numpy_batch(
             )
             target[row, actor_row] = future[sample_idx, agent_idx, :horizon]
             actor_mask[row, actor_row] = mask[sample_idx, agent_idx]
+            selected_future_valid_mask[row, actor_row] = (
+                mask[sample_idx, agent_idx]
+                if future_valid_mask is None
+                else future_valid_mask[sample_idx, agent_idx, :horizon]
+            )
             role_ids[row, actor_row] = role
             selected_indices[row, actor_row] = int(agent_idx)
     return {
@@ -266,6 +280,8 @@ def build_v2_numpy_batch(
         "mask": actor_mask,
         "role_ids": role_ids,
         "ego_future": ego_future,
+        "future_valid_mask": selected_future_valid_mask,
+        "ego_future_valid_mask": ego_future_valid_mask,
         "selected_indices": selected_indices,
     }
 
@@ -328,11 +344,31 @@ def tensorize_batch(batch: dict[str, np.ndarray], torch: Any, device: Any) -> di
         "mask": torch.tensor(batch["mask"], dtype=torch.float32, device=device),
         "role_ids": torch.tensor(batch["role_ids"], dtype=torch.long, device=device),
         "ego_future": torch.tensor(batch["ego_future"], dtype=torch.float32, device=device),
+        "future_valid_mask": torch.tensor(batch["future_valid_mask"], dtype=torch.float32, device=device),
+        "ego_future_valid_mask": torch.tensor(batch["ego_future_valid_mask"], dtype=torch.float32, device=device),
     }
 
 
-def v2_loss(pred, target, mask, ego_future, role_ids, weights: dict[str, float] | None = None):
-    return merge_safety_loss(pred, target, mask, ego_future, role_ids, weights)
+def v2_loss(
+    pred,
+    target,
+    mask,
+    ego_future,
+    role_ids,
+    weights: dict[str, float] | None = None,
+    future_valid_mask=None,
+    ego_future_valid_mask=None,
+):
+    return merge_safety_loss(
+        pred,
+        target,
+        mask,
+        ego_future,
+        role_ids,
+        weights,
+        future_valid_mask=future_valid_mask,
+        ego_future_valid_mask=ego_future_valid_mask,
+    )
 
 
 def load_v2_ensemble(config: Any, checkpoint: str | Path, device: Any | None = None):

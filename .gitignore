@@ -1,2 +1,5 @@
 
 safe_rl_output/
+__pycache__/
+*.py[cod]
+.pytest_cache/

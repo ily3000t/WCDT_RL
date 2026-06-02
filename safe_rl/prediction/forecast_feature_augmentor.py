@@ -234,6 +234,8 @@ def forecast_target_lane_gap_from_trajectories(
     config: Any,
     *,
     default_gap: float = 50.0,
+    valid_mask: np.ndarray | None = None,
+    ego_valid_mask: np.ndarray | None = None,
 ) -> float:
     """Estimate the future target-lane gap used by forecast feature index 5."""
 
@@ -241,6 +243,8 @@ def forecast_target_lane_gap_from_trajectories(
     trajectories = np.asarray(trajectories, dtype=np.float32)
     if trajectories.ndim == 4:
         trajectories = trajectories[:, 0]
+    if valid_mask is not None:
+        valid_mask = np.asarray(valid_mask, dtype=bool)
     if trajectories.ndim != 3 or trajectories.shape[0] == 0 or ego_xy.size == 0:
         return float(default_gap)
     horizon = min(int(ego_xy.shape[0]), int(trajectories.shape[1]))
@@ -248,11 +252,15 @@ def forecast_target_lane_gap_from_trajectories(
         return float(default_gap)
     min_gap = float(default_gap)
     for step_idx in range(horizon):
+        if ego_valid_mask is not None and not bool(np.asarray(ego_valid_mask)[step_idx]):
+            continue
         ego_x = float(ego_xy[step_idx, 0])
         front_gap = float(default_gap)
         rear_gap = float(default_gap)
         saw_target_lane_vehicle = False
-        for traj in trajectories:
+        for actor_idx, traj in enumerate(trajectories):
+            if valid_mask is not None and not bool(valid_mask[actor_idx, step_idx]):
+                continue
             x = float(traj[step_idx, 0])
             y = float(traj[step_idx, 1])
             target_y = target_lane_center_at_x(config, x)

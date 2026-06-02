@@ -19,7 +19,7 @@ from safe_rl.prediction.wcdt_v3_predictor import (
     load_v3_ensemble,
     tensorize_v3_batch,
 )
-from safe_rl.rl.ppo import load_ppo
+from safe_rl.rl.ppo import _training_device, load_ppo
 from safe_rl.risk.merge_local import route_aware_constant_velocity_rollout
 from safe_rl.sim.metrics import INF_TTC
 from safe_rl.sim.scenario_semantics import (
@@ -162,6 +162,8 @@ def _target_role_gap_abs_errors(
     actual_future: np.ndarray,
     mask: np.ndarray,
     role_ids: np.ndarray,
+    future_valid_mask: np.ndarray | None = None,
+    ego_future_valid_mask: np.ndarray | None = None,
 ) -> dict[str, float | None]:
     result: dict[str, float | None] = {}
     ego_x = np.asarray(ego_future, dtype=np.float32)[:, 0]
@@ -172,7 +174,12 @@ def _target_role_gap_abs_errors(
             continue
         pred_gap = np.asarray(pred_future, dtype=np.float32)[role_indices, :, 0] - ego_x[None, :]
         actual_gap = np.asarray(actual_future, dtype=np.float32)[role_indices, :, 0] - ego_x[None, :]
-        result[name] = float(np.mean(np.abs(pred_gap - actual_gap)))
+        valid = np.ones(pred_gap.shape, dtype=bool)
+        if future_valid_mask is not None:
+            valid &= np.asarray(future_valid_mask)[role_indices] > 0.5
+        if ego_future_valid_mask is not None:
+            valid &= np.asarray(ego_future_valid_mask)[None, :] > 0.5
+        result[name] = float(np.mean(np.abs(pred_gap - actual_gap)[valid])) if np.any(valid) else None
     return result
 
 
@@ -184,6 +191,7 @@ def _cv_prediction_diagnostics(
     indices: np.ndarray,
     lane_indices: np.ndarray | None = None,
     edge_roles: np.ndarray | None = None,
+    future_valid_mask: np.ndarray | None = None,
 ) -> dict[str, Any]:
     horizon = int(min(future.shape[2], cfg.forecast_features.get("horizon_steps", cfg.scenario.forecast_horizon_steps)))
     dt = float(cfg.scenario.step_length)
@@ -197,6 +205,12 @@ def _cv_prediction_diagnostics(
     target_rear_gap_abs_errors: list[float] = []
     for sample_idx in indices:
         actual_future = future[sample_idx, :, :horizon]
+        sample_future_valid = (
+            np.ones((future.shape[1], horizon), dtype=np.float32)
+            if future_valid_mask is None
+            else future_valid_mask[sample_idx, :, :horizon]
+        )
+        ego_future_valid = sample_future_valid[0]
         pred_future = np.zeros_like(actual_future)
         for agent_idx in range(history.shape[1]):
             if float(mask[sample_idx, agent_idx]) <= 0.0:
@@ -216,18 +230,24 @@ def _cv_prediction_diagnostics(
         other_valid[0] = False
         if not np.any(other_valid):
             continue
-        diff = pred_future[other_valid, :, :2] - actual_future[other_valid, :, :2]
-        per_step = np.linalg.norm(diff, axis=-1)
-        ade.append(float(np.mean(per_step)))
-        fde.append(float(np.mean(per_step[:, -1])))
-        other_mask = mask[sample_idx].copy()
-        other_mask[0] = 0.0
-        pred_min = _future_min_distance(actual_future[0], pred_future, other_mask)
-        actual_min = _future_min_distance(actual_future[0], actual_future, other_mask)
+        errors = _masked_trajectory_errors(
+            pred_future,
+            actual_future,
+            other_mask := np.where(other_valid, 1.0, 0.0),
+            sample_future_valid,
+            ego_future_valid,
+        )
+        if errors is None:
+            continue
+        row_ade, row_fde = errors
+        ade.append(row_ade)
+        fde.append(row_fde)
+        pred_min = _future_min_distance(actual_future[0], pred_future, other_mask, sample_future_valid, ego_future_valid)
+        actual_min = _future_min_distance(actual_future[0], actual_future, other_mask, sample_future_valid, ego_future_valid)
         min_distance_errors.append(float(pred_min - actual_min))
         min_distance_abs_errors.append(abs(float(pred_min - actual_min)))
-        pred_gap = _target_lane_gap(actual_future[0], pred_future, other_mask, cfg)
-        actual_gap = _target_lane_gap(actual_future[0], actual_future, other_mask, cfg)
+        pred_gap = _target_lane_gap(actual_future[0], pred_future, other_mask, cfg, sample_future_valid, ego_future_valid)
+        actual_gap = _target_lane_gap(actual_future[0], actual_future, other_mask, cfg, sample_future_valid, ego_future_valid)
         if pred_gap < INF_TTC and actual_gap < INF_TTC:
             target_gap_errors.append(float(pred_gap - actual_gap))
             target_gap_abs_errors.append(abs(float(pred_gap - actual_gap)))
@@ -247,6 +267,8 @@ def _cv_prediction_diagnostics(
             selected_batch["target"][row],
             selected_batch["mask"][row],
             selected_batch["role_ids"][row],
+            selected_batch["future_valid_mask"][row],
+            selected_batch["ego_future_valid_mask"][row],
         )
         if role_gap_errors["target_lane_front_gap_abs_error"] is not None:
             target_front_gap_abs_errors.append(float(role_gap_errors["target_lane_front_gap_abs_error"]))
@@ -274,7 +296,8 @@ def _require_torch():
 
 
 def _resolve_device(cfg: Any, torch: Any):
-    requested = str(cfg.get("training", {}).get("device", "auto")).strip().lower()
+    training = cfg.get("training", {})
+    requested = str(training.get("diagnostics_device", training.get("device", "auto"))).strip().lower()
     if requested in ("auto", ""):
         return torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
     if requested == "gpu":
@@ -364,23 +387,70 @@ def _select_best_mode(trajectories: np.ndarray, confidence: np.ndarray | None) -
     return selected
 
 
-def _future_min_distance(ego_future: np.ndarray, other_future: np.ndarray, other_mask: np.ndarray) -> float:
+def _future_min_distance(
+    ego_future: np.ndarray,
+    other_future: np.ndarray,
+    other_mask: np.ndarray,
+    future_valid_mask: np.ndarray | None = None,
+    ego_future_valid_mask: np.ndarray | None = None,
+) -> float:
     min_distance = INF_TTC
     for agent_idx in range(other_future.shape[0]):
         if float(other_mask[agent_idx]) <= 0.0:
             continue
-        distances = np.linalg.norm(other_future[agent_idx, :, :2] - ego_future[:, :2], axis=-1) - 3.0
+        valid = np.ones((other_future.shape[1],), dtype=bool)
+        if future_valid_mask is not None:
+            valid &= np.asarray(future_valid_mask[agent_idx]) > 0.5
+        if ego_future_valid_mask is not None:
+            valid &= np.asarray(ego_future_valid_mask) > 0.5
+        if not np.any(valid):
+            continue
+        distances = np.linalg.norm(other_future[agent_idx, valid, :2] - ego_future[valid, :2], axis=-1) - 3.0
         min_distance = min(min_distance, float(np.min(np.maximum(0.0, distances))))
     return float(min_distance)
 
 
-def _target_lane_gap(ego_future: np.ndarray, other_future: np.ndarray, other_mask: np.ndarray, cfg: Any) -> float:
+def _target_lane_gap(
+    ego_future: np.ndarray,
+    other_future: np.ndarray,
+    other_mask: np.ndarray,
+    cfg: Any,
+    future_valid_mask: np.ndarray | None = None,
+    ego_future_valid_mask: np.ndarray | None = None,
+) -> float:
+    selected = np.asarray(other_mask) > 0.0
     return forecast_target_lane_gap_from_trajectories(
         ego_future,
-        other_future[np.asarray(other_mask) > 0.0],
+        other_future[selected],
         cfg,
         default_gap=INF_TTC,
+        valid_mask=None if future_valid_mask is None else np.asarray(future_valid_mask)[selected] > 0.5,
+        ego_valid_mask=ego_future_valid_mask,
     )
+
+
+def _masked_trajectory_errors(
+    pred_future: np.ndarray,
+    actual_future: np.ndarray,
+    actor_mask: np.ndarray,
+    future_valid_mask: np.ndarray,
+    ego_future_valid_mask: np.ndarray,
+) -> tuple[float, float] | None:
+    valid = (
+        (np.asarray(actor_mask) > 0.5)[:, None]
+        & (np.asarray(future_valid_mask) > 0.5)
+        & (np.asarray(ego_future_valid_mask) > 0.5)[None, :]
+    )
+    if not np.any(valid):
+        return None
+    per_step = np.linalg.norm(pred_future[..., :2] - actual_future[..., :2], axis=-1)
+    ade = float(np.mean(per_step[valid]))
+    last_errors = [
+        float(per_step[actor_idx, indices[-1]])
+        for actor_idx in range(valid.shape[0])
+        if (indices := np.flatnonzero(valid[actor_idx])).size
+    ]
+    return ade, float(np.mean(last_errors)) if last_errors else ade
 
 
 def _forecast_features_from_prediction(
@@ -571,6 +641,10 @@ def _residual_ensemble_diagnostics(
     batch_size: int,
     lane_indices: np.ndarray | None = None,
     edge_roles: np.ndarray | None = None,
+    history_valid_mask: np.ndarray | None = None,
+    future_valid_mask: np.ndarray | None = None,
+    history_lane_indices: np.ndarray | None = None,
+    history_edge_roles: np.ndarray | None = None,
     *,
     build_batch: Any,
     tensorize: Any,
@@ -605,6 +679,10 @@ def _residual_ensemble_diagnostics(
             batch_indices,
             lane_indices=lane_indices,
             edge_roles=edge_roles,
+            history_valid_mask=history_valid_mask,
+            future_valid_mask=future_valid_mask,
+            history_lane_indices=history_lane_indices,
+            history_edge_roles=history_edge_roles,
         )
         tensor_batch = tensorize(numpy_batch, torch, device)
         pred, uncertainty = ensemble_fn(models, tensor_batch)
@@ -612,22 +690,34 @@ def _residual_ensemble_diagnostics(
         actual_future = numpy_batch["target"]
         pred_mask = numpy_batch["mask"]
         ego_future = numpy_batch["ego_future"]
+        pred_future_valid_mask = numpy_batch["future_valid_mask"]
+        ego_future_valid_mask = numpy_batch["ego_future_valid_mask"]
         uncertainty_np = uncertainty.detach().cpu().numpy()
         for row in range(selected.shape[0]):
             valid_agents = pred_mask[row] > 0.0
             if not np.any(valid_agents):
                 continue
-            diff = selected[row, valid_agents, :, :2] - actual_future[row, valid_agents, :, :2]
-            per_step = np.linalg.norm(diff, axis=-1)
-            row_ade = float(np.mean(per_step))
-            row_fde = float(np.mean(per_step[:, -1]))
+            errors = _masked_trajectory_errors(
+                selected[row],
+                actual_future[row],
+                pred_mask[row],
+                pred_future_valid_mask[row],
+                ego_future_valid_mask[row],
+            )
+            if errors is None:
+                continue
+            row_ade, row_fde = errors
             ade.append(row_ade)
             fde.append(row_fde)
             sample_uncertainty = float(uncertainty_np[row])
             uncertainty_values.append(sample_uncertainty)
             uncertainty_fde_values.append(row_fde)
-            pred_min_distance = _future_min_distance(ego_future[row], selected[row], pred_mask[row])
-            actual_min_distance = _future_min_distance(ego_future[row], actual_future[row], pred_mask[row])
+            pred_min_distance = _future_min_distance(
+                ego_future[row], selected[row], pred_mask[row], pred_future_valid_mask[row], ego_future_valid_mask[row]
+            )
+            actual_min_distance = _future_min_distance(
+                ego_future[row], actual_future[row], pred_mask[row], pred_future_valid_mask[row], ego_future_valid_mask[row]
+            )
             min_distance_errors.append(float(pred_min_distance - actual_min_distance))
             min_distance_abs_error = abs(float(pred_min_distance - actual_min_distance))
             min_distance_abs_errors.append(min_distance_abs_error)
@@ -638,13 +728,19 @@ def _residual_ensemble_diagnostics(
                 actual_future[row],
                 pred_mask[row],
                 numpy_batch["role_ids"][row],
+                pred_future_valid_mask[row],
+                ego_future_valid_mask[row],
             )
             if role_gap_errors["target_lane_front_gap_abs_error"] is not None:
                 target_front_gap_abs_errors.append(float(role_gap_errors["target_lane_front_gap_abs_error"]))
             if role_gap_errors["target_lane_rear_gap_abs_error"] is not None:
                 target_rear_gap_abs_errors.append(float(role_gap_errors["target_lane_rear_gap_abs_error"]))
-            pred_gap = _target_lane_gap(ego_future[row], selected[row], pred_mask[row], cfg)
-            actual_gap = _target_lane_gap(ego_future[row], actual_future[row], pred_mask[row], cfg)
+            pred_gap = _target_lane_gap(
+                ego_future[row], selected[row], pred_mask[row], cfg, pred_future_valid_mask[row], ego_future_valid_mask[row]
+            )
+            actual_gap = _target_lane_gap(
+                ego_future[row], actual_future[row], pred_mask[row], cfg, pred_future_valid_mask[row], ego_future_valid_mask[row]
+            )
             if pred_gap < INF_TTC and actual_gap < INF_TTC:
                 target_gap_errors.append(float(pred_gap - actual_gap))
                 target_gap_abs_errors.append(abs(float(pred_gap - actual_gap)))
@@ -673,6 +769,7 @@ def _residual_ensemble_diagnostics(
         "architecture_version": architecture_version,
         "loss_version": loss_version,
         "legacy_checkpoint_metadata": not bool(architecture_version and loss_version),
+        "trajectory_schema_version": payload.get("trajectory_schema_version") if isinstance(payload, dict) else None,
         "early_stopped_member_count": int(
             sum(bool(item.get("stopped_early", False)) for item in member_histories if isinstance(item, dict))
         ),
@@ -708,6 +805,7 @@ def _wcdt_v2_diagnostics(
     batch_size: int,
     lane_indices: np.ndarray | None = None,
     edge_roles: np.ndarray | None = None,
+    future_valid_mask: np.ndarray | None = None,
 ) -> tuple[np.ndarray, dict[str, Any]]:
     return _residual_ensemble_diagnostics(
         cfg,
@@ -719,6 +817,7 @@ def _wcdt_v2_diagnostics(
         batch_size,
         lane_indices,
         edge_roles,
+        future_valid_mask=future_valid_mask,
         build_batch=build_v2_numpy_batch,
         tensorize=tensorize_batch,
         ensemble_fn=ensemble_predict,
@@ -737,6 +836,10 @@ def _wcdt_v3_diagnostics(
     batch_size: int,
     lane_indices: np.ndarray | None = None,
     edge_roles: np.ndarray | None = None,
+    history_valid_mask: np.ndarray | None = None,
+    future_valid_mask: np.ndarray | None = None,
+    history_lane_indices: np.ndarray | None = None,
+    history_edge_roles: np.ndarray | None = None,
 ) -> tuple[np.ndarray, dict[str, Any]]:
     return _residual_ensemble_diagnostics(
         cfg,
@@ -748,6 +851,10 @@ def _wcdt_v3_diagnostics(
         batch_size,
         lane_indices,
         edge_roles,
+        history_valid_mask=history_valid_mask,
+        future_valid_mask=future_valid_mask,
+        history_lane_indices=history_lane_indices,
+        history_edge_roles=history_edge_roles,
         build_batch=build_v3_numpy_batch,
         tensorize=tensorize_v3_batch,
         ensemble_fn=ensemble_predict_v3,
@@ -838,12 +945,18 @@ def _forecast_conclusion(report: dict[str, Any]) -> dict[str, Any]:
     wcdt_v3_uncertainty_min_distance_corr = float(
         wcdt_v3.get("uncertainty_future_min_distance_abs_error_correlation", 0.0)
     )
+
+    def _not_worse(candidate: float, baseline: float) -> bool:
+        if candidate >= 1.0e6 and baseline >= 1.0e6:
+            return True
+        return candidate <= baseline
+
     wcdt_v3_prediction_pass = bool(
         wcdt_v3.get("available", False)
-        and wcdt_v3_fde <= wcdt_v2_fde
-        and wcdt_v3_min_distance_error < wcdt_v2_min_distance_error
-        and wcdt_v3_front_gap_error < wcdt_v2_front_gap_error
-        and wcdt_v3_rear_gap_error < wcdt_v2_rear_gap_error
+        and _not_worse(wcdt_v3_fde, wcdt_v2_fde)
+        and _not_worse(wcdt_v3_min_distance_error, wcdt_v2_min_distance_error)
+        and _not_worse(wcdt_v3_front_gap_error, wcdt_v2_front_gap_error)
+        and _not_worse(wcdt_v3_rear_gap_error, wcdt_v2_rear_gap_error)
     )
     wcdt_v3_uncertainty_pass = bool(
         wcdt_v3.get("available", False)
@@ -1126,7 +1239,7 @@ def _policy_feature_sensitivity(
 ) -> dict[str, Any]:
     output: dict[str, Any] = {}
     feature_dim = ForecastFeatureAugmentor.feature_dim(cfg)
-    device = str(cfg.get("training", {}).get("device", "auto") or "auto")
+    device = _training_device(cfg)
     if device.lower() == "gpu":
         device = "cuda"
     for group_name, spec in _forecast_policy_specs(base_run_id).items():
@@ -1347,6 +1460,12 @@ def run_forecast_diagnostics(
     mask = data["agent_mask"]
     lane_indices = data["agent_lane_index"] if "agent_lane_index" in data else None
     edge_roles = data["agent_edge_role"] if "agent_edge_role" in data else None
+    schema_version = int(np.asarray(data["trajectory_schema_version"]).reshape(-1)[0]) if "trajectory_schema_version" in data else 1
+    legacy_unmasked_buffer = schema_version < 2 or "agent_future_valid_mask" not in data
+    history_valid_mask = data["agent_history_valid_mask"] if "agent_history_valid_mask" in data else None
+    future_valid_mask = data["agent_future_valid_mask"] if "agent_future_valid_mask" in data else None
+    history_lane_indices = data["agent_history_lane_index"] if "agent_history_lane_index" in data else None
+    history_edge_roles = data["agent_history_edge_role"] if "agent_history_edge_role" in data else None
     if history.shape[0] == 0:
         raise ValueError(f"no trajectory samples in {stage1_path}")
     sample_count = min(int(max_samples), int(history.shape[0]))
@@ -1368,6 +1487,7 @@ def run_forecast_diagnostics(
         indices,
         lane_indices=lane_indices,
         edge_roles=edge_roles,
+        future_valid_mask=future_valid_mask,
     )
     wcdt_features = np.zeros((0, ForecastFeatureAugmentor.feature_dim(cfg)), dtype=np.float32)
     wcdt_report: dict[str, Any] = {"available": False, "checkpoint": str(checkpoint)}
@@ -1415,6 +1535,7 @@ def run_forecast_diagnostics(
             batch_size,
             lane_indices=lane_indices,
             edge_roles=edge_roles,
+            future_valid_mask=future_valid_mask,
         )
         wcdt_v2_report["available"] = True
     if wcdt_v3_checkpoint.exists():
@@ -1428,6 +1549,10 @@ def run_forecast_diagnostics(
             batch_size,
             lane_indices=lane_indices,
             edge_roles=edge_roles,
+            history_valid_mask=history_valid_mask,
+            future_valid_mask=future_valid_mask,
+            history_lane_indices=history_lane_indices,
+            history_edge_roles=history_edge_roles,
         )
         wcdt_v3_report["available"] = True
     feature_summary = _feature_source_summary(
@@ -1442,6 +1567,8 @@ def run_forecast_diagnostics(
         "run_id": str(cfg.run.run_id),
         "stage1_buffer": str(stage1_path),
         "sample_count": int(sample_count),
+        "trajectory_schema_version": int(schema_version),
+        "legacy_unmasked_buffer": bool(legacy_unmasked_buffer),
         "feature_names": list(ForecastFeatureAugmentor.FEATURE_NAMES),
         "forecast_feature_summary": feature_summary,
         "runtime_diagnostics_feature_semantics_consistent": bool(

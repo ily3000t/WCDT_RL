@@ -45,6 +45,25 @@ def _prediction_loss_summary_from_checkpoint(checkpoint: str) -> dict | None:
     if not isinstance(payload, dict):
         return None
     history = payload.get("loss_history")
+    member_histories = payload.get("member_histories", [])
+    if member_histories:
+        return {
+            "source": "checkpoint_member_histories",
+            "ensemble_size": int(payload.get("ensemble_size", len(member_histories))),
+            "architecture_version": payload.get("architecture_version"),
+            "loss_version": payload.get("loss_version"),
+            "trajectory_schema_version": payload.get("trajectory_schema_version"),
+            "members": [
+                {
+                    "member": int(item.get("member", index)),
+                    "trained_epochs": int(item.get("trained_epochs", len(item.get("loss_history", [])))),
+                    "best_epoch": int(item.get("best_epoch", 0)),
+                    "best_val_score": float(item.get("best_val_score", 0.0)),
+                    "stopped_early": bool(item.get("stopped_early", False)),
+                }
+                for index, item in enumerate(member_histories)
+            ],
+        }
     if not history:
         return None
     return {
@@ -62,7 +81,10 @@ def run(cfg):
     stage_log("stage3", f"SUMO config={cfg.scenario.sumocfg}")
     stage_log("stage3", f"total_timesteps={cfg.rl.total_timesteps}")
     stage_log("stage3", f"forecast_features={bool(cfg.forecast_features.enabled or cfg.rl.use_wcdt_forecast_features)}")
-    stage_log("stage3", f"device={cfg.get('training', {}).get('device', 'auto')}")
+    stage_log(
+        "stage3",
+        f"device={cfg.get('training', {}).get('ppo_device', cfg.get('training', {}).get('device', 'auto'))}",
+    )
     stage_log("stage3", f"model_output={stage_dir / str(cfg.stage3.model_name)}")
     env = make_env(cfg, seed=int(cfg.run.seed), shield_enabled=False)
     try:
@@ -84,6 +106,7 @@ def run(cfg):
     report["forecast_source"] = str(cfg.forecast_features.get("source", ""))
     report["prediction_checkpoint"] = prediction_checkpoint
     report["prediction_loss_summary"] = _prediction_loss_summary(prediction_checkpoint)
+    report["predictor_summary"] = report["prediction_loss_summary"]
     report["forecast_feature_summary"] = {
         "feature_dim": ForecastFeatureAugmentor.feature_dim(cfg),
         "feature_names": list(ForecastFeatureAugmentor.FEATURE_NAMES),

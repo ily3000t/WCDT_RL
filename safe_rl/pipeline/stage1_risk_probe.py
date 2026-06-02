@@ -77,6 +77,12 @@ def run(cfg) -> Path:
     agent_masks: list[np.ndarray] = []
     agent_lane_indices: list[np.ndarray] = []
     agent_edge_roles: list[np.ndarray] = []
+    history_valid_masks: list[np.ndarray] = []
+    future_valid_masks: list[np.ndarray] = []
+    history_lane_indices: list[np.ndarray] = []
+    history_edge_roles: list[np.ndarray] = []
+    future_lane_indices: list[np.ndarray] = []
+    future_edge_roles: list[np.ndarray] = []
     reports: list[dict] = []
     events_path = stage_dir / "risk_events.jsonl"
     replay_dir = stage_dir / "replay"
@@ -149,6 +155,7 @@ def run(cfg) -> Path:
                         float(info.get("low_ttc", False)),
                         float(info.get("high_drac", False)),
                         float(local.merge_zone_risk),
+                        float(local.taper_miss),
                     ],
                     dtype=np.float32,
                 )
@@ -197,13 +204,31 @@ def run(cfg) -> Path:
                     notes={"episode_report": episode_report},
                 )
                 stage_log("stage1", f"episode={episode} replay={replay_dir / f'episode_{episode:04d}.json'}")
-            hist, fut, mask, lane_indices, edge_roles = env.trajectory_window_samples()
+            (
+                hist,
+                fut,
+                mask,
+                lane_indices,
+                edge_roles,
+                history_valid_mask,
+                future_valid_mask,
+                sample_history_lane_indices,
+                sample_history_edge_roles,
+                sample_future_lane_indices,
+                sample_future_edge_roles,
+            ) = env.trajectory_window_samples()
             if hist.shape[0] > 0:
                 history_samples.append(hist)
                 future_samples.append(fut)
                 agent_masks.append(mask)
                 agent_lane_indices.append(lane_indices)
                 agent_edge_roles.append(edge_roles)
+                history_valid_masks.append(history_valid_mask)
+                future_valid_masks.append(future_valid_mask)
+                history_lane_indices.append(sample_history_lane_indices)
+                history_edge_roles.append(sample_history_edge_roles)
+                future_lane_indices.append(sample_future_lane_indices)
+                future_edge_roles.append(sample_future_edge_roles)
     finally:
         env.close()
 
@@ -216,6 +241,33 @@ def run(cfg) -> Path:
         agent_mask=np.concatenate(agent_masks, axis=0) if agent_masks else np.zeros((0, 1)),
         agent_lane_index=np.concatenate(agent_lane_indices, axis=0) if agent_lane_indices else np.zeros((0, 1), dtype=np.int64),
         agent_edge_role=np.concatenate(agent_edge_roles, axis=0) if agent_edge_roles else np.zeros((0, 1), dtype=np.int64),
+        trajectory_schema_version=np.asarray(2, dtype=np.int64),
+        agent_history_valid_mask=(
+            np.concatenate(history_valid_masks, axis=0) if history_valid_masks else np.zeros((0, 1, 1))
+        ),
+        agent_future_valid_mask=(
+            np.concatenate(future_valid_masks, axis=0) if future_valid_masks else np.zeros((0, 1, 1))
+        ),
+        agent_history_lane_index=(
+            np.concatenate(history_lane_indices, axis=0)
+            if history_lane_indices
+            else np.full((0, 1, 1), -1, dtype=np.int64)
+        ),
+        agent_history_edge_role=(
+            np.concatenate(history_edge_roles, axis=0)
+            if history_edge_roles
+            else np.zeros((0, 1, 1), dtype=np.int64)
+        ),
+        agent_future_lane_index=(
+            np.concatenate(future_lane_indices, axis=0)
+            if future_lane_indices
+            else np.full((0, 1, 1), -1, dtype=np.int64)
+        ),
+        agent_future_edge_role=(
+            np.concatenate(future_edge_roles, axis=0)
+            if future_edge_roles
+            else np.zeros((0, 1, 1), dtype=np.int64)
+        ),
     )
     audit_report = None
     if bool(cfg.stage1.get("audit_enabled", True)):
@@ -231,6 +283,11 @@ def run(cfg) -> Path:
     legal_boundary = legal_continuous[(legal_continuous >= 0.20) & (legal_continuous < 0.80)]
     coverage = _continuous_risk_coverage(legal_continuous)
     audit_gate = _stage1_audit_gate(cfg, len(transitions["actions"]), legal_boundary.shape[0], coverage)
+    trajectory_coverage = _trajectory_coverage_summary(
+        np.concatenate(agent_masks, axis=0) if agent_masks else np.zeros((0, 1)),
+        np.concatenate(history_valid_masks, axis=0) if history_valid_masks else np.zeros((0, 1, 1)),
+        np.concatenate(future_valid_masks, axis=0) if future_valid_masks else np.zeros((0, 1, 1)),
+    )
     report = {
         "stage": "stage1",
         "run_id": cfg.run.run_id,
@@ -242,6 +299,10 @@ def run(cfg) -> Path:
         "transition_count": len(transitions["executed_actions"]),
         "candidate_risk_sample_count": len(transitions["actions"]),
         "trajectory_sample_count": int(sum(item.shape[0] for item in history_samples)),
+        "trajectory_schema": {
+            "version": 2,
+            **trajectory_coverage,
+        },
         "action_sampling": {
             "mode": str(cfg.stage1.get("action_sampling", "random")),
             "configured_probs": configured_sampling_probs(cfg),
@@ -354,6 +415,34 @@ def _continuous_risk_coverage(values: np.ndarray) -> dict:
         "boundary_rate": float(np.mean(boundary)),
         "extreme_risk_rate": float(np.mean(values >= 0.80)),
         "boundary_sample_count": int(np.sum(boundary)),
+    }
+
+
+def _trajectory_coverage_summary(
+    actor_mask: np.ndarray,
+    history_valid_mask: np.ndarray,
+    future_valid_mask: np.ndarray,
+) -> dict:
+    selected = np.asarray(actor_mask, dtype=np.float32) > 0.5
+    history_valid = np.asarray(history_valid_mask, dtype=np.float32) > 0.5
+    future_valid = np.asarray(future_valid_mask, dtype=np.float32) > 0.5
+    if not np.any(selected):
+        return {
+            "selected_actor_count": 0,
+            "history_valid_rate": 0.0,
+            "future_valid_rate": 0.0,
+            "departed_actor_rate": 0.0,
+            "valid_future_horizon": _array_summary([]),
+        }
+    selected_history = history_valid[selected]
+    selected_future = future_valid[selected]
+    future_horizon = np.sum(selected_future, axis=-1).astype(np.float32)
+    return {
+        "selected_actor_count": int(np.sum(selected)),
+        "history_valid_rate": float(np.mean(selected_history)),
+        "future_valid_rate": float(np.mean(selected_future)),
+        "departed_actor_rate": float(np.mean(future_horizon < future_valid.shape[-1])),
+        "valid_future_horizon": _array_summary([float(item) for item in future_horizon.tolist()]),
     }
 
 

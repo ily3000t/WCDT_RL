@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from collections import deque
-from typing import Iterable
+from typing import Any, Iterable
 
 import numpy as np
 
@@ -43,26 +43,48 @@ class HistoryBuffer:
     def to_tensor_arrays(self, ego_id: str) -> tuple[np.ndarray, np.ndarray]:
         """Return padded arrays shaped [agents, history, 5] and [agents]."""
 
+        arrays = self.to_tensor_arrays_with_metadata(ego_id)
+        return arrays["history"], arrays["mask"]
+
+    def to_tensor_arrays_with_metadata(self, ego_id: str, cfg: Any | None = None) -> dict[str, np.ndarray]:
+        """Return runtime history plus timestep validity and route metadata."""
+
         agent_ids = self.agent_ids(ego_id)
-        agent_count = len(agent_ids)
         history = np.zeros((self.max_agents, self.history_steps, 5), dtype=np.float32)
         mask = np.zeros((self.max_agents,), dtype=np.float32)
+        history_valid_mask = np.zeros((self.max_agents, self.history_steps), dtype=np.float32)
+        history_lane_index = np.full((self.max_agents, self.history_steps), -1, dtype=np.int64)
+        history_edge_role = np.zeros((self.max_agents, self.history_steps), dtype=np.int64)
         padded_frames = list(self._frames)
         if len(padded_frames) < self.history_steps:
-            padding = [padded_frames[0] if padded_frames else {}] * (self.history_steps - len(padded_frames))
+            padding = [{}] * (self.history_steps - len(padded_frames))
             padded_frames = padding + padded_frames
         for agent_idx, vehicle_id in enumerate(agent_ids):
             mask[agent_idx] = 1.0
             last_state = None
             for step_idx, frame in enumerate(padded_frames[-self.history_steps :]):
-                state = frame.get(vehicle_id) or last_state
+                observed_state = frame.get(vehicle_id)
+                state = observed_state or last_state
                 if state is None:
                     continue
                 history[agent_idx, step_idx] = np.asarray(state.as_vector(), dtype=np.float32)
+                if observed_state is not None:
+                    history_valid_mask[agent_idx, step_idx] = 1.0
+                    history_lane_index[agent_idx, step_idx] = int(observed_state.lane_index)
+                    if cfg is not None:
+                        from safe_rl.sim.scenario_semantics import edge_role
+
+                        history_edge_role[agent_idx, step_idx] = int(
+                            edge_role(cfg, observed_state.edge_id, observed_state.lane_index)
+                        )
                 last_state = state
-        if agent_count == 0:
-            return history, mask
-        return history, mask
+        return {
+            "history": history,
+            "mask": mask,
+            "history_valid_mask": history_valid_mask,
+            "history_lane_index": history_lane_index,
+            "history_edge_role": history_edge_role,
+        }
 
     def trajectory_samples(
         self,
@@ -74,11 +96,9 @@ class HistoryBuffer:
         agent_ids = self.agent_ids(ego_id)
         future = np.zeros((self.max_agents, horizon_steps, 5), dtype=np.float32)
         for agent_idx, vehicle_id in enumerate(agent_ids):
-            last_state = None
             for step_idx, frame in enumerate(future_frames[:horizon_steps]):
-                state = frame.get(vehicle_id) or last_state
+                state = frame.get(vehicle_id)
                 if state is None:
                     continue
                 future[agent_idx, step_idx] = np.asarray(state.as_vector(), dtype=np.float32)
-                last_state = state
         return history, future, mask

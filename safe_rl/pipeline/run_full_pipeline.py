@@ -30,8 +30,9 @@ VALID_FORECAST_SOURCES = ("constant_velocity", "wcdt", "wcdt_v2", "wcdt_v3")
 DEFAULT_FORECAST_SOURCES = ("constant_velocity", "wcdt_v2")
 VALID_FORECAST_PPO_PROFILES = ("default", "safety", "shield_guided")
 VALID_RUN_MODES = ("new", "resume", "overwrite")
+VALID_PIPELINE_PROFILES = ("default", "smoke")
 RUN_ID_PATTERN = re.compile(r"^[A-Za-z0-9._-]+$")
-PIPELINE_STATE_SCHEMA_VERSION = 2
+PIPELINE_STATE_SCHEMA_VERSION = 3
 PIPELINE_TASK_ORDER = (
     "network_snapshot",
     "stage1",
@@ -68,6 +69,27 @@ def _atomic_write_json(path: str | Path, payload: dict[str, Any]) -> Path:
         json.dump(payload, file, ensure_ascii=False, indent=2, allow_nan=False)
     temporary.replace(path)
     return path
+
+
+def _deep_merge(base: dict[str, Any], override: dict[str, Any]) -> dict[str, Any]:
+    merged = dict(base)
+    for key, value in override.items():
+        if isinstance(value, dict) and isinstance(merged.get(key), dict):
+            merged[key] = _deep_merge(dict(merged[key]), value)
+        else:
+            merged[key] = value
+    return merged
+
+
+def _pipeline_profile_overrides(profile: str) -> dict[str, Any]:
+    profile = str(profile or "default").strip().lower()
+    if profile not in VALID_PIPELINE_PROFILES:
+        raise ValueError(f"pipeline profile must be one of {VALID_PIPELINE_PROFILES}; got {profile!r}")
+    if profile == "default":
+        return {}
+    path = REPO_ROOT / "safe_rl" / "config" / "advanced" / "pipeline_smoke_fast.yaml"
+    with path.open("r", encoding="utf-8") as file:
+        return yaml.safe_load(file) or {}
 
 
 def _validate_run_id(run_id: str) -> str:
@@ -166,10 +188,13 @@ def _normalize_invocation(
     forecast_ppo_timesteps: int | None,
     forecast_ppo_profile: str | None,
     forecast_sources: list[str],
+    pipeline_profile: str,
 ) -> dict[str, Any]:
     profile = str(forecast_ppo_profile or "default").strip().lower()
     if profile not in VALID_FORECAST_PPO_PROFILES:
         raise ValueError(f"forecast PPO profile must be one of {VALID_FORECAST_PPO_PROFILES}; got {profile!r}")
+    normalized_pipeline_profile = str(pipeline_profile or "default").strip().lower()
+    _pipeline_profile_overrides(normalized_pipeline_profile)
     return {
         "stage1_episodes": int(stage1_episodes) if stage1_episodes is not None else None,
         "stage4_episodes": int(stage4_episodes) if stage4_episodes is not None else None,
@@ -178,10 +203,13 @@ def _normalize_invocation(
         "forecast_ppo_timesteps": int(forecast_ppo_timesteps) if forecast_ppo_timesteps is not None else None,
         "forecast_ppo_profile": profile,
         "forecast_sources": list(forecast_sources),
+        "pipeline_profile": normalized_pipeline_profile,
     }
 
 
 def _new_pipeline_state(run_id: str, invocation: dict[str, Any]) -> dict[str, Any]:
+    invocation = dict(invocation)
+    invocation.setdefault("pipeline_profile", "default")
     sources = list(invocation["forecast_sources"])
     tasks = {}
     for task_name in PIPELINE_TASK_ORDER:
@@ -225,6 +253,10 @@ def _load_pipeline_state(path: str | Path) -> dict[str, Any]:
                 "output_hashes": {},
             },
         )
+        state["schema_version"] = 2
+        schema_version = 2
+    if schema_version == 2:
+        state.setdefault("normalized_invocation", {}).setdefault("pipeline_profile", "default")
         state["schema_version"] = PIPELINE_STATE_SCHEMA_VERSION
     elif schema_version != PIPELINE_STATE_SCHEMA_VERSION:
         raise ValueError(f"unsupported pipeline state schema: {state.get('schema_version')}")
@@ -242,6 +274,7 @@ def _resume_invocation(
     forecast_ppo_profile: str | None,
     forecast_sources: str | list[str] | tuple[str, ...] | None,
     forecast_source: str | None,
+    pipeline_profile: str | None = None,
 ) -> dict[str, Any]:
     saved = dict(state["normalized_invocation"])
     explicit_sources = forecast_sources is not None or forecast_source is not None
@@ -258,6 +291,7 @@ def _resume_invocation(
         "forecast_ppo_timesteps": forecast_ppo_timesteps,
         "forecast_ppo_profile": forecast_ppo_profile,
         "forecast_sources": sources if explicit_sources else None,
+        "pipeline_profile": pipeline_profile,
     }
     for key, value in requested.items():
         if value is not None and value != saved.get(key):
@@ -545,26 +579,28 @@ def build_generated_configs(
     forecast_ppo_profile: str = "default",
     forecast_sources: str | list[str] | tuple[str, ...] | None = None,
     forecast_source: str | None = None,
+    pipeline_profile: str = "default",
 ) -> dict[str, Path]:
     generated_dir = Path(generated_dir)
     sources = resolve_forecast_sources(forecast_sources=forecast_sources, forecast_source=forecast_source)
+    profile_payload = _pipeline_profile_overrides(pipeline_profile)
 
-    main_payload: dict[str, Any] = {
+    main_payload: dict[str, Any] = _deep_merge(profile_payload, {
         "run": {"run_id": run_id},
         "prediction": _predictor_training_flags(sources),
-    }
+    })
     if stage1_episodes is not None:
-        main_payload["stage1"] = {"episodes": int(stage1_episodes)}
+        main_payload = _deep_merge(main_payload, {"stage1": {"episodes": int(stage1_episodes)}})
     if stage4_episodes is not None:
-        main_payload["stage4"] = {"episodes": int(stage4_episodes)}
+        main_payload = _deep_merge(main_payload, {"stage4": {"episodes": int(stage4_episodes)}})
     if ppo_timesteps is not None:
-        main_payload["rl"] = {"total_timesteps": int(ppo_timesteps)}
+        main_payload = _deep_merge(main_payload, {"rl": {"total_timesteps": int(ppo_timesteps)}})
 
-    stage2_stage4_payload: dict[str, Any] = {
+    stage2_stage4_payload: dict[str, Any] = _deep_merge(profile_payload, {
         "run": {"run_id": run_id},
         "stage2": {"input_stage4": "auto"},
         "prediction": {"train_enabled": False},
-    }
+    })
 
     groups: list[dict[str, Any]] = [
         {
@@ -583,15 +619,19 @@ def build_generated_configs(
     for source in sources:
         groups.extend(_forecast_stage5_groups(run_id, source))
 
-    requested_stage5_episodes = int(stage5_episodes) if stage5_episodes is not None else 20
-    stage5_payload: dict[str, Any] = {
+    requested_stage5_episodes = (
+        int(stage5_episodes)
+        if stage5_episodes is not None
+        else int(profile_payload.get("stage5", {}).get("episodes_per_group", 20))
+    )
+    stage5_payload: dict[str, Any] = _deep_merge(profile_payload, {
         "run": {"run_id": run_id},
         "stage5": {
             "episodes_per_group": requested_stage5_episodes,
             "seeds": list(range(1, requested_stage5_episodes + 1)),
             "groups": groups,
         },
-    }
+    })
 
     configs = {
         "main": _write_yaml(generated_dir / "main_overrides.yaml", main_payload),
@@ -603,11 +643,14 @@ def build_generated_configs(
         key = f"forecast_{_source_suffix(source)}_ppo"
         configs[key] = _write_yaml(
             generated_dir / f"{key}.yaml",
-            _forecast_payload(
-                run_id,
-                source,
-                forecast_ppo_timesteps if forecast_ppo_timesteps is not None else ppo_timesteps,
-                forecast_ppo_profile=forecast_ppo_profile,
+            _deep_merge(
+                profile_payload,
+                _forecast_payload(
+                    run_id,
+                    source,
+                    forecast_ppo_timesteps if forecast_ppo_timesteps is not None else ppo_timesteps,
+                    forecast_ppo_profile=forecast_ppo_profile,
+                ),
             ),
         )
     if sources:
@@ -671,6 +714,7 @@ def run_full_pipeline(
     forecast_ppo_profile: str | None = None,
     forecast_sources: str | list[str] | tuple[str, ...] | None = None,
     forecast_source: str | None = None,
+    pipeline_profile: str | None = None,
 ) -> Path:
     run_id = _validate_run_id(run_id)
     run_mode = str(run_mode).strip().lower()
@@ -695,6 +739,7 @@ def run_full_pipeline(
             forecast_ppo_profile=forecast_ppo_profile,
             forecast_sources=forecast_sources,
             forecast_source=forecast_source,
+            pipeline_profile=pipeline_profile,
         )
         _validate_resume_state(state, bootstrap_cfg)
         _reset_unfinished_tasks(state)
@@ -709,6 +754,7 @@ def run_full_pipeline(
             forecast_ppo_timesteps=forecast_ppo_timesteps,
             forecast_ppo_profile=forecast_ppo_profile,
             forecast_sources=sources,
+            pipeline_profile=str(pipeline_profile or "default"),
         )
         run_dir = _prepare_new_run_dir(output_root, run_id, run_mode)
         state = _new_pipeline_state(run_id, invocation)
@@ -725,6 +771,7 @@ def run_full_pipeline(
         forecast_ppo_timesteps=invocation["forecast_ppo_timesteps"],
         forecast_ppo_profile=invocation["forecast_ppo_profile"],
         forecast_sources=sources,
+        pipeline_profile=invocation["pipeline_profile"],
     )
     main_cfg = _load_stage_cfg(configs["main"], run_id)
 
@@ -732,6 +779,7 @@ def run_full_pipeline(
     stage_log("full", f"run_mode={run_mode}")
     stage_log("full", f"forecast_sources={sources}")
     stage_log("full", f"forecast_ppo_profile={invocation['forecast_ppo_profile']}")
+    stage_log("full", f"pipeline_profile={invocation['pipeline_profile']}")
     if invocation["forecast_ppo_timesteps"] is not None:
         stage_log("full", f"forecast_ppo_timesteps={invocation['forecast_ppo_timesteps']}")
     for source in sources:
@@ -859,6 +907,12 @@ def main() -> None:
         default=None,
         help="Comma-separated forecast sources. Default: constant_velocity,wcdt_v2. Use wcdt explicitly for legacy v1.",
     )
+    parser.add_argument(
+        "--pipeline-profile",
+        choices=list(VALID_PIPELINE_PROFILES),
+        default=None,
+        help="Pipeline profile. Use 'smoke' for a fast end-to-end validation run.",
+    )
     args = parser.parse_args()
     if args.forecast_source and args.forecast_sources:
         parser.error("Use either --forecast-source or --forecast-sources, not both.")
@@ -873,6 +927,7 @@ def main() -> None:
         forecast_ppo_profile=args.forecast_ppo_profile,
         forecast_sources=args.forecast_sources,
         forecast_source=args.forecast_source,
+        pipeline_profile=args.pipeline_profile,
     )
 
 

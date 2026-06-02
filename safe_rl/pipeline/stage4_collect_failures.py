@@ -9,7 +9,7 @@ from safe_rl.pipeline.common import latest_stage_file, load_stage_config, make_e
 from safe_rl.pipeline.stage1_risk_probe import _continuous_risk_coverage
 from safe_rl.risk.merge_local import candidate_action_risk_samples, candidate_sample_weight, merge_local_stats
 from safe_rl.risk.risk_module import RiskModuleWrapper
-from safe_rl.rl.ppo import load_ppo
+from safe_rl.rl.ppo import _training_device, load_ppo
 from safe_rl.shield.safety_shield import SafetyShield
 from safe_rl.sim.action_space import decode_action
 from safe_rl.utils.config import prepare_run_dir
@@ -146,7 +146,7 @@ def run(cfg) -> Path:
     stage_log("stage4", f"risk_checkpoint={risk_path}")
     stage_log("stage4", f"output_dir={stage_dir}")
     tb = TensorboardLogger(stage_dir / "tensorboard", enabled=bool(cfg.run.get("tensorboard", True)))
-    model = load_ppo(model_path)
+    model = load_ppo(model_path, device=_training_device(cfg))
     risk_model = RiskModuleWrapper(cfg, checkpoint=str(risk_path))
     shadow_shield = SafetyShield(cfg, risk_model)
     shadow_shield.enabled = True
@@ -234,6 +234,7 @@ def run(cfg) -> Path:
                         float(info.get("low_ttc", False)),
                         float(info.get("high_drac", False)),
                         float(local.merge_zone_risk),
+                        float(local.taper_miss),
                     ],
                     dtype=np.float32,
                 )

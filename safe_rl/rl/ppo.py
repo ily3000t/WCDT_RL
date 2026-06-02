@@ -36,7 +36,8 @@ def _require_sb3():
 
 
 def _training_device(config: Any) -> str:
-    requested = str(config.get("training", {}).get("device", "auto")).strip().lower()
+    training = config.get("training", {})
+    requested = str(training.get("ppo_device", training.get("device", "auto"))).strip().lower()
     return "cuda" if requested == "gpu" else requested or "auto"
 
 

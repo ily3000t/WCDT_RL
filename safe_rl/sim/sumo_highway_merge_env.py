@@ -830,7 +830,21 @@ class SumoHighwayMergeEnv(gym.Env):
             "risk_margin_mean": float(np.mean(margins)),
         }
 
-    def trajectory_window_samples(self) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    def trajectory_window_samples(
+        self,
+    ) -> tuple[
+        np.ndarray,
+        np.ndarray,
+        np.ndarray,
+        np.ndarray,
+        np.ndarray,
+        np.ndarray,
+        np.ndarray,
+        np.ndarray,
+        np.ndarray,
+        np.ndarray,
+        np.ndarray,
+    ]:
         """Return padded [sample, agent, time, state] windows from the episode."""
 
         hist = self.history_steps
@@ -844,12 +858,24 @@ class SumoHighwayMergeEnv(gym.Env):
                 np.zeros((0, max_agents), dtype=np.float32),
                 np.zeros((0, max_agents), dtype=np.int64),
                 np.zeros((0, max_agents), dtype=np.int64),
+                np.zeros((0, max_agents, hist), dtype=np.float32),
+                np.zeros((0, max_agents, horizon), dtype=np.float32),
+                np.full((0, max_agents, hist), -1, dtype=np.int64),
+                np.zeros((0, max_agents, hist), dtype=np.int64),
+                np.full((0, max_agents, horizon), -1, dtype=np.int64),
+                np.zeros((0, max_agents, horizon), dtype=np.int64),
             )
         history_samples: list[np.ndarray] = []
         future_samples: list[np.ndarray] = []
         masks: list[np.ndarray] = []
         lane_indices: list[np.ndarray] = []
         edge_roles: list[np.ndarray] = []
+        history_valid_masks: list[np.ndarray] = []
+        future_valid_masks: list[np.ndarray] = []
+        history_lane_indices: list[np.ndarray] = []
+        history_edge_roles: list[np.ndarray] = []
+        future_lane_indices: list[np.ndarray] = []
+        future_edge_roles: list[np.ndarray] = []
         for end_idx in range(hist, len(frames) - horizon):
             latest = frames[end_idx - 1]
             if self.ego_id not in latest:
@@ -864,6 +890,12 @@ class SumoHighwayMergeEnv(gym.Env):
             mask = np.zeros((max_agents,), dtype=np.float32)
             sample_lane_indices = np.full((max_agents,), -1, dtype=np.int64)
             sample_edge_roles = np.zeros((max_agents,), dtype=np.int64)
+            history_valid_mask = np.zeros((max_agents, hist), dtype=np.float32)
+            future_valid_mask = np.zeros((max_agents, horizon), dtype=np.float32)
+            sample_history_lane_indices = np.full((max_agents, hist), -1, dtype=np.int64)
+            sample_history_edge_roles = np.zeros((max_agents, hist), dtype=np.int64)
+            sample_future_lane_indices = np.full((max_agents, horizon), -1, dtype=np.int64)
+            sample_future_edge_roles = np.zeros((max_agents, horizon), dtype=np.int64)
             for agent_idx, vehicle_id in enumerate(agent_ids[:max_agents]):
                 mask[agent_idx] = 1.0
                 latest_state = latest.get(vehicle_id)
@@ -872,22 +904,39 @@ class SumoHighwayMergeEnv(gym.Env):
                     sample_edge_roles[agent_idx] = int(edge_role(self.config, latest_state.edge_id, latest_state.lane_index))
                 last_state = None
                 for step_idx, frame in enumerate(frames[end_idx - hist : end_idx]):
-                    state = frame.get(vehicle_id) or last_state
+                    observed_state = frame.get(vehicle_id)
+                    state = observed_state or last_state
                     if state is None:
                         continue
                     history[agent_idx, step_idx] = np.asarray(state.as_vector(), dtype=np.float32)
+                    if observed_state is not None:
+                        history_valid_mask[agent_idx, step_idx] = 1.0
+                        sample_history_lane_indices[agent_idx, step_idx] = int(observed_state.lane_index)
+                        sample_history_edge_roles[agent_idx, step_idx] = int(
+                            edge_role(self.config, observed_state.edge_id, observed_state.lane_index)
+                        )
                     last_state = state
                 for step_idx, frame in enumerate(frames[end_idx : end_idx + horizon]):
-                    state = frame.get(vehicle_id) or last_state
+                    state = frame.get(vehicle_id)
                     if state is None:
                         continue
                     future[agent_idx, step_idx] = np.asarray(state.as_vector(), dtype=np.float32)
-                    last_state = state
+                    future_valid_mask[agent_idx, step_idx] = 1.0
+                    sample_future_lane_indices[agent_idx, step_idx] = int(state.lane_index)
+                    sample_future_edge_roles[agent_idx, step_idx] = int(
+                        edge_role(self.config, state.edge_id, state.lane_index)
+                    )
             history_samples.append(history)
             future_samples.append(future)
             masks.append(mask)
             lane_indices.append(sample_lane_indices)
             edge_roles.append(sample_edge_roles)
+            history_valid_masks.append(history_valid_mask)
+            future_valid_masks.append(future_valid_mask)
+            history_lane_indices.append(sample_history_lane_indices)
+            history_edge_roles.append(sample_history_edge_roles)
+            future_lane_indices.append(sample_future_lane_indices)
+            future_edge_roles.append(sample_future_edge_roles)
         if not history_samples:
             return (
                 np.zeros((0, max_agents, hist, 5), dtype=np.float32),
@@ -895,6 +944,12 @@ class SumoHighwayMergeEnv(gym.Env):
                 np.zeros((0, max_agents), dtype=np.float32),
                 np.zeros((0, max_agents), dtype=np.int64),
                 np.zeros((0, max_agents), dtype=np.int64),
+                np.zeros((0, max_agents, hist), dtype=np.float32),
+                np.zeros((0, max_agents, horizon), dtype=np.float32),
+                np.full((0, max_agents, hist), -1, dtype=np.int64),
+                np.zeros((0, max_agents, hist), dtype=np.int64),
+                np.full((0, max_agents, horizon), -1, dtype=np.int64),
+                np.zeros((0, max_agents, horizon), dtype=np.int64),
             )
         return (
             np.stack(history_samples, axis=0),
@@ -902,4 +957,10 @@ class SumoHighwayMergeEnv(gym.Env):
             np.stack(masks, axis=0),
             np.stack(lane_indices, axis=0),
             np.stack(edge_roles, axis=0),
+            np.stack(history_valid_masks, axis=0),
+            np.stack(future_valid_masks, axis=0),
+            np.stack(history_lane_indices, axis=0),
+            np.stack(history_edge_roles, axis=0),
+            np.stack(future_lane_indices, axis=0),
+            np.stack(future_edge_roles, axis=0),
         )

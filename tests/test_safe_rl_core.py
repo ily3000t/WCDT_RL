@@ -44,6 +44,7 @@ from safe_rl.pipeline.stage2_train_prediction_risk import (
     _ordered_prediction_indices,
     _risk_ranking_summary,
     _risk_training_arrays,
+    _require_trajectory_schema_v2,
     _split_indices,
     _split_risk_indices,
     _temperature_scaled_probabilities,
@@ -58,6 +59,7 @@ from safe_rl.pipeline.stage2_train_prediction_risk import (
 )
 from safe_rl.pipeline.stage5_paired_eval import _build_acceptance, _build_paired_delta, _group_overrides, _select_eval_seeds
 from safe_rl.pipeline.stage5_confirmatory_eval import (
+    _wcdt_v3_candidate_summary,
     build_confirmatory_payload,
     build_confirmatory_summary,
     validate_confirmatory_inputs,
@@ -73,6 +75,7 @@ from safe_rl.pipeline.stage5_shield_sweep import (
     sweep_variants,
 )
 from safe_rl.prediction.sumo_wcdt_adapter import SumoWcDTAdapter
+from safe_rl.prediction.merge_safety_loss import LOSS_VERSION as MERGE_SAFETY_LOSS_VERSION
 from safe_rl.prediction.wcdt_v2_predictor import (
     INPUT_DIM as WCDT_V2_INPUT_DIM,
     WcDTV2ResidualPredictor,
@@ -103,7 +106,8 @@ from safe_rl.risk.risk_aggregator import aggregate_episode_reports
 from safe_rl.risk.risk_module import RiskModuleWrapper, RiskPrediction, risk_loss
 from safe_rl.risk.stage1_sampling import _merge_heuristic_action, configured_sampling_probs, sampling_summary, select_stage1_action
 from safe_rl.rl.evaluation import validate_model_env_observation_shape
-from safe_rl.rl.ppo import _checkpoint_selection_score, _checkpoint_selection_weights, _safety_score
+from safe_rl.rl.ppo import _checkpoint_selection_score, _checkpoint_selection_weights, _safety_score, _training_device
+from safe_rl.pipeline.stage3_train_ppo import _prediction_loss_summary_from_checkpoint
 from safe_rl.shield.safety_shield import SafetyShield
 from safe_rl.sim.action_space import ACTIONS, decode_action
 from safe_rl.sim.history_buffer import HistoryBuffer
@@ -678,6 +682,35 @@ def test_forecast_conclusion_marks_v3_candidate_only_when_it_beats_v2():
     assert conclusion["wcdt_v3_candidate_for_promotion"]
 
 
+def test_forecast_conclusion_allows_v3_when_both_models_lack_rear_gap_samples():
+    report = {
+        "cv_prediction": {
+            "ade": {"mean": 5.0},
+            "fde": {"mean": 6.0},
+            "future_min_distance_abs_error": {"mean": 3.0},
+        },
+        "wcdt_v2_prediction": {
+            "available": True,
+            "fde": {"mean": 4.0},
+            "future_min_distance_abs_error": {"mean": 2.0},
+            "target_lane_front_gap_abs_error": {"mean": 2.0},
+            "target_lane_rear_gap_abs_error": {"count": 0},
+        },
+        "wcdt_v3_prediction": {
+            "available": True,
+            "fde": {"mean": 4.0},
+            "future_min_distance_abs_error": {"mean": 2.0},
+            "target_lane_front_gap_abs_error": {"mean": 2.0},
+            "target_lane_rear_gap_abs_error": {"count": 0},
+            "uncertainty": {"std": 0.1},
+            "uncertainty_fde_correlation": 0.2,
+        },
+    }
+    conclusion = _forecast_conclusion(report)
+    assert conclusion["wcdt_v3_prediction_quality_pass"]
+    assert conclusion["wcdt_v3_candidate_for_promotion"]
+
+
 class _StaticRiskModel:
     def __init__(self, scores: dict[int, float], uncertainty: float = 0.1):
         self.scores = scores
@@ -1080,6 +1113,56 @@ def test_runtime_wcdt_adapter_keeps_auxiliary_neighbor_local_past_merge_x_fallba
     assert ordered[0] == "aux_front"
 
 
+def test_history_buffer_marks_imputed_history_steps_invalid():
+    cfg = load_config()
+    history = HistoryBuffer(history_steps=3, max_agents=2)
+    ego = VehicleState("ego", 100.0, 53.8, 0.0, 10.0, 0, "main_aux_0", 10.0, "main_aux")
+    history.append([])
+    history.append([ego])
+    history.append([ego])
+    arrays = history.to_tensor_arrays_with_metadata("ego", cfg)
+    assert arrays["mask"].tolist() == [1.0, 0.0]
+    assert arrays["history_valid_mask"][0].tolist() == [0.0, 1.0, 1.0]
+    assert arrays["history_lane_index"][0].tolist() == [-1, 0, 0]
+    assert arrays["history_edge_role"][0, 0] == 0
+
+
+def test_trajectory_window_future_missing_state_is_zero_and_masked():
+    cfg = load_config()
+    env = SumoHighwayMergeEnv.__new__(SumoHighwayMergeEnv)
+    env.history_steps = 2
+    env.top_k = 1
+    env.ego_id = "ego"
+    env.config = cfg
+    ego = VehicleState("ego", 100.0, 53.8, 0.0, 10.0, 0, "main_aux_0", 10.0, "main_aux")
+    actor = VehicleState("actor", 110.0, 57.0, 0.0, 10.0, 1, "main_aux_1", 20.0, "main_aux")
+    horizon = int(cfg.scenario.forecast_horizon_steps)
+    frames = [
+        {"ego": ego, "actor": actor},
+        {"ego": ego, "actor": actor},
+        {"ego": ego, "actor": actor},
+    ]
+    frames.extend({"ego": ego} for _ in range(horizon))
+    env._trajectory_frames = frames
+    (
+        _history,
+        future,
+        mask,
+        _lane_index,
+        _edge_role,
+        _history_valid_mask,
+        future_valid_mask,
+        _history_lane_index,
+        _history_edge_role,
+        _future_lane_index,
+        _future_edge_role,
+    ) = env.trajectory_window_samples()
+    assert mask[0, 1] == 1.0
+    assert future_valid_mask[0, 1, 0] == 1.0
+    assert future_valid_mask[0, 1, 1] == 0.0
+    assert np.count_nonzero(future[0, 1, 1:]) == 0
+
+
 def test_wcdt_v2_actor_selection_prioritizes_merge_local_agents():
     cfg = load_config()
     history = np.zeros((6, cfg.scenario.history_steps, 5), dtype=np.float32)
@@ -1159,6 +1242,30 @@ def test_wcdt_v2_loss_role_gap_and_smoothness_components_are_safe():
     assert jitter_components["smoothness"].item() > smooth_components["smoothness"].item()
 
 
+def test_wcdt_v2_loss_ignores_invalid_future_tail_and_uses_last_valid_fde():
+    torch = pytest.importorskip("torch")
+    target = torch.tensor([[[[5.0, 0.0], [6.0, 0.0], [0.0, 0.0]]]], dtype=torch.float32)
+    pred = target.clone()
+    pred[0, 0, 2, 0] = 1000.0
+    mask = torch.ones((1, 1), dtype=torch.float32)
+    future_valid_mask = torch.tensor([[[1.0, 1.0, 0.0]]], dtype=torch.float32)
+    ego_valid_mask = torch.ones((1, 3), dtype=torch.float32)
+    ego_future = torch.zeros((1, 3, 2), dtype=torch.float32)
+    role_ids = torch.zeros((1, 1), dtype=torch.long)
+    _total, components = v2_loss(
+        pred,
+        target,
+        mask,
+        ego_future,
+        role_ids,
+        future_valid_mask=future_valid_mask,
+        ego_future_valid_mask=ego_valid_mask,
+    )
+    assert components["ade"].item() == pytest.approx(0.0)
+    assert components["fde"].item() == pytest.approx(0.0)
+    assert components["future_min_distance"].item() == pytest.approx(0.0)
+
+
 def _wcdt_v3_test_batch():
     cfg = load_config()
     cfg.prediction["wcdt_v3_max_agents"] = 3
@@ -1187,6 +1294,75 @@ def test_wcdt_v3_batch_uses_full_history_with_fixed_shape():
     assert batch["target"].shape == (1, 3, cfg.scenario.forecast_horizon_steps, 5)
     assert np.all(np.isfinite(batch["history_features"]))
     assert batch["selected_indices"][0].tolist() == [1, 2, 3]
+
+
+def test_wcdt_v3_batch_preserves_timestep_masks_and_route_metadata():
+    cfg, history, future, mask, _batch = _wcdt_v3_test_batch()
+    history_valid = np.ones(history.shape[:3], dtype=np.float32)
+    future_valid = np.ones(future.shape[:3], dtype=np.float32)
+    history_lane_index = np.zeros(history.shape[:3], dtype=np.int64)
+    history_edge_role = np.zeros(history.shape[:3], dtype=np.int64)
+    history_valid[0, 1, 0] = 0.0
+    history_lane_index[0, 1, 1:] = 1
+    history_edge_role[0, 1, 1:] = EDGE_ROLE_TARGET
+    batch = build_v3_numpy_batch(
+        cfg,
+        history,
+        future,
+        mask,
+        np.asarray([0], dtype=np.int64),
+        history_valid_mask=history_valid,
+        future_valid_mask=future_valid,
+        history_lane_indices=history_lane_index,
+        history_edge_roles=history_edge_role,
+    )
+    assert batch["history_valid_mask"][0, 0, 0] == 0.0
+    assert batch["history_lane_ids"][0, 0, 1] == 2  # embedding id reserves 0 for unknown/padding
+    assert batch["history_edge_role_ids"][0, 0, 1] == EDGE_ROLE_TARGET
+
+
+def test_wcdt_v3_output_changes_when_history_route_metadata_changes():
+    torch = pytest.importorskip("torch")
+    cfg, history, future, mask, _batch = _wcdt_v3_test_batch()
+    history_lane_index = np.zeros(history.shape[:3], dtype=np.int64)
+    changed_lane_index = history_lane_index.copy()
+    changed_lane_index[0, 1, :-1] = 1
+    kwargs = {
+        "history_valid_mask": np.ones(history.shape[:3], dtype=np.float32),
+        "future_valid_mask": np.ones(future.shape[:3], dtype=np.float32),
+        "history_edge_roles": np.zeros(history.shape[:3], dtype=np.int64),
+    }
+    original = build_v3_numpy_batch(
+        cfg,
+        history,
+        future,
+        mask,
+        np.asarray([0], dtype=np.int64),
+        history_lane_indices=history_lane_index,
+        **kwargs,
+    )
+    changed = build_v3_numpy_batch(
+        cfg,
+        history,
+        future,
+        mask,
+        np.asarray([0], dtype=np.int64),
+        history_lane_indices=changed_lane_index,
+        **kwargs,
+    )
+    model = WcDTV3TemporalInteractionPredictor(
+        history_steps=int(cfg.scenario.history_steps),
+        horizon_steps=int(cfg.scenario.forecast_horizon_steps),
+        hidden_dim=32,
+        temporal_layers=1,
+        actor_attention_layers=1,
+        num_heads=4,
+        dropout=0.0,
+    ).eval()
+    with torch.no_grad():
+        original_pred = predict_v3_model(model, tensorize_v3_batch(original, torch, torch.device("cpu")))
+        changed_pred = predict_v3_model(model, tensorize_v3_batch(changed, torch, torch.device("cpu")))
+    assert not torch.allclose(original_pred, changed_pred)
 
 
 def test_wcdt_v3_changes_output_when_history_changes_but_last_frame_is_fixed():
@@ -1263,6 +1439,15 @@ def test_wcdt_v3_rejects_wrong_architecture_checkpoint(tmp_path):
         load_v3_ensemble(cfg, checkpoint, torch.device("cpu"))
 
 
+def test_wcdt_v3_rejects_checkpoint_without_required_metadata(tmp_path):
+    torch = pytest.importorskip("torch")
+    cfg = load_config()
+    checkpoint = tmp_path / "missing_metadata_wcdt_v3.pt"
+    torch.save({"model_state_dicts": []}, checkpoint)
+    with pytest.raises(ValueError, match="architecture_version"):
+        load_v3_ensemble(cfg, checkpoint, torch.device("cpu"))
+
+
 def test_wcdt_v2_early_stopping_and_validation_unavailable_behavior():
     cfg = load_config()
     disabled = _wcdt_v2_early_stopping_config(cfg, has_validation=False)
@@ -1321,6 +1506,43 @@ def test_wcdt_v2_old_checkpoint_without_metadata_still_loads(tmp_path):
     assert len(models) == 1
     assert "architecture_version" not in payload
     assert "loss_version" not in payload
+
+
+def test_stage2_v2_v3_training_rejects_legacy_unmasked_trajectory_buffer(tmp_path):
+    path = tmp_path / "legacy_buffer.npz"
+    np.savez_compressed(path, agent_history=np.zeros((1, 1, 1, 5), dtype=np.float32))
+    with np.load(path) as data:
+        with pytest.raises(ValueError, match="trajectory_schema_version"):
+            _require_trajectory_schema_v2(data, "WcDT v3")
+
+
+def test_stage3_predictor_summary_reads_v3_member_histories(tmp_path):
+    torch = pytest.importorskip("torch")
+    checkpoint = tmp_path / "wcdt_v3_predictor.pt"
+    torch.save(
+        {
+            "architecture_version": "wcdt_v3_temporal_actor_transformer_v2",
+            "loss_version": MERGE_SAFETY_LOSS_VERSION,
+            "trajectory_schema_version": 2,
+            "ensemble_size": 1,
+            "member_histories": [
+                {
+                    "member": 0,
+                    "loss_history": [2.0, 1.0],
+                    "trained_epochs": 2,
+                    "best_epoch": 2,
+                    "best_val_score": 1.0,
+                    "stopped_early": False,
+                }
+            ],
+        },
+        checkpoint,
+    )
+    summary = _prediction_loss_summary_from_checkpoint(str(checkpoint))
+    assert summary["architecture_version"] == "wcdt_v3_temporal_actor_transformer_v2"
+    assert summary["loss_version"] == MERGE_SAFETY_LOSS_VERSION
+    assert summary["trajectory_schema_version"] == 2
+    assert summary["members"][0]["trained_epochs"] == 2
 
 
 def test_risk_loss_ignores_zero_weight_samples():
@@ -1931,7 +2153,8 @@ def test_runner_loads_schema_v1_state_with_disabled_v3_task(tmp_path):
         encoding="utf-8",
     )
     state = _load_pipeline_state(state_path)
-    assert state["schema_version"] == 2
+    assert state["schema_version"] == 3
+    assert state["normalized_invocation"]["pipeline_profile"] == "default"
     assert not state["tasks"]["stage3_forecast_wcdt_v3"]["enabled"]
     assert state["tasks"]["stage3_forecast_wcdt_v3"]["status"] == "completed"
 
@@ -1984,7 +2207,7 @@ def test_runner_resume_reuses_saved_invocation_and_rejects_conflicts():
         forecast_sources=None,
         forecast_source=None,
     )
-    assert resumed == invocation
+    assert resumed == {**invocation, "pipeline_profile": "default"}
     with pytest.raises(ValueError, match="ppo_timesteps"):
         _resume_invocation(
             state,
@@ -2060,6 +2283,40 @@ def test_full_pipeline_generated_configs_support_smoke_episode_overrides(tmp_pat
     assert main["stage4"]["episodes"] == 2
     assert stage5["stage5"]["episodes_per_group"] == 2
     assert stage5["stage5"]["seeds"] == [1, 2]
+
+
+def test_full_pipeline_smoke_profile_is_lightweight_and_cli_overrides_profile(tmp_path):
+    configs = build_generated_configs(
+        "safe_rl_smoke_profile",
+        tmp_path,
+        pipeline_profile="smoke",
+        ppo_timesteps=16,
+        forecast_sources=["constant_velocity", "wcdt_v2", "wcdt_v3"],
+    )
+    main = yaml.safe_load(configs["main"].read_text(encoding="utf-8"))
+    stage5 = yaml.safe_load(configs["stage5_multi_groups"].read_text(encoding="utf-8"))
+    assert main["scenario"]["episode_seconds"] == pytest.approx(6.0)
+    assert main["stage1"]["episodes"] == 2
+    assert main["stage1"]["audit_gate"]["enabled"] is False
+    assert main["rl"]["total_timesteps"] == 16
+    assert main["rl"]["n_steps"] == 8
+    assert main["rl"]["batch_size"] == 8
+    assert main["stage3"]["eval_enabled"] is False
+    assert main["prediction"]["wcdt_v2_epochs"] == 1
+    assert main["prediction"]["wcdt_v2_ensemble_size"] == 1
+    assert main["prediction"]["wcdt_v3_epochs"] == 1
+    assert main["prediction"]["wcdt_v3_ensemble_size"] == 1
+    assert main["risk_module"]["epochs"] == 1
+    assert stage5["stage5"]["episodes_per_group"] == 1
+    assert stage5["stage5"]["seeds"] == [1]
+
+
+def test_ppo_training_device_defaults_to_cpu_and_legacy_fallback_remains_available():
+    cfg = load_config()
+    assert _training_device(cfg) == "cpu"
+    del cfg.training["ppo_device"]
+    cfg.training["device"] = "gpu"
+    assert _training_device(cfg) == "cuda"
 
 
 def test_legacy_wcdt_v1_forecast_config_still_loads():
@@ -2189,6 +2446,22 @@ def _fake_group(
             "emergency_fallback_count": int(emergency_fallbacks),
         },
     }
+
+
+def test_wcdt_v3_promotion_gate_rejects_smoke_episode_count_and_slow_policy():
+    reports = {
+        "ppo_wcdt_v2_features": _fake_group([(1, 100.0)], 100.0, completion_time=10.0),
+        "wcdt_v2_prediction_shield": _fake_group([(1, 101.0)], 101.0, replacements=0.1),
+        "ppo_wcdt_v3_features": _fake_group([(1, 101.0)], 101.0, completion_time=12.0),
+        "wcdt_v3_prediction_shield": _fake_group([(1, 102.0)], 102.0, replacements=0.3),
+    }
+    for report in reports.values():
+        report["metrics"]["episodes"] = len(report["episodes"])
+    candidate = _wcdt_v3_candidate_summary(reports)
+    assert not candidate["stage5_candidate_pass"]
+    assert not candidate["checks"]["formal_episode_count"]
+    assert not candidate["checks"]["completion_time_not_degraded_vs_v2"]
+    assert not candidate["checks"]["shield_replacements_not_worse_than_v2"]
 
 
 def test_stage5_dynamic_paired_delta_and_acceptance_for_optional_forecast_groups():

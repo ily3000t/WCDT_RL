@@ -296,18 +296,30 @@ def _wcdt_v2_shield_summary(group_reports: dict[str, dict]) -> dict[str, Any]:
 def _wcdt_v3_candidate_summary(group_reports: dict[str, dict]) -> dict[str, Any]:
     v2 = group_reports.get("ppo_wcdt_v2_features")
     v3 = group_reports.get("ppo_wcdt_v3_features")
+    v2_shield = group_reports.get("wcdt_v2_prediction_shield")
+    v3_shield = group_reports.get("wcdt_v3_prediction_shield")
+    v2_completion = _metric(v2, "completion_time_mean")
+    completion_limit = max(v2_completion * 1.05, v2_completion + 1.0)
     checks = {
+        "formal_episode_count": _metric(v3, "episodes") >= 50.0,
         "reward_not_degraded_vs_v2": _metric(v3, "average_reward") >= _metric(v2, "average_reward") - 5.0,
         "safety_violation_not_worse_than_v2": _metric(v3, "safety_violation_rate")
         <= _metric(v2, "safety_violation_rate"),
         "proxy_collision_zero": _metric(v3, "proxy_collision_rate") == 0.0,
         "merge_success_not_worse_than_v2": _metric(v3, "merge_success_rate")
         >= _metric(v2, "merge_success_rate"),
+        "completion_time_not_degraded_vs_v2": _metric(v3, "completion_time_mean") <= completion_limit,
+        "shield_fallback_rate_zero": _metric(v3_shield, "fallback_rate", 1.0) == 0.0,
+        "shield_emergency_fallback_not_worse_than_v2": _metric(v3_shield, "emergency_fallback_rate", 1.0)
+        <= _metric(v2_shield, "emergency_fallback_rate", 0.0),
+        "shield_replacements_not_worse_than_v2": _metric(v3_shield, "mean_actual_replacements", 1.0e9)
+        <= _metric(v2_shield, "mean_actual_replacements", 0.0) + 0.10,
     }
     return {
-        "available": bool(v2 and v3),
+        "available": bool(v2 and v3 and v2_shield and v3_shield),
         "checks": checks,
-        "stage5_candidate_pass": bool(v2 and v3 and all(checks.values())),
+        "completion_time_limit": float(completion_limit),
+        "stage5_candidate_pass": bool(v2 and v3 and v2_shield and v3_shield and all(checks.values())),
         "acceptance": _forecast_acceptance(v2, v3),
     }
 
@@ -395,6 +407,12 @@ def build_confirmatory_summary(
     wcdt_v3["candidate_for_promotion"] = bool(
         wcdt_v3.get("stage5_candidate_pass") and wcdt_v3.get("prediction_candidate_for_promotion")
     )
+    if wcdt_v3["candidate_for_promotion"]:
+        wcdt_v3["promotion_reason"] = "diagnostics_and_formal_stage5_passed"
+    elif not diagnostics or not wcdt_v3.get("checks", {}).get("formal_episode_count", False):
+        wcdt_v3["promotion_reason"] = "insufficient_formal_evidence"
+    else:
+        wcdt_v3["promotion_reason"] = "promotion_gate_failed"
     return {
         "final_result_summary": FINAL_RESULT_SUMMARY,
         "model_role_explanations": MODEL_ROLE_EXPLANATIONS,

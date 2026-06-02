@@ -20,7 +20,8 @@ from safe_rl.sim.scenario_semantics import distance_to_taper_for_position, edge_
 HISTORY_INPUT_DIM = 10
 LANE_EMBEDDING_COUNT = 17
 EDGE_ROLE_EMBEDDING_COUNT = 5
-ARCHITECTURE_VERSION = "wcdt_v3_temporal_actor_transformer_v1"
+ARCHITECTURE_VERSION = "wcdt_v3_temporal_actor_transformer_v2"
+TRAJECTORY_SCHEMA_VERSION = 2
 
 
 def _require_torch():
@@ -53,13 +54,14 @@ def _history_actor_features(
     cfg: Any,
     ego_history: np.ndarray,
     actor_history: np.ndarray,
-    ego_lane_index: int | None,
+    ego_lane_indices: np.ndarray | None,
 ) -> np.ndarray:
     history_steps = min(ego_history.shape[0], actor_history.shape[0])
     output = np.zeros((history_steps, HISTORY_INPUT_DIM), dtype=np.float32)
     for step_idx in range(history_steps):
         ego = ego_history[step_idx]
         actor = actor_history[step_idx]
+        ego_lane_index = None if ego_lane_indices is None else int(ego_lane_indices[step_idx])
         relative_heading = float(actor[2] - ego[2])
         output[step_idx] = np.asarray(
             [
@@ -87,6 +89,10 @@ def build_v3_numpy_batch(
     indices: np.ndarray,
     lane_indices: np.ndarray | None = None,
     edge_roles: np.ndarray | None = None,
+    history_valid_mask: np.ndarray | None = None,
+    future_valid_mask: np.ndarray | None = None,
+    history_lane_indices: np.ndarray | None = None,
+    history_edge_roles: np.ndarray | None = None,
 ) -> dict[str, np.ndarray]:
     sample_indices = np.asarray(indices, dtype=np.int64)
     history_steps = int(history.shape[2])
@@ -103,15 +109,24 @@ def build_v3_numpy_batch(
     lane_ids = np.zeros((batch, max_agents), dtype=np.int64)
     edge_role_ids = np.zeros((batch, max_agents), dtype=np.int64)
     ego_future = np.zeros((batch, horizon, 5), dtype=np.float32)
+    selected_history_valid_mask = np.ones((batch, max_agents, history_steps), dtype=np.float32)
+    selected_future_valid_mask = np.zeros((batch, max_agents, horizon), dtype=np.float32)
+    ego_future_valid_mask = np.ones((batch, horizon), dtype=np.float32)
+    selected_history_lane_ids = np.zeros((batch, max_agents, history_steps), dtype=np.int64)
+    selected_history_edge_role_ids = np.zeros((batch, max_agents, history_steps), dtype=np.int64)
     selected_indices = np.full((batch, max_agents), -1, dtype=np.int64)
 
     for row, sample_idx in enumerate(sample_indices):
         ego_history = history[sample_idx, 0]
         ego_latest = ego_history[-1]
         ego_future[row] = future[sample_idx, 0, :horizon]
+        if future_valid_mask is not None:
+            ego_future_valid_mask[row] = future_valid_mask[sample_idx, 0, :horizon]
         sample_lanes = None if lane_indices is None else lane_indices[sample_idx]
         sample_roles = None if edge_roles is None else edge_roles[sample_idx]
-        ego_lane = None if sample_lanes is None else int(sample_lanes[0])
+        sample_history_lanes = None if history_lane_indices is None else history_lane_indices[sample_idx]
+        sample_history_roles = None if history_edge_roles is None else history_edge_roles[sample_idx]
+        ego_history_lanes = None if sample_history_lanes is None else sample_history_lanes[0]
         ordered = ordered_merge_local_indices(cfg, history[sample_idx], mask[sample_idx], sample_lanes, sample_roles)
         for actor_row, agent_idx in enumerate(ordered[:max_agents]):
             latest = history[sample_idx, agent_idx, -1]
@@ -122,14 +137,34 @@ def build_v3_numpy_batch(
                 cfg,
                 ego_history,
                 history[sample_idx, agent_idx],
-                ego_lane,
+                ego_history_lanes,
             )
             baseline[row, actor_row] = _constant_velocity_future(latest, horizon, dt, cfg, lane)
             target[row, actor_row] = future[sample_idx, agent_idx, :horizon]
             actor_mask[row, actor_row] = mask[sample_idx, agent_idx]
+            selected_history_valid_mask[row, actor_row] = (
+                mask[sample_idx, agent_idx]
+                if history_valid_mask is None
+                else history_valid_mask[sample_idx, agent_idx, :history_steps]
+            )
+            selected_future_valid_mask[row, actor_row] = (
+                mask[sample_idx, agent_idx]
+                if future_valid_mask is None
+                else future_valid_mask[sample_idx, agent_idx, :horizon]
+            )
             role_ids[row, actor_row] = role
             lane_ids[row, actor_row] = _lane_embedding_id(lane)
             edge_role_ids[row, actor_row] = _edge_role_embedding_id(actor_edge_role)
+            if sample_history_lanes is not None:
+                selected_history_lane_ids[row, actor_row] = np.asarray(
+                    [_lane_embedding_id(value) for value in sample_history_lanes[agent_idx, :history_steps]],
+                    dtype=np.int64,
+                )
+            if sample_history_roles is not None:
+                selected_history_edge_role_ids[row, actor_row] = np.asarray(
+                    [_edge_role_embedding_id(value) for value in sample_history_roles[agent_idx, :history_steps]],
+                    dtype=np.int64,
+                )
             selected_indices[row, actor_row] = int(agent_idx)
     return {
         "history_features": history_features,
@@ -140,12 +175,19 @@ def build_v3_numpy_batch(
         "lane_ids": lane_ids,
         "edge_role_ids": edge_role_ids,
         "ego_future": ego_future,
+        "history_valid_mask": selected_history_valid_mask,
+        "future_valid_mask": selected_future_valid_mask,
+        "ego_future_valid_mask": ego_future_valid_mask,
+        "history_lane_ids": selected_history_lane_ids,
+        "history_edge_role_ids": selected_history_edge_role_ids,
         "selected_indices": selected_indices,
     }
 
 
 def build_v3_runtime_batch(cfg: Any, history: HistoryBuffer, ego_id: str) -> dict[str, np.ndarray]:
-    agent_history, agent_mask = history.to_tensor_arrays(ego_id)
+    runtime_history = history.to_tensor_arrays_with_metadata(ego_id, cfg)
+    agent_history = runtime_history["history"]
+    agent_mask = runtime_history["mask"]
     horizon = int(cfg.forecast_features.get("horizon_steps", cfg.scenario.forecast_horizon_steps))
     future = np.zeros((1, agent_history.shape[0], horizon, 5), dtype=np.float32)
     latest = history.latest()
@@ -166,6 +208,9 @@ def build_v3_runtime_batch(cfg: Any, history: HistoryBuffer, ego_id: str) -> dic
         np.asarray([0], dtype=np.int64),
         lane_indices=lane_indices,
         edge_roles=edge_roles,
+        history_valid_mask=runtime_history["history_valid_mask"][None, ...],
+        history_lane_indices=runtime_history["history_lane_index"][None, ...],
+        history_edge_roles=runtime_history["history_edge_role"][None, ...],
     )
     return {key: value[0:1] if key != "selected_indices" else value[0] for key, value in batch.items()}
 
@@ -198,6 +243,7 @@ class WcDTV3TemporalInteractionPredictor(_TORCH_MODULE_BASE):
         self.role_embedding = nn.Embedding(ROLE_COUNT, 16)
         self.lane_embedding = nn.Embedding(LANE_EMBEDDING_COUNT, 8)
         self.edge_role_embedding = nn.Embedding(EDGE_ROLE_EMBEDDING_COUNT, 8)
+        self.temporal_route_projection = nn.Linear(16, int(hidden_dim))
         self.static_projection = nn.Linear(32, int(hidden_dim))
         actor_layer = nn.TransformerEncoderLayer(
             d_model=int(hidden_dim),
@@ -213,11 +259,45 @@ class WcDTV3TemporalInteractionPredictor(_TORCH_MODULE_BASE):
             nn.Linear(int(hidden_dim), self.horizon_steps * 2),
         )
 
-    def forward(self, history_features, role_ids, lane_ids, edge_role_ids, actor_mask, baseline):
+    def forward(
+        self,
+        history_features,
+        history_valid_mask,
+        history_lane_ids,
+        history_edge_role_ids,
+        role_ids,
+        lane_ids,
+        edge_role_ids,
+        actor_mask,
+        baseline,
+    ):
         batch, actors, history_steps, _dim = history_features.shape
-        temporal = self.history_projection(history_features) + self.position_embedding[:, :, :history_steps]
+        temporal_route = self.temporal_route_projection(
+            _BASE_TORCH.cat(
+                [
+                    self.lane_embedding(history_lane_ids),
+                    self.edge_role_embedding(history_edge_role_ids),
+                ],
+                dim=-1,
+            )
+        )
+        temporal = self.history_projection(history_features) + temporal_route + self.position_embedding[:, :, :history_steps]
         temporal = temporal.reshape(batch * actors, history_steps, -1)
-        temporal = self.temporal_encoder(temporal)[:, -1].reshape(batch, actors, -1)
+        temporal_padding_mask = (history_valid_mask <= 0.0).reshape(batch * actors, history_steps)
+        safe_temporal_padding_mask = temporal_padding_mask.clone()
+        all_history_padding = safe_temporal_padding_mask.all(dim=1)
+        safe_temporal_padding_mask[all_history_padding, 0] = False
+        temporal = self.temporal_encoder(temporal, src_key_padding_mask=safe_temporal_padding_mask)
+        valid_indices = (~temporal_padding_mask).long() * _BASE_TORCH.arange(
+            history_steps,
+            device=history_features.device,
+        ).view(1, history_steps)
+        last_valid = valid_indices.amax(dim=1)
+        temporal = temporal.gather(
+            dim=1,
+            index=last_valid[:, None, None].expand(-1, 1, temporal.shape[-1]),
+        ).squeeze(1)
+        temporal = temporal.reshape(batch, actors, -1)
         static = self.static_projection(
             _BASE_TORCH.cat(
                 [
@@ -252,16 +332,42 @@ def tensorize_v3_batch(batch: dict[str, np.ndarray], torch: Any, device: Any) ->
         "lane_ids": torch.tensor(batch["lane_ids"], dtype=torch.long, device=device),
         "edge_role_ids": torch.tensor(batch["edge_role_ids"], dtype=torch.long, device=device),
         "ego_future": torch.tensor(batch["ego_future"], dtype=torch.float32, device=device),
+        "history_valid_mask": torch.tensor(batch["history_valid_mask"], dtype=torch.float32, device=device),
+        "future_valid_mask": torch.tensor(batch["future_valid_mask"], dtype=torch.float32, device=device),
+        "ego_future_valid_mask": torch.tensor(batch["ego_future_valid_mask"], dtype=torch.float32, device=device),
+        "history_lane_ids": torch.tensor(batch["history_lane_ids"], dtype=torch.long, device=device),
+        "history_edge_role_ids": torch.tensor(batch["history_edge_role_ids"], dtype=torch.long, device=device),
     }
 
 
-def v3_loss(pred, target, mask, ego_future, role_ids, weights: dict[str, float] | None = None):
-    return merge_safety_loss(pred, target, mask, ego_future, role_ids, weights)
+def v3_loss(
+    pred,
+    target,
+    mask,
+    ego_future,
+    role_ids,
+    weights: dict[str, float] | None = None,
+    future_valid_mask=None,
+    ego_future_valid_mask=None,
+):
+    return merge_safety_loss(
+        pred,
+        target,
+        mask,
+        ego_future,
+        role_ids,
+        weights,
+        future_valid_mask=future_valid_mask,
+        ego_future_valid_mask=ego_future_valid_mask,
+    )
 
 
 def _predict_model(model: Any, batch: dict[str, Any]):
     return model(
         batch["history_features"],
+        batch["history_valid_mask"],
+        batch["history_lane_ids"],
+        batch["history_edge_role_ids"],
         batch["role_ids"],
         batch["lane_ids"],
         batch["edge_role_ids"],
@@ -284,8 +390,17 @@ def load_v3_ensemble(config: Any, checkpoint: str | Path, device: Any | None = N
     device = device or _resolve_device(config, torch)
     payload = torch.load(checkpoint, map_location=device)
     architecture = payload.get("architecture_version")
-    if architecture and architecture != ARCHITECTURE_VERSION:
+    if architecture != ARCHITECTURE_VERSION:
         raise ValueError(f"unsupported WcDT v3 architecture_version={architecture!r}; expected {ARCHITECTURE_VERSION!r}")
+    loss_version = payload.get("loss_version")
+    if loss_version != LOSS_VERSION:
+        raise ValueError(f"unsupported WcDT v3 loss_version={loss_version!r}; expected {LOSS_VERSION!r}")
+    schema_version = int(payload.get("trajectory_schema_version", -1))
+    if schema_version != TRAJECTORY_SCHEMA_VERSION:
+        raise ValueError(
+            f"unsupported WcDT v3 trajectory_schema_version={schema_version!r}; "
+            f"expected {TRAJECTORY_SCHEMA_VERSION!r}"
+        )
     model_kwargs = {
         "history_steps": int(payload.get("history_steps", config.scenario.history_steps)),
         "horizon_steps": int(payload.get("horizon_steps", config.scenario.forecast_horizon_steps)),

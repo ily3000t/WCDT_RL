@@ -7,6 +7,10 @@ run:
 
 training:
   device: "auto"
+  stage2_device: "auto"
+  ppo_device: "cpu"
+  forecast_runtime_device: "cpu"
+  diagnostics_device: "auto"
   pin_memory: true
   num_workers: 0
   persistent_workers: true

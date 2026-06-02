@@ -7,7 +7,7 @@ import numpy as np
 
 from safe_rl.pipeline.common import make_env
 from safe_rl.risk.risk_aggregator import aggregate_episode_reports
-from safe_rl.rl.ppo import load_ppo
+from safe_rl.rl.ppo import _training_device, load_ppo
 from safe_rl.utils.progress import TensorboardLogger, progress_iter, stage_log
 from safe_rl.utils.replay import write_replay_file
 
@@ -33,10 +33,7 @@ def evaluate_ppo(
     tensorboard: TensorboardLogger | None = None,
     tensorboard_step_offset: int = 0,
 ) -> dict:
-    device = str(cfg.get("training", {}).get("device", "auto") or "auto")
-    if device.lower() == "gpu":
-        device = "cuda"
-    model = load_ppo(model_path, device=device)
+    model = load_ppo(model_path, device=_training_device(cfg))
     shape_env = make_env(cfg, seed=int(seeds[0]) if seeds else int(cfg.run.seed), shield_enabled=shield_enabled, risk_checkpoint=risk_checkpoint)
     try:
         validate_model_env_observation_shape(model, shape_env, model_path)
