@@ -23,6 +23,7 @@ from safe_rl.pipeline.stage5_paired_eval import (
     _shield_acceptance,
 )
 from safe_rl.rl.evaluation import evaluate_ppo
+from safe_rl.sim.metrics import SAFETY_METRIC_VERSION
 from safe_rl.utils.config import REPO_ROOT, _to_config_dict, clone_with_overrides, load_config
 from safe_rl.utils.progress import TensorboardLogger, stage_log
 
@@ -535,6 +536,9 @@ def run(cfg, episodes: int = 50) -> Path:
     report = {
         "stage": "stage5_confirmatory",
         "config": str(config_path),
+        "safety_metric_version": str(
+            cfg.risk_module.get("safety_metric_version", SAFETY_METRIC_VERSION)
+        ),
         "seeds": seeds,
         "groups": group_reports,
         "paired_delta": paired_delta,

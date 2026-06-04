@@ -38,6 +38,12 @@ class StepMetrics:
     merge_gap: float
     lane_oob: bool = False
     hard_brake: bool = False
+    geometric_overlap: bool = False
+    closest_vehicle_id: str = ""
+    closest_vehicle_edge: str = ""
+    closest_vehicle_lane: int = -1
+    ttc_vehicle_id: str = ""
+    drac_vehicle_id: str = ""
 
     def risk_label(self) -> float:
         return float(

@@ -11,6 +11,7 @@ from safe_rl.prediction.forecast_feature_augmentor import (
     ForecastFeatureAugmentor,
     forecast_target_lane_gap_from_trajectories,
 )
+from safe_rl.prediction.trajectory_postprocess import trajectory_to_states
 from safe_rl.prediction.sumo_wcdt_adapter import SumoWcDTAdapter
 from safe_rl.prediction.wcdt_v2_predictor import build_v2_numpy_batch, ensemble_predict, load_v2_ensemble, tensorize_batch
 from safe_rl.prediction.wcdt_v3_predictor import (
@@ -21,7 +22,14 @@ from safe_rl.prediction.wcdt_v3_predictor import (
 )
 from safe_rl.rl.ppo import _training_device, load_ppo
 from safe_rl.risk.merge_local import route_aware_constant_velocity_rollout
-from safe_rl.sim.metrics import INF_TTC
+from safe_rl.sim.metrics import (
+    SAFETY_METRIC_VERSION,
+    INF_TTC,
+    bbox_gap,
+    drac,
+    relative_ttc,
+    trajectory_min_obb_gap,
+)
 from safe_rl.sim.scenario_semantics import (
     EDGE_ROLE_AUXILIARY,
     EDGE_ROLE_MAINLINE,
@@ -192,6 +200,8 @@ def _cv_prediction_diagnostics(
     lane_indices: np.ndarray | None = None,
     edge_roles: np.ndarray | None = None,
     future_valid_mask: np.ndarray | None = None,
+    agent_length: np.ndarray | None = None,
+    agent_width: np.ndarray | None = None,
 ) -> dict[str, Any]:
     horizon = int(min(future.shape[2], cfg.forecast_features.get("horizon_steps", cfg.scenario.forecast_horizon_steps)))
     dt = float(cfg.scenario.step_length)
@@ -242,8 +252,32 @@ def _cv_prediction_diagnostics(
         row_ade, row_fde = errors
         ade.append(row_ade)
         fde.append(row_fde)
-        pred_min = _future_min_distance(actual_future[0], pred_future, other_mask, sample_future_valid, ego_future_valid)
-        actual_min = _future_min_distance(actual_future[0], actual_future, other_mask, sample_future_valid, ego_future_valid)
+        sample_length = None if agent_length is None else agent_length[sample_idx]
+        sample_width = None if agent_width is None else agent_width[sample_idx]
+        ego_length = 4.8 if sample_length is None else float(sample_length[0])
+        ego_width = 1.8 if sample_width is None else float(sample_width[0])
+        pred_min = _future_min_distance(
+            actual_future[0],
+            pred_future,
+            other_mask,
+            sample_future_valid,
+            ego_future_valid,
+            sample_length,
+            sample_width,
+            ego_length,
+            ego_width,
+        )
+        actual_min = _future_min_distance(
+            actual_future[0],
+            actual_future,
+            other_mask,
+            sample_future_valid,
+            ego_future_valid,
+            sample_length,
+            sample_width,
+            ego_length,
+            ego_width,
+        )
         min_distance_errors.append(float(pred_min - actual_min))
         min_distance_abs_errors.append(abs(float(pred_min - actual_min)))
         pred_gap = _target_lane_gap(actual_future[0], pred_future, other_mask, cfg, sample_future_valid, ego_future_valid)
@@ -259,6 +293,8 @@ def _cv_prediction_diagnostics(
         indices,
         lane_indices=lane_indices,
         edge_roles=edge_roles,
+        agent_length=agent_length,
+        agent_width=agent_width,
     )
     for row in range(selected_batch["baseline"].shape[0]):
         role_gap_errors = _target_role_gap_abs_errors(
@@ -393,21 +429,22 @@ def _future_min_distance(
     other_mask: np.ndarray,
     future_valid_mask: np.ndarray | None = None,
     ego_future_valid_mask: np.ndarray | None = None,
+    agent_length: np.ndarray | None = None,
+    agent_width: np.ndarray | None = None,
+    ego_length: float = 4.8,
+    ego_width: float = 1.8,
 ) -> float:
-    min_distance = INF_TTC
-    for agent_idx in range(other_future.shape[0]):
-        if float(other_mask[agent_idx]) <= 0.0:
-            continue
-        valid = np.ones((other_future.shape[1],), dtype=bool)
-        if future_valid_mask is not None:
-            valid &= np.asarray(future_valid_mask[agent_idx]) > 0.5
-        if ego_future_valid_mask is not None:
-            valid &= np.asarray(ego_future_valid_mask) > 0.5
-        if not np.any(valid):
-            continue
-        distances = np.linalg.norm(other_future[agent_idx, valid, :2] - ego_future[valid, :2], axis=-1) - 3.0
-        min_distance = min(min_distance, float(np.min(np.maximum(0.0, distances))))
-    return float(min_distance)
+    return trajectory_min_obb_gap(
+        ego_future,
+        other_future,
+        other_mask,
+        future_valid_mask,
+        ego_future_valid_mask,
+        agent_length,
+        agent_width,
+        ego_length,
+        ego_width,
+    )
 
 
 def _target_lane_gap(
@@ -470,24 +507,21 @@ def _forecast_features_from_prediction(
     ego_rollout = route_aware_constant_velocity_rollout(ego_state, horizon, dt, cfg)[0]
     ego_future = np.asarray([[state.x, state.y] for state in ego_rollout], dtype=np.float32)
     target_lane_gap = forecast_target_lane_gap_from_trajectories(ego_future, trajectories, cfg)
-    for traj in trajectories:
-        previous_distance = INF_TTC
+    for actor_idx, traj in enumerate(trajectories):
         agent_min = 50.0
-        for step_idx, step in enumerate(traj):
-            dx = float(step[0] - ego_future[step_idx, 0])
-            dy = float(step[1] - ego_future[step_idx, 1])
-            distance = max(0.0, float(np.hypot(dx, dy)) - 3.0)
+        predicted_states = trajectory_to_states(traj, dt=dt, vehicle_id=f"pred_{actor_idx}")
+        for step_idx, other_future in enumerate(predicted_states):
+            ego_state = ego_rollout[step_idx]
+            dx = float(other_future.x - ego_state.x)
+            dy = float(other_future.y - ego_state.y)
+            distance = bbox_gap(ego_state, other_future)
             if distance < min_distance:
                 min_distance = distance
                 nearest_dx = dx
                 nearest_dy = dy
             agent_min = min(agent_min, distance)
-            if previous_distance < INF_TTC:
-                closing = max(0.0, (previous_distance - distance) / max(dt, 1.0e-6))
-                if closing > 1.0e-6:
-                    min_ttc = min(min_ttc, distance / closing)
-                    max_drac = max(max_drac, (closing * closing) / (2.0 * max(distance, 1.0e-6)))
-            previous_distance = distance
+            min_ttc = min(min_ttc, relative_ttc(ego_state, other_future))
+            max_drac = max(max_drac, drac(ego_state, other_future))
         top_risks.append(1.0 / (1.0 + agent_min))
     top = np.sort(np.asarray(top_risks, dtype=np.float32))[::-1]
     top = np.pad(top[:3], (0, max(0, 3 - len(top))), constant_values=0.0)
@@ -645,6 +679,8 @@ def _residual_ensemble_diagnostics(
     future_valid_mask: np.ndarray | None = None,
     history_lane_indices: np.ndarray | None = None,
     history_edge_roles: np.ndarray | None = None,
+    agent_length: np.ndarray | None = None,
+    agent_width: np.ndarray | None = None,
     *,
     build_batch: Any,
     tensorize: Any,
@@ -683,6 +719,8 @@ def _residual_ensemble_diagnostics(
             future_valid_mask=future_valid_mask,
             history_lane_indices=history_lane_indices,
             history_edge_roles=history_edge_roles,
+            agent_length=agent_length,
+            agent_width=agent_width,
         )
         tensor_batch = tensorize(numpy_batch, torch, device)
         pred, uncertainty = ensemble_fn(models, tensor_batch)
@@ -713,10 +751,26 @@ def _residual_ensemble_diagnostics(
             uncertainty_values.append(sample_uncertainty)
             uncertainty_fde_values.append(row_fde)
             pred_min_distance = _future_min_distance(
-                ego_future[row], selected[row], pred_mask[row], pred_future_valid_mask[row], ego_future_valid_mask[row]
+                ego_future[row],
+                selected[row],
+                pred_mask[row],
+                pred_future_valid_mask[row],
+                ego_future_valid_mask[row],
+                numpy_batch["agent_length"][row],
+                numpy_batch["agent_width"][row],
+                float(numpy_batch["ego_length"][row]),
+                float(numpy_batch["ego_width"][row]),
             )
             actual_min_distance = _future_min_distance(
-                ego_future[row], actual_future[row], pred_mask[row], pred_future_valid_mask[row], ego_future_valid_mask[row]
+                ego_future[row],
+                actual_future[row],
+                pred_mask[row],
+                pred_future_valid_mask[row],
+                ego_future_valid_mask[row],
+                numpy_batch["agent_length"][row],
+                numpy_batch["agent_width"][row],
+                float(numpy_batch["ego_length"][row]),
+                float(numpy_batch["ego_width"][row]),
             )
             min_distance_errors.append(float(pred_min_distance - actual_min_distance))
             min_distance_abs_error = abs(float(pred_min_distance - actual_min_distance))
@@ -806,6 +860,8 @@ def _wcdt_v2_diagnostics(
     lane_indices: np.ndarray | None = None,
     edge_roles: np.ndarray | None = None,
     future_valid_mask: np.ndarray | None = None,
+    agent_length: np.ndarray | None = None,
+    agent_width: np.ndarray | None = None,
 ) -> tuple[np.ndarray, dict[str, Any]]:
     return _residual_ensemble_diagnostics(
         cfg,
@@ -818,6 +874,8 @@ def _wcdt_v2_diagnostics(
         lane_indices,
         edge_roles,
         future_valid_mask=future_valid_mask,
+        agent_length=agent_length,
+        agent_width=agent_width,
         build_batch=build_v2_numpy_batch,
         tensorize=tensorize_batch,
         ensemble_fn=ensemble_predict,
@@ -840,6 +898,8 @@ def _wcdt_v3_diagnostics(
     future_valid_mask: np.ndarray | None = None,
     history_lane_indices: np.ndarray | None = None,
     history_edge_roles: np.ndarray | None = None,
+    agent_length: np.ndarray | None = None,
+    agent_width: np.ndarray | None = None,
 ) -> tuple[np.ndarray, dict[str, Any]]:
     return _residual_ensemble_diagnostics(
         cfg,
@@ -855,6 +915,8 @@ def _wcdt_v3_diagnostics(
         future_valid_mask=future_valid_mask,
         history_lane_indices=history_lane_indices,
         history_edge_roles=history_edge_roles,
+        agent_length=agent_length,
+        agent_width=agent_width,
         build_batch=build_v3_numpy_batch,
         tensorize=tensorize_v3_batch,
         ensemble_fn=ensemble_predict_v3,
@@ -1461,11 +1523,19 @@ def run_forecast_diagnostics(
     lane_indices = data["agent_lane_index"] if "agent_lane_index" in data else None
     edge_roles = data["agent_edge_role"] if "agent_edge_role" in data else None
     schema_version = int(np.asarray(data["trajectory_schema_version"]).reshape(-1)[0]) if "trajectory_schema_version" in data else 1
-    legacy_unmasked_buffer = schema_version < 2 or "agent_future_valid_mask" not in data
+    metric_value = np.asarray(data["safety_metric_version"]).reshape(-1)[0] if "safety_metric_version" in data else ""
+    metric_version = metric_value.decode("utf-8") if isinstance(metric_value, bytes) else str(metric_value)
+    legacy_unmasked_buffer = (
+        schema_version < 3
+        or "agent_future_valid_mask" not in data
+        or metric_version != SAFETY_METRIC_VERSION
+    )
     history_valid_mask = data["agent_history_valid_mask"] if "agent_history_valid_mask" in data else None
     future_valid_mask = data["agent_future_valid_mask"] if "agent_future_valid_mask" in data else None
     history_lane_indices = data["agent_history_lane_index"] if "agent_history_lane_index" in data else None
     history_edge_roles = data["agent_history_edge_role"] if "agent_history_edge_role" in data else None
+    agent_length = data["agent_length"] if "agent_length" in data else None
+    agent_width = data["agent_width"] if "agent_width" in data else None
     if history.shape[0] == 0:
         raise ValueError(f"no trajectory samples in {stage1_path}")
     sample_count = min(int(max_samples), int(history.shape[0]))
@@ -1488,6 +1558,8 @@ def run_forecast_diagnostics(
         lane_indices=lane_indices,
         edge_roles=edge_roles,
         future_valid_mask=future_valid_mask,
+        agent_length=agent_length,
+        agent_width=agent_width,
     )
     wcdt_features = np.zeros((0, ForecastFeatureAugmentor.feature_dim(cfg)), dtype=np.float32)
     wcdt_report: dict[str, Any] = {"available": False, "checkpoint": str(checkpoint)}
@@ -1536,6 +1608,8 @@ def run_forecast_diagnostics(
             lane_indices=lane_indices,
             edge_roles=edge_roles,
             future_valid_mask=future_valid_mask,
+            agent_length=agent_length,
+            agent_width=agent_width,
         )
         wcdt_v2_report["available"] = True
     if wcdt_v3_checkpoint.exists():
@@ -1553,6 +1627,8 @@ def run_forecast_diagnostics(
             future_valid_mask=future_valid_mask,
             history_lane_indices=history_lane_indices,
             history_edge_roles=history_edge_roles,
+            agent_length=agent_length,
+            agent_width=agent_width,
         )
         wcdt_v3_report["available"] = True
     feature_summary = _feature_source_summary(
@@ -1568,6 +1644,7 @@ def run_forecast_diagnostics(
         "stage1_buffer": str(stage1_path),
         "sample_count": int(sample_count),
         "trajectory_schema_version": int(schema_version),
+        "safety_metric_version": metric_version,
         "legacy_unmasked_buffer": bool(legacy_unmasked_buffer),
         "feature_names": list(ForecastFeatureAugmentor.FEATURE_NAMES),
         "forecast_feature_summary": feature_summary,

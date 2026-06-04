@@ -45,6 +45,7 @@ def _step_safety_record(
     min_ttc = _safe_float(info.get("min_ttc"), 1.0e9)
     max_drac = _safe_float(info.get("max_drac"), 0.0)
     collision = bool(info.get("collision", False))
+    geometric_overlap = bool(info.get("geometric_overlap", False))
     near_miss = bool(info.get("near_miss", False))
     proxy_collision = min_distance <= float(collision_threshold)
     safety_violation = bool(collision or proxy_collision or near_miss or min_ttc < 0.30)
@@ -54,6 +55,8 @@ def _step_safety_record(
         "shield_record_index": int(step_index) if shield_enabled else None,
         "raw_action": int(raw_action),
         "final_action": int(final_action),
+        "raw_action_name": str(info.get("raw_action_name", "")),
+        "final_action_name": str(info.get("final_action_name", "")),
         "reward": float(reward),
         "terminated": bool(terminated),
         "truncated": bool(truncated),
@@ -63,6 +66,7 @@ def _step_safety_record(
         "drac": max_drac,
         "drac_raw": max_drac,
         "collision": collision,
+        "geometric_overlap": geometric_overlap,
         "near_miss": near_miss,
         "proxy_collision": proxy_collision,
         "safety_violation": safety_violation,
@@ -73,6 +77,17 @@ def _step_safety_record(
         "target_lane_gap": _safe_float(info.get("target_lane_gap"), 1.0e9),
         "distance_to_taper": _safe_float(info.get("distance_to_taper"), 1.0e9),
         "taper_miss": bool(info.get("taper_miss", False)),
+        "closest_vehicle_id": str(info.get("closest_vehicle_id", "")),
+        "closest_vehicle_edge": str(info.get("closest_vehicle_edge", "")),
+        "closest_vehicle_lane": int(info.get("closest_vehicle_lane", -1)),
+        "ttc_vehicle_id": str(info.get("ttc_vehicle_id", "")),
+        "drac_vehicle_id": str(info.get("drac_vehicle_id", "")),
+        "ego_on_auxiliary": bool(info.get("ego_on_auxiliary", False)),
+        "best_merge_action": str(info.get("best_merge_action", "")),
+        "best_merge_action_risk": info.get("best_merge_action_risk"),
+        "safe_merge_opportunity_count": int(info.get("safe_merge_opportunity_count", 0)),
+        "missed_safe_merge_opportunity_count": int(info.get("missed_safe_merge_opportunity_count", 0)),
+        "safety_metric_version": str(info.get("safety_metric_version", "")),
     }
 
 
@@ -154,6 +169,7 @@ def evaluate_ppo(
                     risk_checkpoint=risk_checkpoint if shield_enabled else None,
                     model_path=str(model_path),
                     group_name=group_name,
+                    safety_metric_version=str(cfg.risk_module.get("safety_metric_version", "")),
                     notes={"episode_report": report, "step_safety_records": step_safety_records},
                 )
         finally:

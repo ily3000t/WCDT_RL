@@ -30,6 +30,7 @@ scenario:
   step_length: 0.1
   episode_seconds: 80.0
   control_interval_steps: 5
+  lane_change_duration: 1.0
   top_k_neighbors: 5
   history_steps: 11
   forecast_horizon_steps: 30
@@ -65,6 +66,9 @@ scenario:
   merge_target_lane: 1
   merge_zone_distance: 80.0
   merge_conflict_gap: 8.0
+  merge_opportunity_min_front_gap: 12.0
+  merge_opportunity_min_rear_gap: 12.0
+  merge_opportunity_min_distance_to_taper: 60.0
 
 prediction:
   enabled: true
@@ -147,6 +151,7 @@ forecast_features:
 
 risk_module:
   enabled: true
+  safety_metric_version: "oriented_box_v1"
   use_wcdt_latent: true
   use_explicit_risk_features: true
   action_conditioned: true

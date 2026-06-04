@@ -33,6 +33,7 @@ def write_replay_file(
     risk_checkpoint: str | None = None,
     model_path: str | None = None,
     group_name: str | None = None,
+    safety_metric_version: str | None = None,
     notes: dict[str, Any] | None = None,
 ) -> None:
     path = Path(path)
@@ -53,6 +54,7 @@ def write_replay_file(
             "risk_checkpoint": risk_checkpoint,
             "model_path": model_path,
             "group_name": group_name,
+            "safety_metric_version": safety_metric_version,
             "notes": notes or {},
             **_scenario_snapshot_metadata(path, run_id),
         },

@@ -24,6 +24,7 @@ from safe_rl.pipeline import (
 from safe_rl.utils.config import DEFAULT_CONFIG_PATH, REPO_ROOT, load_config
 from safe_rl.utils.progress import stage_log
 from safe_rl.sim.scenario_snapshot import SCENARIO_SUFFIXES, snapshot_scenario
+from safe_rl.sim.metrics import SAFETY_METRIC_VERSION
 
 
 VALID_FORECAST_SOURCES = ("constant_velocity", "wcdt", "wcdt_v2", "wcdt_v3")
@@ -245,6 +246,7 @@ def _new_pipeline_state(run_id: str, invocation: dict[str, Any]) -> dict[str, An
         "pipeline_profile": pipeline_profile,
         "pipeline_profile_config_sha256": _pipeline_profile_config_sha256(pipeline_profile),
         "default_config_sha256": _sha256(DEFAULT_CONFIG_PATH),
+        "safety_metric_version": SAFETY_METRIC_VERSION,
         "scenario_snapshot_sha256": None,
         "scenario_source_sha256": None,
         "tasks": tasks,
@@ -390,6 +392,10 @@ def _validate_completed_outputs(state: dict[str, Any]) -> None:
 
 
 def _validate_resume_state(state: dict[str, Any], cfg: Any) -> None:
+    if state.get("safety_metric_version") != SAFETY_METRIC_VERSION:
+        raise ValueError(
+            "safety metric version changed since the run started; use a new run id or --run-mode overwrite"
+        )
     if state.get("default_config_sha256") != _sha256(DEFAULT_CONFIG_PATH):
         raise ValueError("default config changed since the run started; use a new run id or --run-mode overwrite")
     pipeline_profile = str(

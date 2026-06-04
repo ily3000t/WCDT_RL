@@ -4,6 +4,7 @@ from pathlib import Path
 
 from safe_rl.pipeline.common import latest_stage_file, load_stage_config, parse_config_arg, write_report
 from safe_rl.rl.evaluation import evaluate_ppo
+from safe_rl.sim.metrics import SAFETY_METRIC_VERSION
 from safe_rl.utils.config import clone_with_overrides, prepare_run_dir
 from safe_rl.utils.progress import TensorboardLogger, stage_log
 
@@ -89,6 +90,9 @@ def _paired_delta(a_report: dict | None, b_report: dict | None) -> dict | None:
                 "safety_violation_delta": int(
                     int(bool(item.get("safety_violation", False))) - int(bool(left.get("safety_violation", False)))
                 ),
+                "geometric_overlap_delta": int(
+                    int(bool(item.get("geometric_overlap", False))) - int(bool(left.get("geometric_overlap", False)))
+                ),
                 "proxy_collision_count_delta": int(
                     int(item.get("proxy_collision_count", int(bool(item.get("proxy_collision", False)))))
                     - int(left.get("proxy_collision_count", int(bool(left.get("proxy_collision", False)))))
@@ -125,6 +129,10 @@ def _paired_delta(a_report: dict | None, b_report: dict | None) -> dict | None:
                 "emergency_fallback_delta": int(
                     item.get("emergency_fallback_count", 0) - left.get("emergency_fallback_count", 0)
                 ),
+                "missed_safe_merge_opportunity_delta": int(
+                    item.get("missed_safe_merge_opportunity_count", 0)
+                    - left.get("missed_safe_merge_opportunity_count", 0)
+                ),
             }
         )
     if not rows:
@@ -139,6 +147,10 @@ def _paired_delta(a_report: dict | None, b_report: dict | None) -> dict | None:
         "mean_drac_capped_delta": sum(row["drac_capped_delta"] for row in rows) / len(rows),
         "mean_proxy_collision_delta": sum(row["proxy_collision_delta"] for row in rows) / len(rows),
         "mean_safety_violation_delta": sum(row["safety_violation_delta"] for row in rows) / len(rows),
+        "mean_geometric_overlap_delta": sum(row["geometric_overlap_delta"] for row in rows) / len(rows),
+        "mean_missed_safe_merge_opportunity_delta": (
+            sum(row["missed_safe_merge_opportunity_delta"] for row in rows) / len(rows)
+        ),
         "proxy_collision_count_delta": sum(row["proxy_collision_count_delta"] for row in rows),
         "safety_violation_count_delta": sum(row["safety_violation_count_delta"] for row in rows),
         "taper_miss_count_delta": sum(row["taper_miss_delta"] for row in rows),
@@ -380,6 +392,9 @@ def run(cfg) -> Path:
     report = {
         "stage": "stage5",
         "paired_eval": bool(cfg.stage5.paired_eval),
+        "safety_metric_version": str(
+            cfg.risk_module.get("safety_metric_version", SAFETY_METRIC_VERSION)
+        ),
         "seeds": seeds,
         "groups": group_reports,
         "forecast_baseline_group": forecast_baseline,

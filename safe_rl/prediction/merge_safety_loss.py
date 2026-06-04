@@ -5,7 +5,7 @@ from typing import Any
 
 ROLE_TARGET_FRONT = 0
 ROLE_TARGET_REAR = 1
-LOSS_VERSION = "merge_safety_v3_masked"
+LOSS_VERSION = "merge_safety_v4_rect_gap"
 
 
 def _require_torch():
@@ -75,6 +75,38 @@ def _ordering_error(pred, valid_mask, role_ids):
     return masked_mean(torch.relu(rear_x - front_x + 4.8), pair_mask)
 
 
+def _rect_gap_approx(
+    actor_xy,
+    actor_heading,
+    ego_xy,
+    ego_heading,
+    actor_length,
+    actor_width,
+    ego_length,
+    ego_width,
+):
+    """Differentiable ego-aligned rectangular surface gap approximation."""
+
+    torch = _require_torch()
+    actor_forward = torch.stack((torch.cos(actor_heading), torch.sin(actor_heading)), dim=-1)
+    ego_forward = torch.stack((torch.cos(ego_heading), torch.sin(ego_heading)), dim=-1)
+    ego_lateral = torch.stack((-ego_forward[..., 1], ego_forward[..., 0]), dim=-1)
+    actor_center = actor_xy - 0.5 * actor_length[..., None] * actor_forward
+    ego_center = ego_xy - 0.5 * ego_length[..., None] * ego_forward
+    relative = actor_center - ego_center
+    longitudinal = torch.abs((relative * ego_forward).sum(dim=-1))
+    lateral = torch.abs((relative * ego_lateral).sum(dim=-1))
+    longitudinal_clearance = torch.clamp(
+        longitudinal - 0.5 * (actor_length + ego_length),
+        min=0.0,
+    )
+    lateral_clearance = torch.clamp(
+        lateral - 0.5 * (actor_width + ego_width),
+        min=0.0,
+    )
+    return torch.sqrt(longitudinal_clearance.square() + lateral_clearance.square() + 1.0e-12)
+
+
 def merge_safety_loss(
     pred,
     target,
@@ -84,6 +116,10 @@ def merge_safety_loss(
     weights: dict[str, float] | None = None,
     future_valid_mask=None,
     ego_future_valid_mask=None,
+    agent_length=None,
+    agent_width=None,
+    ego_length=None,
+    ego_width=None,
 ) -> tuple[Any, dict[str, Any]]:
     torch = _require_torch()
     weights = weights or {}
@@ -100,8 +136,58 @@ def merge_safety_loss(
     ade = masked_mean(distance, valid_mask)
     fde = _last_valid_error(distance, valid_mask)
     ego_xy = ego_future[:, None, :, :2]
-    pred_gap = torch.clamp(torch.linalg.norm(pred[..., :2] - ego_xy, dim=-1) - 3.0, min=0.0)
-    target_gap = torch.clamp(torch.linalg.norm(target[..., :2] - ego_xy, dim=-1) - 3.0, min=0.0)
+    if agent_length is None:
+        agent_length = torch.full(
+            (pred.shape[0], pred.shape[1]),
+            4.8,
+            dtype=pred.dtype,
+            device=pred.device,
+        )
+    if agent_width is None:
+        agent_width = torch.full(
+            (pred.shape[0], pred.shape[1]),
+            1.8,
+            dtype=pred.dtype,
+            device=pred.device,
+        )
+    actor_length = agent_length[:, :, None].to(dtype=pred.dtype)
+    actor_width = agent_width[:, :, None].to(dtype=pred.dtype)
+    if ego_length is None:
+        ego_length = torch.full((pred.shape[0],), 4.8, dtype=pred.dtype, device=pred.device)
+    if ego_width is None:
+        ego_width = torch.full((pred.shape[0],), 1.8, dtype=pred.dtype, device=pred.device)
+    ego_length = ego_length[:, None, None].to(dtype=pred.dtype)
+    ego_width = ego_width[:, None, None].to(dtype=pred.dtype)
+    ego_heading = (
+        ego_future[:, None, :, 2]
+        if ego_future.shape[-1] > 2
+        else torch.zeros_like(ego_future[:, None, :, 0])
+    )
+    actor_heading = (
+        target[..., 2]
+        if target.shape[-1] > 2
+        else torch.zeros_like(target[..., 0])
+    )
+    pred_gap = _rect_gap_approx(
+        pred[..., :2],
+        actor_heading,
+        ego_xy,
+        ego_heading,
+        actor_length,
+        actor_width,
+        ego_length,
+        ego_width,
+    )
+    target_gap = _rect_gap_approx(
+        target[..., :2],
+        actor_heading,
+        ego_xy,
+        ego_heading,
+        actor_length,
+        actor_width,
+        ego_length,
+        ego_width,
+    )
     min_dist = _future_min_distance_error(pred_gap, target_gap, valid_mask)
     front_gap = _role_gap_error(pred, target, ego_xy, valid_mask, role_ids, ROLE_TARGET_FRONT)
     rear_gap = _role_gap_error(pred, target, ego_xy, valid_mask, role_ids, ROLE_TARGET_REAR)

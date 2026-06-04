@@ -19,8 +19,9 @@ from safe_rl.shield.safety_shield import SafetyShield
 from safe_rl.sim.action_space import ACTIONS, decode_action
 from safe_rl.sim.gym_compat import gym, spaces
 from safe_rl.sim.history_buffer import HistoryBuffer
-from safe_rl.sim.metrics import INF_TTC, compute_step_metrics, explicit_risk_features
+from safe_rl.sim.metrics import SAFETY_METRIC_VERSION, INF_TTC, compute_step_metrics, explicit_risk_features
 from safe_rl.sim.scenario_semantics import (
+    auxiliary_lane_index,
     distance_to_taper,
     edge_role,
     is_auxiliary_edge,
@@ -30,6 +31,7 @@ from safe_rl.sim.scenario_semantics import (
     merge_target_lane,
     merge_zone_edges,
     target_lane_edges,
+    target_lane_index,
     target_lane_mapping,
 )
 from safe_rl.sim.types import StepMetrics, VehicleState
@@ -97,6 +99,12 @@ class SumoHighwayMergeEnv(gym.Env):
         self._last_done_reason = ""
         self._curriculum_profile = "disabled"
         self._curriculum_applied = False
+        self._first_merge_request_step: int | None = None
+        self._first_merge_request_distance_to_taper: float | None = None
+        self._first_target_lane_entry_step: int | None = None
+        self._first_target_lane_entry_distance_to_taper: float | None = None
+        self._safe_merge_opportunity_count = 0
+        self._missed_safe_merge_opportunity_count = 0
 
     def _import_traci(self):
         if self._traci_module is not None:
@@ -141,6 +149,12 @@ class SumoHighwayMergeEnv(gym.Env):
         self._last_done_reason = ""
         self._curriculum_profile = self._select_curriculum_profile()
         self._curriculum_applied = False
+        self._first_merge_request_step = None
+        self._first_merge_request_distance_to_taper = None
+        self._first_target_lane_entry_step = None
+        self._first_target_lane_entry_distance_to_taper = None
+        self._safe_merge_opportunity_count = 0
+        self._missed_safe_merge_opportunity_count = 0
         if self.shield is not None and hasattr(self.shield, "reset_episode_state"):
             self.shield.reset_episode_state()
 
@@ -165,8 +179,10 @@ class SumoHighwayMergeEnv(gym.Env):
         final_action = raw_action
         intervention = None
         context = self.get_risk_context()
+        self._record_merge_opportunity(context, raw_action)
         if self.shield is not None and self.shield.enabled:
             final_action, intervention = self.shield.select_action(raw_action, context)
+            intervention["step"] = int(self._episode_step)
             self._interventions.append(intervention)
 
         lane_oob = self._apply_action(final_action)
@@ -199,8 +215,19 @@ class SumoHighwayMergeEnv(gym.Env):
             merge_target_lanes=target_lane_mapping(self.config),
         )
         self._episode_metrics.append(metrics)
+        if intervention is not None:
+            intervention.update(
+                {
+                    "min_distance": float(metrics.min_distance),
+                    "min_ttc": float(metrics.min_ttc),
+                    "max_drac": float(metrics.max_drac),
+                    "geometric_overlap": bool(metrics.geometric_overlap),
+                    "closest_vehicle_id": str(metrics.closest_vehicle_id),
+                }
+            )
         if ego is not None:
             self._ego_speeds.append(float(ego.speed))
+            self._record_target_lane_entry(ego)
 
         terminated, done_reason = self._done(metrics)
         self._last_done_reason = done_reason
@@ -210,6 +237,8 @@ class SumoHighwayMergeEnv(gym.Env):
         info = self._info(metrics=metrics, done_reason=done_reason, intervention=intervention)
         info["raw_action"] = int(raw_action.index)
         info["final_action"] = int(final_action.index)
+        info["raw_action_name"] = str(raw_action.name)
+        info["final_action_name"] = str(final_action.name)
         self._last_ego_speed = ego.speed if ego else 0.0
         self._last_ego_x = ego.x if ego else self._last_ego_x
         return obs, float(reward), bool(terminated), bool(truncated), info
@@ -648,6 +677,46 @@ class SumoHighwayMergeEnv(gym.Env):
         }
         return total_penalty, debug
 
+    def _merge_lateral_cmd(self, ego: VehicleState | None) -> int:
+        if ego is None or not is_auxiliary_edge(self.config, ego.edge_id):
+            return 0
+        return int(target_lane_index(self.config, ego.edge_id) - auxiliary_lane_index(self.config, ego.edge_id))
+
+    def _record_merge_opportunity(self, context: dict[str, Any], raw_action: Any) -> None:
+        ego = context.get("ego")
+        local = context.get("merge_local")
+        merge_cmd = self._merge_lateral_cmd(ego)
+        if ego is None or local is None or merge_cmd == 0:
+            return
+        if int(raw_action.lateral_cmd) == merge_cmd and self._first_merge_request_step is None:
+            self._first_merge_request_step = int(self._episode_step)
+            self._first_merge_request_distance_to_taper = float(local.merge_distance)
+        safe_opportunity = bool(
+            float(local.target_front_gap)
+            >= float(self.config.scenario.get("merge_opportunity_min_front_gap", 12.0))
+            and float(local.target_rear_gap)
+            >= float(self.config.scenario.get("merge_opportunity_min_rear_gap", 12.0))
+            and float(local.merge_distance)
+            >= float(self.config.scenario.get("merge_opportunity_min_distance_to_taper", 60.0))
+            and any(
+                action.lateral_cmd == merge_cmd and is_candidate_legal(action, context)
+                for action in ACTIONS
+            )
+        )
+        if not safe_opportunity:
+            return
+        self._safe_merge_opportunity_count += 1
+        if int(raw_action.lateral_cmd) != merge_cmd:
+            self._missed_safe_merge_opportunity_count += 1
+
+    def _record_target_lane_entry(self, ego: VehicleState) -> None:
+        if self._first_target_lane_entry_step is not None:
+            return
+        if not is_target_lane(self.config, ego.edge_id, ego.lane_index):
+            return
+        self._first_target_lane_entry_step = int(self._episode_step)
+        self._first_target_lane_entry_distance_to_taper = float(distance_to_taper(self.config, ego))
+
     def _info(
         self,
         metrics: StepMetrics | None = None,
@@ -659,6 +728,9 @@ class SumoHighwayMergeEnv(gym.Env):
             "step": self._episode_step,
             "done_reason": done_reason,
             "intervention": intervention,
+            "safety_metric_version": str(
+                self.config.risk_module.get("safety_metric_version", SAFETY_METRIC_VERSION)
+            ),
         }
         if self._last_reward_debug:
             info["reward_debug"] = self._last_reward_debug
@@ -676,6 +748,12 @@ class SumoHighwayMergeEnv(gym.Env):
                 merge_gap=local.target_lane_gap,
                 lane_oob=metrics.lane_oob,
                 hard_brake=metrics.hard_brake,
+                geometric_overlap=metrics.geometric_overlap,
+                closest_vehicle_id=metrics.closest_vehicle_id,
+                closest_vehicle_edge=metrics.closest_vehicle_edge,
+                closest_vehicle_lane=metrics.closest_vehicle_lane,
+                ttc_vehicle_id=metrics.ttc_vehicle_id,
+                drac_vehicle_id=metrics.drac_vehicle_id,
             )
             info.update(local_metrics.to_dict())
             info.update(
@@ -691,8 +769,22 @@ class SumoHighwayMergeEnv(gym.Env):
                     "ego_on_auxiliary": local.ego_on_auxiliary,
                     "distance_to_taper": local.merge_distance,
                     "taper_miss": local.taper_miss,
+                    "first_merge_request_step": self._first_merge_request_step,
+                    "first_merge_request_distance_to_taper": self._first_merge_request_distance_to_taper,
+                    "first_target_lane_entry_step": self._first_target_lane_entry_step,
+                    "first_target_lane_entry_distance_to_taper": self._first_target_lane_entry_distance_to_taper,
+                    "safe_merge_opportunity_count": int(self._safe_merge_opportunity_count),
+                    "missed_safe_merge_opportunity_count": int(self._missed_safe_merge_opportunity_count),
                 }
             )
+            if intervention is not None:
+                best_action = decode_action(int(intervention.get("best_candidate_action", intervention.get("raw_action", 0))))
+                merge_cmd = self._merge_lateral_cmd(self._get_ego())
+                info["best_merge_action"] = best_action.name if best_action.lateral_cmd == merge_cmd else ""
+                info["best_merge_action_risk"] = float(intervention.get("best_candidate_risk", 0.0))
+            else:
+                info["best_merge_action"] = ""
+                info["best_merge_action_risk"] = None
             info["explicit_risk_features"] = explicit_risk_features(local_metrics)
         return info
 
@@ -725,6 +817,7 @@ class SumoHighwayMergeEnv(gym.Env):
 
     def episode_report(self) -> dict[str, Any]:
         collisions = [metric.collision for metric in self._episode_metrics]
+        geometric_overlaps = [metric.geometric_overlap for metric in self._episode_metrics]
         near_misses = [metric.near_miss for metric in self._episode_metrics]
         min_distances = [metric.min_distance for metric in self._episode_metrics]
         ttcs = [metric.min_ttc for metric in self._episode_metrics if metric.min_ttc < INF_TTC]
@@ -767,17 +860,33 @@ class SumoHighwayMergeEnv(gym.Env):
                 "emergency_reason": str(item.get("emergency_reason", "")),
                 "emergency_saturated_count": int(item.get("emergency_saturated_count", 0)),
                 "emergency_saturated_required": int(item.get("emergency_saturated_required", 0)),
+                "raw_action": int(item.get("raw_action", -1)),
+                "final_action": int(item.get("final_action", -1)),
+                "raw_action_name": str(item.get("raw_action_name", "")),
+                "final_action_name": str(item.get("final_action_name", "")),
+                "best_candidate_action": int(item.get("best_candidate_action", -1)),
+                "best_candidate_action_name": str(item.get("best_candidate_action_name", "")),
+                "step": int(item.get("step", -1)),
+                "min_distance": float(item.get("min_distance", INF_TTC)),
+                "min_ttc": float(item.get("min_ttc", INF_TTC)),
+                "max_drac": float(item.get("max_drac", 0.0)),
+                "geometric_overlap": bool(item.get("geometric_overlap", False)),
+                "closest_vehicle_id": str(item.get("closest_vehicle_id", "")),
             }
             for item in self._interventions
         ]
         return {
             "seed": self.seed_value,
+            "safety_metric_version": str(
+                self.config.risk_module.get("safety_metric_version", SAFETY_METRIC_VERSION)
+            ),
             "curriculum_profile": self._curriculum_profile,
             "done_reason": self._last_done_reason,
             "taper_miss": self._last_done_reason == "taper_miss",
             "steps": self._episode_step,
             "completion_time": completion_time,
             "collision": any(collisions),
+            "geometric_overlap": any(geometric_overlaps),
             "near_miss": any(near_misses),
             "proxy_collision": bool(proxy_collision),
             "safety_violation": safety_violation,
@@ -807,6 +916,17 @@ class SumoHighwayMergeEnv(gym.Env):
             "final_action_histogram": dict(final_actions),
             "shield_score_records": score_records,
             "shield_guided_reward_summary": self._shield_guided_reward_summary(),
+            "first_merge_request_step": self._first_merge_request_step,
+            "first_merge_request_distance_to_taper": self._first_merge_request_distance_to_taper,
+            "first_target_lane_entry_step": self._first_target_lane_entry_step,
+            "first_target_lane_entry_distance_to_taper": self._first_target_lane_entry_distance_to_taper,
+            "safe_merge_opportunity_count": int(self._safe_merge_opportunity_count),
+            "missed_safe_merge_opportunity_count": int(self._missed_safe_merge_opportunity_count),
+            "missed_safe_merge_opportunity_rate": (
+                float(self._missed_safe_merge_opportunity_count / self._safe_merge_opportunity_count)
+                if self._safe_merge_opportunity_count
+                else 0.0
+            ),
         }
 
     def _shield_guided_reward_summary(self) -> dict[str, Any]:
@@ -832,7 +952,11 @@ class SumoHighwayMergeEnv(gym.Env):
 
     def trajectory_window_samples(
         self,
+        *,
+        include_dimensions: bool = False,
     ) -> tuple[
+        np.ndarray,
+        np.ndarray,
         np.ndarray,
         np.ndarray,
         np.ndarray,
@@ -852,7 +976,7 @@ class SumoHighwayMergeEnv(gym.Env):
         max_agents = self.top_k + 1
         frames = self._trajectory_frames
         if len(frames) < hist + horizon:
-            return (
+            result = (
                 np.zeros((0, max_agents, hist, 5), dtype=np.float32),
                 np.zeros((0, max_agents, horizon, 5), dtype=np.float32),
                 np.zeros((0, max_agents), dtype=np.float32),
@@ -865,6 +989,9 @@ class SumoHighwayMergeEnv(gym.Env):
                 np.full((0, max_agents, horizon), -1, dtype=np.int64),
                 np.zeros((0, max_agents, horizon), dtype=np.int64),
             )
+            if include_dimensions:
+                return (*result, np.full((0, max_agents), 4.8, dtype=np.float32), np.full((0, max_agents), 1.8, dtype=np.float32))
+            return result
         history_samples: list[np.ndarray] = []
         future_samples: list[np.ndarray] = []
         masks: list[np.ndarray] = []
@@ -876,6 +1003,8 @@ class SumoHighwayMergeEnv(gym.Env):
         history_edge_roles: list[np.ndarray] = []
         future_lane_indices: list[np.ndarray] = []
         future_edge_roles: list[np.ndarray] = []
+        agent_lengths: list[np.ndarray] = []
+        agent_widths: list[np.ndarray] = []
         for end_idx in range(hist, len(frames) - horizon):
             latest = frames[end_idx - 1]
             if self.ego_id not in latest:
@@ -896,12 +1025,16 @@ class SumoHighwayMergeEnv(gym.Env):
             sample_history_edge_roles = np.zeros((max_agents, hist), dtype=np.int64)
             sample_future_lane_indices = np.full((max_agents, horizon), -1, dtype=np.int64)
             sample_future_edge_roles = np.zeros((max_agents, horizon), dtype=np.int64)
+            sample_agent_lengths = np.full((max_agents,), 4.8, dtype=np.float32)
+            sample_agent_widths = np.full((max_agents,), 1.8, dtype=np.float32)
             for agent_idx, vehicle_id in enumerate(agent_ids[:max_agents]):
                 mask[agent_idx] = 1.0
                 latest_state = latest.get(vehicle_id)
                 if latest_state is not None:
                     sample_lane_indices[agent_idx] = int(latest_state.lane_index)
                     sample_edge_roles[agent_idx] = int(edge_role(self.config, latest_state.edge_id, latest_state.lane_index))
+                    sample_agent_lengths[agent_idx] = float(latest_state.length)
+                    sample_agent_widths[agent_idx] = float(latest_state.width)
                 last_state = None
                 for step_idx, frame in enumerate(frames[end_idx - hist : end_idx]):
                     observed_state = frame.get(vehicle_id)
@@ -937,8 +1070,10 @@ class SumoHighwayMergeEnv(gym.Env):
             history_edge_roles.append(sample_history_edge_roles)
             future_lane_indices.append(sample_future_lane_indices)
             future_edge_roles.append(sample_future_edge_roles)
+            agent_lengths.append(sample_agent_lengths)
+            agent_widths.append(sample_agent_widths)
         if not history_samples:
-            return (
+            result = (
                 np.zeros((0, max_agents, hist, 5), dtype=np.float32),
                 np.zeros((0, max_agents, horizon, 5), dtype=np.float32),
                 np.zeros((0, max_agents), dtype=np.float32),
@@ -951,7 +1086,10 @@ class SumoHighwayMergeEnv(gym.Env):
                 np.full((0, max_agents, horizon), -1, dtype=np.int64),
                 np.zeros((0, max_agents, horizon), dtype=np.int64),
             )
-        return (
+            if include_dimensions:
+                return (*result, np.full((0, max_agents), 4.8, dtype=np.float32), np.full((0, max_agents), 1.8, dtype=np.float32))
+            return result
+        result = (
             np.stack(history_samples, axis=0),
             np.stack(future_samples, axis=0),
             np.stack(masks, axis=0),
@@ -964,3 +1102,6 @@ class SumoHighwayMergeEnv(gym.Env):
             np.stack(future_lane_indices, axis=0),
             np.stack(future_edge_roles, axis=0),
         )
+        if include_dimensions:
+            return (*result, np.stack(agent_lengths, axis=0), np.stack(agent_widths, axis=0))
+        return result

@@ -9,6 +9,7 @@ from safe_rl.risk.merge_local import (
     nearest_future_gap,
     route_aware_constant_velocity_rollout,
 )
+from safe_rl.prediction.trajectory_postprocess import trajectory_to_states
 from safe_rl.sim.metrics import INF_TTC, bbox_gap, drac, relative_ttc
 from safe_rl.sim.scenario_semantics import is_target_lane, target_lane_center_at_x
 
@@ -163,25 +164,28 @@ class ForecastFeatureAugmentor:
         horizon = int(min(trajectories.shape[-2], self.config.forecast_features.get("horizon_steps", trajectories.shape[-2])))
         ego_rollout = route_aware_constant_velocity_rollout(ego, horizon, dt, self.config)[0]
         target_lane_gap = forecast_target_lane_gap_from_trajectories(ego_rollout, trajectories, self.config)
-        for traj in trajectories:
+        references = [vehicle for vehicle in vehicles if vehicle.vehicle_id != ego.vehicle_id]
+        for actor_idx, traj in enumerate(trajectories):
             agent_min = 50.0
-            previous_distance = INF_TTC
-            for step_idx, step in enumerate(traj[:horizon]):
+            reference = references[actor_idx] if actor_idx < len(references) else None
+            predicted_states = trajectory_to_states(
+                traj[:horizon],
+                reference=reference,
+                dt=dt,
+                vehicle_id=f"pred_{actor_idx}",
+            )
+            for step_idx, other_future in enumerate(predicted_states):
                 ego_future = ego_rollout[min(step_idx, len(ego_rollout) - 1)]
-                dx = float(step[0] - ego_future.x)
-                dy = float(step[1] - ego_future.y)
-                distance = max(0.0, float(np.hypot(dx, dy)) - 3.0)
+                dx = float(other_future.x - ego_future.x)
+                dy = float(other_future.y - ego_future.y)
+                distance = bbox_gap(ego_future, other_future)
                 if distance < min_distance:
                     min_distance = distance
                     nearest_dx = dx
                     nearest_dy = dy
                 agent_min = min(agent_min, distance)
-                if previous_distance < INF_TTC:
-                    closing = max(0.0, (previous_distance - distance) / max(dt, 1.0e-6))
-                    if closing > 1.0e-6:
-                        min_ttc = min(min_ttc, distance / closing)
-                        max_drac = max(max_drac, (closing * closing) / (2.0 * max(distance, 1.0e-6)))
-                previous_distance = distance
+                min_ttc = min(min_ttc, relative_ttc(ego_future, other_future))
+                max_drac = max(max_drac, drac(ego_future, other_future))
             top_risks.append(1.0 / (1.0 + agent_min))
         top = np.sort(np.asarray(top_risks, dtype=np.float32))[::-1]
         top = np.pad(top[:3], (0, max(0, 3 - len(top))), constant_values=0.0)

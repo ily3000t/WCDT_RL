@@ -9,6 +9,7 @@ from safe_rl.pipeline.common import json_ready, load_stage_config, make_env, par
 from safe_rl.risk.merge_local import candidate_action_risk_samples, candidate_sample_weight, merge_local_stats
 from safe_rl.risk.risk_aggregator import aggregate_episode_reports
 from safe_rl.risk.stage1_sampling import configured_sampling_probs, sampling_summary, select_stage1_action
+from safe_rl.sim.metrics import SAFETY_METRIC_VERSION
 from safe_rl.utils.config import prepare_run_dir
 from safe_rl.utils.io import append_jsonl
 from safe_rl.utils.progress import TensorboardLogger, progress_iter, stage_log
@@ -83,6 +84,8 @@ def run(cfg) -> Path:
     history_edge_roles: list[np.ndarray] = []
     future_lane_indices: list[np.ndarray] = []
     future_edge_roles: list[np.ndarray] = []
+    agent_lengths: list[np.ndarray] = []
+    agent_widths: list[np.ndarray] = []
     reports: list[dict] = []
     events_path = stage_dir / "risk_events.jsonl"
     replay_dir = stage_dir / "replay"
@@ -177,6 +180,8 @@ def run(cfg) -> Path:
                                 "min_distance": info.get("min_distance"),
                                 "min_ttc": info.get("min_ttc"),
                                 "max_drac": info.get("max_drac"),
+                                "geometric_overlap": info.get("geometric_overlap"),
+                                "closest_vehicle_id": info.get("closest_vehicle_id"),
                                 "merge_gap": local.target_lane_gap,
                                 "target_front_gap": local.target_front_gap,
                                 "target_rear_gap": local.target_rear_gap,
@@ -201,6 +206,7 @@ def run(cfg) -> Path:
                     seed=episode_seed,
                     actions=episode_actions,
                     shield_enabled=False,
+                    safety_metric_version=SAFETY_METRIC_VERSION,
                     notes={"episode_report": episode_report},
                 )
                 stage_log("stage1", f"episode={episode} replay={replay_dir / f'episode_{episode:04d}.json'}")
@@ -216,7 +222,9 @@ def run(cfg) -> Path:
                 sample_history_edge_roles,
                 sample_future_lane_indices,
                 sample_future_edge_roles,
-            ) = env.trajectory_window_samples()
+                sample_agent_lengths,
+                sample_agent_widths,
+            ) = env.trajectory_window_samples(include_dimensions=True)
             if hist.shape[0] > 0:
                 history_samples.append(hist)
                 future_samples.append(fut)
@@ -229,6 +237,8 @@ def run(cfg) -> Path:
                 history_edge_roles.append(sample_history_edge_roles)
                 future_lane_indices.append(sample_future_lane_indices)
                 future_edge_roles.append(sample_future_edge_roles)
+                agent_lengths.append(sample_agent_lengths)
+                agent_widths.append(sample_agent_widths)
     finally:
         env.close()
 
@@ -241,7 +251,10 @@ def run(cfg) -> Path:
         agent_mask=np.concatenate(agent_masks, axis=0) if agent_masks else np.zeros((0, 1)),
         agent_lane_index=np.concatenate(agent_lane_indices, axis=0) if agent_lane_indices else np.zeros((0, 1), dtype=np.int64),
         agent_edge_role=np.concatenate(agent_edge_roles, axis=0) if agent_edge_roles else np.zeros((0, 1), dtype=np.int64),
-        trajectory_schema_version=np.asarray(2, dtype=np.int64),
+        trajectory_schema_version=np.asarray(3, dtype=np.int64),
+        safety_metric_version=np.asarray(SAFETY_METRIC_VERSION),
+        agent_length=np.concatenate(agent_lengths, axis=0) if agent_lengths else np.full((0, 1), 4.8),
+        agent_width=np.concatenate(agent_widths, axis=0) if agent_widths else np.full((0, 1), 1.8),
         agent_history_valid_mask=(
             np.concatenate(history_valid_masks, axis=0) if history_valid_masks else np.zeros((0, 1, 1))
         ),
@@ -300,7 +313,8 @@ def run(cfg) -> Path:
         "candidate_risk_sample_count": len(transitions["actions"]),
         "trajectory_sample_count": int(sum(item.shape[0] for item in history_samples)),
         "trajectory_schema": {
-            "version": 2,
+            "version": 3,
+            "safety_metric_version": SAFETY_METRIC_VERSION,
             **trajectory_coverage,
         },
         "action_sampling": {

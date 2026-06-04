@@ -102,6 +102,7 @@ from safe_rl.risk.merge_local import (
     candidate_action_risk_samples,
     continuous_risk_target,
     is_candidate_legal,
+    rollout_ego,
     route_aware_constant_velocity_rollout,
     target_lane_neighbors,
 )
@@ -115,7 +116,7 @@ from safe_rl.pipeline.stage3_train_ppo import _prediction_loss_summary, _predict
 from safe_rl.shield.safety_shield import SafetyShield
 from safe_rl.sim.action_space import ACTIONS, decode_action
 from safe_rl.sim.history_buffer import HistoryBuffer
-from safe_rl.sim.metrics import compute_step_metrics
+from safe_rl.sim.metrics import INF_TTC, bbox_gap, compute_step_metrics, drac, geometric_overlap, relative_ttc
 from safe_rl.sim.scenario_validation import validate_scenario_geometry
 from safe_rl.sim.scenario_semantics import (
     EDGE_ROLE_AUXILIARY,
@@ -150,6 +151,36 @@ def test_metrics_detect_near_miss():
     metrics = compute_step_metrics(ego, [ego, other], collision=False)
     assert metrics.min_distance < 1.0
     assert metrics.near_miss
+
+
+def test_oriented_box_gap_does_not_flag_parallel_adjacent_lane_vehicle():
+    ego = VehicleState("ego", 10.0, 0.0, 0.0, 10.0, 0, "lane0", 0.0, "main_aux")
+    other = VehicleState("other", 10.0, 3.2, 0.0, 10.0, 1, "lane1", 0.0, "main_aux")
+    assert bbox_gap(ego, other) == pytest.approx(1.4, abs=1.0e-6)
+    assert not geometric_overlap(ego, other)
+    assert relative_ttc(ego, other) == INF_TTC
+    assert drac(ego, other) == 0.0
+    metrics = compute_step_metrics(ego, [ego, other], collision=False)
+    assert not metrics.near_miss
+    assert not metrics.geometric_overlap
+
+
+def test_oriented_box_gap_matches_same_lane_longitudinal_clearance():
+    ego = VehicleState("ego", 10.0, 0.0, 0.0, 10.0, 0, "lane", 0.0, "main_aux")
+    other = VehicleState("other", 20.0, 0.0, 0.0, 10.0, 0, "lane", 0.0, "main_aux")
+    assert bbox_gap(ego, other) == pytest.approx(5.2, abs=1.0e-6)
+
+
+def test_oriented_box_overlap_and_crossing_path_ttc():
+    ego = VehicleState("ego", 2.4, 0.0, 0.0, 10.0, 0, "lane", 0.0, "main_aux")
+    overlap = VehicleState("overlap", 2.4, 0.0, 0.0, 0.0, 0, "lane", 0.0, "main_aux")
+    assert geometric_overlap(ego, overlap)
+    assert bbox_gap(ego, overlap) == 0.0
+
+    crossing = VehicleState("crossing", 10.0, 7.6, -0.5 * np.pi, 10.0, 0, "lane", 0.0, "main_aux")
+    ttc = relative_ttc(ego, crossing)
+    assert 0.0 < ttc < 2.0
+    assert drac(ego, crossing) > 0.0
 
 
 def test_metrics_merge_gap_supports_auxiliary_corridor_and_target_lane_filter():
@@ -288,6 +319,18 @@ def test_route_aware_rollout_projects_cross_edge_position_from_net_geometry():
     assert on_aux.lane_pos == pytest.approx(5.0, abs=0.05)
     assert on_aux.x == pytest.approx(306.50, abs=0.10)
     assert on_aux.y == pytest.approx(53.8)
+
+
+def test_candidate_lane_change_rollout_is_continuous():
+    cfg = load_config()
+    ego = VehicleState("ego", 400.0, 53.8, 0.0, 10.0, 0, "main_aux_0", 100.0, "main_aux")
+    merge_action = next(action for action in ACTIONS if action.name == "left_hold")
+    rollout, missed = rollout_ego(ego, merge_action, 12, 0.1, cfg)
+    assert not missed
+    assert rollout[0].y > ego.y
+    assert rollout[0].y < 57.0
+    assert rollout[-1].lane_index == 1
+    assert rollout[-1].y == pytest.approx(57.0, abs=0.05)
 
 
 def test_taper_miss_is_separate_from_lane_oob():
@@ -1493,7 +1536,7 @@ def test_wcdt_v3_early_stopping_disables_without_validation():
     assert enabled["patience"] == 10
 
 
-def test_wcdt_v2_old_checkpoint_without_metadata_still_loads(tmp_path):
+def test_wcdt_v2_old_checkpoint_without_metadata_is_rejected(tmp_path):
     torch = pytest.importorskip("torch")
     cfg = load_config()
     model = WcDTV2ResidualPredictor(WCDT_V2_INPUT_DIM, horizon_steps=3, hidden_dim=8)
@@ -1506,10 +1549,8 @@ def test_wcdt_v2_old_checkpoint_without_metadata_still_loads(tmp_path):
         },
         checkpoint,
     )
-    models, payload, _device = load_v2_ensemble(cfg, checkpoint, torch.device("cpu"))
-    assert len(models) == 1
-    assert "architecture_version" not in payload
-    assert "loss_version" not in payload
+    with pytest.raises(ValueError, match="architecture_version"):
+        load_v2_ensemble(cfg, checkpoint, torch.device("cpu"))
 
 
 def test_stage2_v2_v3_training_rejects_legacy_unmasked_trajectory_buffer(tmp_path):

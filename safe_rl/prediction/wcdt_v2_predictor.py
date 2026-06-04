@@ -12,6 +12,7 @@ from safe_rl.prediction.merge_safety_loss import (
     ROLE_TARGET_REAR,
     merge_safety_loss,
 )
+from safe_rl.sim.metrics import SAFETY_METRIC_VERSION
 from safe_rl.sim.scenario_semantics import (
     EDGE_ROLE_AUXILIARY,
     EDGE_ROLE_RAMP,
@@ -216,6 +217,8 @@ def build_v2_numpy_batch(
     history_valid_mask: np.ndarray | None = None,
     history_lane_indices: np.ndarray | None = None,
     history_edge_roles: np.ndarray | None = None,
+    agent_length: np.ndarray | None = None,
+    agent_width: np.ndarray | None = None,
 ) -> dict[str, np.ndarray]:
     sample_indices = np.asarray(indices, dtype=np.int64)
     horizon = int(min(future.shape[2], cfg.prediction.get("wcdt_v2_horizon_steps", cfg.scenario.forecast_horizon_steps)))
@@ -232,9 +235,17 @@ def build_v2_numpy_batch(
     selected_future_valid_mask = np.zeros((batch, max_agents, horizon), dtype=np.float32)
     ego_future_valid_mask = np.ones((batch, horizon), dtype=np.float32)
     selected_indices = np.full((batch, max_agents), -1, dtype=np.int64)
+    selected_length = np.full((batch, max_agents), 4.8, dtype=np.float32)
+    selected_width = np.full((batch, max_agents), 1.8, dtype=np.float32)
+    ego_length = np.full((batch,), 4.8, dtype=np.float32)
+    ego_width = np.full((batch,), 1.8, dtype=np.float32)
 
     for row, sample_idx in enumerate(sample_indices):
         ego_latest = history[sample_idx, 0, -1]
+        if agent_length is not None:
+            ego_length[row] = float(agent_length[sample_idx, 0])
+        if agent_width is not None:
+            ego_width[row] = float(agent_width[sample_idx, 0])
         ego_future[row] = future[sample_idx, 0, :horizon]
         if future_valid_mask is not None:
             ego_future_valid_mask[row] = future_valid_mask[sample_idx, 0, :horizon]
@@ -273,6 +284,10 @@ def build_v2_numpy_batch(
             )
             role_ids[row, actor_row] = role
             selected_indices[row, actor_row] = int(agent_idx)
+            if agent_length is not None:
+                selected_length[row, actor_row] = float(agent_length[sample_idx, agent_idx])
+            if agent_width is not None:
+                selected_width[row, actor_row] = float(agent_width[sample_idx, agent_idx])
     return {
         "features": features,
         "baseline": baseline,
@@ -283,6 +298,10 @@ def build_v2_numpy_batch(
         "future_valid_mask": selected_future_valid_mask,
         "ego_future_valid_mask": ego_future_valid_mask,
         "selected_indices": selected_indices,
+        "agent_length": selected_length,
+        "agent_width": selected_width,
+        "ego_length": ego_length,
+        "ego_width": ego_width,
     }
 
 
@@ -346,6 +365,10 @@ def tensorize_batch(batch: dict[str, np.ndarray], torch: Any, device: Any) -> di
         "ego_future": torch.tensor(batch["ego_future"], dtype=torch.float32, device=device),
         "future_valid_mask": torch.tensor(batch["future_valid_mask"], dtype=torch.float32, device=device),
         "ego_future_valid_mask": torch.tensor(batch["ego_future_valid_mask"], dtype=torch.float32, device=device),
+        "agent_length": torch.tensor(batch["agent_length"], dtype=torch.float32, device=device),
+        "agent_width": torch.tensor(batch["agent_width"], dtype=torch.float32, device=device),
+        "ego_length": torch.tensor(batch["ego_length"], dtype=torch.float32, device=device),
+        "ego_width": torch.tensor(batch["ego_width"], dtype=torch.float32, device=device),
     }
 
 
@@ -358,6 +381,10 @@ def v2_loss(
     weights: dict[str, float] | None = None,
     future_valid_mask=None,
     ego_future_valid_mask=None,
+    agent_length=None,
+    agent_width=None,
+    ego_length=None,
+    ego_width=None,
 ):
     return merge_safety_loss(
         pred,
@@ -368,6 +395,10 @@ def v2_loss(
         weights,
         future_valid_mask=future_valid_mask,
         ego_future_valid_mask=ego_future_valid_mask,
+        agent_length=agent_length,
+        agent_width=agent_width,
+        ego_length=ego_length,
+        ego_width=ego_width,
     )
 
 
@@ -375,6 +406,20 @@ def load_v2_ensemble(config: Any, checkpoint: str | Path, device: Any | None = N
     torch, _nn = _require_torch()
     device = device or _resolve_device(config, torch)
     payload = torch.load(checkpoint, map_location=device)
+    architecture = payload.get("architecture_version")
+    if architecture != ARCHITECTURE_VERSION:
+        raise ValueError(f"unsupported WcDT v2 architecture_version={architecture!r}; expected {ARCHITECTURE_VERSION!r}")
+    loss_version = payload.get("loss_version")
+    if loss_version != LOSS_VERSION:
+        raise ValueError(f"unsupported WcDT v2 loss_version={loss_version!r}; expected {LOSS_VERSION!r}")
+    schema_version = int(payload.get("trajectory_schema_version", -1))
+    if schema_version != 3:
+        raise ValueError(f"unsupported WcDT v2 trajectory_schema_version={schema_version!r}; expected 3")
+    metric_version = str(payload.get("safety_metric_version", ""))
+    if metric_version != SAFETY_METRIC_VERSION:
+        raise ValueError(
+            f"unsupported WcDT v2 safety_metric_version={metric_version!r}; expected {SAFETY_METRIC_VERSION!r}"
+        )
     horizon = int(payload.get("horizon_steps", config.forecast_features.get("horizon_steps", config.scenario.forecast_horizon_steps)))
     hidden_dim = int(payload.get("hidden_dim", config.prediction.get("wcdt_v2_hidden_dim", 128)))
     states = payload.get("model_state_dicts")

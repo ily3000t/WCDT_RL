@@ -9,6 +9,7 @@ import numpy as np
 
 from safe_rl.pipeline.common import latest_stage_file, load_stage_config, parse_config_arg, write_report
 from safe_rl.prediction.forecast_feature_augmentor import forecast_target_lane_gap_from_trajectories
+from safe_rl.sim.metrics import SAFETY_METRIC_VERSION, trajectory_min_obb_gap
 from safe_rl.sim.scenario_semantics import (
     EDGE_ROLE_AUXILIARY,
     EDGE_ROLE_RAMP,
@@ -225,7 +226,14 @@ def _trajectory_schema_version(data: Any) -> int:
     return int(np.asarray(data["trajectory_schema_version"]).reshape(-1)[0])
 
 
-def _require_trajectory_schema_v2(data: Any, consumer: str) -> None:
+def _safety_metric_version(data: Any) -> str:
+    if not _has_key(data, "safety_metric_version"):
+        return ""
+    value = np.asarray(data["safety_metric_version"]).reshape(-1)[0]
+    return value.decode("utf-8") if isinstance(value, bytes) else str(value)
+
+
+def _require_trajectory_schema_v3(data: Any, consumer: str) -> None:
     version = _trajectory_schema_version(data)
     required = {
         "agent_history_valid_mask",
@@ -234,13 +242,24 @@ def _require_trajectory_schema_v2(data: Any, consumer: str) -> None:
         "agent_history_edge_role",
         "agent_future_lane_index",
         "agent_future_edge_role",
+        "agent_length",
+        "agent_width",
+        "safety_metric_version",
     }
     missing = sorted(key for key in required if not _has_key(data, key))
-    if version < 2 or missing:
+    metric_version = _safety_metric_version(data)
+    if version < 3 or missing or metric_version != SAFETY_METRIC_VERSION:
         raise ValueError(
-            f"{consumer} training requires trajectory_schema_version>=2 with timestep masks and route metadata; "
-            f"found version={version}, missing={missing}. Re-run Stage1 with a new run id."
+            f"{consumer} training requires trajectory_schema_version>=3 and "
+            f"safety_metric_version={SAFETY_METRIC_VERSION!r}; found version={version}, "
+            f"safety_metric_version={metric_version!r}, missing={missing}. Re-run Stage1 with a new run id."
         )
+
+
+def _require_trajectory_schema_v2(data: Any, consumer: str) -> None:
+    """Compatibility alias; current formal training still requires schema v3."""
+
+    _require_trajectory_schema_v3(data, consumer)
 
 
 def _risk_training_arrays(data: Any, risk_type_count: int = 6) -> dict[str, np.ndarray]:
@@ -842,6 +861,7 @@ def _train_risk_module(
             "training_summary": training_summary,
             "temperature": float(runtime_temperature),
             "apply_temperature": bool(apply_runtime_temperature),
+            "safety_metric_version": SAFETY_METRIC_VERSION,
         },
         checkpoint,
     )
@@ -852,6 +872,7 @@ def _train_risk_module(
         "risk_training_summary": training_summary,
         "risk_ranking_summary": ranking_summary,
         "risk_calibration_summary": calibration_summary,
+        "risk_safety_metric_version": SAFETY_METRIC_VERSION,
     }
 
 
@@ -1081,25 +1102,22 @@ def _future_min_distance(
     other_mask: np.ndarray,
     future_valid_mask: np.ndarray | None = None,
     ego_future_valid_mask: np.ndarray | None = None,
+    agent_length: np.ndarray | None = None,
+    agent_width: np.ndarray | None = None,
+    ego_length: float = 4.8,
+    ego_width: float = 1.8,
 ) -> float:
-    min_distance = 1.0e6
-    horizon = min(ego_future.shape[0], other_future.shape[1])
-    for agent_idx in range(other_future.shape[0]):
-        if float(other_mask[agent_idx]) <= 0.0:
-            continue
-        valid = np.ones((horizon,), dtype=bool)
-        if future_valid_mask is not None:
-            valid &= np.asarray(future_valid_mask[agent_idx, :horizon]) > 0.5
-        if ego_future_valid_mask is not None:
-            valid &= np.asarray(ego_future_valid_mask[:horizon]) > 0.5
-        if not np.any(valid):
-            continue
-        distances = np.linalg.norm(
-            other_future[agent_idx, :horizon, :2][valid] - ego_future[:horizon, :2][valid],
-            axis=-1,
-        ) - 3.0
-        min_distance = min(min_distance, float(np.min(np.maximum(0.0, distances))))
-    return float(min_distance)
+    return trajectory_min_obb_gap(
+        ego_future,
+        other_future,
+        other_mask,
+        future_valid_mask,
+        ego_future_valid_mask,
+        agent_length,
+        agent_width,
+        ego_length,
+        ego_width,
+    )
 
 
 def _target_role_gap_abs_errors(
@@ -1413,7 +1431,7 @@ def _build_wcdt_v2_loader(
         return None
     if indices.size == 0:
         return None
-    _require_trajectory_schema_v2(data, "WcDT v2")
+    _require_trajectory_schema_v3(data, "WcDT v2")
     batch = build_v2_numpy_batch(
         cfg,
         data["agent_history"],
@@ -1423,6 +1441,8 @@ def _build_wcdt_v2_loader(
         lane_indices=data["agent_lane_index"] if "agent_lane_index" in data else None,
         edge_roles=data["agent_edge_role"] if "agent_edge_role" in data else None,
         future_valid_mask=data["agent_future_valid_mask"],
+        agent_length=data["agent_length"],
+        agent_width=data["agent_width"],
     )
     dataset = TensorDataset(
         torch.tensor(batch["features"], dtype=torch.float32),
@@ -1433,6 +1453,10 @@ def _build_wcdt_v2_loader(
         torch.tensor(batch["ego_future"], dtype=torch.float32),
         torch.tensor(batch["future_valid_mask"], dtype=torch.float32),
         torch.tensor(batch["ego_future_valid_mask"], dtype=torch.float32),
+        torch.tensor(batch["agent_length"], dtype=torch.float32),
+        torch.tensor(batch["agent_width"], dtype=torch.float32),
+        torch.tensor(batch["ego_length"], dtype=torch.float32),
+        torch.tensor(batch["ego_width"], dtype=torch.float32),
     )
     return DataLoader(dataset, batch_size=_wcdt_v2_batch_size(cfg), shuffle=shuffle, **_loader_kwargs(cfg, device))
 
@@ -1457,7 +1481,7 @@ def _wcdt_v2_validation_metrics(cfg: Any, models: list[Any], loader: Any, device
     for model in models:
         model.eval()
     with torch.no_grad():
-        for features, baseline, target, mask, role_ids, ego_future, future_valid_mask, ego_future_valid_mask in loader:
+        for features, baseline, target, mask, role_ids, ego_future, future_valid_mask, ego_future_valid_mask, agent_length, agent_width, ego_length, ego_width in loader:
             batch = {
                 "features": features.to(device, non_blocking=pin_memory),
                 "baseline": baseline.to(device, non_blocking=pin_memory),
@@ -1467,6 +1491,10 @@ def _wcdt_v2_validation_metrics(cfg: Any, models: list[Any], loader: Any, device
                 "ego_future": ego_future.to(device, non_blocking=pin_memory),
                 "future_valid_mask": future_valid_mask.to(device, non_blocking=pin_memory),
                 "ego_future_valid_mask": ego_future_valid_mask.to(device, non_blocking=pin_memory),
+                "agent_length": agent_length.to(device, non_blocking=pin_memory),
+                "agent_width": agent_width.to(device, non_blocking=pin_memory),
+                "ego_length": ego_length.to(device, non_blocking=pin_memory),
+                "ego_width": ego_width.to(device, non_blocking=pin_memory),
             }
             pred, uncertainty = ensemble_predict(models, batch)
             loss, components = v2_loss(
@@ -1478,6 +1506,10 @@ def _wcdt_v2_validation_metrics(cfg: Any, models: list[Any], loader: Any, device
                 dict(cfg.prediction.get("wcdt_v2_loss_weights", {})),
                 future_valid_mask=batch["future_valid_mask"],
                 ego_future_valid_mask=batch["ego_future_valid_mask"],
+                agent_length=batch["agent_length"],
+                agent_width=batch["agent_width"],
+                ego_length=batch["ego_length"],
+                ego_width=batch["ego_width"],
             )
             val_losses.append(float(loss.detach().cpu()))
             for name, value in components.items():
@@ -1490,6 +1522,10 @@ def _wcdt_v2_validation_metrics(cfg: Any, models: list[Any], loader: Any, device
             role_ids_np = batch["role_ids"].detach().cpu().numpy()
             future_valid_np = batch["future_valid_mask"].detach().cpu().numpy()
             ego_future_valid_np = batch["ego_future_valid_mask"].detach().cpu().numpy()
+            agent_length_np = batch["agent_length"].detach().cpu().numpy()
+            agent_width_np = batch["agent_width"].detach().cpu().numpy()
+            ego_length_np = batch["ego_length"].detach().cpu().numpy()
+            ego_width_np = batch["ego_width"].detach().cpu().numpy()
             for row in range(pred_np.shape[0]):
                 errors = _masked_trajectory_errors(
                     pred_np[row],
@@ -1506,10 +1542,26 @@ def _wcdt_v2_validation_metrics(cfg: Any, models: list[Any], loader: Any, device
                 uncertainty_values.append(float(uncertainty_np[row]))
                 uncertainty_fde_values.append(row_fde)
                 pred_min = _future_min_distance(
-                    ego_np[row], pred_np[row], mask_np[row], future_valid_np[row], ego_future_valid_np[row]
+                    ego_np[row],
+                    pred_np[row],
+                    mask_np[row],
+                    future_valid_np[row],
+                    ego_future_valid_np[row],
+                    agent_length_np[row],
+                    agent_width_np[row],
+                    float(ego_length_np[row]),
+                    float(ego_width_np[row]),
                 )
                 actual_min = _future_min_distance(
-                    ego_np[row], target_np[row], mask_np[row], future_valid_np[row], ego_future_valid_np[row]
+                    ego_np[row],
+                    target_np[row],
+                    mask_np[row],
+                    future_valid_np[row],
+                    ego_future_valid_np[row],
+                    agent_length_np[row],
+                    agent_width_np[row],
+                    float(ego_length_np[row]),
+                    float(ego_width_np[row]),
                 )
                 future_min_distance_errors.append(float(pred_min - actual_min))
                 min_distance_abs_error = abs(float(pred_min - actual_min))
@@ -1571,7 +1623,7 @@ def _wcdt_v2_cv_baseline_metrics(cfg: Any, loader: Any, device: Any, pin_memory:
     target_gap_abs_errors: list[float] = []
     target_front_gap_abs_errors: list[float] = []
     target_rear_gap_abs_errors: list[float] = []
-    for features, baseline, target, mask, role_ids, ego_future, future_valid_mask, ego_future_valid_mask in loader:
+    for features, baseline, target, mask, role_ids, ego_future, future_valid_mask, ego_future_valid_mask, agent_length, agent_width, ego_length, ego_width in loader:
         pred_np = baseline.numpy()
         target_np = target.numpy()
         mask_np = mask.numpy()
@@ -1579,6 +1631,10 @@ def _wcdt_v2_cv_baseline_metrics(cfg: Any, loader: Any, device: Any, pin_memory:
         role_ids_np = role_ids.numpy()
         future_valid_np = future_valid_mask.numpy()
         ego_future_valid_np = ego_future_valid_mask.numpy()
+        agent_length_np = agent_length.numpy()
+        agent_width_np = agent_width.numpy()
+        ego_length_np = ego_length.numpy()
+        ego_width_np = ego_width.numpy()
         for row in range(pred_np.shape[0]):
             errors = _masked_trajectory_errors(
                 pred_np[row], target_np[row], mask_np[row], future_valid_np[row], ego_future_valid_np[row]
@@ -1589,10 +1645,26 @@ def _wcdt_v2_cv_baseline_metrics(cfg: Any, loader: Any, device: Any, pin_memory:
             ade.append(row_ade)
             fde.append(row_fde)
             pred_min = _future_min_distance(
-                ego_np[row], pred_np[row], mask_np[row], future_valid_np[row], ego_future_valid_np[row]
+                ego_np[row],
+                pred_np[row],
+                mask_np[row],
+                future_valid_np[row],
+                ego_future_valid_np[row],
+                agent_length_np[row],
+                agent_width_np[row],
+                float(ego_length_np[row]),
+                float(ego_width_np[row]),
             )
             actual_min = _future_min_distance(
-                ego_np[row], target_np[row], mask_np[row], future_valid_np[row], ego_future_valid_np[row]
+                ego_np[row],
+                target_np[row],
+                mask_np[row],
+                future_valid_np[row],
+                ego_future_valid_np[row],
+                agent_length_np[row],
+                agent_width_np[row],
+                float(ego_length_np[row]),
+                float(ego_width_np[row]),
             )
             future_min_distance_abs_errors.append(abs(float(pred_min - actual_min)))
             role_gap_errors = _target_role_gap_abs_errors(
@@ -1694,6 +1766,10 @@ def _train_wcdt_v2_predictor(
                 ego_future,
                 future_valid_mask,
                 ego_future_valid_mask,
+                agent_length,
+                agent_width,
+                ego_length,
+                ego_width,
             ) in train_loader:
                 features = features.to(device, non_blocking=pin_memory)
                 baseline = baseline.to(device, non_blocking=pin_memory)
@@ -1703,6 +1779,10 @@ def _train_wcdt_v2_predictor(
                 ego_future = ego_future.to(device, non_blocking=pin_memory)
                 future_valid_mask = future_valid_mask.to(device, non_blocking=pin_memory)
                 ego_future_valid_mask = ego_future_valid_mask.to(device, non_blocking=pin_memory)
+                agent_length = agent_length.to(device, non_blocking=pin_memory)
+                agent_width = agent_width.to(device, non_blocking=pin_memory)
+                ego_length = ego_length.to(device, non_blocking=pin_memory)
+                ego_width = ego_width.to(device, non_blocking=pin_memory)
                 pred = model(features, baseline)
                 loss, components = v2_loss(
                     pred,
@@ -1713,6 +1793,10 @@ def _train_wcdt_v2_predictor(
                     loss_weights,
                     future_valid_mask=future_valid_mask,
                     ego_future_valid_mask=ego_future_valid_mask,
+                    agent_length=agent_length,
+                    agent_width=agent_width,
+                    ego_length=ego_length,
+                    ego_width=ego_width,
                 )
                 optimizer.zero_grad()
                 loss.backward()
@@ -1823,6 +1907,7 @@ def _train_wcdt_v2_predictor(
         "architecture_version": ARCHITECTURE_VERSION,
         "loss_version": LOSS_VERSION,
         "trajectory_schema_version": _trajectory_schema_version(data),
+        "safety_metric_version": _safety_metric_version(data),
         "horizon_steps": int(horizon),
         "history_steps": int(cfg.scenario.history_steps),
         "input_dim": int(INPUT_DIM),
@@ -1852,6 +1937,7 @@ def _train_wcdt_v2_predictor(
         "wcdt_v2_architecture_version": ARCHITECTURE_VERSION,
         "wcdt_v2_loss_version": LOSS_VERSION,
         "wcdt_v2_trajectory_schema_version": _trajectory_schema_version(data),
+        "wcdt_v2_safety_metric_version": _safety_metric_version(data),
         "wcdt_v2_early_stopping_config": early_stopping,
         "wcdt_v2_prediction_best_val_score": float(payload["best_val_score"]),
     }
@@ -1863,7 +1949,7 @@ def _build_wcdt_v3_loader(cfg: Any, data: Any, sample_indices: np.ndarray, devic
 
     if not _has_key(data, "agent_history") or data["agent_history"].shape[0] == 0 or sample_indices.size == 0:
         return None
-    _require_trajectory_schema_v2(data, "WcDT v3")
+    _require_trajectory_schema_v3(data, "WcDT v3")
     batch = build_v3_numpy_batch(
         cfg,
         data["agent_history"],
@@ -1876,6 +1962,8 @@ def _build_wcdt_v3_loader(cfg: Any, data: Any, sample_indices: np.ndarray, devic
         future_valid_mask=data["agent_future_valid_mask"],
         history_lane_indices=data["agent_history_lane_index"],
         history_edge_roles=data["agent_history_edge_role"],
+        agent_length=data["agent_length"],
+        agent_width=data["agent_width"],
     )
     dataset = TensorDataset(
         torch.tensor(batch["history_features"], dtype=torch.float32),
@@ -1891,6 +1979,10 @@ def _build_wcdt_v3_loader(cfg: Any, data: Any, sample_indices: np.ndarray, devic
         torch.tensor(batch["ego_future_valid_mask"], dtype=torch.float32),
         torch.tensor(batch["history_lane_ids"], dtype=torch.long),
         torch.tensor(batch["history_edge_role_ids"], dtype=torch.long),
+        torch.tensor(batch["agent_length"], dtype=torch.float32),
+        torch.tensor(batch["agent_width"], dtype=torch.float32),
+        torch.tensor(batch["ego_length"], dtype=torch.float32),
+        torch.tensor(batch["ego_width"], dtype=torch.float32),
     )
     return DataLoader(dataset, batch_size=_wcdt_v3_batch_size(cfg), shuffle=shuffle, **_loader_kwargs(cfg, device))
 
@@ -1910,6 +2002,10 @@ def _wcdt_v3_tensor_batch(items: tuple[Any, ...], device: Any, pin_memory: bool)
         ego_future_valid_mask,
         history_lane_ids,
         history_edge_role_ids,
+        agent_length,
+        agent_width,
+        ego_length,
+        ego_width,
     ) = items
     return {
         "history_features": history_features.to(device, non_blocking=pin_memory),
@@ -1925,6 +2021,10 @@ def _wcdt_v3_tensor_batch(items: tuple[Any, ...], device: Any, pin_memory: bool)
         "ego_future_valid_mask": ego_future_valid_mask.to(device, non_blocking=pin_memory),
         "history_lane_ids": history_lane_ids.to(device, non_blocking=pin_memory),
         "history_edge_role_ids": history_edge_role_ids.to(device, non_blocking=pin_memory),
+        "agent_length": agent_length.to(device, non_blocking=pin_memory),
+        "agent_width": agent_width.to(device, non_blocking=pin_memory),
+        "ego_length": ego_length.to(device, non_blocking=pin_memory),
+        "ego_width": ego_width.to(device, non_blocking=pin_memory),
     }
 
 
@@ -1960,6 +2060,10 @@ def _wcdt_v3_validation_metrics(cfg: Any, models: list[Any], loader: Any, device
                 dict(cfg.prediction.get("wcdt_v2_loss_weights", {})),
                 future_valid_mask=batch["future_valid_mask"],
                 ego_future_valid_mask=batch["ego_future_valid_mask"],
+                agent_length=batch["agent_length"],
+                agent_width=batch["agent_width"],
+                ego_length=batch["ego_length"],
+                ego_width=batch["ego_width"],
             )
             val_losses.append(float(loss.detach().cpu()))
             for name, value in components.items():
@@ -1972,6 +2076,10 @@ def _wcdt_v3_validation_metrics(cfg: Any, models: list[Any], loader: Any, device
             role_ids_np = batch["role_ids"].detach().cpu().numpy()
             future_valid_np = batch["future_valid_mask"].detach().cpu().numpy()
             ego_future_valid_np = batch["ego_future_valid_mask"].detach().cpu().numpy()
+            agent_length_np = batch["agent_length"].detach().cpu().numpy()
+            agent_width_np = batch["agent_width"].detach().cpu().numpy()
+            ego_length_np = batch["ego_length"].detach().cpu().numpy()
+            ego_width_np = batch["ego_width"].detach().cpu().numpy()
             for row in range(pred_np.shape[0]):
                 errors = _masked_trajectory_errors(
                     pred_np[row],
@@ -1988,10 +2096,26 @@ def _wcdt_v3_validation_metrics(cfg: Any, models: list[Any], loader: Any, device
                 uncertainty_values.append(float(uncertainty_np[row]))
                 uncertainty_fde_values.append(row_fde)
                 pred_min = _future_min_distance(
-                    ego_np[row], pred_np[row], mask_np[row], future_valid_np[row], ego_future_valid_np[row]
+                    ego_np[row],
+                    pred_np[row],
+                    mask_np[row],
+                    future_valid_np[row],
+                    ego_future_valid_np[row],
+                    agent_length_np[row],
+                    agent_width_np[row],
+                    float(ego_length_np[row]),
+                    float(ego_width_np[row]),
                 )
                 actual_min = _future_min_distance(
-                    ego_np[row], target_np[row], mask_np[row], future_valid_np[row], ego_future_valid_np[row]
+                    ego_np[row],
+                    target_np[row],
+                    mask_np[row],
+                    future_valid_np[row],
+                    ego_future_valid_np[row],
+                    agent_length_np[row],
+                    agent_width_np[row],
+                    float(ego_length_np[row]),
+                    float(ego_width_np[row]),
                 )
                 min_distance_error = float(pred_min - actual_min)
                 future_min_distance_errors.append(min_distance_error)
@@ -2061,6 +2185,10 @@ def _wcdt_v3_cv_baseline_metrics(cfg: Any, loader: Any) -> dict[str, Any]:
             ego_future_valid_mask,
             _history_lane_ids,
             _history_edge_role_ids,
+            agent_length,
+            agent_width,
+            ego_length,
+            ego_width,
         ) = items
         pred_np = baseline.numpy()
         target_np = target.numpy()
@@ -2069,6 +2197,10 @@ def _wcdt_v3_cv_baseline_metrics(cfg: Any, loader: Any) -> dict[str, Any]:
         role_ids_np = role_ids.numpy()
         future_valid_np = future_valid_mask.numpy()
         ego_future_valid_np = ego_future_valid_mask.numpy()
+        agent_length_np = agent_length.numpy()
+        agent_width_np = agent_width.numpy()
+        ego_length_np = ego_length.numpy()
+        ego_width_np = ego_width.numpy()
         for row in range(pred_np.shape[0]):
             errors = _masked_trajectory_errors(
                 pred_np[row], target_np[row], mask_np[row], future_valid_np[row], ego_future_valid_np[row]
@@ -2079,10 +2211,26 @@ def _wcdt_v3_cv_baseline_metrics(cfg: Any, loader: Any) -> dict[str, Any]:
             ade.append(row_ade)
             fde.append(row_fde)
             pred_min = _future_min_distance(
-                ego_np[row], pred_np[row], mask_np[row], future_valid_np[row], ego_future_valid_np[row]
+                ego_np[row],
+                pred_np[row],
+                mask_np[row],
+                future_valid_np[row],
+                ego_future_valid_np[row],
+                agent_length_np[row],
+                agent_width_np[row],
+                float(ego_length_np[row]),
+                float(ego_width_np[row]),
             )
             actual_min = _future_min_distance(
-                ego_np[row], target_np[row], mask_np[row], future_valid_np[row], ego_future_valid_np[row]
+                ego_np[row],
+                target_np[row],
+                mask_np[row],
+                future_valid_np[row],
+                ego_future_valid_np[row],
+                agent_length_np[row],
+                agent_width_np[row],
+                float(ego_length_np[row]),
+                float(ego_width_np[row]),
             )
             future_min_distance_abs_errors.append(abs(float(pred_min - actual_min)))
             role_gap_errors = _target_role_gap_abs_errors(
@@ -2195,6 +2343,10 @@ def _train_wcdt_v3_predictor(
                     loss_weights,
                     future_valid_mask=batch["future_valid_mask"],
                     ego_future_valid_mask=batch["ego_future_valid_mask"],
+                    agent_length=batch["agent_length"],
+                    agent_width=batch["agent_width"],
+                    ego_length=batch["ego_length"],
+                    ego_width=batch["ego_width"],
                 )
                 optimizer.zero_grad()
                 loss.backward()
@@ -2295,6 +2447,7 @@ def _train_wcdt_v3_predictor(
         "architecture_version": ARCHITECTURE_VERSION,
         "loss_version": LOSS_VERSION,
         "trajectory_schema_version": _trajectory_schema_version(data),
+        "safety_metric_version": _safety_metric_version(data),
         **model_kwargs,
         "ensemble_size": int(ensemble_size),
         "loss_weights": loss_weights,
@@ -2317,6 +2470,7 @@ def _train_wcdt_v3_predictor(
         "wcdt_v3_architecture_version": ARCHITECTURE_VERSION,
         "wcdt_v3_loss_version": LOSS_VERSION,
         "wcdt_v3_trajectory_schema_version": _trajectory_schema_version(data),
+        "wcdt_v3_safety_metric_version": _safety_metric_version(data),
         "wcdt_v3_early_stopping_config": early_stopping,
         "wcdt_v3_prediction_best_val_score": float(payload["best_val_score"]),
     }
@@ -2341,6 +2495,7 @@ def run(cfg) -> Path:
     tb = TensorboardLogger(stage_dir / "tensorboard", enabled=bool(cfg.run.get("tensorboard", True)))
     initial_prediction_report_path = stage_dir / "stage2_initial_prediction_report.json"
     data = np.load(input_path, allow_pickle=False)
+    _require_trajectory_schema_v3(data, "Stage2")
     stage4_data = np.load(input_stage4_path, allow_pickle=False) if input_stage4_path is not None else None
     risk_data = _merge_risk_buffers(data, stage4_data)
     executed_count = int(data["executed_actions"].shape[0]) if "executed_actions" in data else int(data["actions"].shape[0])
@@ -2374,6 +2529,8 @@ def run(cfg) -> Path:
         "risk_transition_count": int(risk_data["actions"].shape[0]),
         "tensorboard": str(stage_dir / "tensorboard"),
         "device": str(device),
+        "trajectory_schema_version": _trajectory_schema_version(data),
+        "safety_metric_version": _safety_metric_version(data),
         "prediction_train_enabled": bool(cfg.prediction.get("train_enabled", True)),
         "wcdt_v1_train_enabled": bool(cfg.prediction.get("wcdt_v1_train_enabled", False)),
         "wcdt_v2_train_enabled": bool(cfg.prediction.get("wcdt_v2_train_enabled", True)),
@@ -2395,6 +2552,8 @@ def run(cfg) -> Path:
                 "stage": "stage2_initial_prediction",
                 "run_id": cfg.run.run_id,
                 "input_stage1": str(input_path),
+                "trajectory_schema_version": _trajectory_schema_version(data),
+                "safety_metric_version": _safety_metric_version(data),
                 "prediction_checkpoint": report.get("prediction_checkpoint"),
                 "prediction_best_checkpoint": report.get("prediction_best_checkpoint"),
                 "prediction_loss_history": report.get("prediction_loss_history", []),

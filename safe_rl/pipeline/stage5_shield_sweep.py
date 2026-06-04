@@ -17,6 +17,7 @@ from safe_rl.pipeline.stage5_paired_eval import (
     _shield_acceptance,
 )
 from safe_rl.rl.evaluation import evaluate_ppo
+from safe_rl.sim.metrics import SAFETY_METRIC_VERSION
 from safe_rl.utils.config import REPO_ROOT, clone_with_overrides, load_config, _to_config_dict
 from safe_rl.utils.progress import TensorboardLogger, stage_log
 
@@ -498,6 +499,9 @@ def run(cfg, include_aggressive: bool = False, include_calibrated: bool = False)
         "stage": "stage5_sweep",
         "run_id": cfg.run.run_id,
         "config": str(config_path),
+        "safety_metric_version": str(
+            cfg.risk_module.get("safety_metric_version", SAFETY_METRIC_VERSION)
+        ),
         "risk_checkpoint": risk_checkpoint,
         "seeds": seeds,
         "include_aggressive": bool(include_aggressive),

@@ -6,6 +6,7 @@ from pathlib import Path
 from safe_rl.prediction.forecast_feature_augmentor import ForecastFeatureAugmentor
 from safe_rl.pipeline.common import load_stage_config, make_env, parse_config_arg, write_report
 from safe_rl.rl.ppo import train_ppo
+from safe_rl.sim.metrics import SAFETY_METRIC_VERSION
 from safe_rl.utils.config import prepare_run_dir
 from safe_rl.utils.progress import stage_log
 
@@ -128,6 +129,9 @@ def run(cfg):
     )
     report["observation_dim"] = int(observation_shape[0]) if observation_shape else 0
     report["observation_shape"] = observation_shape
+    report["safety_metric_version"] = str(
+        cfg.risk_module.get("safety_metric_version", SAFETY_METRIC_VERSION)
+    )
     write_report(stage_dir / "stage3_training_report.json", report)
     stage_log("stage3", f"tensorboard={stage_dir / 'tensorboard'}")
     stage_log("stage3", f"report={stage_dir / 'stage3_training_report.json'}")

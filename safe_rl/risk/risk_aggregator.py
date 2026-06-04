@@ -77,10 +77,36 @@ def aggregate_episode_reports(reports: list[dict]) -> dict:
         dtype=np.float32,
     )
     taper_misses = np.asarray([float(bool(report.get("taper_miss", False))) for report in reports], dtype=np.float32)
+    geometric_overlaps = np.asarray(
+        [float(bool(report.get("geometric_overlap", False))) for report in reports],
+        dtype=np.float32,
+    )
+    first_merge_request_distance = np.asarray(
+        [
+            float(report["first_merge_request_distance_to_taper"])
+            for report in reports
+            if report.get("first_merge_request_distance_to_taper") is not None
+        ],
+        dtype=np.float32,
+    )
+    first_target_entry_distance = np.asarray(
+        [
+            float(report["first_target_lane_entry_distance_to_taper"])
+            for report in reports
+            if report.get("first_target_lane_entry_distance_to_taper") is not None
+        ],
+        dtype=np.float32,
+    )
+    safe_merge_opportunities = int(sum(int(report.get("safe_merge_opportunity_count", 0)) for report in reports))
+    missed_safe_merge_opportunities = int(
+        sum(int(report.get("missed_safe_merge_opportunity_count", 0)) for report in reports)
+    )
     return {
         "episodes": len(reports),
         "collision_rate": float(np.mean(collisions)),
         "near_miss_rate": float(np.mean(near_misses)),
+        "geometric_overlap_rate": float(np.mean(geometric_overlaps)),
+        "geometric_overlap_count": int(np.sum(geometric_overlaps)),
         "proxy_collision_rate": float(np.mean(proxy_collisions)),
         "safety_violation_rate": float(np.mean(safety_violations)),
         "proxy_collision_count": int(np.sum(proxy_collision_counts)),
@@ -109,4 +135,23 @@ def aggregate_episode_reports(reports: list[dict]) -> dict:
         "emergency_fallback_count": int(np.sum(emergency_fallbacks)),
         "taper_miss_rate": float(np.mean(taper_misses)) if taper_misses.size else 0.0,
         "taper_miss_count": int(np.sum(taper_misses)),
+        "first_merge_request_distance_to_taper_mean": (
+            float(np.mean(first_merge_request_distance)) if first_merge_request_distance.size else None
+        ),
+        "first_merge_request_distance_to_taper_p50": (
+            float(np.percentile(first_merge_request_distance, 50)) if first_merge_request_distance.size else None
+        ),
+        "first_target_lane_entry_distance_to_taper_mean": (
+            float(np.mean(first_target_entry_distance)) if first_target_entry_distance.size else None
+        ),
+        "first_target_lane_entry_distance_to_taper_p50": (
+            float(np.percentile(first_target_entry_distance, 50)) if first_target_entry_distance.size else None
+        ),
+        "safe_merge_opportunity_count": safe_merge_opportunities,
+        "missed_safe_merge_opportunity_count": missed_safe_merge_opportunities,
+        "missed_safe_merge_opportunity_rate": (
+            float(missed_safe_merge_opportunities / safe_merge_opportunities)
+            if safe_merge_opportunities
+            else 0.0
+        ),
     }

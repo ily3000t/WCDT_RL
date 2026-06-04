@@ -6,6 +6,7 @@ from typing import Any
 import numpy as np
 
 from safe_rl.prediction.merge_safety_loss import LOSS_VERSION, merge_safety_loss
+from safe_rl.sim.metrics import SAFETY_METRIC_VERSION
 from safe_rl.prediction.wcdt_v2_predictor import (
     ROLE_COUNT,
     _constant_velocity_future,
@@ -21,7 +22,7 @@ HISTORY_INPUT_DIM = 10
 LANE_EMBEDDING_COUNT = 17
 EDGE_ROLE_EMBEDDING_COUNT = 5
 ARCHITECTURE_VERSION = "wcdt_v3_temporal_actor_transformer_v2"
-TRAJECTORY_SCHEMA_VERSION = 2
+TRAJECTORY_SCHEMA_VERSION = 3
 
 
 def _require_torch():
@@ -93,6 +94,8 @@ def build_v3_numpy_batch(
     future_valid_mask: np.ndarray | None = None,
     history_lane_indices: np.ndarray | None = None,
     history_edge_roles: np.ndarray | None = None,
+    agent_length: np.ndarray | None = None,
+    agent_width: np.ndarray | None = None,
 ) -> dict[str, np.ndarray]:
     sample_indices = np.asarray(indices, dtype=np.int64)
     history_steps = int(history.shape[2])
@@ -115,10 +118,18 @@ def build_v3_numpy_batch(
     selected_history_lane_ids = np.zeros((batch, max_agents, history_steps), dtype=np.int64)
     selected_history_edge_role_ids = np.zeros((batch, max_agents, history_steps), dtype=np.int64)
     selected_indices = np.full((batch, max_agents), -1, dtype=np.int64)
+    selected_length = np.full((batch, max_agents), 4.8, dtype=np.float32)
+    selected_width = np.full((batch, max_agents), 1.8, dtype=np.float32)
+    ego_length = np.full((batch,), 4.8, dtype=np.float32)
+    ego_width = np.full((batch,), 1.8, dtype=np.float32)
 
     for row, sample_idx in enumerate(sample_indices):
         ego_history = history[sample_idx, 0]
         ego_latest = ego_history[-1]
+        if agent_length is not None:
+            ego_length[row] = float(agent_length[sample_idx, 0])
+        if agent_width is not None:
+            ego_width[row] = float(agent_width[sample_idx, 0])
         ego_future[row] = future[sample_idx, 0, :horizon]
         if future_valid_mask is not None:
             ego_future_valid_mask[row] = future_valid_mask[sample_idx, 0, :horizon]
@@ -166,6 +177,10 @@ def build_v3_numpy_batch(
                     dtype=np.int64,
                 )
             selected_indices[row, actor_row] = int(agent_idx)
+            if agent_length is not None:
+                selected_length[row, actor_row] = float(agent_length[sample_idx, agent_idx])
+            if agent_width is not None:
+                selected_width[row, actor_row] = float(agent_width[sample_idx, agent_idx])
     return {
         "history_features": history_features,
         "baseline": baseline,
@@ -181,6 +196,10 @@ def build_v3_numpy_batch(
         "history_lane_ids": selected_history_lane_ids,
         "history_edge_role_ids": selected_history_edge_role_ids,
         "selected_indices": selected_indices,
+        "agent_length": selected_length,
+        "agent_width": selected_width,
+        "ego_length": ego_length,
+        "ego_width": ego_width,
     }
 
 
@@ -337,6 +356,10 @@ def tensorize_v3_batch(batch: dict[str, np.ndarray], torch: Any, device: Any) ->
         "ego_future_valid_mask": torch.tensor(batch["ego_future_valid_mask"], dtype=torch.float32, device=device),
         "history_lane_ids": torch.tensor(batch["history_lane_ids"], dtype=torch.long, device=device),
         "history_edge_role_ids": torch.tensor(batch["history_edge_role_ids"], dtype=torch.long, device=device),
+        "agent_length": torch.tensor(batch["agent_length"], dtype=torch.float32, device=device),
+        "agent_width": torch.tensor(batch["agent_width"], dtype=torch.float32, device=device),
+        "ego_length": torch.tensor(batch["ego_length"], dtype=torch.float32, device=device),
+        "ego_width": torch.tensor(batch["ego_width"], dtype=torch.float32, device=device),
     }
 
 
@@ -349,6 +372,10 @@ def v3_loss(
     weights: dict[str, float] | None = None,
     future_valid_mask=None,
     ego_future_valid_mask=None,
+    agent_length=None,
+    agent_width=None,
+    ego_length=None,
+    ego_width=None,
 ):
     return merge_safety_loss(
         pred,
@@ -359,6 +386,10 @@ def v3_loss(
         weights,
         future_valid_mask=future_valid_mask,
         ego_future_valid_mask=ego_future_valid_mask,
+        agent_length=agent_length,
+        agent_width=agent_width,
+        ego_length=ego_length,
+        ego_width=ego_width,
     )
 
 
@@ -400,6 +431,11 @@ def load_v3_ensemble(config: Any, checkpoint: str | Path, device: Any | None = N
         raise ValueError(
             f"unsupported WcDT v3 trajectory_schema_version={schema_version!r}; "
             f"expected {TRAJECTORY_SCHEMA_VERSION!r}"
+        )
+    metric_version = str(payload.get("safety_metric_version", ""))
+    if metric_version != SAFETY_METRIC_VERSION:
+        raise ValueError(
+            f"unsupported WcDT v3 safety_metric_version={metric_version!r}; expected {SAFETY_METRIC_VERSION!r}"
         )
     model_kwargs = {
         "history_steps": int(payload.get("history_steps", config.scenario.history_steps)),

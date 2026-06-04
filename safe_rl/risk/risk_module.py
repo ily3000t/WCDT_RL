@@ -9,6 +9,7 @@ import numpy as np
 from safe_rl.risk.merge_local import evaluate_candidate_action_risk
 from safe_rl.risk.risk_feature_extractor import extract_candidate_features
 from safe_rl.sim.action_space import CandidateAction
+from safe_rl.sim.metrics import SAFETY_METRIC_VERSION
 
 try:
     import torch
@@ -115,6 +116,13 @@ class RiskModuleWrapper:
         if torch is None:
             raise ImportError("Loading learned risk checkpoints requires torch.")
         payload = torch.load(checkpoint, map_location="cpu")
+        if isinstance(payload, dict):
+            metric_version = str(payload.get("safety_metric_version", ""))
+            expected = str(self.config.risk_module.get("safety_metric_version", SAFETY_METRIC_VERSION))
+            if metric_version != expected:
+                raise ValueError(
+                    f"unsupported Risk Module safety_metric_version={metric_version!r}; expected {expected!r}"
+                )
         state = payload["model_state_dict"] if isinstance(payload, dict) and "model_state_dict" in payload else payload
         model = RiskModule(
             explicit_dim=int(self.config.risk_module.explicit_feature_dim),
@@ -139,7 +147,15 @@ class RiskModuleWrapper:
         if torch is None or self.model is None:
             raise RuntimeError("No learned risk model is available to save.")
         Path(checkpoint).parent.mkdir(parents=True, exist_ok=True)
-        torch.save({"model_state_dict": self.model.state_dict()}, checkpoint)
+        torch.save(
+            {
+                "model_state_dict": self.model.state_dict(),
+                "safety_metric_version": str(
+                    self.config.risk_module.get("safety_metric_version", SAFETY_METRIC_VERSION)
+                ),
+            },
+            checkpoint,
+        )
 
     def predict(self, action: CandidateAction, context: dict[str, Any]) -> RiskPrediction:
         if self.model is None:

@@ -22,6 +22,51 @@ def modal_to_numpy(prediction: dict[str, Any], mode: int = 0) -> np.ndarray:
     return trajectories.astype(np.float32)
 
 
+def trajectory_to_states(
+    trajectory: np.ndarray,
+    *,
+    reference: VehicleState | None = None,
+    dt: float = 0.1,
+    vehicle_id: str = "pred",
+) -> list[VehicleState]:
+    """Convert predicted front-bumper positions into states with derived motion."""
+
+    trajectory = np.asarray(trajectory, dtype=np.float32)
+    if trajectory.ndim != 2 or trajectory.shape[0] == 0:
+        return []
+    previous_x = float(reference.x) if reference is not None else float(trajectory[0, 0])
+    previous_y = float(reference.y) if reference is not None else float(trajectory[0, 1])
+    previous_heading = float(reference.heading) if reference is not None else 0.0
+    states: list[VehicleState] = []
+    for step in trajectory:
+        x = float(step[0])
+        y = float(step[1])
+        dx = x - previous_x
+        dy = y - previous_y
+        distance = float(np.hypot(dx, dy))
+        heading = float(np.arctan2(dy, dx)) if distance > 1.0e-6 else previous_heading
+        speed = distance / max(float(dt), 1.0e-6)
+        states.append(
+            VehicleState(
+                vehicle_id=vehicle_id,
+                x=x,
+                y=y,
+                heading=heading,
+                speed=speed,
+                lane_index=int(reference.lane_index) if reference is not None else 0,
+                lane_id=str(reference.lane_id) if reference is not None else "",
+                lane_pos=float(reference.lane_pos) if reference is not None else 0.0,
+                edge_id=str(reference.edge_id) if reference is not None else "",
+                length=float(reference.length) if reference is not None else 4.8,
+                width=float(reference.width) if reference is not None else 1.8,
+            )
+        )
+        previous_x = x
+        previous_y = y
+        previous_heading = heading
+    return states
+
+
 def trajectory_risk_summary(
     ego: VehicleState,
     predicted_trajectories: np.ndarray,

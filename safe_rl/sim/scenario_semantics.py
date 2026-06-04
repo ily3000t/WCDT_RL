@@ -195,6 +195,31 @@ def _point_at_distance(points: tuple[tuple[float, float], ...], distance: float)
     return points[-1]
 
 
+def lane_point(config: Any, edge_id: str, lane_index: int, lane_pos: float) -> tuple[float, float] | None:
+    geometry = _lane_geometry(config, edge_id, lane_index)
+    if geometry is None:
+        return None
+    return _point_at_distance(geometry["points"], lane_pos)
+
+
+def lane_heading(config: Any, edge_id: str, lane_index: int, lane_pos: float) -> float | None:
+    """Return the route tangent heading at a lane position."""
+
+    geometry = _lane_geometry(config, edge_id, lane_index)
+    if geometry is None:
+        return None
+    length = max(float(geometry["length"]), 0.0)
+    start = _point_at_distance(geometry["points"], max(0.0, float(lane_pos) - 0.25))
+    end = _point_at_distance(geometry["points"], min(length, float(lane_pos) + 0.25))
+    if start is None or end is None:
+        return None
+    dx = float(end[0] - start[0])
+    dy = float(end[1] - start[1])
+    if math.hypot(dx, dy) <= 1.0e-9:
+        return None
+    return float(math.atan2(dy, dx))
+
+
 def _nearest_distance_on_shape(
     points: tuple[tuple[float, float], ...],
     x: float,
@@ -486,6 +511,9 @@ def advance_route_state(
     point = _point_at_distance(geometry["points"], current.lane_pos) if geometry is not None else None
     if point is not None:
         current.x, current.y = point
+        heading = lane_heading(config, current.edge_id, current.lane_index, current.lane_pos)
+        if heading is not None:
+            current.heading = heading
     else:
         current.x = float(state.x) + max(0.0, float(distance))
         current.y = lane_center(config, current.lane_index, current.edge_id, current.lane_pos)

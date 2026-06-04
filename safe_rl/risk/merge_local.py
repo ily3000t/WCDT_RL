@@ -7,7 +7,7 @@ from typing import Any
 import numpy as np
 
 from safe_rl.sim.action_space import ACTIONS, CandidateAction
-from safe_rl.sim.metrics import INF_TTC, bbox_gap, compute_step_metrics, explicit_risk_features
+from safe_rl.sim.metrics import INF_TTC, bbox_gap, compute_step_metrics, drac, explicit_risk_features, relative_ttc
 from safe_rl.sim.scenario_semantics import (
     advance_route_state,
     auxiliary_lane_index,
@@ -284,10 +284,22 @@ def rollout_ego(
     lane_pos = float(ego.lane_pos)
     lateral_velocity = float(action.lateral_cmd) * 0.6
     acceleration = float(action.accel_cmd) * 1.5
-    lane_index = int(ego.lane_index) + int(action.lateral_cmd)
-    current = VehicleState(**{**ego.to_dict(), "lane_index": lane_index})
+    source_lane = int(ego.lane_index)
+    target_lane = source_lane + int(action.lateral_cmd)
+    current = VehicleState(**{**ego.to_dict(), "lane_index": source_lane})
+    target_current = VehicleState(
+        **{
+            **ego.to_dict(),
+            "lane_index": target_lane,
+            "lane_id": f"{ego.edge_id}_{target_lane}",
+        }
+    )
+    lane_change_duration = max(
+        float(config.scenario.get("lane_change_duration", 1.0)) if config is not None else 1.0,
+        dt,
+    )
     taper_miss = False
-    for _step in range(max(1, horizon_steps)):
+    for step_idx in range(max(1, horizon_steps)):
         speed = max(0.0, speed + acceleration * dt)
         if config is None:
             x += speed * math.cos(float(ego.heading)) * dt
@@ -299,7 +311,7 @@ def rollout_ego(
                 y=float(y),
                 heading=ego.heading,
                 speed=float(speed),
-                lane_index=lane_index,
+                lane_index=target_lane,
                 lane_id=ego.lane_id,
                 lane_pos=float(lane_pos),
                 edge_id=ego.edge_id,
@@ -308,15 +320,43 @@ def rollout_ego(
                 accel=acceleration,
             )
         else:
-            next_state, step_taper_miss = advance_route_state(
-                config,
-                current,
-                max(0.0, speed) * dt,
-                lane_index=current.lane_index,
+            distance = max(0.0, speed) * dt
+            source_next, source_taper_miss = advance_route_state(
+                config, current, distance, lane_index=current.lane_index
             )
+            if action.lateral_cmd == 0:
+                next_state = source_next
+                target_next = source_next
+                progress = 1.0
+            else:
+                target_next, _target_taper_miss = advance_route_state(
+                    config, target_current, distance, lane_index=target_current.lane_index
+                )
+                raw_progress = min(1.0, float((step_idx + 1) * dt / lane_change_duration))
+                progress = raw_progress * raw_progress * (3.0 - 2.0 * raw_progress)
+                if source_taper_miss and raw_progress < 1.0:
+                    taper_miss = True
+                    next_state = source_next
+                elif raw_progress >= 1.0:
+                    next_state = target_next
+                else:
+                    next_state = VehicleState(
+                        **{
+                            **source_next.to_dict(),
+                            "x": float(source_next.x + progress * (target_next.x - source_next.x)),
+                            "y": float(source_next.y + progress * (target_next.y - source_next.y)),
+                            "lane_index": source_lane,
+                            "lane_id": f"{source_next.edge_id}_{source_lane}",
+                        }
+                    )
+                    dx = float(next_state.x - current.x)
+                    dy = float(next_state.y - current.y)
+                    if math.hypot(dx, dy) > 1.0e-9:
+                        next_state.heading = float(math.atan2(dy, dx))
             next_state.speed = float(speed)
             next_state.accel = float(acceleration)
-            taper_miss = taper_miss or step_taper_miss
+            taper_miss = taper_miss or (source_taper_miss and progress < 1.0)
+            target_current = target_next
         states.append(next_state)
         current = next_state
         lane_pos = float(next_state.lane_pos)
@@ -539,9 +579,6 @@ def nearest_future_gap(
                 min_gap = gap
                 nearest_dx = float(other.x - ego_state.x)
                 nearest_dy = float(other.y - ego_state.y)
-            prev_gap = bbox_gap(ego_rollout[step_idx - 1], rollout[step_idx - 1]) if step_idx > 0 else INF_TTC
-            closing = max(0.0, (prev_gap - gap) / max(1.0e-6, dt)) if prev_gap < INF_TTC else 0.0
-            if closing > 1.0e-6:
-                min_ttc = min(min_ttc, gap / closing)
-                max_drac = max(max_drac, (closing * closing) / (2.0 * max(gap, 1.0e-6)))
+            min_ttc = min(min_ttc, relative_ttc(ego_state, other))
+            max_drac = max(max_drac, drac(ego_state, other))
     return float(min_gap), float(min_ttc), float(max_drac), float(nearest_dx), float(nearest_dy)

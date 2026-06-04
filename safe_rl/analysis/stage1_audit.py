@@ -108,6 +108,16 @@ def audit_stage1_buffer(buffer_path: str | Path, output_dir: str | Path) -> dict
     }
     report = {
         "buffer": str(buffer_path),
+        "trajectory_schema_version": (
+            int(np.asarray(data["trajectory_schema_version"]).reshape(-1)[0])
+            if "trajectory_schema_version" in data
+            else None
+        ),
+        "safety_metric_version": (
+            str(np.asarray(data["safety_metric_version"]).reshape(-1)[0])
+            if "safety_metric_version" in data
+            else None
+        ),
         "transition_count": int(data["executed_actions"].shape[0]) if "executed_actions" in data else int(actions.shape[0]),
         "candidate_risk_sample_count": int(actions.shape[0]),
         "episode_count": int(len(set(episode_ids.tolist()))) if episode_ids.size else 0,

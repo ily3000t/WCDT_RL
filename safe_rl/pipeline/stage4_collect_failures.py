@@ -325,6 +325,7 @@ def run(cfg) -> Path:
                     shield_enabled=intervention_env,
                     risk_checkpoint=str(risk_path) if intervention_env else None,
                     model_path=str(model_path),
+                    safety_metric_version=str(cfg.risk_module.get("safety_metric_version", "")),
                     notes={"mode": mode, "episode_report": episode_report},
                 )
                 stage_log("stage4", f"episode={episode} replay={replay_path}")
