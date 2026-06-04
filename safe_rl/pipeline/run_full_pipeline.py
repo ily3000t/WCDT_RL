@@ -27,12 +27,12 @@ from safe_rl.sim.scenario_snapshot import SCENARIO_SUFFIXES, snapshot_scenario
 
 
 VALID_FORECAST_SOURCES = ("constant_velocity", "wcdt", "wcdt_v2", "wcdt_v3")
-DEFAULT_FORECAST_SOURCES = ("constant_velocity", "wcdt_v2")
+DEFAULT_FORECAST_SOURCES = ("constant_velocity", "wcdt_v3")
 VALID_FORECAST_PPO_PROFILES = ("default", "safety", "shield_guided")
 VALID_RUN_MODES = ("new", "resume", "overwrite")
 VALID_PIPELINE_PROFILES = ("default", "smoke")
 RUN_ID_PATTERN = re.compile(r"^[A-Za-z0-9._-]+$")
-PIPELINE_STATE_SCHEMA_VERSION = 3
+PIPELINE_STATE_SCHEMA_VERSION = 4
 PIPELINE_TASK_ORDER = (
     "network_snapshot",
     "stage1",
@@ -87,9 +87,23 @@ def _pipeline_profile_overrides(profile: str) -> dict[str, Any]:
         raise ValueError(f"pipeline profile must be one of {VALID_PIPELINE_PROFILES}; got {profile!r}")
     if profile == "default":
         return {}
-    path = REPO_ROOT / "safe_rl" / "config" / "advanced" / "pipeline_smoke_fast.yaml"
+    path = _pipeline_profile_config_path(profile)
     with path.open("r", encoding="utf-8") as file:
         return yaml.safe_load(file) or {}
+
+
+def _pipeline_profile_config_path(profile: str) -> Path | None:
+    profile = str(profile or "default").strip().lower()
+    if profile == "default":
+        return None
+    if profile == "smoke":
+        return REPO_ROOT / "safe_rl" / "config" / "advanced" / "pipeline_smoke_fast.yaml"
+    raise ValueError(f"pipeline profile must be one of {VALID_PIPELINE_PROFILES}; got {profile!r}")
+
+
+def _pipeline_profile_config_sha256(profile: str) -> str | None:
+    path = _pipeline_profile_config_path(profile)
+    return _sha256(path) if path is not None else None
 
 
 def _validate_run_id(run_id: str) -> str:
@@ -211,6 +225,7 @@ def _new_pipeline_state(run_id: str, invocation: dict[str, Any]) -> dict[str, An
     invocation = dict(invocation)
     invocation.setdefault("pipeline_profile", "default")
     sources = list(invocation["forecast_sources"])
+    pipeline_profile = str(invocation.get("pipeline_profile", "default"))
     tasks = {}
     for task_name in PIPELINE_TASK_ORDER:
         enabled = _task_enabled(task_name, sources)
@@ -227,6 +242,8 @@ def _new_pipeline_state(run_id: str, invocation: dict[str, Any]) -> dict[str, An
         "run_id": run_id,
         "normalized_invocation": invocation,
         "forecast_sources": sources,
+        "pipeline_profile": pipeline_profile,
+        "pipeline_profile_config_sha256": _pipeline_profile_config_sha256(pipeline_profile),
         "default_config_sha256": _sha256(DEFAULT_CONFIG_PATH),
         "scenario_snapshot_sha256": None,
         "scenario_source_sha256": None,
@@ -257,7 +274,20 @@ def _load_pipeline_state(path: str | Path) -> dict[str, Any]:
         schema_version = 2
     if schema_version == 2:
         state.setdefault("normalized_invocation", {}).setdefault("pipeline_profile", "default")
+        state["schema_version"] = 3
+        schema_version = 3
+    if schema_version == 3:
+        profile = str(state.setdefault("normalized_invocation", {}).setdefault("pipeline_profile", "default"))
+        state.setdefault("pipeline_profile", profile)
+        if "pipeline_profile_config_sha256" not in state:
+            if profile != "default":
+                raise ValueError(
+                    "pipeline state is missing pipeline profile hash for a non-default profile; "
+                    "use a new run id or --run-mode overwrite"
+                )
+            state["pipeline_profile_config_sha256"] = None
         state["schema_version"] = PIPELINE_STATE_SCHEMA_VERSION
+        schema_version = PIPELINE_STATE_SCHEMA_VERSION
     elif schema_version != PIPELINE_STATE_SCHEMA_VERSION:
         raise ValueError(f"unsupported pipeline state schema: {state.get('schema_version')}")
     return state
@@ -362,6 +392,13 @@ def _validate_completed_outputs(state: dict[str, Any]) -> None:
 def _validate_resume_state(state: dict[str, Any], cfg: Any) -> None:
     if state.get("default_config_sha256") != _sha256(DEFAULT_CONFIG_PATH):
         raise ValueError("default config changed since the run started; use a new run id or --run-mode overwrite")
+    pipeline_profile = str(
+        state.get("pipeline_profile")
+        or state.get("normalized_invocation", {}).get("pipeline_profile", "default")
+    )
+    expected_profile_hash = _pipeline_profile_config_sha256(pipeline_profile)
+    if state.get("pipeline_profile_config_sha256") != expected_profile_hash:
+        raise ValueError("pipeline profile config changed since the run started; use a new run id or --run-mode overwrite")
     snapshot_hash = state.get("scenario_snapshot_sha256")
     source_hash = state.get("scenario_source_sha256")
     if snapshot_hash:
@@ -905,7 +942,7 @@ def main() -> None:
     parser.add_argument(
         "--forecast-sources",
         default=None,
-        help="Comma-separated forecast sources. Default: constant_velocity,wcdt_v2. Use wcdt explicitly for legacy v1.",
+        help="Comma-separated forecast sources. Default: constant_velocity,wcdt_v3. Use wcdt/wcdt_v2 explicitly for legacy or ablation branches.",
     )
     parser.add_argument(
         "--pipeline-profile",

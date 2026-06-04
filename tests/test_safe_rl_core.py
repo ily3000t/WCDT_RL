@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import xml.etree.ElementTree as ET
+import hashlib
 import json
 from pathlib import Path
 from types import SimpleNamespace
@@ -26,6 +27,7 @@ from safe_rl.pipeline.run_full_pipeline import (
     _managed_run_dirs,
     _new_pipeline_state,
     _load_pipeline_state,
+    _pipeline_profile_config_sha256,
     _predictor_training_flags,
     _prepare_new_run_dir,
     _remove_managed_run_dirs,
@@ -33,6 +35,7 @@ from safe_rl.pipeline.run_full_pipeline import (
     _resume_invocation,
     _run_pipeline_task,
     _validate_completed_outputs,
+    _validate_resume_state,
     _validate_run_id,
     build_generated_configs,
     resolve_forecast_sources,
@@ -64,6 +67,7 @@ from safe_rl.pipeline.stage5_confirmatory_eval import (
     build_confirmatory_summary,
     validate_confirmatory_inputs,
 )
+from safe_rl.pipeline.stage5_failure_audit import build_failure_audit, write_replay_commands
 from safe_rl.pipeline.stage5_shield_sweep import (
     AGGRESSIVE_VARIANTS,
     DEFAULT_VARIANTS,
@@ -105,9 +109,9 @@ from safe_rl.risk.risk_feature_extractor import extract_candidate_features
 from safe_rl.risk.risk_aggregator import aggregate_episode_reports
 from safe_rl.risk.risk_module import RiskModuleWrapper, RiskPrediction, risk_loss
 from safe_rl.risk.stage1_sampling import _merge_heuristic_action, configured_sampling_probs, sampling_summary, select_stage1_action
-from safe_rl.rl.evaluation import validate_model_env_observation_shape
+from safe_rl.rl.evaluation import _step_safety_record, validate_model_env_observation_shape
 from safe_rl.rl.ppo import _checkpoint_selection_score, _checkpoint_selection_weights, _safety_score, _training_device
-from safe_rl.pipeline.stage3_train_ppo import _prediction_loss_summary_from_checkpoint
+from safe_rl.pipeline.stage3_train_ppo import _prediction_loss_summary, _prediction_loss_summary_from_checkpoint
 from safe_rl.shield.safety_shield import SafetyShield
 from safe_rl.sim.action_space import ACTIONS, decode_action
 from safe_rl.sim.history_buffer import HistoryBuffer
@@ -1545,6 +1549,45 @@ def test_stage3_predictor_summary_reads_v3_member_histories(tmp_path):
     assert summary["members"][0]["trained_epochs"] == 2
 
 
+def test_stage3_predictor_summary_does_not_misattribute_v1_loss_to_v2_v3(tmp_path):
+    torch = pytest.importorskip("torch")
+    stage2_dir = tmp_path / "stage2"
+    stage2_dir.mkdir()
+    (stage2_dir / "stage2_training_report.json").write_text(
+        json.dumps({"prediction_loss_history": [9.0, 8.0, 7.0]}),
+        encoding="utf-8",
+    )
+    checkpoint = stage2_dir / "wcdt_v3_predictor.pt"
+    torch.save(
+        {
+            "architecture_version": "wcdt_v3_temporal_actor_transformer_v2",
+            "loss_version": MERGE_SAFETY_LOSS_VERSION,
+            "trajectory_schema_version": 2,
+            "ensemble_size": 1,
+            "member_histories": [
+                {
+                    "member": 0,
+                    "loss_history": [2.0, 1.0],
+                    "trained_epochs": 2,
+                    "best_epoch": 2,
+                    "best_val_score": 1.0,
+                    "stopped_early": False,
+                }
+            ],
+        },
+        checkpoint,
+    )
+    v3_summary = _prediction_loss_summary(str(checkpoint), "wcdt_v3")
+    assert v3_summary["source"] == "checkpoint_member_histories"
+    assert v3_summary["architecture_version"] == "wcdt_v3_temporal_actor_transformer_v2"
+
+    legacy_checkpoint = stage2_dir / "wcdt_predictor.pt"
+    torch.save({"loss_history": [3.0, 2.0]}, legacy_checkpoint)
+    legacy_summary = _prediction_loss_summary(str(legacy_checkpoint), "wcdt")
+    assert legacy_summary == {"epochs": 3, "first": 9.0, "last": 7.0, "min": 7.0}
+    assert _prediction_loss_summary(None, "constant_velocity") is None
+
+
 def test_risk_loss_ignores_zero_weight_samples():
     torch = pytest.importorskip("torch")
     output = {
@@ -1918,6 +1961,7 @@ def test_stage5_shield_sweep_variant_report_includes_efficiency_metrics():
 
 
 def test_forecast_source_parser_rejects_conflicting_legacy_and_multi_args():
+    assert resolve_forecast_sources() == ["constant_velocity", "wcdt_v3"]
     assert resolve_forecast_sources("constant_velocity,wcdt,wcdt_v2") == ["constant_velocity", "wcdt", "wcdt_v2"]
     assert resolve_forecast_sources("constant_velocity,wcdt_v2,wcdt_v3") == [
         "constant_velocity",
@@ -1938,7 +1982,8 @@ def test_full_pipeline_generated_configs_use_forecast_model_and_checkpoint(tmp_p
     )
     assert "forecast_cv_ppo" in configs
     assert "forecast_wcdt_ppo" not in configs
-    assert "forecast_wcdt_v2_ppo" in configs
+    assert "forecast_wcdt_v2_ppo" not in configs
+    assert "forecast_wcdt_v3_ppo" in configs
     stage5 = yaml.safe_load(configs["stage5_multi_groups"].read_text(encoding="utf-8"))
     groups = {item["name"]: item for item in stage5["stage5"]["groups"]}
     assert stage5["stage5"]["episodes_per_group"] == 20
@@ -1954,21 +1999,21 @@ def test_full_pipeline_generated_configs_use_forecast_model_and_checkpoint(tmp_p
         "safe_rl_output/runs/safe_rl_test_run_forecast_cv/stage3/ppo_model.zip"
     )
     assert "ppo_wcdt_features" not in groups
-    assert groups["ppo_wcdt_v2_features"]["model_path"] == (
-        "safe_rl_output/runs/safe_rl_test_run_forecast_wcdt_v2/stage3/ppo_model.zip"
+    assert groups["ppo_wcdt_v3_features"]["model_path"] == (
+        "safe_rl_output/runs/safe_rl_test_run_forecast_wcdt_v3/stage3/ppo_model.zip"
     )
-    assert groups["ppo_wcdt_v2_features"]["forecast_checkpoint"] == (
-        "safe_rl_output/runs/safe_rl_test_run/stage2/wcdt_v2_predictor.pt"
+    assert groups["ppo_wcdt_v3_features"]["forecast_checkpoint"] == (
+        "safe_rl_output/runs/safe_rl_test_run/stage2/wcdt_v3_predictor.pt"
     )
-    assert groups["wcdt_v2_prediction_shield"]["forecast_checkpoint"] == (
-        "safe_rl_output/runs/safe_rl_test_run/stage2/wcdt_v2_predictor.pt"
+    assert groups["wcdt_v3_prediction_shield"]["forecast_checkpoint"] == (
+        "safe_rl_output/runs/safe_rl_test_run/stage2/wcdt_v3_predictor.pt"
     )
     main = yaml.safe_load(configs["main"].read_text(encoding="utf-8"))
     assert main["prediction"] == {
         "train_enabled": True,
         "wcdt_v1_train_enabled": False,
-        "wcdt_v2_train_enabled": True,
-        "wcdt_v3_train_enabled": False,
+        "wcdt_v2_train_enabled": False,
+        "wcdt_v3_train_enabled": True,
     }
 
     stage2_stage4 = yaml.safe_load(configs["stage2_with_stage4"].read_text(encoding="utf-8"))
@@ -1981,11 +2026,11 @@ def test_full_pipeline_generated_configs_use_forecast_model_and_checkpoint(tmp_p
     assert forecast_cv["forecast_features"]["allow_heuristic_fallback"] is False
     assert forecast_cv["rl"]["total_timesteps"] == 128
 
-    forecast_wcdt_v2 = yaml.safe_load(configs["forecast_wcdt_v2_ppo"].read_text(encoding="utf-8"))
-    assert forecast_wcdt_v2["run"]["run_id"] == "safe_rl_test_run_forecast_wcdt_v2"
-    assert forecast_wcdt_v2["forecast_features"]["source"] == "wcdt_v2"
-    assert forecast_wcdt_v2["forecast_features"]["checkpoint"] == (
-        "safe_rl_output/runs/safe_rl_test_run/stage2/wcdt_v2_predictor.pt"
+    forecast_wcdt_v3 = yaml.safe_load(configs["forecast_wcdt_v3_ppo"].read_text(encoding="utf-8"))
+    assert forecast_wcdt_v3["run"]["run_id"] == "safe_rl_test_run_forecast_wcdt_v3"
+    assert forecast_wcdt_v3["forecast_features"]["source"] == "wcdt_v3"
+    assert forecast_wcdt_v3["forecast_features"]["checkpoint"] == (
+        "safe_rl_output/runs/safe_rl_test_run/stage2/wcdt_v3_predictor.pt"
     )
 
 
@@ -2153,10 +2198,51 @@ def test_runner_loads_schema_v1_state_with_disabled_v3_task(tmp_path):
         encoding="utf-8",
     )
     state = _load_pipeline_state(state_path)
-    assert state["schema_version"] == 3
+    assert state["schema_version"] == 4
     assert state["normalized_invocation"]["pipeline_profile"] == "default"
+    assert state["pipeline_profile"] == "default"
+    assert state["pipeline_profile_config_sha256"] is None
     assert not state["tasks"]["stage3_forecast_wcdt_v3"]["enabled"]
     assert state["tasks"]["stage3_forecast_wcdt_v3"]["status"] == "completed"
+
+
+def test_runner_rejects_old_non_default_profile_state_without_profile_hash(tmp_path):
+    state_path = tmp_path / "pipeline_state.json"
+    state_path.write_text(
+        json.dumps(
+            {
+                "schema_version": 3,
+                "run_id": "safe_rl_old_smoke",
+                "normalized_invocation": {"pipeline_profile": "smoke"},
+                "forecast_sources": ["constant_velocity"],
+                "tasks": {},
+            }
+        ),
+        encoding="utf-8",
+    )
+    with pytest.raises(ValueError, match="pipeline profile hash"):
+        _load_pipeline_state(state_path)
+
+
+def test_runner_resume_validates_pipeline_profile_hash():
+    cfg = load_config()
+    invocation = {
+        "stage1_episodes": None,
+        "stage4_episodes": None,
+        "stage5_episodes": None,
+        "ppo_timesteps": None,
+        "forecast_ppo_timesteps": None,
+        "forecast_ppo_profile": "default",
+        "forecast_sources": ["constant_velocity"],
+        "pipeline_profile": "smoke",
+    }
+    state = _new_pipeline_state("safe_rl_test", invocation)
+    assert state["pipeline_profile_config_sha256"] == _pipeline_profile_config_sha256("smoke")
+    state["default_config_sha256"] = hashlib.sha256(Path("safe_rl/config/default_safe_rl.yaml").read_bytes()).hexdigest()
+    _validate_resume_state(state, cfg)
+    state["pipeline_profile_config_sha256"] = "changed"
+    with pytest.raises(ValueError, match="pipeline profile config changed"):
+        _validate_resume_state(state, cfg)
 
 
 def test_runner_pipeline_task_records_outputs_and_skips_completed(tmp_path):
@@ -2517,6 +2603,97 @@ def test_stage5_dynamic_paired_delta_and_acceptance_for_optional_forecast_groups
     assert single_acceptance["wcdt_prediction_shield"]["available"]
 
 
+def test_stage5_failure_audit_identifies_min_distance_zero_and_writes_replay_commands(tmp_path, monkeypatch):
+    cfg = load_config()
+    cfg.run["output_root"] = str(tmp_path / "runs")
+    monkeypatch.setattr("safe_rl.pipeline.stage5_failure_audit.load_config", lambda: cfg)
+    run_dir = tmp_path / "runs" / "safe_rl_audit" / "stage5"
+    replay_dir = run_dir / "replay"
+    replay_dir.mkdir(parents=True)
+    report = {
+        "groups": {
+            "cv_prediction_shield": {
+                "episodes": [
+                    {
+                        "seed": 7,
+                        "episode_reward": 12.0,
+                        "merge_success": True,
+                        "proxy_collision": True,
+                        "safety_violation": True,
+                        "min_distance": 0.0,
+                        "ttc_p1": 0.0,
+                        "drac_p99_raw": 1_000_000.0,
+                        "actual_replacement_count": 2,
+                        "emergency_fallback_count": 1,
+                        "replacement_reason_counts": {"emergency_fallback": 1},
+                        "shield_score_records": [
+                            {
+                                "raw_action": 4,
+                                "final_action": 1,
+                                "raw_risk": 0.99,
+                                "best_candidate_risk": 0.99,
+                                "replacement_reason": "emergency_fallback",
+                                "emergency_fallback": True,
+                                "emergency_reason": "min_distance",
+                            }
+                        ],
+                    }
+                ]
+            }
+        }
+    }
+    (run_dir / "formal_paired_eval_report.json").write_text(json.dumps(report), encoding="utf-8")
+    (replay_dir / "cv_prediction_shield_seed_7.json").write_text(json.dumps({"actions": [4, 4]}), encoding="utf-8")
+
+    audit = build_failure_audit("safe_rl_audit", groups=["cv_prediction_shield"], eval_stage="stage5")
+    assert audit["failure_counts"] == {"cv_prediction_shield": 1}
+    failure = audit["failures"]["cv_prediction_shield"][0]
+    assert failure["seed"] == 7
+    assert failure["first_failure_step"] == "unavailable"
+    assert "missing_step_trace" in failure["failure_classification"]
+    assert "late_emergency" in failure["failure_classification"]
+    assert failure["shield_records_near_failure"][0]["raw_risk"] == 0.99
+
+    commands = tmp_path / "commands.ps1"
+    write_replay_commands(commands, audit)
+    content = commands.read_text(encoding="utf-8")
+    assert "cv_prediction_shield_seed_7.json" in content
+    assert "--gui --delay-ms 200" in content
+
+
+def test_step_safety_record_marks_proxy_collision_for_failure_audit():
+    record = _step_safety_record(
+        step_index=4,
+        raw_action=5,
+        final_action=3,
+        reward=-2.5,
+        terminated=False,
+        truncated=False,
+        info={
+            "step": 20,
+            "done_reason": "",
+            "min_distance": 0.1,
+            "min_ttc": 0.2,
+            "max_drac": 123.0,
+            "near_miss": True,
+            "target_front_gap": 1.2,
+            "target_rear_gap": 0.8,
+            "target_lane_gap": 2.0,
+            "distance_to_taper": 15.0,
+        },
+        collision_threshold=0.25,
+        shield_enabled=True,
+    )
+    assert record["step"] == 20
+    assert record["control_step"] == 4
+    assert record["shield_record_index"] == 4
+    assert record["raw_action"] == 5
+    assert record["final_action"] == 3
+    assert record["proxy_collision"]
+    assert record["safety_violation"]
+    assert record["drac_raw"] == pytest.approx(123.0)
+
+
 def test_forecast_behavior_diagnostics_supports_cv_vs_wcdt_v2(tmp_path, monkeypatch):
     monkeypatch.chdir(tmp_path)
     replay_dir = tmp_path / "safe_rl_output" / "runs" / "safe_rl_behavior_test" / "stage5" / "replay"
@@ -2543,7 +2720,7 @@ def test_forecast_behavior_diagnostics_supports_cv_vs_wcdt_v2(tmp_path, monkeypa
     assert comparison["right_action_histogram"]["5"] == 2
 
 
-def test_confirmatory_payload_generates_fifty_seed_six_group_config():
+def test_confirmatory_payload_generates_fifty_seed_cv_wcdt_v3_config():
     payload = build_confirmatory_payload("safe_rl_test_run")
     groups = {item["name"]: item for item in payload["stage5"]["groups"]}
     assert payload["stage5"]["episodes_per_group"] == 50
@@ -2553,11 +2730,11 @@ def test_confirmatory_payload_generates_fifty_seed_six_group_config():
         "ppo_shield",
         "ppo_cv_features",
         "cv_prediction_shield",
-        "ppo_wcdt_v2_features",
-        "wcdt_v2_prediction_shield",
+        "ppo_wcdt_v3_features",
+        "wcdt_v3_prediction_shield",
     }
-    assert groups["ppo_wcdt_v2_features"]["forecast_checkpoint"] == (
-        "safe_rl_output/runs/safe_rl_test_run/stage2/wcdt_v2_predictor.pt"
+    assert groups["ppo_wcdt_v3_features"]["forecast_checkpoint"] == (
+        "safe_rl_output/runs/safe_rl_test_run/stage2/wcdt_v3_predictor.pt"
     )
 
 
@@ -2581,24 +2758,29 @@ def test_confirmatory_input_validation_reports_missing_checkpoints():
         validate_confirmatory_inputs(payload)
 
 
-def test_confirmatory_summary_marks_wcdt_v2_shield_not_needed():
+def test_confirmatory_summary_uses_wcdt_v3_as_main_prediction_branch():
     reports = {
         "ppo": _fake_group([(1, 100.0)], 100.0, min_distance=2.0),
         "ppo_shield": _fake_group([(1, 101.0)], 101.0, min_distance=2.1, replacements=1.0),
         "ppo_cv_features": _fake_group([(1, 105.0)], 105.0, min_distance=3.0, drac=8.0),
-        "ppo_wcdt_v2_features": _fake_group([(1, 110.0)], 110.0, min_distance=5.0, drac=4.0),
-        "wcdt_v2_prediction_shield": _fake_group([(1, 110.0)], 110.0, min_distance=5.0, drac=4.0),
+        "ppo_wcdt_v3_features": _fake_group([(1, 110.0)], 110.0, min_distance=5.0, drac=4.0),
+        "wcdt_v3_prediction_shield": _fake_group([(1, 110.0)], 110.0, min_distance=5.0, drac=4.0),
     }
+    for report in reports.values():
+        report["metrics"]["episodes"] = 50
     paired = _build_paired_delta(reports)
     acceptance = _build_acceptance(reports)
     summary = build_confirmatory_summary(reports, paired, acceptance)
     assert summary["ppo_shield_mainline"]["pass"]
-    assert summary["wcdt_v2_forecast_mainline"]["pass"]
+    assert summary["wcdt_v3_forecast_mainline"]["pass"]
+    assert summary["wcdt_v3_candidate"]["available"]
+    assert summary["wcdt_v3_candidate"]["reference_branch"] == "constant_velocity"
+    assert summary["wcdt_v3_candidate"]["stage5_candidate_pass"]
     assert summary["final_result_summary"]["trusted_mainline"] == ["ppo", "ppo_shield"]
-    assert summary["final_result_summary"]["best_safety_combo"] == "wcdt_v2_prediction_shield"
-    assert summary["model_role_explanations"]["wcdt_v2_prediction_shield"]["shield_enabled"] is True
+    assert summary["final_result_summary"]["recommended_prediction_branch"] == "ppo_wcdt_v3_features"
+    assert summary["final_result_summary"]["best_safety_combo"] == "wcdt_v3_prediction_shield"
+    assert summary["model_role_explanations"]["wcdt_v3_prediction_shield"]["shield_enabled"] is True
     assert summary["reporting_recommendation"][0]["comparison"] == "ppo_vs_ppo_shield"
-    assert summary["wcdt_v2_shield"]["shield_not_needed_on_wcdt_v2_policy"]
     assert summary["forecast_policy_utilization_summary"]["available"] is False
     assert summary["overall_pass"]
 
@@ -2625,7 +2807,7 @@ def test_confirmatory_summary_marks_wcdt_v2_shield_low_frequency_backstop():
     assert summary["wcdt_v2_shield"]["low_frequency_safety_backstop"]
     assert summary["wcdt_v2_shield"]["shield_status"] == "low_frequency_safety_backstop"
     assert summary["wcdt_v2_shield"]["mean_emergency_fallbacks"] == pytest.approx(0.1)
-    assert summary["overall_pass"]
+    assert not summary["overall_pass"]
 
 
 def test_confirmatory_summary_uses_forecast_policy_utilization_diagnostics():
@@ -2657,8 +2839,9 @@ def test_confirmatory_summary_uses_forecast_policy_utilization_diagnostics():
     summary = build_confirmatory_summary(reports, _build_paired_delta(reports), _build_acceptance(reports), diagnostics)
     utilization = summary["forecast_policy_utilization_summary"]
     assert utilization["available"]
-    assert utilization["wcdt_v2_predictor_quality_pass"]
-    assert utilization["wcdt_v2_ppo_better_than_cv"]
+    assert utilization["main_forecast_branch"] == "wcdt_v2"
+    assert utilization["predictor_quality_pass"]
+    assert utilization["ppo_better_than_cv"]
     assert utilization["forecast_policy_underutilized"]
 
 

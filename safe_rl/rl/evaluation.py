@@ -22,6 +22,60 @@ def validate_model_env_observation_shape(model: Any, env: Any, model_path: str |
         )
 
 
+def _safe_float(value: Any, default: float = 0.0) -> float:
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def _step_safety_record(
+    *,
+    step_index: int,
+    raw_action: int,
+    final_action: int,
+    reward: float,
+    terminated: bool,
+    truncated: bool,
+    info: dict[str, Any],
+    collision_threshold: float,
+    shield_enabled: bool,
+) -> dict[str, Any]:
+    min_distance = _safe_float(info.get("min_distance"), 1.0e9)
+    min_ttc = _safe_float(info.get("min_ttc"), 1.0e9)
+    max_drac = _safe_float(info.get("max_drac"), 0.0)
+    collision = bool(info.get("collision", False))
+    near_miss = bool(info.get("near_miss", False))
+    proxy_collision = min_distance <= float(collision_threshold)
+    safety_violation = bool(collision or proxy_collision or near_miss or min_ttc < 0.30)
+    return {
+        "step": int(info.get("step", step_index)),
+        "control_step": int(step_index),
+        "shield_record_index": int(step_index) if shield_enabled else None,
+        "raw_action": int(raw_action),
+        "final_action": int(final_action),
+        "reward": float(reward),
+        "terminated": bool(terminated),
+        "truncated": bool(truncated),
+        "done_reason": info.get("done_reason", ""),
+        "min_distance": min_distance,
+        "min_ttc": min_ttc,
+        "drac": max_drac,
+        "drac_raw": max_drac,
+        "collision": collision,
+        "near_miss": near_miss,
+        "proxy_collision": proxy_collision,
+        "safety_violation": safety_violation,
+        "low_ttc": bool(info.get("low_ttc", False)),
+        "high_drac": bool(info.get("high_drac", False)),
+        "target_front_gap": _safe_float(info.get("target_front_gap"), 1.0e9),
+        "target_rear_gap": _safe_float(info.get("target_rear_gap"), 1.0e9),
+        "target_lane_gap": _safe_float(info.get("target_lane_gap"), 1.0e9),
+        "distance_to_taper": _safe_float(info.get("distance_to_taper"), 1.0e9),
+        "taper_miss": bool(info.get("taper_miss", False)),
+    }
+
+
 def evaluate_ppo(
     cfg: Any,
     model_path: str | Path,
@@ -43,11 +97,13 @@ def evaluate_ppo(
         shape_env.close()
     reports: list[dict] = []
     rewards: list[float] = []
+    collision_threshold = float(cfg.risk_module.collision_distance_threshold)
     for episode_idx, seed in enumerate(progress_iter(seeds, desc=f"Eval {group_name or 'ppo'} seeds")):
         env = make_env(cfg, seed=seed, shield_enabled=shield_enabled, risk_checkpoint=risk_checkpoint)
         total_reward = 0.0
         actions: list[int] = []
         executed_actions: list[int] = []
+        step_safety_records: list[dict[str, Any]] = []
         try:
             obs, _info = env.reset(seed=seed)
             terminated = truncated = False
@@ -55,7 +111,21 @@ def evaluate_ppo(
                 action, _state = model.predict(obs, deterministic=True)
                 actions.append(int(action))
                 obs, reward, terminated, truncated, _info = env.step(int(action))
-                executed_actions.append(int(_info.get("final_action", action)))
+                final_action = int(_info.get("final_action", action))
+                executed_actions.append(final_action)
+                step_safety_records.append(
+                    _step_safety_record(
+                        step_index=len(actions) - 1,
+                        raw_action=int(action),
+                        final_action=final_action,
+                        reward=float(reward),
+                        terminated=bool(terminated),
+                        truncated=bool(truncated),
+                        info=_info,
+                        collision_threshold=collision_threshold,
+                        shield_enabled=shield_enabled,
+                    )
+                )
                 total_reward += float(reward)
             report = env.episode_report()
             report["episode_reward"] = total_reward
@@ -84,7 +154,7 @@ def evaluate_ppo(
                     risk_checkpoint=risk_checkpoint if shield_enabled else None,
                     model_path=str(model_path),
                     group_name=group_name,
-                    notes={"episode_report": report},
+                    notes={"episode_report": report, "step_safety_records": step_safety_records},
                 )
         finally:
             env.close()

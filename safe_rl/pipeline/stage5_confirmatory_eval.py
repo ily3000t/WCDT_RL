@@ -27,7 +27,7 @@ from safe_rl.utils.config import REPO_ROOT, _to_config_dict, clone_with_override
 from safe_rl.utils.progress import TensorboardLogger, stage_log
 
 
-DEFAULT_FORECAST_SOURCES = ("constant_velocity", "wcdt_v2")
+DEFAULT_FORECAST_SOURCES = ("constant_velocity", "wcdt_v3")
 
 MODEL_ROLE_EXPLANATIONS: dict[str, dict[str, str | bool]] = {
     "ppo": {
@@ -73,32 +73,32 @@ MODEL_ROLE_EXPLANATIONS: dict[str, dict[str, str | bool]] = {
         "meaning": "Legacy WcDT v1 forecast-feature PPO with Shield, kept for diagnostics only.",
     },
     "ppo_wcdt_v2_features": {
-        "role": "recommended_prediction_branch",
+        "role": "explicit_ablation",
         "observation": "63D forecast-augmented observation",
         "forecast_source": "wcdt_v2",
         "shield_enabled": False,
-        "meaning": "Recommended WcDT v2 forecast-feature PPO branch.",
+        "meaning": "WcDT v2 residual MLP forecast-feature PPO branch kept as an explicit ablation.",
     },
     "wcdt_v2_prediction_shield": {
-        "role": "best_safety_combo",
+        "role": "explicit_ablation_with_shield",
         "observation": "63D forecast-augmented observation",
         "forecast_source": "wcdt_v2",
         "shield_enabled": True,
-        "meaning": "WcDT v2 forecast-feature PPO with Shield enabled.",
+        "meaning": "WcDT v2 forecast-feature PPO with Shield enabled, kept as an explicit ablation.",
     },
     "ppo_wcdt_v3_features": {
-        "role": "candidate_prediction_branch",
+        "role": "recommended_prediction_branch",
         "observation": "63D forecast-augmented observation",
         "forecast_source": "wcdt_v3",
         "shield_enabled": False,
-        "meaning": "Candidate WcDT v3 temporal-interaction forecast-feature PPO branch.",
+        "meaning": "Current WcDT v3 temporal-interaction forecast-feature PPO main prediction branch.",
     },
     "wcdt_v3_prediction_shield": {
-        "role": "candidate_prediction_branch_with_shield",
+        "role": "best_safety_combo",
         "observation": "63D forecast-augmented observation",
         "forecast_source": "wcdt_v3",
         "shield_enabled": True,
-        "meaning": "Candidate WcDT v3 temporal-interaction forecast-feature PPO with Shield enabled.",
+        "meaning": "Current WcDT v3 temporal-interaction forecast-feature PPO with Shield enabled.",
     },
 }
 
@@ -108,12 +108,12 @@ REPORTING_RECOMMENDATION: list[dict[str, str]] = [
         "purpose": "Report the trusted Shield mainline against the baseline PPO.",
     },
     {
-        "comparison": "ppo_cv_features_vs_ppo_wcdt_v2_features",
-        "purpose": "Report WcDT v2 forecast features against the constant-velocity forecast control.",
+        "comparison": "ppo_cv_features_vs_ppo_wcdt_v3_features",
+        "purpose": "Report WcDT v3 forecast features against the constant-velocity forecast control.",
     },
     {
-        "comparison": "ppo_wcdt_v2_features_vs_wcdt_v2_prediction_shield",
-        "purpose": "Report whether Shield further improves the WcDT v2 forecast policy.",
+        "comparison": "ppo_wcdt_v3_features_vs_wcdt_v3_prediction_shield",
+        "purpose": "Report whether Shield further improves the WcDT v3 forecast policy.",
     },
     {
         "comparison": "legacy_wcdt_v1",
@@ -121,7 +121,7 @@ REPORTING_RECOMMENDATION: list[dict[str, str]] = [
     },
     {
         "comparison": "ppo_wcdt_v2_features_vs_ppo_wcdt_v3_features",
-        "purpose": "Report the optional WcDT v3 temporal-interaction ablation when that branch is enabled.",
+        "purpose": "Report WcDT v2 as an explicit ablation when that branch is enabled.",
     },
     {
         "comparison": "main_result_table",
@@ -135,8 +135,9 @@ REPORTING_RECOMMENDATION: list[dict[str, str]] = [
 FINAL_RESULT_SUMMARY: dict[str, str | list[str]] = {
     "trusted_mainline": ["ppo", "ppo_shield"],
     "forecast_control": "ppo_cv_features",
-    "recommended_prediction_branch": "ppo_wcdt_v2_features",
-    "best_safety_combo": "wcdt_v2_prediction_shield",
+    "recommended_prediction_branch": "ppo_wcdt_v3_features",
+    "best_safety_combo": "wcdt_v3_prediction_shield",
+    "explicit_ablation": ["ppo_wcdt_v2_features", "wcdt_v2_prediction_shield"],
     "diagnostic_only": ["ppo_wcdt_features", "wcdt_prediction_shield"],
 }
 
@@ -293,34 +294,75 @@ def _wcdt_v2_shield_summary(group_reports: dict[str, dict]) -> dict[str, Any]:
     }
 
 
+def _wcdt_v3_forecast_summary(group_reports: dict[str, dict]) -> dict[str, Any]:
+    cv = group_reports.get("ppo_cv_features")
+    v3 = group_reports.get("ppo_wcdt_v3_features")
+    checks = {
+        "reward_not_degraded_vs_cv": _metric(v3, "average_reward") >= _metric(cv, "average_reward") - 5.0,
+        "min_distance_p1_not_worse_than_cv": _metric(v3, "min_distance_p1") >= _metric(cv, "min_distance_p1"),
+        "drac_p99_capped_not_worse_than_cv": _metric(v3, "drac_p99_capped", _metric(v3, "drac_p99", 1.0e9))
+        <= _metric(cv, "drac_p99_capped", _metric(cv, "drac_p99", -1.0)),
+        "safety_violation_not_worse_than_cv": _metric(v3, "safety_violation_rate")
+        <= _metric(cv, "safety_violation_rate"),
+        "proxy_collision_zero": _metric(v3, "proxy_collision_rate") == 0.0,
+        "merge_success_complete": _metric(v3, "merge_success_rate") == 1.0,
+    }
+    return {
+        "available": bool(cv and v3),
+        "checks": checks,
+        "pass": bool(cv and v3 and all(checks.values())),
+        "acceptance": _forecast_acceptance(cv, v3),
+    }
+
+
 def _wcdt_v3_candidate_summary(group_reports: dict[str, dict]) -> dict[str, Any]:
+    cv = group_reports.get("ppo_cv_features")
+    cv_shield = group_reports.get("cv_prediction_shield")
     v2 = group_reports.get("ppo_wcdt_v2_features")
     v3 = group_reports.get("ppo_wcdt_v3_features")
     v2_shield = group_reports.get("wcdt_v2_prediction_shield")
     v3_shield = group_reports.get("wcdt_v3_prediction_shield")
-    v2_completion = _metric(v2, "completion_time_mean")
-    completion_limit = max(v2_completion * 1.05, v2_completion + 1.0)
+    reference = v2 or cv
+    reference_shield = v2_shield or cv_shield
+    reference_branch = "wcdt_v2" if v2 else "constant_velocity"
+    reference_completion = _metric(reference, "completion_time_mean")
+    completion_limit = max(reference_completion * 1.05, reference_completion + 1.0)
     checks = {
         "formal_episode_count": _metric(v3, "episodes") >= 50.0,
-        "reward_not_degraded_vs_v2": _metric(v3, "average_reward") >= _metric(v2, "average_reward") - 5.0,
-        "safety_violation_not_worse_than_v2": _metric(v3, "safety_violation_rate")
-        <= _metric(v2, "safety_violation_rate"),
+        "reference_available": bool(reference),
+        "reward_not_degraded_vs_reference": _metric(v3, "average_reward") >= _metric(reference, "average_reward") - 5.0,
+        "safety_violation_not_worse_than_reference": _metric(v3, "safety_violation_rate")
+        <= _metric(reference, "safety_violation_rate"),
         "proxy_collision_zero": _metric(v3, "proxy_collision_rate") == 0.0,
-        "merge_success_not_worse_than_v2": _metric(v3, "merge_success_rate")
-        >= _metric(v2, "merge_success_rate"),
-        "completion_time_not_degraded_vs_v2": _metric(v3, "completion_time_mean") <= completion_limit,
+        "merge_success_not_worse_than_reference": _metric(v3, "merge_success_rate")
+        >= _metric(reference, "merge_success_rate"),
+        "completion_time_not_degraded_vs_reference": _metric(v3, "completion_time_mean") <= completion_limit,
         "shield_fallback_rate_zero": _metric(v3_shield, "fallback_rate", 1.0) == 0.0,
-        "shield_emergency_fallback_not_worse_than_v2": _metric(v3_shield, "emergency_fallback_rate", 1.0)
-        <= _metric(v2_shield, "emergency_fallback_rate", 0.0),
-        "shield_replacements_not_worse_than_v2": _metric(v3_shield, "mean_actual_replacements", 1.0e9)
-        <= _metric(v2_shield, "mean_actual_replacements", 0.0) + 0.10,
+        "shield_emergency_fallback_not_worse_than_reference": _metric(v3_shield, "emergency_fallback_rate", 1.0)
+        <= _metric(reference_shield, "emergency_fallback_rate", 0.0),
+        "shield_replacements_not_worse_than_reference": _metric(v3_shield, "mean_actual_replacements", 1.0e9)
+        <= _metric(reference_shield, "mean_actual_replacements", 0.0) + 0.10,
     }
+    if v2:
+        checks.update(
+            {
+                "reward_not_degraded_vs_v2": checks["reward_not_degraded_vs_reference"],
+                "safety_violation_not_worse_than_v2": checks["safety_violation_not_worse_than_reference"],
+                "merge_success_not_worse_than_v2": checks["merge_success_not_worse_than_reference"],
+                "completion_time_not_degraded_vs_v2": checks["completion_time_not_degraded_vs_reference"],
+                "shield_emergency_fallback_not_worse_than_v2": checks[
+                    "shield_emergency_fallback_not_worse_than_reference"
+                ],
+                "shield_replacements_not_worse_than_v2": checks["shield_replacements_not_worse_than_reference"],
+            }
+        )
     return {
-        "available": bool(v2 and v3 and v2_shield and v3_shield),
+        "available": bool(reference and v3 and v3_shield),
+        "reference_branch": reference_branch,
         "checks": checks,
         "completion_time_limit": float(completion_limit),
-        "stage5_candidate_pass": bool(v2 and v3 and v2_shield and v3_shield and all(checks.values())),
-        "acceptance": _forecast_acceptance(v2, v3),
+        "stage5_candidate_pass": bool(reference and v3 and v3_shield and all(checks.values())),
+        "acceptance": _forecast_acceptance(reference, v3),
     }
 
 
@@ -349,29 +391,34 @@ def _forecast_policy_utilization_summary(
         }
     conclusion = diagnostics.get("forecast_conclusion", {})
     sensitivity_groups = diagnostics.get("policy_feature_sensitivity", {}).get("groups", {})
-    wcdt_v2_sensitivity = sensitivity_groups.get("ppo_wcdt_v2_features", {})
-    wcdt_v2 = _wcdt_v2_forecast_summary(group_reports)
-    action_sensitive = bool(wcdt_v2_sensitivity.get("action_sensitive_to_forecast_features", False))
-    predictor_quality_pass = bool(conclusion.get("wcdt_v2_prediction_quality_pass", False))
-    predictor_uncertainty_pass = bool(conclusion.get("wcdt_v2_uncertainty_quality_pass", False))
+    branch = "wcdt_v3" if "ppo_wcdt_v3_features" in group_reports else "wcdt_v2"
+    group_name = f"ppo_{branch}_features"
+    sensitivity = sensitivity_groups.get(group_name, {})
+    forecast_summary = _wcdt_v3_forecast_summary(group_reports) if branch == "wcdt_v3" else _wcdt_v2_forecast_summary(group_reports)
+    action_sensitive = bool(sensitivity.get("action_sensitive_to_forecast_features", False))
+    predictor_quality_pass = bool(conclusion.get(f"{branch}_prediction_quality_pass", False))
+    predictor_uncertainty_pass = bool(conclusion.get(f"{branch}_uncertainty_quality_pass", False))
     policy_underutilized = bool(
         predictor_quality_pass
         and predictor_uncertainty_pass
-        and wcdt_v2_sensitivity.get("available", False)
+        and sensitivity.get("available", False)
         and not action_sensitive
     )
     return {
         "available": True,
-        "wcdt_v2_predictor_quality_pass": predictor_quality_pass,
-        "wcdt_v2_predictor_uncertainty_pass": predictor_uncertainty_pass,
-        "wcdt_v2_recommended_for_stage5": bool(conclusion.get("wcdt_v2_recommended_for_stage5", False)),
-        "wcdt_v2_ppo_better_than_cv": bool(wcdt_v2.get("pass", False)),
-        "feature_sensitivity_available": bool(wcdt_v2_sensitivity.get("available", False)),
-        "wcdt_v2_action_sensitive_to_forecast_features": action_sensitive,
-        "original_vs_zeroed_action_agreement_rate": wcdt_v2_sensitivity.get(
+        "main_forecast_branch": branch,
+        "predictor_quality_pass": predictor_quality_pass,
+        "predictor_uncertainty_pass": predictor_uncertainty_pass,
+        "recommended_for_stage5": bool(conclusion.get(f"{branch}_recommended_for_stage5", False))
+        if branch == "wcdt_v2"
+        else bool(conclusion.get("wcdt_v3_candidate_for_promotion", False)),
+        "ppo_better_than_cv": bool(forecast_summary.get("pass", False)),
+        "feature_sensitivity_available": bool(sensitivity.get("available", False)),
+        "action_sensitive_to_forecast_features": action_sensitive,
+        "original_vs_zeroed_action_agreement_rate": sensitivity.get(
             "original_vs_zeroed_action_agreement_rate"
         ),
-        "original_vs_shuffled_action_agreement_rate": wcdt_v2_sensitivity.get(
+        "original_vs_shuffled_action_agreement_rate": sensitivity.get(
             "original_vs_shuffled_action_agreement_rate"
         ),
         "forecast_policy_underutilized": policy_underutilized,
@@ -398,6 +445,7 @@ def build_confirmatory_summary(
     mainline = _mainline_shield_summary(group_reports)
     wcdt_v2 = _wcdt_v2_forecast_summary(group_reports)
     wcdt_v2_shield = _wcdt_v2_shield_summary(group_reports)
+    wcdt_v3_forecast = _wcdt_v3_forecast_summary(group_reports)
     wcdt_v3 = _wcdt_v3_candidate_summary(group_reports)
     wcdt_v3_shield = _wcdt_v3_shield_summary(group_reports)
     forecast_conclusion = (diagnostics or {}).get("forecast_conclusion", {})
@@ -420,16 +468,19 @@ def build_confirmatory_summary(
         "main_result_groups": {
             "trusted_baseline": ["ppo", "ppo_shield"],
             "forecast_control": "ppo_cv_features",
-            "recommended_prediction_branch": "ppo_wcdt_v2_features",
+            "recommended_prediction_branch": "ppo_wcdt_v3_features",
+            "best_safety_combo": "wcdt_v3_prediction_shield",
+            "explicit_ablation": ["ppo_wcdt_v2_features", "wcdt_v2_prediction_shield"],
             "diagnostic_only": ["ppo_wcdt_features", "wcdt_prediction_shield"],
         },
         "ppo_shield_mainline": mainline,
-        "wcdt_v2_forecast_mainline": wcdt_v2,
+        "wcdt_v3_forecast_mainline": wcdt_v3_forecast,
+        "wcdt_v2_explicit_ablation": wcdt_v2,
         "wcdt_v2_shield": wcdt_v2_shield,
         "wcdt_v3_candidate": wcdt_v3,
         "wcdt_v3_shield": wcdt_v3_shield,
         "forecast_policy_utilization_summary": _forecast_policy_utilization_summary(group_reports, diagnostics),
-        "overall_pass": bool(mainline.get("pass") and wcdt_v2.get("pass")),
+        "overall_pass": bool(mainline.get("pass") and wcdt_v3_forecast.get("pass")),
         "paired_delta": paired_delta,
         "acceptance": acceptance,
     }

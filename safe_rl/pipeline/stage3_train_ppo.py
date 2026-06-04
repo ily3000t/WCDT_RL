@@ -10,9 +10,14 @@ from safe_rl.utils.config import prepare_run_dir
 from safe_rl.utils.progress import stage_log
 
 
-def _prediction_loss_summary(checkpoint: str | None) -> dict | None:
+def _prediction_loss_summary(checkpoint: str | None, forecast_source: str | None = None) -> dict | None:
     if not checkpoint:
         return None
+    source = str(forecast_source or "").strip().lower()
+    if source == "constant_velocity":
+        return None
+    if source in {"wcdt_v2", "wcdt_v3"}:
+        return _prediction_loss_summary_from_checkpoint(checkpoint)
     report_path = Path(checkpoint).parent / "stage2_training_report.json"
     if not report_path.exists():
         return _prediction_loss_summary_from_checkpoint(checkpoint)
@@ -105,7 +110,7 @@ def run(cfg):
     report["forecast_features_enabled"] = bool(cfg.forecast_features.enabled or cfg.rl.use_wcdt_forecast_features)
     report["forecast_source"] = str(cfg.forecast_features.get("source", ""))
     report["prediction_checkpoint"] = prediction_checkpoint
-    report["prediction_loss_summary"] = _prediction_loss_summary(prediction_checkpoint)
+    report["prediction_loss_summary"] = _prediction_loss_summary(prediction_checkpoint, report["forecast_source"])
     report["predictor_summary"] = report["prediction_loss_summary"]
     report["forecast_feature_summary"] = {
         "feature_dim": ForecastFeatureAugmentor.feature_dim(cfg),
