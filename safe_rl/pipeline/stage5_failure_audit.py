@@ -35,6 +35,15 @@ def _is_failure(episode: dict[str, Any], collision_threshold: float) -> bool:
     )
 
 
+def _is_task_failure(episode: dict[str, Any]) -> bool:
+    done_reason = str(episode.get("done_reason", "") or "")
+    return bool(
+        episode.get("taper_miss", False)
+        or done_reason == "taper_miss"
+        or episode.get("merge_success") is False
+    )
+
+
 def _compact_record(record: dict[str, Any]) -> dict[str, Any]:
     keys = (
         "raw_action",
@@ -140,8 +149,21 @@ def _classify_failure(
     replacement_count = int(_safe_float(episode.get("actual_replacement_count"), 0.0))
     if bool(episode.get("geometric_overlap", False)):
         labels.append("geometric_metric_overlap")
+    if bool(episode.get("taper_miss", False)) or str(episode.get("done_reason", "") or "") == "taper_miss":
+        labels.append("taper_miss")
+    if episode.get("merge_success") is False:
+        labels.append("merge_task_failure")
+    if episode.get("first_merge_request_step") is None and (
+        bool(episode.get("taper_miss", False)) or episode.get("merge_success") is False
+    ):
+        labels.append("no_merge_request_before_taper")
     if float(episode.get("missed_safe_merge_opportunity_rate", 0.0) or 0.0) > 0.0:
         labels.append("missed_safe_merge_opportunity")
+    if (
+        episode.get("first_merge_request_distance_to_taper") is not None
+        and _safe_float(episode.get("first_merge_request_distance_to_taper"), 1.0e9) < 60.0
+    ):
+        labels.append("late_merge_request")
     if emergency_count > 0 and _safe_float(episode.get("min_distance"), 1.0e9) <= 0.0:
         labels.append("late_emergency")
     if records:
@@ -206,6 +228,7 @@ def _episode_summary(
             "episode_reward": _safe_float(episode.get("episode_reward"), 0.0),
             "merge_success": bool(episode.get("merge_success", False)),
             "done_reason": episode.get("done_reason"),
+            "taper_miss": bool(episode.get("taper_miss", False)),
             "collision": bool(episode.get("collision", False)),
             "geometric_overlap": bool(episode.get("geometric_overlap", False)),
             "near_miss": bool(episode.get("near_miss", False)),
@@ -244,6 +267,7 @@ def build_failure_audit(
     groups: list[str] | tuple[str, ...] = DEFAULT_GROUPS,
     eval_stage: str = "stage5",
     collision_threshold: float = 0.25,
+    include_task_failures: bool = False,
 ) -> dict[str, Any]:
     cfg = load_config()
     cfg.run["run_id"] = run_id
@@ -255,13 +279,17 @@ def build_failure_audit(
         report = json.load(file)
     replay_dir = base_dir / "replay"
     failures: dict[str, list[dict[str, Any]]] = {}
+    safety_failures: dict[str, list[dict[str, Any]]] = {}
+    task_failures: dict[str, list[dict[str, Any]]] = {}
     for group in groups:
         group_report = report.get("groups", {}).get(group)
         if not group_report:
             failures[group] = []
+            safety_failures[group] = []
+            task_failures[group] = []
             continue
         episodes = group_report.get("episodes", []) or []
-        failures[group] = [
+        safety_failures[group] = [
             _episode_summary(
                 run_id=run_id,
                 eval_stage=eval_stage,
@@ -273,6 +301,25 @@ def build_failure_audit(
             for episode in episodes
             if isinstance(episode, dict) and _is_failure(episode, collision_threshold)
         ]
+        task_failures[group] = [
+            _episode_summary(
+                run_id=run_id,
+                eval_stage=eval_stage,
+                replay_dir=replay_dir,
+                group=group,
+                episode=episode,
+                collision_threshold=collision_threshold,
+            )
+            for episode in episodes
+            if isinstance(episode, dict) and _is_task_failure(episode)
+        ]
+        if include_task_failures:
+            by_seed = {int(item["seed"]): item for item in safety_failures[group]}
+            for item in task_failures[group]:
+                by_seed.setdefault(int(item["seed"]), item)
+            failures[group] = list(by_seed.values())
+        else:
+            failures[group] = list(safety_failures[group])
     classification_counts: dict[str, int] = {}
     for items in failures.values():
         for item in items:
@@ -285,8 +332,13 @@ def build_failure_audit(
         "replay_dir": str(replay_dir),
         "groups": list(groups),
         "collision_threshold": float(collision_threshold),
+        "include_task_failures": bool(include_task_failures),
+        "safety_failure_counts": {group: len(items) for group, items in safety_failures.items()},
+        "task_failure_counts": {group: len(items) for group, items in task_failures.items()},
         "failure_counts": {group: len(items) for group, items in failures.items()},
         "classification_counts": classification_counts,
+        "safety_failures": safety_failures,
+        "task_failures": task_failures,
         "failures": failures,
     }
 
@@ -308,7 +360,13 @@ def write_replay_commands(path: str | Path, audit: dict[str, Any]) -> Path:
     return path
 
 
-def run(run_id: str, groups: list[str], eval_stage: str = "stage5", collision_threshold: float = 0.25) -> Path:
+def run(
+    run_id: str,
+    groups: list[str],
+    eval_stage: str = "stage5",
+    collision_threshold: float = 0.25,
+    include_task_failures: bool = False,
+) -> Path:
     cfg = load_config()
     cfg.run["run_id"] = run_id
     stage_dir = run_root(cfg) / eval_stage / "failure_audit"
@@ -317,6 +375,7 @@ def run(run_id: str, groups: list[str], eval_stage: str = "stage5", collision_th
         groups=groups,
         eval_stage=eval_stage,
         collision_threshold=collision_threshold,
+        include_task_failures=include_task_failures,
     )
     report_path = stage_dir / "failure_audit_report.json"
     commands_path = stage_dir / "failure_replay_commands.ps1"
@@ -337,9 +396,20 @@ def main() -> None:
     )
     parser.add_argument("--eval-stage", default="stage5", help="Evaluation stage directory, e.g. stage5 or stage5_confirmatory.")
     parser.add_argument("--collision-threshold", type=float, default=0.25)
+    parser.add_argument(
+        "--include-task-failures",
+        action="store_true",
+        help="Also audit merge task failures such as taper_miss or merge_success=false.",
+    )
     args = parser.parse_args()
     groups = [item.strip() for item in str(args.groups).split(",") if item.strip()]
-    run(args.run_id, groups=groups, eval_stage=args.eval_stage, collision_threshold=float(args.collision_threshold))
+    run(
+        args.run_id,
+        groups=groups,
+        eval_stage=args.eval_stage,
+        collision_threshold=float(args.collision_threshold),
+        include_task_failures=bool(args.include_task_failures),
+    )
 
 
 if __name__ == "__main__":

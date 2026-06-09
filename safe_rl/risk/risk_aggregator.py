@@ -101,6 +101,9 @@ def aggregate_episode_reports(reports: list[dict]) -> dict:
     missed_safe_merge_opportunities = int(
         sum(int(report.get("missed_safe_merge_opportunity_count", 0)) for report in reports)
     )
+    task_merge_opportunities = int(sum(int(report.get("task_merge_opportunity_count", 0)) for report in reports))
+    task_would_merges = int(sum(int(report.get("task_would_merge_count", 0)) for report in reports))
+    task_missed_merges = int(sum(int(report.get("task_missed_merge_count", 0)) for report in reports))
     return {
         "episodes": len(reports),
         "collision_rate": float(np.mean(collisions)),
@@ -153,5 +156,14 @@ def aggregate_episode_reports(reports: list[dict]) -> dict:
             float(missed_safe_merge_opportunities / safe_merge_opportunities)
             if safe_merge_opportunities
             else 0.0
+        ),
+        "task_merge_opportunity_count": task_merge_opportunities,
+        "task_would_merge_count": task_would_merges,
+        "task_would_merge_rate": (
+            float(task_would_merges / task_merge_opportunities) if task_merge_opportunities else 0.0
+        ),
+        "task_missed_merge_count": task_missed_merges,
+        "task_missed_merge_rate": (
+            float(task_missed_merges / task_merge_opportunities) if task_merge_opportunities else 0.0
         ),
     }

@@ -119,13 +119,17 @@ def run(cfg):
         "source": str(cfg.forecast_features.get("source", "")),
     } if report["forecast_features_enabled"] else None
     shield_guided_cfg = dict(cfg.rl.get("shield_guided_reward", {}) or {})
+    reward_profile = str(cfg.rl.get("reward_profile", "default"))
     report["reward_risk_checkpoint"] = (
         str(shield_guided_cfg.get("risk_checkpoint", ""))
-        if str(cfg.rl.get("reward_profile", "default")) == "shield_guided_forecast"
+        if reward_profile in {"shield_guided_forecast", "merge_timing_forecast"}
         else ""
     )
     report["shield_guided_reward_config"] = (
-        shield_guided_cfg if str(cfg.rl.get("reward_profile", "default")) == "shield_guided_forecast" else None
+        shield_guided_cfg if reward_profile in {"shield_guided_forecast", "merge_timing_forecast"} else None
+    )
+    report["merge_timing_reward_config"] = (
+        dict(cfg.rl.get("merge_timing_reward", {}) or {}) if reward_profile == "merge_timing_forecast" else None
     )
     report["observation_dim"] = int(observation_shape[0]) if observation_shape else 0
     report["observation_shape"] = observation_shape

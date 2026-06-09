@@ -124,12 +124,12 @@ def make_env(
         shield = SafetyShield(cfg, risk_model)
         shield.enabled = True
     reward_risk_model = None
-    if str(cfg.rl.get("reward_profile", "default")) == "shield_guided_forecast":
+    if str(cfg.rl.get("reward_profile", "default")) in {"shield_guided_forecast", "merge_timing_forecast"}:
         reward_cfg = cfg.rl.get("shield_guided_reward", {})
         configured_checkpoint = reward_risk_checkpoint or reward_cfg.get("risk_checkpoint")
         if not configured_checkpoint:
             raise FileNotFoundError(
-                "rl.reward_profile=shield_guided_forecast requires "
+                "rl.reward_profile=shield_guided_forecast or merge_timing_forecast requires "
                 "rl.shield_guided_reward.risk_checkpoint or make_env(..., reward_risk_checkpoint=...)."
             )
         checkpoint_path = _resolve_repo_path(configured_checkpoint)

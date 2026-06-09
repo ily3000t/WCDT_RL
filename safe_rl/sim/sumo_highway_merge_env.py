@@ -105,6 +105,9 @@ class SumoHighwayMergeEnv(gym.Env):
         self._first_target_lane_entry_distance_to_taper: float | None = None
         self._safe_merge_opportunity_count = 0
         self._missed_safe_merge_opportunity_count = 0
+        self._task_merge_records: list[dict[str, Any]] = []
+        self._last_task_merge_record: dict[str, Any] = {}
+        self._task_missed_consecutive_count = 0
 
     def _import_traci(self):
         if self._traci_module is not None:
@@ -155,6 +158,9 @@ class SumoHighwayMergeEnv(gym.Env):
         self._first_target_lane_entry_distance_to_taper = None
         self._safe_merge_opportunity_count = 0
         self._missed_safe_merge_opportunity_count = 0
+        self._task_merge_records.clear()
+        self._last_task_merge_record = {}
+        self._task_missed_consecutive_count = 0
         if self.shield is not None and hasattr(self.shield, "reset_episode_state"):
             self.shield.reset_episode_state()
 
@@ -563,13 +569,22 @@ class SumoHighwayMergeEnv(gym.Env):
         if metrics.lane_oob:
             reward += reward_cfg.lane_oob
         reward_profile = str(self.config.rl.get("reward_profile", "default"))
-        if reward_profile in {"safety_forecast", "shield_guided_forecast"}:
+        if reward_profile in {"safety_forecast", "shield_guided_forecast", "merge_timing_forecast"}:
             reward += self._safety_forecast_reward_adjustment(ego, metrics)
-        if reward_profile == "shield_guided_forecast":
+        if reward_profile in {"shield_guided_forecast", "merge_timing_forecast"}:
             shield_penalty, reward_debug = self._shield_guided_reward_adjustment(raw_action, risk_context)
             reward += shield_penalty
             self._last_reward_debug = reward_debug
             self._reward_debug_records.append(reward_debug)
+        if reward_profile == "merge_timing_forecast":
+            timing_adjustment, timing_debug = self._merge_timing_reward_adjustment(
+                ego,
+                done_reason,
+                raw_action,
+                risk_context,
+            )
+            reward += timing_adjustment
+            self._last_reward_debug = {**self._last_reward_debug, **timing_debug}
         return float(reward)
 
     def _safety_forecast_reward_adjustment(self, ego: VehicleState | None, metrics: StepMetrics) -> float:
@@ -677,6 +692,114 @@ class SumoHighwayMergeEnv(gym.Env):
         }
         return total_penalty, debug
 
+    def _task_merge_shadow(self, context: dict[str, Any] | None, raw_action: Any | None) -> dict[str, Any]:
+        debug: dict[str, Any] = {
+            "available": False,
+            "task_merge_opportunity": False,
+            "task_would_merge": False,
+            "task_missed_merge": False,
+            "task_deadline_urgency": 0.0,
+            "task_safe_merge_action": "",
+            "task_safe_merge_action_index": None,
+            "task_consecutive_missed_count": int(self._task_missed_consecutive_count),
+            "distance_to_taper": None,
+        }
+        if context is None or raw_action is None:
+            return debug
+        ego = context.get("ego")
+        local = context.get("merge_local")
+        merge_cmd = self._merge_lateral_cmd(ego)
+        if ego is None or local is None or merge_cmd == 0:
+            self._task_missed_consecutive_count = 0
+            return debug
+
+        deadline_distance = float(self.config.rl.get("merge_timing_reward", {}).get("deadline_distance", 120.0))
+        distance = max(0.0, float(local.merge_distance))
+        urgency = float(np.clip((deadline_distance - distance) / max(deadline_distance, 1.0e-6), 0.0, 1.0))
+        safe_action = next(
+            (
+                action
+                for action in ACTIONS
+                if action.lateral_cmd == merge_cmd and is_candidate_legal(action, context)
+            ),
+            None,
+        )
+        safe_gap = bool(
+            safe_action is not None
+            and float(local.target_front_gap)
+            >= float(self.config.scenario.get("merge_opportunity_min_front_gap", 12.0))
+            and float(local.target_rear_gap)
+            >= float(self.config.scenario.get("merge_opportunity_min_rear_gap", 12.0))
+        )
+        missed = bool(safe_gap and int(raw_action.lateral_cmd) != merge_cmd)
+        if missed:
+            self._task_missed_consecutive_count += 1
+        else:
+            self._task_missed_consecutive_count = 0
+        debug.update(
+            {
+                "available": True,
+                "task_merge_opportunity": safe_gap,
+                "task_would_merge": bool(missed and urgency > 0.0),
+                "task_missed_merge": missed,
+                "task_deadline_urgency": urgency,
+                "task_safe_merge_action": str(safe_action.name) if safe_action is not None else "",
+                "task_safe_merge_action_index": int(safe_action.index) if safe_action is not None else None,
+                "task_consecutive_missed_count": int(self._task_missed_consecutive_count),
+                "distance_to_taper": distance,
+            }
+        )
+        return debug
+
+    def _merge_timing_reward_adjustment(
+        self,
+        ego: VehicleState | None,
+        done_reason: str,
+        raw_action: Any | None,
+        context: dict[str, Any] | None,
+    ) -> tuple[float, dict[str, Any]]:
+        cfg = self.config.rl.get("merge_timing_reward", {})
+        record = (
+            self._last_task_merge_record
+            if int(self._last_task_merge_record.get("step", -1)) == int(self._episode_step)
+            else self._task_merge_shadow(context, raw_action)
+        )
+        urgency = float(record.get("task_deadline_urgency", 0.0) or 0.0)
+        grace = int(cfg.get("consecutive_missed_grace", 2))
+        missed_count = int(record.get("task_consecutive_missed_count", 0) or 0)
+        missed_penalty = 0.0
+        if bool(record.get("task_missed_merge", False)) and missed_count > grace:
+            missed_penalty = float(cfg.get("missed_opportunity_weight", -2.0)) * urgency
+
+        deadline_penalty = 0.0
+        if ego is not None and is_auxiliary_edge(self.config, ego.edge_id):
+            deadline_penalty = float(cfg.get("taper_deadline_weight", -4.0)) * urgency
+
+        taper_penalty = float(cfg.get("taper_miss_penalty", -35.0)) if done_reason == "taper_miss" else 0.0
+        early_bonus = 0.0
+        if (
+            ego is not None
+            and self._first_target_lane_entry_step == int(self._episode_step)
+            and self._first_target_lane_entry_distance_to_taper is not None
+            and float(self._first_target_lane_entry_distance_to_taper)
+            >= float(cfg.get("bonus_min_distance_to_taper", 60.0))
+        ):
+            early_bonus = float(cfg.get("early_safe_merge_bonus", 1.5))
+        total = float(missed_penalty + deadline_penalty + taper_penalty + early_bonus)
+        debug = {
+            "merge_timing_reward_adjustment": total,
+            "merge_timing_missed_penalty": float(missed_penalty),
+            "merge_timing_deadline_penalty": float(deadline_penalty),
+            "merge_timing_taper_miss_penalty": float(taper_penalty),
+            "merge_timing_early_safe_merge_bonus": float(early_bonus),
+            "task_merge_opportunity": bool(record.get("task_merge_opportunity", False)),
+            "task_would_merge": bool(record.get("task_would_merge", False)),
+            "task_missed_merge": bool(record.get("task_missed_merge", False)),
+            "task_deadline_urgency": urgency,
+            "task_consecutive_missed_count": missed_count,
+        }
+        return total, debug
+
     def _merge_lateral_cmd(self, ego: VehicleState | None) -> int:
         if ego is None or not is_auxiliary_edge(self.config, ego.edge_id):
             return 0
@@ -687,21 +810,19 @@ class SumoHighwayMergeEnv(gym.Env):
         local = context.get("merge_local")
         merge_cmd = self._merge_lateral_cmd(ego)
         if ego is None or local is None or merge_cmd == 0:
+            self._last_task_merge_record = {}
             return
         if int(raw_action.lateral_cmd) == merge_cmd and self._first_merge_request_step is None:
             self._first_merge_request_step = int(self._episode_step)
             self._first_merge_request_distance_to_taper = float(local.merge_distance)
+        task_record = self._task_merge_shadow(context, raw_action)
+        task_record["step"] = int(self._episode_step)
+        self._last_task_merge_record = task_record
+        self._task_merge_records.append(task_record)
         safe_opportunity = bool(
-            float(local.target_front_gap)
-            >= float(self.config.scenario.get("merge_opportunity_min_front_gap", 12.0))
-            and float(local.target_rear_gap)
-            >= float(self.config.scenario.get("merge_opportunity_min_rear_gap", 12.0))
+            task_record.get("task_merge_opportunity", False)
             and float(local.merge_distance)
             >= float(self.config.scenario.get("merge_opportunity_min_distance_to_taper", 60.0))
-            and any(
-                action.lateral_cmd == merge_cmd and is_candidate_legal(action, context)
-                for action in ACTIONS
-            )
         )
         if not safe_opportunity:
             return
@@ -775,6 +896,11 @@ class SumoHighwayMergeEnv(gym.Env):
                     "first_target_lane_entry_distance_to_taper": self._first_target_lane_entry_distance_to_taper,
                     "safe_merge_opportunity_count": int(self._safe_merge_opportunity_count),
                     "missed_safe_merge_opportunity_count": int(self._missed_safe_merge_opportunity_count),
+                    "task_merge_opportunity": bool(self._last_task_merge_record.get("task_merge_opportunity", False)),
+                    "task_would_merge": bool(self._last_task_merge_record.get("task_would_merge", False)),
+                    "task_missed_merge": bool(self._last_task_merge_record.get("task_missed_merge", False)),
+                    "task_deadline_urgency": float(self._last_task_merge_record.get("task_deadline_urgency", 0.0)),
+                    "task_safe_merge_action": str(self._last_task_merge_record.get("task_safe_merge_action", "")),
                 }
             )
             if intervention is not None:
@@ -845,6 +971,10 @@ class SumoHighwayMergeEnv(gym.Env):
         raw_actions = Counter(str(item.get("raw_action", "")) for item in self._interventions)
         final_actions = Counter(str(item.get("final_action", "")) for item in self._interventions)
         emergency_fallback_count = sum(1 for item in self._interventions if item.get("emergency_fallback"))
+        task_available_records = [record for record in self._task_merge_records if record.get("available")]
+        task_merge_count = sum(1 for record in task_available_records if record.get("task_merge_opportunity"))
+        task_would_merge_count = sum(1 for record in task_available_records if record.get("task_would_merge"))
+        task_missed_merge_count = sum(1 for record in task_available_records if record.get("task_missed_merge"))
         score_records = [
             {
                 "replacement_reason": str(item.get("replacement_reason", "")),
@@ -926,6 +1056,15 @@ class SumoHighwayMergeEnv(gym.Env):
                 float(self._missed_safe_merge_opportunity_count / self._safe_merge_opportunity_count)
                 if self._safe_merge_opportunity_count
                 else 0.0
+            ),
+            "task_merge_opportunity_count": int(task_merge_count),
+            "task_would_merge_count": int(task_would_merge_count),
+            "task_would_merge_rate": (
+                float(task_would_merge_count / max(task_merge_count, 1)) if task_merge_count else 0.0
+            ),
+            "task_missed_merge_count": int(task_missed_merge_count),
+            "task_missed_merge_rate": (
+                float(task_missed_merge_count / max(task_merge_count, 1)) if task_merge_count else 0.0
             ),
         }
 

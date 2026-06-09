@@ -1,0 +1,6 @@
+run:
+  run_id: safe_rl_smoke
+stage2:
+  input_stage4: auto
+prediction:
+  train_enabled: false

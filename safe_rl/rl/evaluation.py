@@ -87,6 +87,11 @@ def _step_safety_record(
         "best_merge_action_risk": info.get("best_merge_action_risk"),
         "safe_merge_opportunity_count": int(info.get("safe_merge_opportunity_count", 0)),
         "missed_safe_merge_opportunity_count": int(info.get("missed_safe_merge_opportunity_count", 0)),
+        "task_merge_opportunity": bool(info.get("task_merge_opportunity", False)),
+        "task_would_merge": bool(info.get("task_would_merge", False)),
+        "task_missed_merge": bool(info.get("task_missed_merge", False)),
+        "task_deadline_urgency": _safe_float(info.get("task_deadline_urgency"), 0.0),
+        "task_safe_merge_action": str(info.get("task_safe_merge_action", "")),
         "safety_metric_version": str(info.get("safety_metric_version", "")),
     }
 

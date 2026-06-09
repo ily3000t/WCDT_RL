@@ -836,6 +836,75 @@ def test_shield_guided_reward_does_not_penalize_safe_raw_action():
     assert not debug["would_replace"]
 
 
+def _merge_timing_context(cfg=None, *, front_gap=20.0, rear_gap=20.0, distance_to_taper=30.0):
+    cfg = cfg or load_config()
+    ego = VehicleState("ego", 490.0, 53.8, 0.0, 20.0, 0, "main_aux_0", 190.0, "main_aux")
+    return {
+        "ego": ego,
+        "vehicles": [ego],
+        "lane_count": 4,
+        "config": cfg,
+        "merge_local": SimpleNamespace(
+            target_front_gap=front_gap,
+            target_rear_gap=rear_gap,
+            merge_distance=distance_to_taper,
+        ),
+    }
+
+
+def test_merge_timing_reward_penalty_scales_with_deadline_urgency():
+    cfg = load_config()
+    cfg.rl["reward_profile"] = "merge_timing_forecast"
+    cfg.rl["merge_timing_reward"]["deadline_distance"] = 120.0
+    cfg.rl["merge_timing_reward"]["consecutive_missed_grace"] = 0
+    env = SumoHighwayMergeEnv(cfg, seed=1, reward_risk_model=_StaticRiskModel({4: 0.10}))
+    far, far_debug = env._merge_timing_reward_adjustment(
+        _merge_timing_context(cfg, distance_to_taper=110.0)["ego"],
+        "",
+        decode_action(5),
+        _merge_timing_context(cfg, distance_to_taper=110.0),
+    )
+    near, near_debug = env._merge_timing_reward_adjustment(
+        _merge_timing_context(cfg, distance_to_taper=30.0)["ego"],
+        "",
+        decode_action(5),
+        _merge_timing_context(cfg, distance_to_taper=30.0),
+    )
+    assert far_debug["task_missed_merge"]
+    assert near_debug["task_deadline_urgency"] > far_debug["task_deadline_urgency"]
+    assert near < far
+
+
+def test_merge_timing_reward_respects_missed_opportunity_grace():
+    cfg = load_config()
+    cfg.rl["merge_timing_reward"]["consecutive_missed_grace"] = 2
+    env = SumoHighwayMergeEnv(cfg, seed=1, reward_risk_model=_StaticRiskModel({4: 0.10}))
+    context = _merge_timing_context(cfg, distance_to_taper=30.0)
+    env._record_merge_opportunity(context, decode_action(5))
+    penalty, debug = env._merge_timing_reward_adjustment(context["ego"], "", decode_action(5), context)
+    assert debug["task_consecutive_missed_count"] == 1
+    assert debug["merge_timing_missed_penalty"] == pytest.approx(0.0)
+    assert penalty < 0.0  # deadline penalty still applies near taper.
+
+
+def test_merge_timing_reward_does_not_bonus_unsafe_gap():
+    cfg = load_config()
+    env = SumoHighwayMergeEnv(cfg, seed=1, reward_risk_model=_StaticRiskModel({4: 0.10}))
+    context = _merge_timing_context(cfg, front_gap=3.0, rear_gap=3.0, distance_to_taper=80.0)
+    penalty, debug = env._merge_timing_reward_adjustment(context["ego"], "", decode_action(5), context)
+    assert not debug["task_merge_opportunity"]
+    assert debug["merge_timing_early_safe_merge_bonus"] == pytest.approx(0.0)
+    assert debug["merge_timing_missed_penalty"] == pytest.approx(0.0)
+
+
+def test_merge_timing_reward_penalizes_taper_miss_terminal():
+    cfg = load_config()
+    env = SumoHighwayMergeEnv(cfg, seed=1, reward_risk_model=_StaticRiskModel({4: 0.10}))
+    penalty, debug = env._merge_timing_reward_adjustment(None, "taper_miss", decode_action(4), None)
+    assert penalty <= -35.0
+    assert debug["merge_timing_taper_miss_penalty"] == pytest.approx(-35.0)
+
+
 def test_shield_keeps_raw_action_below_activation_threshold():
     cfg = _shield_cfg()
     shield = SafetyShield(cfg, _StaticRiskModel({4: 0.50}))
@@ -1695,6 +1764,9 @@ def test_stage5_metrics_distinguish_shield_calls_from_replacements():
                 "actual_replacement_count": 0,
                 "fallback_count": 0,
                 "emergency_fallback_count": 0,
+                "task_merge_opportunity_count": 2,
+                "task_would_merge_count": 1,
+                "task_missed_merge_count": 1,
             },
             {
                 "collision": False,
@@ -1716,6 +1788,9 @@ def test_stage5_metrics_distinguish_shield_calls_from_replacements():
                 "actual_replacement_count": 2,
                 "fallback_count": 0,
                 "emergency_fallback_count": 1,
+                "task_merge_opportunity_count": 3,
+                "task_would_merge_count": 2,
+                "task_missed_merge_count": 2,
             },
         ]
     )
@@ -1738,6 +1813,11 @@ def test_stage5_metrics_distinguish_shield_calls_from_replacements():
     assert metrics["steps_p95"] == pytest.approx(119.0)
     assert metrics["completion_time_mean"] == pytest.approx(11.0)
     assert metrics["completion_time_p95"] == pytest.approx(11.9)
+    assert metrics["task_merge_opportunity_count"] == 5
+    assert metrics["task_would_merge_count"] == 3
+    assert metrics["task_would_merge_rate"] == pytest.approx(0.6)
+    assert metrics["task_missed_merge_count"] == 3
+    assert metrics["task_missed_merge_rate"] == pytest.approx(0.6)
     assert metrics["ego_speed_mean"] == pytest.approx(19.0)
     assert metrics["ego_speed_p10"] == pytest.approx(12.3)
     assert metrics["hard_brake_rate"] == pytest.approx(0.125)
@@ -2506,6 +2586,52 @@ def test_full_pipeline_shield_guided_profile_binds_base_risk_module_for_forecast
     )
 
 
+def test_full_pipeline_merge_timing_profile_binds_base_risk_module_for_forecast_only(tmp_path):
+    configs = build_generated_configs(
+        "safe_rl_test_run",
+        tmp_path,
+        ppo_timesteps=20000,
+        forecast_ppo_timesteps=100000,
+        forecast_ppo_profile="merge_timing",
+        forecast_sources=["wcdt_v3"],
+    )
+    main = yaml.safe_load(configs["main"].read_text(encoding="utf-8"))
+    forecast = yaml.safe_load(configs["forecast_wcdt_v3_ppo"].read_text(encoding="utf-8"))
+    assert "reward_profile" not in main["rl"]
+    assert forecast["rl"]["total_timesteps"] == 100000
+    assert forecast["rl"]["reward_profile"] == "merge_timing_forecast"
+    assert forecast["rl"]["shield_guided_reward"]["risk_checkpoint"] == (
+        "safe_rl_output/runs/safe_rl_test_run/stage2/risk_module.pt"
+    )
+
+
+def test_forecast_branch_runner_builds_merge_timing_stage5_groups():
+    from safe_rl.pipeline.train_forecast_branches import _forecast_training_payload, _stage5_payload
+
+    payload = _forecast_training_payload(
+        base_run_id="safe_rl_base",
+        source="wcdt_v3",
+        suffix="merge_timing",
+        profile="merge_timing",
+        timesteps=100000,
+    )
+    assert payload["run"]["run_id"] == "safe_rl_base_forecast_wcdt_v3_merge_timing"
+    assert payload["rl"]["reward_profile"] == "merge_timing_forecast"
+    assert payload["rl"]["shield_guided_reward"]["risk_checkpoint"] == (
+        "safe_rl_output/runs/safe_rl_base/stage2/risk_module.pt"
+    )
+
+    stage5 = _stage5_payload("safe_rl_base", ["constant_velocity", "wcdt_v3"], "merge_timing")
+    groups = {item["name"]: item for item in stage5["stage5"]["groups"]}
+    assert "ppo_wcdt_v3_features" in groups
+    assert "wcdt_v3_prediction_shield" in groups
+    assert "ppo_wcdt_v3_merge_timing_features" in groups
+    assert "wcdt_v3_merge_timing_prediction_shield" in groups
+    assert groups["ppo_wcdt_v3_merge_timing_features"]["model_path"].endswith(
+        "safe_rl_base_forecast_wcdt_v3_merge_timing/stage3/ppo_model.zip"
+    )
+
+
 def _fake_group(
     seed_rewards: list[tuple[int, float]],
     reward: float,
@@ -2678,7 +2804,21 @@ def test_stage5_failure_audit_identifies_min_distance_zero_and_writes_replay_com
                                 "emergency_reason": "min_distance",
                             }
                         ],
-                    }
+                    },
+                    {
+                        "seed": 8,
+                        "episode_reward": -5.0,
+                        "merge_success": False,
+                        "done_reason": "taper_miss",
+                        "taper_miss": True,
+                        "proxy_collision": False,
+                        "safety_violation": False,
+                        "min_distance": 3.0,
+                        "ttc_p1": 2.0,
+                        "drac_p99_raw": 2.0,
+                        "missed_safe_merge_opportunity_count": 4,
+                        "missed_safe_merge_opportunity_rate": 1.0,
+                    },
                 ]
             }
         }
@@ -2688,6 +2828,8 @@ def test_stage5_failure_audit_identifies_min_distance_zero_and_writes_replay_com
 
     audit = build_failure_audit("safe_rl_audit", groups=["cv_prediction_shield"], eval_stage="stage5")
     assert audit["failure_counts"] == {"cv_prediction_shield": 1}
+    assert audit["safety_failure_counts"] == {"cv_prediction_shield": 1}
+    assert audit["task_failure_counts"] == {"cv_prediction_shield": 1}
     failure = audit["failures"]["cv_prediction_shield"][0]
     assert failure["seed"] == 7
     assert failure["first_failure_step"] == "unavailable"
@@ -2700,6 +2842,17 @@ def test_stage5_failure_audit_identifies_min_distance_zero_and_writes_replay_com
     content = commands.read_text(encoding="utf-8")
     assert "cv_prediction_shield_seed_7.json" in content
     assert "--gui --delay-ms 200" in content
+
+    audit_with_tasks = build_failure_audit(
+        "safe_rl_audit",
+        groups=["cv_prediction_shield"],
+        eval_stage="stage5",
+        include_task_failures=True,
+    )
+    assert audit_with_tasks["failure_counts"] == {"cv_prediction_shield": 2}
+    task_failure = [item for item in audit_with_tasks["failures"]["cv_prediction_shield"] if item["seed"] == 8][0]
+    assert "taper_miss" in task_failure["failure_classification"]
+    assert "merge_task_failure" in task_failure["failure_classification"]
 
 
 def test_step_safety_record_marks_proxy_collision_for_failure_audit():

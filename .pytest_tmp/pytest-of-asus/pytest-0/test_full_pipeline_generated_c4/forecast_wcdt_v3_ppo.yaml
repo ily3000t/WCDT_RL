@@ -1,0 +1,10 @@
+run:
+  run_id: safe_rl_smoke_forecast_wcdt_v3
+forecast_features:
+  enabled: true
+  use_for_ppo_observation: true
+  source: wcdt_v3
+  checkpoint: safe_rl_output/runs/safe_rl_smoke/stage2/wcdt_v3_predictor.pt
+  allow_heuristic_fallback: false
+rl:
+  use_wcdt_forecast_features: true

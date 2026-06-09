@@ -1,0 +1,127 @@
+{
+  "schema_version": 4,
+  "run_id": "safe_rl_test",
+  "normalized_invocation": {
+    "stage1_episodes": null,
+    "stage4_episodes": null,
+    "stage5_episodes": null,
+    "ppo_timesteps": null,
+    "forecast_ppo_timesteps": null,
+    "forecast_ppo_profile": "default",
+    "forecast_sources": [
+      "constant_velocity"
+    ],
+    "pipeline_profile": "default"
+  },
+  "forecast_sources": [
+    "constant_velocity"
+  ],
+  "pipeline_profile": "default",
+  "pipeline_profile_config_sha256": null,
+  "default_config_sha256": "788768e3626a226f9baff1a5c3ddad627d448d3543b3e09bc6b9eaf82ea79021",
+  "safety_metric_version": "oriented_box_v1",
+  "scenario_snapshot_sha256": null,
+  "scenario_source_sha256": null,
+  "tasks": {
+    "network_snapshot": {
+      "enabled": true,
+      "status": "pending",
+      "started_at": null,
+      "completed_at": null,
+      "required_outputs": [],
+      "output_hashes": {}
+    },
+    "stage1": {
+      "enabled": true,
+      "status": "completed",
+      "started_at": "2026-06-09T08:34:50.625015+00:00",
+      "completed_at": "2026-06-09T08:34:50.628390+00:00",
+      "required_outputs": [
+        "E:\\WcDT_RL\\.pytest_tmp\\pytest-of-asus\\pytest-0\\test_runner_pipeline_task_reco0\\artifact.txt"
+      ],
+      "output_hashes": {
+        "E:\\WcDT_RL\\.pytest_tmp\\pytest-of-asus\\pytest-0\\test_runner_pipeline_task_reco0\\artifact.txt": "a4c3ed04a95a3da14a9d235c83d868bed7c0f45cf7f3faa751ee8f50598d2211"
+      }
+    },
+    "stage2_initial": {
+      "enabled": true,
+      "status": "pending",
+      "started_at": null,
+      "completed_at": null,
+      "required_outputs": [],
+      "output_hashes": {}
+    },
+    "stage3_baseline": {
+      "enabled": true,
+      "status": "pending",
+      "started_at": null,
+      "completed_at": null,
+      "required_outputs": [],
+      "output_hashes": {}
+    },
+    "stage4": {
+      "enabled": true,
+      "status": "pending",
+      "started_at": null,
+      "completed_at": null,
+      "required_outputs": [],
+      "output_hashes": {}
+    },
+    "stage2_with_stage4": {
+      "enabled": true,
+      "status": "pending",
+      "started_at": null,
+      "completed_at": null,
+      "required_outputs": [],
+      "output_hashes": {}
+    },
+    "stage3_forecast_cv": {
+      "enabled": true,
+      "status": "pending",
+      "started_at": null,
+      "completed_at": null,
+      "required_outputs": [],
+      "output_hashes": {}
+    },
+    "stage3_forecast_wcdt": {
+      "enabled": false,
+      "status": "completed",
+      "started_at": null,
+      "completed_at": null,
+      "required_outputs": [],
+      "output_hashes": {}
+    },
+    "stage3_forecast_wcdt_v2": {
+      "enabled": false,
+      "status": "completed",
+      "started_at": null,
+      "completed_at": null,
+      "required_outputs": [],
+      "output_hashes": {}
+    },
+    "stage3_forecast_wcdt_v3": {
+      "enabled": false,
+      "status": "completed",
+      "started_at": null,
+      "completed_at": null,
+      "required_outputs": [],
+      "output_hashes": {}
+    },
+    "stage5": {
+      "enabled": true,
+      "status": "pending",
+      "started_at": null,
+      "completed_at": null,
+      "required_outputs": [],
+      "output_hashes": {}
+    },
+    "diagnostics": {
+      "enabled": true,
+      "status": "pending",
+      "started_at": null,
+      "completed_at": null,
+      "required_outputs": [],
+      "output_hashes": {}
+    }
+  }
+}

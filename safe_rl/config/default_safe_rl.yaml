@@ -227,6 +227,14 @@ rl:
     would_replace_penalty_weight: -2.0
     uncertainty_threshold: 0.40
     use_calibrated_risk: false
+  merge_timing_reward:
+    deadline_distance: 120.0
+    missed_opportunity_weight: -2.0
+    taper_deadline_weight: -4.0
+    taper_miss_penalty: -35.0
+    early_safe_merge_bonus: 1.5
+    bonus_min_distance_to_taper: 60.0
+    consecutive_missed_grace: 2
 
 shield:
   enabled: false

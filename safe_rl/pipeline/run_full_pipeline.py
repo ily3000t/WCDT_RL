@@ -29,7 +29,7 @@ from safe_rl.sim.metrics import SAFETY_METRIC_VERSION
 
 VALID_FORECAST_SOURCES = ("constant_velocity", "wcdt", "wcdt_v2", "wcdt_v3")
 DEFAULT_FORECAST_SOURCES = ("constant_velocity", "wcdt_v3")
-VALID_FORECAST_PPO_PROFILES = ("default", "safety", "shield_guided")
+VALID_FORECAST_PPO_PROFILES = ("default", "safety", "shield_guided", "merge_timing")
 VALID_RUN_MODES = ("new", "resume", "overwrite")
 VALID_PIPELINE_PROFILES = ("default", "smoke")
 RUN_ID_PATTERN = re.compile(r"^[A-Za-z0-9._-]+$")
@@ -577,8 +577,10 @@ def _forecast_payload(
         raise ValueError(f"forecast PPO profile must be one of {VALID_FORECAST_PPO_PROFILES}; got {profile!r}")
     if profile == "safety":
         payload["rl"]["reward_profile"] = "safety_forecast"
-    elif profile == "shield_guided":
-        payload["rl"]["reward_profile"] = "shield_guided_forecast"
+    elif profile in {"shield_guided", "merge_timing"}:
+        payload["rl"]["reward_profile"] = (
+            "merge_timing_forecast" if profile == "merge_timing" else "shield_guided_forecast"
+        )
         payload["rl"]["shield_guided_reward"] = {
             "risk_checkpoint": _relative_run_path(run_id, "stage2", "risk_module.pt"),
         }
@@ -936,7 +938,9 @@ def main() -> None:
         default=None,
         help=(
             "Forecast PPO reward profile. 'safety' writes rl.reward_profile=safety_forecast; "
-            "'shield_guided' writes rl.reward_profile=shield_guided_forecast and binds the base risk module."
+            "'shield_guided' writes rl.reward_profile=shield_guided_forecast; "
+            "'merge_timing' writes rl.reward_profile=merge_timing_forecast. "
+            "The guided profiles bind the base risk module."
         ),
     )
     parser.add_argument(
