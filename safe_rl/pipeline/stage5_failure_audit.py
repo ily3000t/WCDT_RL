@@ -136,6 +136,74 @@ def _records_near_failure(records: list[dict[str, Any]], first_step: int | None,
     return [_compact_record(item) for item in selected]
 
 
+def _compact_step_trace(item: dict[str, Any]) -> dict[str, Any]:
+    keys = (
+        "step",
+        "control_step",
+        "raw_action",
+        "final_action",
+        "raw_action_name",
+        "final_action_name",
+        "ego_edge",
+        "ego_lane",
+        "distance_to_taper",
+        "target_front_gap",
+        "target_rear_gap",
+        "task_merge_opportunity",
+        "task_would_merge",
+        "task_missed_merge",
+        "task_deadline_urgency",
+        "forecast_aware_raw_task_risk",
+        "forecast_aware_best_task_risk",
+        "forecast_aware_best_action",
+        "forecast_aware_best_action_name",
+        "forecast_aware_would_merge",
+        "forecast_aware_safety_risk",
+        "forecast_aware_uncertainty",
+        "forecast_aware_target_front_gap",
+        "forecast_aware_target_rear_gap",
+        "task_replacement",
+        "task_replacement_reason",
+        "taper_miss",
+        "done_reason",
+        "min_distance",
+        "min_ttc",
+        "drac",
+    )
+    return {key: item.get(key) for key in keys if key in item}
+
+
+def _task_failure_step(step_trace: list[dict[str, Any]], episode: dict[str, Any]) -> int | None:
+    for index, item in enumerate(step_trace):
+        if bool(item.get("taper_miss", False)) or str(item.get("done_reason", "") or "") == "taper_miss":
+            return int(item.get("step", index))
+    if step_trace and _is_task_failure(episode):
+        return int(step_trace[-1].get("step", len(step_trace) - 1))
+    return None
+
+
+def _step_trace_near_failure(
+    step_trace: list[dict[str, Any]],
+    first_step: int | None,
+    *,
+    window: int = 10,
+) -> list[dict[str, Any]]:
+    if not step_trace:
+        return []
+    if first_step is None:
+        return [_compact_step_trace(item) for item in step_trace[-min(len(step_trace), window):]]
+    lower = max(0, first_step - window)
+    upper = first_step + 1
+    selected = [
+        item
+        for index, item in enumerate(step_trace)
+        if lower <= int(item.get("step", item.get("control_step", index))) <= upper
+    ]
+    if not selected:
+        selected = step_trace[-min(len(step_trace), window):]
+    return [_compact_step_trace(item) for item in selected]
+
+
 def _classify_failure(
     episode: dict[str, Any],
     records: list[dict[str, Any]],
@@ -206,6 +274,8 @@ def _episode_summary(
     replay = _load_replay(replay_path)
     step_trace = _step_trace_from_replay(replay)
     first_step = _first_failure_step(step_trace, collision_threshold)
+    task_step = _task_failure_step(step_trace, episode)
+    trace_focus_step = first_step if first_step is not None else task_step
     records = episode.get("shield_score_records", []) or []
     records = [item for item in records if isinstance(item, dict)]
     replay_command = (
@@ -213,6 +283,12 @@ def _episode_summary(
         f"--replay {_powershell_quote(replay_path)}"
     )
     classification = _classify_failure(episode, records, first_step, bool(step_trace))
+    step_trace_near_failure = _step_trace_near_failure(step_trace, trace_focus_step)
+    if _is_task_failure(episode) and any(
+        str(item.get("forecast_aware_best_action_name", "")).startswith("left_")
+        for item in step_trace_near_failure
+    ):
+        classification.append("forecast_aware_merge_available")
     return {
         "run_id": run_id,
         "eval_stage": eval_stage,
@@ -238,6 +314,7 @@ def _episode_summary(
             "ttc_p1": _safe_float(episode.get("ttc_p1"), 0.0),
             "drac_p99_raw": _safe_float(episode.get("drac_p99_raw"), _safe_float(episode.get("drac_p99"), 0.0)),
             "actual_replacement_count": int(_safe_float(episode.get("actual_replacement_count"), 0.0)),
+            "task_replacement_count": int(_safe_float(episode.get("task_replacement_count"), 0.0)),
             "emergency_fallback_count": int(_safe_float(episode.get("emergency_fallback_count"), 0.0)),
             "fallback_count": int(_safe_float(episode.get("fallback_count"), 0.0)),
             "steps": int(_safe_float(episode.get("steps"), 0.0)),
@@ -252,12 +329,28 @@ def _episode_summary(
             "missed_safe_merge_opportunity_rate": _safe_float(
                 episode.get("missed_safe_merge_opportunity_rate"), 0.0
             ),
+            "deadline_missed_safe_merge_rate": _safe_float(
+                episode.get("deadline_missed_safe_merge_rate"), 0.0
+            ),
+            "missed_safe_merge_after_urgency_0_5_rate": _safe_float(
+                episode.get("missed_safe_merge_after_urgency_0_5_rate"), 0.0
+            ),
+            "safe_merge_after_urgency_0_5_count": int(
+                _safe_float(episode.get("safe_merge_after_urgency_0_5_count"), 0.0)
+            ),
+            "missed_safe_merge_after_urgency_0_5_count": int(
+                _safe_float(episode.get("missed_safe_merge_after_urgency_0_5_count"), 0.0)
+            ),
+            "no_merge_request_before_taper_count": int(
+                _safe_float(episode.get("no_merge_request_before_taper_count"), 0.0)
+            ),
         },
         "replacement_reason_counts": episode.get("replacement_reason_counts", {}) or {},
         "raw_action_histogram": episode.get("raw_action_histogram", {}) or {},
         "final_action_histogram": episode.get("final_action_histogram", {}) or {},
         "shield_record_count": len(records),
         "shield_records_near_failure": _records_near_failure(records, first_step),
+        "step_trace_near_failure": step_trace_near_failure,
     }
 
 

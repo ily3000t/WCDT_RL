@@ -71,6 +71,10 @@ def aggregate_episode_reports(reports: list[dict]) -> dict:
     interventions = np.asarray([float(report.get("intervention_count", 0)) for report in reports], dtype=np.float32)
     shield_calls = np.asarray([float(report.get("shield_call_count", report.get("intervention_count", 0))) for report in reports], dtype=np.float32)
     replacements = np.asarray([float(report.get("actual_replacement_count", 0)) for report in reports], dtype=np.float32)
+    task_replacements = np.asarray(
+        [float(report.get("task_replacement_count", 0)) for report in reports],
+        dtype=np.float32,
+    )
     fallbacks = np.asarray([float(report.get("fallback_count", 0)) for report in reports], dtype=np.float32)
     emergency_fallbacks = np.asarray(
         [float(report.get("emergency_fallback_count", 0)) for report in reports],
@@ -104,6 +108,20 @@ def aggregate_episode_reports(reports: list[dict]) -> dict:
     task_merge_opportunities = int(sum(int(report.get("task_merge_opportunity_count", 0)) for report in reports))
     task_would_merges = int(sum(int(report.get("task_would_merge_count", 0)) for report in reports))
     task_missed_merges = int(sum(int(report.get("task_missed_merge_count", 0)) for report in reports))
+    deadline_opportunities = int(
+        sum(int(report.get("deadline_safe_merge_opportunity_count", 0)) for report in reports)
+    )
+    deadline_missed = int(sum(int(report.get("deadline_missed_safe_merge_count", 0)) for report in reports))
+    urgency_missed = int(
+        sum(int(report.get("missed_safe_merge_after_urgency_0_5_count", 0)) for report in reports)
+    )
+    urgency_opportunities = int(
+        sum(int(report.get("safe_merge_after_urgency_0_5_count", 0)) for report in reports)
+    )
+    no_merge_before_taper = np.asarray(
+        [float(report.get("no_merge_request_before_taper_count", 0)) for report in reports],
+        dtype=np.float32,
+    )
     return {
         "episodes": len(reports),
         "collision_rate": float(np.mean(collisions)),
@@ -132,6 +150,9 @@ def aggregate_episode_reports(reports: list[dict]) -> dict:
         "mean_shield_calls": float(np.mean(shield_calls)),
         "actual_replacement_rate": float(np.mean(replacements > 0)),
         "mean_actual_replacements": float(np.mean(replacements)),
+        "task_replacement_rate": float(np.mean(task_replacements > 0)),
+        "mean_task_replacements": float(np.mean(task_replacements)),
+        "task_replacement_count": int(np.sum(task_replacements)),
         "fallback_rate": float(np.mean(fallbacks > 0)),
         "emergency_fallback_rate": float(np.mean(emergency_fallbacks > 0)),
         "mean_emergency_fallbacks": float(np.mean(emergency_fallbacks)),
@@ -166,4 +187,16 @@ def aggregate_episode_reports(reports: list[dict]) -> dict:
         "task_missed_merge_rate": (
             float(task_missed_merges / task_merge_opportunities) if task_merge_opportunities else 0.0
         ),
+        "deadline_safe_merge_opportunity_count": deadline_opportunities,
+        "deadline_missed_safe_merge_count": deadline_missed,
+        "deadline_missed_safe_merge_rate": (
+            float(deadline_missed / deadline_opportunities) if deadline_opportunities else 0.0
+        ),
+        "missed_safe_merge_after_urgency_0_5_count": urgency_missed,
+        "safe_merge_after_urgency_0_5_count": urgency_opportunities,
+        "missed_safe_merge_after_urgency_0_5_rate": (
+            float(urgency_missed / urgency_opportunities) if urgency_opportunities else 0.0
+        ),
+        "no_merge_request_before_taper_count": int(np.sum(no_merge_before_taper)),
+        "no_merge_request_before_taper_rate": float(np.mean(no_merge_before_taper > 0)),
     }

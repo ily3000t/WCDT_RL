@@ -1,0 +1,310 @@
+from __future__ import annotations
+
+from typing import Any
+
+import numpy as np
+
+from safe_rl.prediction.trajectory_postprocess import trajectory_to_states
+from safe_rl.risk.merge_local import (
+    is_candidate_legal,
+    merge_local_stats,
+    rollout_ego,
+    route_aware_constant_velocity_rollout,
+)
+from safe_rl.sim.action_space import ACTIONS, CandidateAction, decode_action
+from safe_rl.sim.history_buffer import HistoryBuffer
+from safe_rl.sim.metrics import INF_TTC, bbox_gap, drac, relative_ttc
+from safe_rl.sim.scenario_semantics import is_target_lane
+from safe_rl.sim.types import VehicleState
+
+
+def _safe_float(value: Any, default: float = 0.0) -> float:
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return float(default)
+
+
+def _prediction_array(prediction: dict[str, Any]) -> np.ndarray | None:
+    trajectories = prediction.get("future_trajectories")
+    if trajectories is None:
+        return None
+    if hasattr(trajectories, "detach"):
+        trajectories = trajectories.detach().cpu().numpy()
+    trajectories = np.asarray(trajectories, dtype=np.float32)
+    if trajectories.ndim == 5:
+        trajectories = trajectories[0]
+    if trajectories.ndim == 4:
+        trajectories = trajectories[:, 0]
+    if trajectories.ndim != 3 or trajectories.size == 0:
+        return None
+    return trajectories
+
+
+class ForecastAwareTaskScorer:
+    """Rule-based task risk scorer for taper-deadline merge decisions.
+
+    The scorer intentionally does not depend on the learned Risk Module. It uses the
+    current forecast source when available and falls back to route-aware constant
+    velocity rollouts, so it can be used for diagnostics across CV/WcDT branches.
+    """
+
+    def __init__(self, config: Any, predictor: Any | None = None):
+        self.config = config
+        self.predictor = predictor
+
+    def score(
+        self,
+        context: dict[str, Any],
+        raw_action: int | CandidateAction,
+        *,
+        merge_cmd: int,
+        deadline_distance: float,
+        urgency: float,
+    ) -> dict[str, Any]:
+        ego = context.get("ego")
+        if ego is None or int(merge_cmd) == 0:
+            return self._empty()
+        raw = decode_action(raw_action)
+        horizon = int(self.config.forecast_features.get("horizon_steps", self.config.scenario.forecast_horizon_steps))
+        dt = float(self.config.scenario.step_length)
+        other_rollouts, uncertainty, source = self._other_rollouts(context, horizon, dt)
+        scores = [
+            self._candidate_score(
+                action,
+                context,
+                other_rollouts,
+                uncertainty,
+                merge_cmd=int(merge_cmd),
+                urgency=float(urgency),
+                deadline_distance=float(deadline_distance),
+                dt=dt,
+            )
+            for action in ACTIONS
+            if is_candidate_legal(action, context)
+        ]
+        scores = [item for item in scores if item is not None]
+        if not scores:
+            return self._empty(source=source, uncertainty=uncertainty)
+        raw_score = next((item for item in scores if int(item["action"]) == int(raw.index)), None)
+        if raw_score is None:
+            raw_score = self._candidate_score(
+                raw,
+                context,
+                other_rollouts,
+                uncertainty,
+                merge_cmd=int(merge_cmd),
+                urgency=float(urgency),
+                deadline_distance=float(deadline_distance),
+                dt=dt,
+            )
+        best = min(scores, key=lambda item: float(item["task_risk"]))
+        best_action = decode_action(int(best["action"]))
+        safety_threshold = float(self.config.shield.get("task_backstop_safety_risk_threshold", 0.35))
+        uncertainty_threshold = float(self.config.shield.get("task_backstop_uncertainty_threshold", 0.40))
+        front_threshold = float(self.config.scenario.get("merge_opportunity_min_front_gap", 12.0))
+        rear_threshold = float(self.config.scenario.get("merge_opportunity_min_rear_gap", 12.0))
+        would_merge = bool(
+            int(best_action.lateral_cmd) == int(merge_cmd)
+            and int(raw.lateral_cmd) != int(merge_cmd)
+            and float(best["safety_risk"]) <= safety_threshold
+            and float(best["target_front_gap"]) >= front_threshold
+            and float(best["target_rear_gap"]) >= rear_threshold
+            and float(uncertainty) <= uncertainty_threshold
+        )
+        raw_score = raw_score or best
+        return {
+            "forecast_aware_available": True,
+            "forecast_aware_source": source,
+            "forecast_aware_raw_task_risk": float(raw_score["task_risk"]),
+            "forecast_aware_raw_safety_risk": float(raw_score["safety_risk"]),
+            "forecast_aware_best_task_risk": float(best["task_risk"]),
+            "forecast_aware_best_action": int(best_action.index),
+            "forecast_aware_best_action_name": str(best_action.name),
+            "forecast_aware_would_merge": would_merge,
+            "forecast_aware_safety_risk": float(best["safety_risk"]),
+            "forecast_aware_best_safety_risk": float(best["safety_risk"]),
+            "forecast_aware_uncertainty": float(uncertainty),
+            "forecast_aware_future_min_distance": float(best["future_min_distance"]),
+            "forecast_aware_future_min_ttc": float(best["future_min_ttc"]),
+            "forecast_aware_future_max_drac": float(best["future_max_drac"]),
+            "forecast_aware_target_front_gap": float(best["target_front_gap"]),
+            "forecast_aware_target_rear_gap": float(best["target_rear_gap"]),
+            "forecast_aware_taper_miss_risk": float(best["taper_miss_risk"]),
+            "forecast_aware_merge_progress_bonus": float(best["merge_progress_bonus"]),
+        }
+
+    def _empty(self, *, source: str = "unavailable", uncertainty: float = 0.0) -> dict[str, Any]:
+        return {
+            "forecast_aware_available": False,
+            "forecast_aware_source": source,
+            "forecast_aware_raw_task_risk": None,
+            "forecast_aware_raw_safety_risk": None,
+            "forecast_aware_best_task_risk": None,
+            "forecast_aware_best_action": None,
+            "forecast_aware_best_action_name": "",
+            "forecast_aware_would_merge": False,
+            "forecast_aware_safety_risk": None,
+            "forecast_aware_best_safety_risk": None,
+            "forecast_aware_uncertainty": float(uncertainty),
+            "forecast_aware_future_min_distance": None,
+            "forecast_aware_future_min_ttc": None,
+            "forecast_aware_future_max_drac": None,
+            "forecast_aware_target_front_gap": None,
+            "forecast_aware_target_rear_gap": None,
+            "forecast_aware_taper_miss_risk": None,
+            "forecast_aware_merge_progress_bonus": None,
+        }
+
+    def _other_rollouts(
+        self,
+        context: dict[str, Any],
+        horizon: int,
+        dt: float,
+    ) -> tuple[list[list[VehicleState]], float, str]:
+        ego = context.get("ego")
+        vehicles = [vehicle for vehicle in context.get("vehicles", []) if ego is None or vehicle.vehicle_id != ego.vehicle_id]
+        if self.predictor is not None:
+            try:
+                prediction = self.predictor.predict(context)
+                trajectories = _prediction_array(prediction)
+                if trajectories is not None:
+                    return (
+                        self._prediction_rollouts(context, trajectories, prediction, horizon, dt),
+                        _safe_float(prediction.get("uncertainty"), 0.0),
+                        "forecast",
+                    )
+            except Exception:
+                if not bool(self.config.forecast_features.get("allow_heuristic_fallback", False)):
+                    raise
+        return (
+            [route_aware_constant_velocity_rollout(vehicle, horizon, dt, self.config)[0] for vehicle in vehicles],
+            0.0,
+            "constant_velocity",
+        )
+
+    def _prediction_rollouts(
+        self,
+        context: dict[str, Any],
+        trajectories: np.ndarray,
+        prediction: dict[str, Any],
+        horizon: int,
+        dt: float,
+    ) -> list[list[VehicleState]]:
+        history = context.get("history")
+        latest = context.get("history").latest() if isinstance(history, HistoryBuffer) else {}
+        ids = history.agent_ids(str(context["ego"].vehicle_id)) if isinstance(history, HistoryBuffer) and context.get("ego") is not None else []
+        selected = prediction.get("selected_indices")
+        if selected is None:
+            references = [vehicle for vehicle in context.get("vehicles", []) if vehicle.vehicle_id != context.get("ego").vehicle_id]
+        else:
+            references = []
+            for value in list(selected):
+                try:
+                    idx = int(value)
+                except (TypeError, ValueError):
+                    continue
+                if idx <= 0 or idx >= len(ids):
+                    continue
+                ref = latest.get(ids[idx])
+                if ref is not None:
+                    references.append(ref)
+        rollouts: list[list[VehicleState]] = []
+        for actor_idx, traj in enumerate(trajectories[: len(references)]):
+            reference = references[actor_idx]
+            states = trajectory_to_states(
+                traj[:horizon],
+                reference=reference,
+                dt=dt,
+                vehicle_id=f"forecast_{reference.vehicle_id}",
+            )
+            if states:
+                rollouts.append(states)
+        if not rollouts:
+            ego = context.get("ego")
+            vehicles = [vehicle for vehicle in context.get("vehicles", []) if ego is None or vehicle.vehicle_id != ego.vehicle_id]
+            rollouts = [route_aware_constant_velocity_rollout(vehicle, horizon, dt, self.config)[0] for vehicle in vehicles]
+        return rollouts
+
+    def _candidate_score(
+        self,
+        action: CandidateAction,
+        context: dict[str, Any],
+        other_rollouts: list[list[VehicleState]],
+        uncertainty: float,
+        *,
+        merge_cmd: int,
+        urgency: float,
+        deadline_distance: float,
+        dt: float,
+    ) -> dict[str, Any] | None:
+        ego = context.get("ego")
+        if ego is None:
+            return None
+        horizon = int(self.config.forecast_features.get("horizon_steps", self.config.scenario.forecast_horizon_steps))
+        ego_rollout, taper_miss = rollout_ego(ego, action, horizon, dt, self.config)
+        min_distance = INF_TTC
+        min_ttc = INF_TTC
+        max_drac = 0.0
+        front_gap = INF_TTC
+        rear_gap = INF_TTC
+        for step_idx, ego_future in enumerate(ego_rollout):
+            step_target_vehicles: list[VehicleState] = []
+            for rollout in other_rollouts:
+                if not rollout:
+                    continue
+                other = rollout[min(step_idx, len(rollout) - 1)]
+                min_distance = min(min_distance, bbox_gap(ego_future, other))
+                min_ttc = min(min_ttc, relative_ttc(ego_future, other))
+                max_drac = max(max_drac, drac(ego_future, other))
+                if is_target_lane(self.config, other.edge_id, other.lane_index):
+                    step_target_vehicles.append(other)
+            if step_target_vehicles:
+                stats = merge_local_stats(ego_future, [ego_future, *step_target_vehicles], self.config)
+                front_gap = min(front_gap, float(stats.target_front_gap))
+                rear_gap = min(rear_gap, float(stats.target_rear_gap))
+        if front_gap >= INF_TTC:
+            front_gap = float(getattr(context.get("merge_local"), "target_front_gap", INF_TTC))
+        if rear_gap >= INF_TTC:
+            rear_gap = float(getattr(context.get("merge_local"), "target_rear_gap", INF_TTC))
+        front_threshold = float(self.config.scenario.get("merge_opportunity_min_front_gap", 12.0))
+        rear_threshold = float(self.config.scenario.get("merge_opportunity_min_rear_gap", 12.0))
+        distance_risk = float(np.clip((5.0 - min_distance) / 5.0, 0.0, 1.0))
+        ttc_risk = float(np.clip((2.0 - min_ttc) / 2.0, 0.0, 1.0)) if min_ttc < INF_TTC else 0.0
+        drac_risk = float(np.clip(max_drac / 20.0, 0.0, 1.0))
+        front_risk = float(np.clip((front_threshold - front_gap) / max(front_threshold, 1.0e-6), 0.0, 1.0))
+        rear_risk = float(np.clip((rear_threshold - rear_gap) / max(rear_threshold, 1.0e-6), 0.0, 1.0))
+        unsafe_gap_risk = max(front_risk, rear_risk)
+        taper_miss_risk = 1.0 if taper_miss else (float(urgency) if int(action.lateral_cmd) != int(merge_cmd) else 0.0)
+        safety_risk = max(distance_risk, ttc_risk, drac_risk, unsafe_gap_risk)
+        uncertainty_risk = float(np.clip(float(uncertainty) / 0.40, 0.0, 1.0))
+        merge_progress_bonus = (
+            0.20
+            if int(action.lateral_cmd) == int(merge_cmd)
+            and unsafe_gap_risk <= 0.0
+            and not taper_miss
+            else 0.0
+        )
+        task_risk = float(
+            np.clip(
+                0.35 * taper_miss_risk
+                + 0.25 * unsafe_gap_risk
+                + 0.25 * safety_risk
+                + 0.15 * uncertainty_risk
+                - merge_progress_bonus,
+                0.0,
+                1.0,
+            )
+        )
+        return {
+            "action": int(action.index),
+            "task_risk": task_risk,
+            "safety_risk": float(safety_risk),
+            "future_min_distance": float(min_distance),
+            "future_min_ttc": float(min_ttc),
+            "future_max_drac": float(max_drac),
+            "target_front_gap": float(front_gap),
+            "target_rear_gap": float(rear_gap),
+            "taper_miss_risk": float(taper_miss_risk),
+            "merge_progress_bonus": float(merge_progress_bonus),
+        }

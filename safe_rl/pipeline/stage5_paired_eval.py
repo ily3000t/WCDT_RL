@@ -125,6 +125,9 @@ def _paired_delta(a_report: dict | None, b_report: dict | None) -> dict | None:
                 "actual_replacement_delta": int(
                     item.get("actual_replacement_count", 0) - left.get("actual_replacement_count", 0)
                 ),
+                "task_replacement_delta": int(
+                    item.get("task_replacement_count", 0) - left.get("task_replacement_count", 0)
+                ),
                 "fallback_delta": int(item["fallback_count"] - left["fallback_count"]),
                 "emergency_fallback_delta": int(
                     item.get("emergency_fallback_count", 0) - left.get("emergency_fallback_count", 0)
@@ -132,6 +135,14 @@ def _paired_delta(a_report: dict | None, b_report: dict | None) -> dict | None:
                 "missed_safe_merge_opportunity_delta": int(
                     item.get("missed_safe_merge_opportunity_count", 0)
                     - left.get("missed_safe_merge_opportunity_count", 0)
+                ),
+                "deadline_missed_safe_merge_delta": int(
+                    item.get("deadline_missed_safe_merge_count", 0)
+                    - left.get("deadline_missed_safe_merge_count", 0)
+                ),
+                "no_merge_request_before_taper_delta": int(
+                    item.get("no_merge_request_before_taper_count", 0)
+                    - left.get("no_merge_request_before_taper_count", 0)
                 ),
             }
         )
@@ -163,9 +174,16 @@ def _paired_delta(a_report: dict | None, b_report: dict | None) -> dict | None:
         "mean_hard_brake_rate_delta": sum(row["hard_brake_rate_delta"] for row in rows) / len(rows),
         "mean_intervention_delta": sum(row["intervention_delta"] for row in rows) / len(rows),
         "mean_actual_replacement_delta": sum(row["actual_replacement_delta"] for row in rows) / len(rows),
+        "mean_task_replacement_delta": sum(row["task_replacement_delta"] for row in rows) / len(rows),
+        "task_replacement_count_delta": sum(row["task_replacement_delta"] for row in rows),
         "mean_fallback_delta": sum(row["fallback_delta"] for row in rows) / len(rows),
         "mean_emergency_fallback_delta": sum(row["emergency_fallback_delta"] for row in rows) / len(rows),
         "emergency_fallback_count_delta": sum(row["emergency_fallback_delta"] for row in rows),
+        "deadline_missed_safe_merge_count_delta": sum(row["deadline_missed_safe_merge_delta"] for row in rows),
+        "mean_deadline_missed_safe_merge_delta": (
+            sum(row["deadline_missed_safe_merge_delta"] for row in rows) / len(rows)
+        ),
+        "no_merge_request_before_taper_count_delta": sum(row["no_merge_request_before_taper_delta"] for row in rows),
     }
 
 

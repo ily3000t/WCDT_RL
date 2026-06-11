@@ -113,6 +113,7 @@ from safe_rl.risk.stage1_sampling import _merge_heuristic_action, configured_sam
 from safe_rl.rl.evaluation import _step_safety_record, validate_model_env_observation_shape
 from safe_rl.rl.ppo import _checkpoint_selection_score, _checkpoint_selection_weights, _safety_score, _training_device
 from safe_rl.pipeline.stage3_train_ppo import _prediction_loss_summary, _prediction_loss_summary_from_checkpoint
+from safe_rl.shield.forecast_task_scorer import ForecastAwareTaskScorer
 from safe_rl.shield.safety_shield import SafetyShield
 from safe_rl.sim.action_space import ACTIONS, decode_action
 from safe_rl.sim.history_buffer import HistoryBuffer
@@ -903,6 +904,77 @@ def test_merge_timing_reward_penalizes_taper_miss_terminal():
     penalty, debug = env._merge_timing_reward_adjustment(None, "taper_miss", decode_action(4), None)
     assert penalty <= -35.0
     assert debug["merge_timing_taper_miss_penalty"] == pytest.approx(-35.0)
+
+
+def test_forecast_aware_task_scorer_recommends_merge_near_deadline_with_safe_gap():
+    cfg = load_config()
+    context = _merge_timing_context(cfg, front_gap=30.0, rear_gap=30.0, distance_to_taper=20.0)
+    scorer = ForecastAwareTaskScorer(cfg)
+    result = scorer.score(context, decode_action(5), merge_cmd=1, deadline_distance=120.0, urgency=0.8)
+    assert result["forecast_aware_available"]
+    assert str(result["forecast_aware_best_action_name"]).startswith("left_")
+    assert result["forecast_aware_would_merge"]
+
+
+def test_forecast_aware_task_scorer_blocks_merge_when_gap_is_unsafe():
+    cfg = load_config()
+    context = _merge_timing_context(cfg, front_gap=2.0, rear_gap=2.0, distance_to_taper=20.0)
+    scorer = ForecastAwareTaskScorer(cfg)
+    result = scorer.score(context, decode_action(5), merge_cmd=1, deadline_distance=120.0, urgency=0.8)
+    assert result["forecast_aware_available"]
+    assert not result["forecast_aware_would_merge"]
+    assert float(result["forecast_aware_safety_risk"]) > cfg.shield.task_backstop_safety_risk_threshold
+
+
+def test_task_backstop_requires_consecutive_shadow_and_counts_separately():
+    cfg = load_config()
+    cfg.shield["enabled"] = True
+    cfg.shield["task_backstop_enabled"] = True
+    cfg.shield["task_backstop_consecutive_steps"] = 2
+    env = SumoHighwayMergeEnv(cfg, seed=1, shield=SafetyShield(cfg, _StaticRiskModel({4: 0.1, 5: 0.1, 7: 0.1})))
+    context = _merge_timing_context(cfg, front_gap=30.0, rear_gap=30.0, distance_to_taper=20.0)
+    raw = decode_action(5)
+    env._record_merge_opportunity(context, raw)
+    first = env._maybe_task_backstop(raw, raw, context, {"raw_action": raw.index, "final_action": raw.index})
+    assert first is None
+    env._record_merge_opportunity(context, raw)
+    second = env._maybe_task_backstop(raw, raw, context, {"raw_action": raw.index, "final_action": raw.index})
+    assert second is not None
+    assert second["replacement_reason"] == "task_backstop"
+    assert str(second["final_action_name"]).startswith("left_")
+    env._task_replacements.append(second)
+    env._interventions.append({"raw_action": raw.index, "final_action": raw.index, "replacement_reason": "raw_safe"})
+    report = env.episode_report()
+    assert report["task_replacement_count"] == 1
+    assert report["actual_replacement_count"] == 0
+
+
+def test_step_safety_record_includes_forecast_task_trace_fields():
+    record = _step_safety_record(
+        step_index=3,
+        raw_action=5,
+        final_action=5,
+        reward=0.0,
+        terminated=False,
+        truncated=False,
+        collision_threshold=0.25,
+        shield_enabled=True,
+        info={
+            "step": 3,
+            "raw_action_name": "keep_accelerate",
+            "final_action_name": "keep_accelerate",
+            "ego_edge": "main_aux",
+            "ego_lane": 0,
+            "forecast_aware_best_action_name": "left_hold",
+            "forecast_aware_best_task_risk": 0.2,
+            "forecast_aware_would_merge": True,
+            "task_replacement": False,
+        },
+    )
+    assert record["ego_edge"] == "main_aux"
+    assert record["ego_lane"] == 0
+    assert record["forecast_aware_best_action_name"] == "left_hold"
+    assert record["forecast_aware_would_merge"]
 
 
 def test_shield_keeps_raw_action_below_activation_threshold():

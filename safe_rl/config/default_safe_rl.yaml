@@ -256,6 +256,13 @@ shield:
   emergency_saturated_consecutive_enabled: false
   emergency_saturated_consecutive_steps: 2
   emergency_actions: ["keep_decelerate", "keep_hold"]
+  forecast_task_shadow_enabled: true
+  task_backstop_enabled: false
+  task_backstop_deadline_distance: 120.0
+  task_backstop_urgency_threshold: 0.5
+  task_backstop_consecutive_steps: 2
+  task_backstop_safety_risk_threshold: 0.35
+  task_backstop_uncertainty_threshold: 0.40
   prefer_closest_safe_action: true
   filter_illegal_candidates: true
   fallback_action: "decelerate"
