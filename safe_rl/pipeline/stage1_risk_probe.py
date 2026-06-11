@@ -5,6 +5,10 @@ from pathlib import Path
 import numpy as np
 
 from safe_rl.analysis.stage1_audit import audit_stage1_buffer
+from safe_rl.prediction.actor_selector import (
+    ACTOR_SELECTION_VERSION,
+    actor_selection_config_hash,
+)
 from safe_rl.pipeline.common import json_ready, load_stage_config, make_env, parse_config_arg, write_report
 from safe_rl.risk.merge_local import candidate_action_risk_samples, candidate_sample_weight, merge_local_stats
 from safe_rl.risk.risk_aggregator import aggregate_episode_reports
@@ -86,6 +90,10 @@ def run(cfg) -> Path:
     future_edge_roles: list[np.ndarray] = []
     agent_lengths: list[np.ndarray] = []
     agent_widths: list[np.ndarray] = []
+    relevance_masks: list[np.ndarray] = []
+    relevance_scores: list[np.ndarray] = []
+    selector_relevant_counts: list[np.ndarray] = []
+    selector_overflows: list[np.ndarray] = []
     reports: list[dict] = []
     events_path = stage_dir / "risk_events.jsonl"
     replay_dir = stage_dir / "replay"
@@ -224,6 +232,10 @@ def run(cfg) -> Path:
                 sample_future_edge_roles,
                 sample_agent_lengths,
                 sample_agent_widths,
+                sample_relevance_mask,
+                sample_relevance_score,
+                sample_selector_relevant_count,
+                sample_selector_overflow,
             ) = env.trajectory_window_samples(include_dimensions=True)
             if hist.shape[0] > 0:
                 history_samples.append(hist)
@@ -239,6 +251,10 @@ def run(cfg) -> Path:
                 future_edge_roles.append(sample_future_edge_roles)
                 agent_lengths.append(sample_agent_lengths)
                 agent_widths.append(sample_agent_widths)
+                relevance_masks.append(sample_relevance_mask)
+                relevance_scores.append(sample_relevance_score)
+                selector_relevant_counts.append(sample_selector_relevant_count)
+                selector_overflows.append(sample_selector_overflow)
     finally:
         env.close()
 
@@ -251,8 +267,10 @@ def run(cfg) -> Path:
         agent_mask=np.concatenate(agent_masks, axis=0) if agent_masks else np.zeros((0, 1)),
         agent_lane_index=np.concatenate(agent_lane_indices, axis=0) if agent_lane_indices else np.zeros((0, 1), dtype=np.int64),
         agent_edge_role=np.concatenate(agent_edge_roles, axis=0) if agent_edge_roles else np.zeros((0, 1), dtype=np.int64),
-        trajectory_schema_version=np.asarray(3, dtype=np.int64),
+        trajectory_schema_version=np.asarray(4, dtype=np.int64),
         safety_metric_version=np.asarray(SAFETY_METRIC_VERSION),
+        actor_selection_version=np.asarray(ACTOR_SELECTION_VERSION),
+        actor_selection_config_hash=np.asarray(actor_selection_config_hash(cfg)),
         agent_length=np.concatenate(agent_lengths, axis=0) if agent_lengths else np.full((0, 1), 4.8),
         agent_width=np.concatenate(agent_widths, axis=0) if agent_widths else np.full((0, 1), 1.8),
         agent_history_valid_mask=(
@@ -280,6 +298,26 @@ def run(cfg) -> Path:
             np.concatenate(future_edge_roles, axis=0)
             if future_edge_roles
             else np.zeros((0, 1, 1), dtype=np.int64)
+        ),
+        agent_relevance_mask=(
+            np.concatenate(relevance_masks, axis=0)
+            if relevance_masks
+            else np.zeros((0, 1), dtype=np.float32)
+        ),
+        agent_relevance_score=(
+            np.concatenate(relevance_scores, axis=0)
+            if relevance_scores
+            else np.zeros((0, 1), dtype=np.float32)
+        ),
+        actor_selector_relevant_count=(
+            np.concatenate(selector_relevant_counts, axis=0)
+            if selector_relevant_counts
+            else np.zeros((0,), dtype=np.int64)
+        ),
+        actor_selector_overflow=(
+            np.concatenate(selector_overflows, axis=0)
+            if selector_overflows
+            else np.zeros((0,), dtype=np.float32)
         ),
     )
     audit_report = None
@@ -313,8 +351,15 @@ def run(cfg) -> Path:
         "candidate_risk_sample_count": len(transitions["actions"]),
         "trajectory_sample_count": int(sum(item.shape[0] for item in history_samples)),
         "trajectory_schema": {
-            "version": 3,
+            "version": 4,
             "safety_metric_version": SAFETY_METRIC_VERSION,
+            "actor_selection_version": ACTOR_SELECTION_VERSION,
+            "actor_selection_config_hash": actor_selection_config_hash(cfg),
+            "actor_selector_overflow_rate": (
+                float(np.mean(np.concatenate(selector_overflows, axis=0)))
+                if selector_overflows
+                else 0.0
+            ),
             **trajectory_coverage,
         },
         "action_sampling": {

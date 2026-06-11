@@ -4,41 +4,21 @@ from typing import Any
 
 import numpy as np
 
+from safe_rl.prediction.forecast_rollout_bundle import (
+    ForecastRolloutBundle,
+    get_or_build_forecast_rollout_bundle,
+)
 from safe_rl.prediction.trajectory_postprocess import trajectory_to_states
 from safe_rl.risk.merge_local import (
     is_candidate_legal,
     merge_local_stats,
     rollout_ego,
-    route_aware_constant_velocity_rollout,
 )
 from safe_rl.sim.action_space import ACTIONS, CandidateAction, decode_action
-from safe_rl.sim.history_buffer import HistoryBuffer
 from safe_rl.sim.metrics import INF_TTC, bbox_gap, drac, relative_ttc
-from safe_rl.sim.scenario_semantics import is_target_lane
+from safe_rl.sim.history_buffer import HistoryBuffer
+from safe_rl.sim.scenario_semantics import is_target_lane, merge_corridor_progress
 from safe_rl.sim.types import VehicleState
-
-
-def _safe_float(value: Any, default: float = 0.0) -> float:
-    try:
-        return float(value)
-    except (TypeError, ValueError):
-        return float(default)
-
-
-def _prediction_array(prediction: dict[str, Any]) -> np.ndarray | None:
-    trajectories = prediction.get("future_trajectories")
-    if trajectories is None:
-        return None
-    if hasattr(trajectories, "detach"):
-        trajectories = trajectories.detach().cpu().numpy()
-    trajectories = np.asarray(trajectories, dtype=np.float32)
-    if trajectories.ndim == 5:
-        trajectories = trajectories[0]
-    if trajectories.ndim == 4:
-        trajectories = trajectories[:, 0]
-    if trajectories.ndim != 3 or trajectories.size == 0:
-        return None
-    return trajectories
 
 
 class ForecastAwareTaskScorer:
@@ -68,7 +48,15 @@ class ForecastAwareTaskScorer:
         raw = decode_action(raw_action)
         horizon = int(self.config.forecast_features.get("horizon_steps", self.config.scenario.forecast_horizon_steps))
         dt = float(self.config.scenario.step_length)
-        other_rollouts, uncertainty, source, selected_vehicle_ids = self._other_rollouts(context, horizon, dt)
+        bundle = get_or_build_forecast_rollout_bundle(
+            self.config,
+            context,
+            self.predictor,
+        )
+        other_rollouts = bundle.rollout_lists()
+        uncertainty = float(bundle.combined_uncertainty)
+        source = "hybrid" if self.predictor is not None else "constant_velocity"
+        selected_vehicle_ids = [actor.vehicle_id for actor in bundle.actors]
         scores = [
             self._candidate_score(
                 action,
@@ -109,10 +97,25 @@ class ForecastAwareTaskScorer:
         target_rear_vehicle_id = str(getattr(local, "target_rear_vehicle_id", "") or "")
         target_front_required = bool(target_front_vehicle_id)
         target_rear_required = bool(target_rear_vehicle_id)
-        selected_vehicle_id_set = {str(value) for value in selected_vehicle_ids if str(value)}
+        selected_vehicle_id_set = {
+            str(value)
+            for value in bundle.wcdt_selected_vehicle_ids
+            if str(value)
+        }
+        combined_vehicle_id_set = {
+            str(value)
+            for value in selected_vehicle_ids
+            if str(value)
+        }
         target_front_covered = not target_front_required or target_front_vehicle_id in selected_vehicle_id_set
         target_rear_covered = not target_rear_required or target_rear_vehicle_id in selected_vehicle_id_set
-        coverage_complete = bool(target_front_covered and target_rear_covered)
+        target_front_safety_covered = (
+            not target_front_required or target_front_vehicle_id in combined_vehicle_id_set
+        )
+        target_rear_safety_covered = (
+            not target_rear_required or target_rear_vehicle_id in combined_vehicle_id_set
+        )
+        coverage_complete = bool(bundle.forecast_safety_actor_coverage_complete)
         max_gap_jump = float(self.config.shield.get("task_backstop_max_first_step_gap_jump", 20.0))
         current_front_gap = float(getattr(local, "target_front_gap", INF_TTC))
         current_rear_gap = float(getattr(local, "target_rear_gap", INF_TTC))
@@ -134,11 +137,38 @@ class ForecastAwareTaskScorer:
                 and abs(first_rear_gap - current_rear_gap) <= max_gap_jump
             )
         )
-        gap_consistency_pass = bool(coverage_complete and front_consistent and rear_consistent)
+        front_progress_error, front_progress_pass = self._first_step_progress_consistency(
+            bundle,
+            target_front_vehicle_id,
+            dt,
+        )
+        rear_progress_error, rear_progress_pass = self._first_step_progress_consistency(
+            bundle,
+            target_rear_vehicle_id,
+            dt,
+        )
+        identity_consistent = bool(
+            front_consistent
+            and rear_consistent
+            and (not target_front_required or first_front_vehicle_id == target_front_vehicle_id)
+            and (not target_rear_required or first_rear_vehicle_id == target_rear_vehicle_id)
+        )
+        physical_consistency_pass = bool(
+            identity_consistent and front_progress_pass and rear_progress_pass
+        )
+        gap_consistency_pass = bool(
+            coverage_complete
+            and front_consistent
+            and rear_consistent
+            and physical_consistency_pass
+        )
         would_merge = bool(
             int(best_action.lateral_cmd) == int(merge_cmd)
             and int(raw.lateral_cmd) != int(merge_cmd)
             and coverage_complete
+            and bundle.wcdt_required_actor_coverage_complete
+            and not bundle.actor_selector_overflow
+            and not bundle.cv_fallback_overflow
             and gap_consistency_pass
             and float(best["safety_risk"]) <= safety_threshold
             and float(best["target_front_gap"]) >= front_threshold
@@ -170,6 +200,10 @@ class ForecastAwareTaskScorer:
             "forecast_first_step_target_front_gap": first_front_gap,
             "forecast_first_step_target_rear_gap": first_rear_gap,
             "forecast_gap_consistency_pass": gap_consistency_pass,
+            "forecast_gap_physical_consistency_pass": physical_consistency_pass,
+            "forecast_vehicle_identity_consistent": identity_consistent,
+            "forecast_front_first_step_progress_error": front_progress_error,
+            "forecast_rear_first_step_progress_error": rear_progress_error,
             "forecast_selected_vehicle_ids": list(selected_vehicle_ids),
             "forecast_target_front_vehicle_id": target_front_vehicle_id,
             "forecast_target_rear_vehicle_id": target_rear_vehicle_id,
@@ -177,12 +211,17 @@ class ForecastAwareTaskScorer:
             "forecast_target_rear_required": target_rear_required,
             "forecast_target_front_covered": target_front_covered,
             "forecast_target_rear_covered": target_rear_covered,
-            "forecast_actor_coverage_complete": coverage_complete,
+            "forecast_target_front_safety_covered": target_front_safety_covered,
+            "forecast_target_rear_safety_covered": target_rear_safety_covered,
+            "forecast_actor_coverage_complete": bool(
+                bundle.wcdt_required_actor_coverage_complete
+            ),
             "forecast_closest_vehicle_id": str(best["closest_vehicle_id"]),
             "forecast_front_gap_vehicle_id": str(best["front_gap_vehicle_id"]),
             "forecast_rear_gap_vehicle_id": str(best["rear_gap_vehicle_id"]),
             "forecast_aware_taper_miss_risk": float(best["taper_miss_risk"]),
             "forecast_aware_merge_progress_bonus": float(best["merge_progress_bonus"]),
+            **bundle.trace_fields(),
         }
 
     def _empty(self, *, source: str = "unavailable", uncertainty: float = 0.0) -> dict[str, Any]:
@@ -209,6 +248,10 @@ class ForecastAwareTaskScorer:
             "forecast_first_step_target_front_gap": None,
             "forecast_first_step_target_rear_gap": None,
             "forecast_gap_consistency_pass": False,
+            "forecast_gap_physical_consistency_pass": False,
+            "forecast_vehicle_identity_consistent": False,
+            "forecast_front_first_step_progress_error": None,
+            "forecast_rear_first_step_progress_error": None,
             "forecast_selected_vehicle_ids": [],
             "forecast_target_front_vehicle_id": "",
             "forecast_target_rear_vehicle_id": "",
@@ -216,7 +259,23 @@ class ForecastAwareTaskScorer:
             "forecast_target_rear_required": False,
             "forecast_target_front_covered": False,
             "forecast_target_rear_covered": False,
+            "forecast_target_front_safety_covered": False,
+            "forecast_target_rear_safety_covered": False,
             "forecast_actor_coverage_complete": False,
+            "wcdt_required_actor_coverage_complete": False,
+            "forecast_safety_actor_coverage_complete": False,
+            "actor_selector_relevant_count": 0,
+            "actor_selector_overflow": False,
+            "actor_selector_dropped_relevant_ids": [],
+            "cv_fallback_overflow": False,
+            "cv_fallback_dropped_vehicle_ids": [],
+            "forecast_wcdt_selected_vehicle_ids": [],
+            "forecast_cv_fallback_vehicle_ids": [],
+            "forecast_actor_sources": {},
+            "forecast_actor_relevance": {},
+            "forecast_wcdt_uncertainty": 0.0,
+            "forecast_cv_fallback_uncertainty": 0.0,
+            "combined_forecast_uncertainty": float(uncertainty),
             "forecast_closest_vehicle_id": "",
             "forecast_front_gap_vehicle_id": "",
             "forecast_rear_gap_vehicle_id": "",
@@ -224,41 +283,29 @@ class ForecastAwareTaskScorer:
             "forecast_aware_merge_progress_bonus": None,
         }
 
-    def _other_rollouts(
+    def _first_step_progress_consistency(
         self,
-        context: dict[str, Any],
-        horizon: int,
+        bundle: ForecastRolloutBundle,
+        vehicle_id: str,
         dt: float,
-    ) -> tuple[list[list[VehicleState]], float, str, list[str]]:
-        ego = context.get("ego")
-        vehicles = [vehicle for vehicle in context.get("vehicles", []) if ego is None or vehicle.vehicle_id != ego.vehicle_id]
-        if self.predictor is not None:
-            try:
-                prediction = self.predictor.predict(context)
-                trajectories = _prediction_array(prediction)
-                if trajectories is not None:
-                    rollouts, selected_vehicle_ids = self._prediction_rollouts(
-                        context,
-                        trajectories,
-                        prediction,
-                        horizon,
-                        dt,
-                    )
-                    return (
-                        rollouts,
-                        _safe_float(prediction.get("uncertainty"), 0.0),
-                        "forecast",
-                        selected_vehicle_ids,
-                    )
-            except Exception:
-                if not bool(self.config.forecast_features.get("allow_heuristic_fallback", False)):
-                    raise
-        return (
-            [route_aware_constant_velocity_rollout(vehicle, horizon, dt, self.config)[0] for vehicle in vehicles],
-            0.0,
-            "constant_velocity",
-            [str(vehicle.vehicle_id) for vehicle in vehicles],
+    ) -> tuple[float | None, bool]:
+        if not vehicle_id:
+            return None, True
+        actor = bundle.actor_by_id(vehicle_id)
+        if actor is None or actor.current_state is None or not actor.trajectory:
+            return None, False
+        current_progress = merge_corridor_progress(self.config, actor.current_state)
+        first_progress = merge_corridor_progress(self.config, actor.trajectory[0])
+        if current_progress is None or first_progress is None:
+            return None, False
+        expected = (
+            float(actor.current_state.speed) * float(dt)
+            + 0.5 * float(actor.current_state.accel) * float(dt) * float(dt)
         )
+        actual = float(first_progress - current_progress)
+        error = abs(actual - expected)
+        tolerance = max(2.0, 0.5 * abs(expected))
+        return float(error), bool(error <= tolerance)
 
     def _prediction_rollouts(
         self,
@@ -268,41 +315,37 @@ class ForecastAwareTaskScorer:
         horizon: int,
         dt: float,
     ) -> tuple[list[list[VehicleState]], list[str]]:
+        """Compatibility helper using explicit vehicle IDs, never row-position inference."""
+
         history = context.get("history")
-        latest = context.get("history").latest() if isinstance(history, HistoryBuffer) else {}
-        ids = history.agent_ids(str(context["ego"].vehicle_id)) if isinstance(history, HistoryBuffer) and context.get("ego") is not None else []
-        selected_vehicle_ids = prediction.get("selected_vehicle_ids")
-        if selected_vehicle_ids is None:
-            selected_vehicle_ids = []
-            for value in list(prediction.get("selected_indices") or []):
-                try:
-                    idx = int(value)
-                except (TypeError, ValueError):
-                    selected_vehicle_ids.append("")
-                    continue
-                selected_vehicle_ids.append(str(ids[idx]) if 0 < idx < len(ids) else "")
-        selected_vehicle_ids = [str(value or "") for value in list(selected_vehicle_ids)]
+        latest = history.latest() if isinstance(history, HistoryBuffer) else {
+            str(vehicle.vehicle_id): vehicle
+            for vehicle in context.get("vehicles", [])
+        }
+        selected_vehicle_ids = [
+            str(value or "")
+            for value in prediction.get("selected_vehicle_ids", [])
+        ]
         rollouts: list[list[VehicleState]] = []
         used_vehicle_ids: list[str] = []
-        for actor_idx, traj in enumerate(trajectories):
-            vehicle_id = selected_vehicle_ids[actor_idx] if actor_idx < len(selected_vehicle_ids) else ""
-            reference = latest.get(vehicle_id) if vehicle_id else None
+        for actor_idx, trajectory in enumerate(np.asarray(trajectories)):
+            vehicle_id = (
+                selected_vehicle_ids[actor_idx]
+                if actor_idx < len(selected_vehicle_ids)
+                else ""
+            )
+            reference = latest.get(vehicle_id)
             if reference is None:
                 continue
             states = trajectory_to_states(
-                traj[:horizon],
+                trajectory[:horizon],
                 reference=reference,
                 dt=dt,
-                vehicle_id=str(reference.vehicle_id),
+                vehicle_id=vehicle_id,
             )
             if states:
                 rollouts.append(states)
-                used_vehicle_ids.append(str(reference.vehicle_id))
-        if not rollouts:
-            ego = context.get("ego")
-            vehicles = [vehicle for vehicle in context.get("vehicles", []) if ego is None or vehicle.vehicle_id != ego.vehicle_id]
-            rollouts = [route_aware_constant_velocity_rollout(vehicle, horizon, dt, self.config)[0] for vehicle in vehicles]
-            used_vehicle_ids = [str(vehicle.vehicle_id) for vehicle in vehicles]
+                used_vehicle_ids.append(vehicle_id)
         return rollouts, used_vehicle_ids
 
     def _candidate_score(

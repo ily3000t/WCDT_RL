@@ -40,6 +40,12 @@ class HistoryBuffer:
         ids.extend(vehicle_id for vehicle_id in sorted(latest) if vehicle_id != ego_id)
         return ids[: self.max_agents]
 
+    def all_agent_ids(self, ego_id: str) -> list[str]:
+        latest = self.latest()
+        ids = [ego_id] if ego_id in latest else []
+        ids.extend(vehicle_id for vehicle_id in sorted(latest) if vehicle_id != ego_id)
+        return ids
+
     def to_tensor_arrays(self, ego_id: str) -> tuple[np.ndarray, np.ndarray]:
         """Return padded arrays shaped [agents, history, 5] and [agents]."""
 
@@ -49,7 +55,22 @@ class HistoryBuffer:
     def to_tensor_arrays_with_metadata(self, ego_id: str, cfg: Any | None = None) -> dict[str, np.ndarray]:
         """Return runtime history plus timestep validity and route metadata."""
 
-        agent_ids = self.agent_ids(ego_id)
+        return self.build_tensor_for_ids(
+            ego_id,
+            [vehicle_id for vehicle_id in self.agent_ids(ego_id) if vehicle_id != ego_id],
+            cfg,
+        )
+
+    def build_tensor_for_ids(
+        self,
+        ego_id: str,
+        selected_actor_ids: Iterable[str],
+        cfg: Any | None = None,
+    ) -> dict[str, np.ndarray]:
+        """Build fixed tensors for ego followed by explicitly ordered actor IDs."""
+
+        selected = [str(vehicle_id) for vehicle_id in selected_actor_ids if str(vehicle_id) != ego_id]
+        agent_ids = ([ego_id] if ego_id in self.latest() else []) + selected[: max(0, self.max_agents - 1)]
         history = np.zeros((self.max_agents, self.history_steps, 5), dtype=np.float32)
         mask = np.zeros((self.max_agents,), dtype=np.float32)
         history_valid_mask = np.zeros((self.max_agents, self.history_steps), dtype=np.float32)
@@ -84,6 +105,7 @@ class HistoryBuffer:
             "history_valid_mask": history_valid_mask,
             "history_lane_index": history_lane_index,
             "history_edge_role": history_edge_role,
+            "agent_ids": np.asarray(agent_ids, dtype=str),
         }
 
     def trajectory_samples(

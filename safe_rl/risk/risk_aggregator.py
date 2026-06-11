@@ -132,6 +132,26 @@ def aggregate_episode_reports(reports: list[dict]) -> dict:
         [float(report.get("forecast_gap_consistency_pass_rate", 0.0)) for report in reports],
         dtype=np.float32,
     )
+    wcdt_relevant_coverage_rates = np.asarray(
+        [float(report.get("wcdt_relevant_actor_coverage_rate", 0.0)) for report in reports],
+        dtype=np.float32,
+    )
+    combined_safety_coverage_rates = np.asarray(
+        [float(report.get("combined_forecast_safety_coverage_rate", 0.0)) for report in reports],
+        dtype=np.float32,
+    )
+    selector_overflow_rates = np.asarray(
+        [float(report.get("actor_selector_overflow_rate", 0.0)) for report in reports],
+        dtype=np.float32,
+    )
+    cv_fallback_overflow_rates = np.asarray(
+        [float(report.get("cv_fallback_overflow_rate", 0.0)) for report in reports],
+        dtype=np.float32,
+    )
+    cv_fallback_usage_rates = np.asarray(
+        [float(report.get("cv_fallback_usage_rate", 0.0)) for report in reports],
+        dtype=np.float32,
+    )
     task_backstop_watch_count = int(sum(int(report.get("task_backstop_watch_count", 0)) for report in reports))
     task_backstop_eligible_count = int(
         sum(int(report.get("task_backstop_eligible_count", 0)) for report in reports)
@@ -218,6 +238,11 @@ def aggregate_episode_reports(reports: list[dict]) -> dict:
         "no_merge_request_before_taper_rate": float(np.mean(no_merge_before_taper > 0)),
         "forecast_actor_coverage_complete_rate": float(np.mean(forecast_coverage_rates)),
         "forecast_gap_consistency_pass_rate": float(np.mean(forecast_gap_consistency_rates)),
+        "wcdt_relevant_actor_coverage_rate": float(np.mean(wcdt_relevant_coverage_rates)),
+        "combined_forecast_safety_coverage_rate": float(np.mean(combined_safety_coverage_rates)),
+        "actor_selector_overflow_rate": float(np.mean(selector_overflow_rates)),
+        "cv_fallback_overflow_rate": float(np.mean(cv_fallback_overflow_rates)),
+        "cv_fallback_usage_rate": float(np.mean(cv_fallback_usage_rates)),
         "task_backstop_watch_count": task_backstop_watch_count,
         "task_backstop_eligible_count": task_backstop_eligible_count,
         "task_backstop_veto_reason_counts": dict(task_backstop_veto_reason_counts),

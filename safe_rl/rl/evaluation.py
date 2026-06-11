@@ -122,7 +122,30 @@ def _step_safety_record(
         "forecast_first_step_target_front_gap": info.get("forecast_first_step_target_front_gap"),
         "forecast_first_step_target_rear_gap": info.get("forecast_first_step_target_rear_gap"),
         "forecast_gap_consistency_pass": bool(info.get("forecast_gap_consistency_pass", False)),
+        "forecast_gap_physical_consistency_pass": bool(
+            info.get("forecast_gap_physical_consistency_pass", False)
+        ),
+        "forecast_vehicle_identity_consistent": bool(
+            info.get("forecast_vehicle_identity_consistent", False)
+        ),
+        "forecast_front_first_step_progress_error": info.get(
+            "forecast_front_first_step_progress_error"
+        ),
+        "forecast_rear_first_step_progress_error": info.get(
+            "forecast_rear_first_step_progress_error"
+        ),
         "forecast_selected_vehicle_ids": list(info.get("forecast_selected_vehicle_ids", []) or []),
+        "forecast_wcdt_selected_vehicle_ids": list(
+            info.get("forecast_wcdt_selected_vehicle_ids", []) or []
+        ),
+        "forecast_cv_fallback_vehicle_ids": list(
+            info.get("forecast_cv_fallback_vehicle_ids", []) or []
+        ),
+        "forecast_actor_sources": dict(info.get("forecast_actor_sources", {}) or {}),
+        "forecast_actor_relevance": dict(info.get("forecast_actor_relevance", {}) or {}),
+        "forecast_wcdt_uncertainty": info.get("forecast_wcdt_uncertainty"),
+        "forecast_cv_fallback_uncertainty": info.get("forecast_cv_fallback_uncertainty"),
+        "combined_forecast_uncertainty": info.get("combined_forecast_uncertainty"),
         "forecast_target_front_vehicle_id": str(info.get("forecast_target_front_vehicle_id", "")),
         "forecast_target_rear_vehicle_id": str(info.get("forecast_target_rear_vehicle_id", "")),
         "forecast_target_front_required": bool(info.get("forecast_target_front_required", False)),
@@ -130,6 +153,21 @@ def _step_safety_record(
         "forecast_target_front_covered": bool(info.get("forecast_target_front_covered", False)),
         "forecast_target_rear_covered": bool(info.get("forecast_target_rear_covered", False)),
         "forecast_actor_coverage_complete": bool(info.get("forecast_actor_coverage_complete", False)),
+        "wcdt_required_actor_coverage_complete": bool(
+            info.get("wcdt_required_actor_coverage_complete", False)
+        ),
+        "forecast_safety_actor_coverage_complete": bool(
+            info.get("forecast_safety_actor_coverage_complete", False)
+        ),
+        "actor_selector_relevant_count": int(info.get("actor_selector_relevant_count", 0)),
+        "actor_selector_overflow": bool(info.get("actor_selector_overflow", False)),
+        "actor_selector_dropped_relevant_ids": list(
+            info.get("actor_selector_dropped_relevant_ids", []) or []
+        ),
+        "cv_fallback_overflow": bool(info.get("cv_fallback_overflow", False)),
+        "cv_fallback_dropped_vehicle_ids": list(
+            info.get("cv_fallback_dropped_vehicle_ids", []) or []
+        ),
         "forecast_closest_vehicle_id": str(info.get("forecast_closest_vehicle_id", "")),
         "forecast_front_gap_vehicle_id": str(info.get("forecast_front_gap_vehicle_id", "")),
         "forecast_rear_gap_vehicle_id": str(info.get("forecast_rear_gap_vehicle_id", "")),

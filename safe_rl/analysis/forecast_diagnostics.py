@@ -824,6 +824,11 @@ def _residual_ensemble_diagnostics(
         "loss_version": loss_version,
         "legacy_checkpoint_metadata": not bool(architecture_version and loss_version),
         "trajectory_schema_version": payload.get("trajectory_schema_version") if isinstance(payload, dict) else None,
+        "actor_selection_version": payload.get("actor_selection_version") if isinstance(payload, dict) else None,
+        "actor_selection_config_hash": (
+            payload.get("actor_selection_config_hash") if isinstance(payload, dict) else None
+        ),
+        "max_actor_count": payload.get("max_actor_count") if isinstance(payload, dict) else None,
         "early_stopped_member_count": int(
             sum(bool(item.get("stopped_early", False)) for item in member_histories if isinstance(item, dict))
         ),
@@ -1525,8 +1530,22 @@ def run_forecast_diagnostics(
     schema_version = int(np.asarray(data["trajectory_schema_version"]).reshape(-1)[0]) if "trajectory_schema_version" in data else 1
     metric_value = np.asarray(data["safety_metric_version"]).reshape(-1)[0] if "safety_metric_version" in data else ""
     metric_version = metric_value.decode("utf-8") if isinstance(metric_value, bytes) else str(metric_value)
+    selection_value = np.asarray(data["actor_selection_version"]).reshape(-1)[0] if "actor_selection_version" in data else ""
+    actor_selection_version = (
+        selection_value.decode("utf-8") if isinstance(selection_value, bytes) else str(selection_value)
+    )
+    selection_hash_value = (
+        np.asarray(data["actor_selection_config_hash"]).reshape(-1)[0]
+        if "actor_selection_config_hash" in data
+        else ""
+    )
+    actor_selection_config_hash = (
+        selection_hash_value.decode("utf-8")
+        if isinstance(selection_hash_value, bytes)
+        else str(selection_hash_value)
+    )
     legacy_unmasked_buffer = (
-        schema_version < 3
+        schema_version < 4
         or "agent_future_valid_mask" not in data
         or metric_version != SAFETY_METRIC_VERSION
     )
@@ -1645,6 +1664,25 @@ def run_forecast_diagnostics(
         "sample_count": int(sample_count),
         "trajectory_schema_version": int(schema_version),
         "safety_metric_version": metric_version,
+        "actor_selection_version": actor_selection_version,
+        "actor_selection_config_hash": actor_selection_config_hash,
+        "actor_selector_overflow_rate": (
+            float(np.mean(np.asarray(data["actor_selector_overflow"], dtype=np.float32)))
+            if "actor_selector_overflow" in data and np.asarray(data["actor_selector_overflow"]).size
+            else 0.0
+        ),
+        "relevant_actor_coverage": (
+            float(
+                np.mean(
+                    np.sum(np.asarray(data["agent_relevance_mask"], dtype=np.float32), axis=1)
+                    >= np.asarray(data["actor_selector_relevant_count"], dtype=np.int64)
+                )
+            )
+            if "agent_relevance_mask" in data
+            and "actor_selector_relevant_count" in data
+            and np.asarray(data["actor_selector_relevant_count"]).size
+            else 0.0
+        ),
         "legacy_unmasked_buffer": bool(legacy_unmasked_buffer),
         "feature_names": list(ForecastFeatureAugmentor.FEATURE_NAMES),
         "forecast_feature_summary": feature_summary,

@@ -5,6 +5,11 @@ from typing import Any
 
 import numpy as np
 
+from safe_rl.prediction.actor_selector import (
+    ACTOR_SELECTION_VERSION,
+    actor_selection_config_hash,
+    select_merge_relevant_actors,
+)
 from safe_rl.risk.merge_local import route_aware_constant_velocity_rollout
 from safe_rl.prediction.merge_safety_loss import (
     LOSS_VERSION,
@@ -305,14 +310,30 @@ def build_v2_numpy_batch(
     }
 
 
-def build_v2_runtime_batch(cfg: Any, history: HistoryBuffer, ego_id: str) -> dict[str, np.ndarray]:
-    agent_history, agent_mask = history.to_tensor_arrays(ego_id)
+def build_v2_runtime_batch(cfg: Any, history: HistoryBuffer, ego_id: str) -> dict[str, Any]:
+    latest = history.latest()
+    ego = latest.get(ego_id)
+    if ego is None:
+        raise ValueError(f"WcDT v2 runtime history has no ego vehicle {ego_id!r}.")
+    max_actors = int(cfg.prediction.get("wcdt_v2_max_agents", cfg.prediction.max_pred_num))
+    selection = select_merge_relevant_actors(
+        cfg,
+        ego,
+        list(latest.values()),
+        max_actors,
+    )
+    runtime_history = history.build_tensor_for_ids(
+        ego_id,
+        selection.selected_actor_ids,
+        cfg,
+    )
+    agent_history = runtime_history["history"]
+    agent_mask = runtime_history["mask"]
     horizon = int(cfg.forecast_features.get("horizon_steps", cfg.scenario.forecast_horizon_steps))
     future = np.zeros((1, agent_history.shape[0], horizon, 5), dtype=np.float32)
     full_history = agent_history[None, ...]
     full_mask = agent_mask[None, ...]
-    latest = history.latest()
-    ids = history.agent_ids(ego_id)
+    ids = [str(value) for value in runtime_history["agent_ids"].tolist()]
     lane_indices = np.full((1, agent_history.shape[0]), -1, dtype=np.int64)
     edge_roles = np.zeros((1, agent_history.shape[0]), dtype=np.int64)
     for agent_idx, vehicle_id in enumerate(ids):
@@ -330,7 +351,13 @@ def build_v2_runtime_batch(cfg: Any, history: HistoryBuffer, ego_id: str) -> dic
         lane_indices=lane_indices,
         edge_roles=edge_roles,
     )
-    return {key: value[0:1] if key != "selected_indices" else value[0] for key, value in batch.items()}
+    output = {
+        key: value[0:1] if key != "selected_indices" else value[0]
+        for key, value in batch.items()
+    }
+    output["runtime_agent_ids"] = ids
+    output["actor_selection"] = selection
+    return output
 
 
 class WcDTV2ResidualPredictor(_TORCH_MODULE_BASE):
@@ -413,12 +440,34 @@ def load_v2_ensemble(config: Any, checkpoint: str | Path, device: Any | None = N
     if loss_version != LOSS_VERSION:
         raise ValueError(f"unsupported WcDT v2 loss_version={loss_version!r}; expected {LOSS_VERSION!r}")
     schema_version = int(payload.get("trajectory_schema_version", -1))
-    if schema_version != 3:
-        raise ValueError(f"unsupported WcDT v2 trajectory_schema_version={schema_version!r}; expected 3")
+    if schema_version != 4:
+        raise ValueError(f"unsupported WcDT v2 trajectory_schema_version={schema_version!r}; expected 4")
     metric_version = str(payload.get("safety_metric_version", ""))
     if metric_version != SAFETY_METRIC_VERSION:
         raise ValueError(
             f"unsupported WcDT v2 safety_metric_version={metric_version!r}; expected {SAFETY_METRIC_VERSION!r}"
+        )
+    selection_version = str(payload.get("actor_selection_version", ""))
+    if selection_version != ACTOR_SELECTION_VERSION:
+        raise ValueError(
+            f"unsupported WcDT v2 actor_selection_version={selection_version!r}; "
+            f"expected {ACTOR_SELECTION_VERSION!r}"
+        )
+    configured_selection_hash = actor_selection_config_hash(config)
+    checkpoint_selection_hash = str(payload.get("actor_selection_config_hash", ""))
+    if checkpoint_selection_hash != configured_selection_hash:
+        raise ValueError(
+            "WcDT v2 actor_selection_config_hash mismatch: "
+            f"checkpoint={checkpoint_selection_hash!r}, runtime={configured_selection_hash!r}"
+        )
+    max_actor_count = int(payload.get("max_actor_count", -1))
+    configured_max_actor_count = int(
+        config.prediction.get("wcdt_v2_max_agents", config.prediction.max_pred_num)
+    )
+    if max_actor_count != configured_max_actor_count:
+        raise ValueError(
+            "WcDT v2 max_actor_count mismatch: "
+            f"checkpoint={max_actor_count}, runtime={configured_max_actor_count}"
         )
     horizon = int(payload.get("horizon_steps", config.forecast_features.get("horizon_steps", config.scenario.forecast_horizon_steps)))
     hidden_dim = int(payload.get("hidden_dim", config.prediction.get("wcdt_v2_hidden_dim", 128)))
@@ -467,16 +516,19 @@ class WcDTV2Predictor:
         batch = build_v2_runtime_batch(self.config, history, str(ego.vehicle_id))
         tensor_batch = tensorize_batch(batch, self._torch, self.device)
         mean, uncertainty = ensemble_predict(self.models, tensor_batch)
-        agent_ids = history.agent_ids(str(ego.vehicle_id))
+        agent_ids = list(batch["runtime_agent_ids"])
         selected_vehicle_ids = [
             str(agent_ids[int(index)]) if 0 < int(index) < len(agent_ids) else ""
             for index in batch["selected_indices"].tolist()
         ]
+        selection = batch["actor_selection"]
         return {
             "future_trajectories": mean.detach().cpu().numpy()[0],
             "uncertainty": float(uncertainty.detach().cpu().numpy()[0]),
             "mode_confidence": None,
             "selected_indices": batch["selected_indices"].tolist(),
             "selected_vehicle_ids": selected_vehicle_ids,
+            "forecast_source": "wcdt_v2",
+            "actor_selection": selection.to_dict(),
             "checkpoint": self.checkpoint_path,
         }

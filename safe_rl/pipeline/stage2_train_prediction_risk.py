@@ -233,7 +233,21 @@ def _safety_metric_version(data: Any) -> str:
     return value.decode("utf-8") if isinstance(value, bytes) else str(value)
 
 
-def _require_trajectory_schema_v3(data: Any, consumer: str) -> None:
+def _trajectory_string(data: Any, key: str) -> str:
+    if not _has_key(data, key):
+        return ""
+    value = np.asarray(data[key]).reshape(-1)[0]
+    if isinstance(value, bytes):
+        value = value.decode("utf-8")
+    return str(value)
+
+
+def _require_trajectory_schema_v3(data: Any, consumer: str, cfg: Any | None = None) -> None:
+    from safe_rl.prediction.actor_selector import (
+        ACTOR_SELECTION_VERSION,
+        actor_selection_config_hash,
+    )
+
     version = _trajectory_schema_version(data)
     required = {
         "agent_history_valid_mask",
@@ -245,19 +259,36 @@ def _require_trajectory_schema_v3(data: Any, consumer: str) -> None:
         "agent_length",
         "agent_width",
         "safety_metric_version",
+        "actor_selection_version",
+        "actor_selection_config_hash",
+        "agent_relevance_mask",
+        "agent_relevance_score",
+        "actor_selector_relevant_count",
+        "actor_selector_overflow",
     }
     missing = sorted(key for key in required if not _has_key(data, key))
     metric_version = _safety_metric_version(data)
-    if version < 3 or missing or metric_version != SAFETY_METRIC_VERSION:
+    selection_version = _trajectory_string(data, "actor_selection_version")
+    selection_hash = _trajectory_string(data, "actor_selection_config_hash")
+    expected_hash = actor_selection_config_hash(cfg) if cfg is not None else selection_hash
+    if (
+        version < 4
+        or missing
+        or metric_version != SAFETY_METRIC_VERSION
+        or selection_version != ACTOR_SELECTION_VERSION
+        or selection_hash != expected_hash
+    ):
         raise ValueError(
-            f"{consumer} training requires trajectory_schema_version>=3 and "
+            f"{consumer} training requires trajectory_schema_version>=4, "
             f"safety_metric_version={SAFETY_METRIC_VERSION!r}; found version={version}, "
-            f"safety_metric_version={metric_version!r}, missing={missing}. Re-run Stage1 with a new run id."
+            f"safety_metric_version={metric_version!r}, actor_selection_version={selection_version!r}, "
+            f"actor_selection_config_hash={selection_hash!r}, expected_hash={expected_hash!r}, "
+            f"missing={missing}. Re-run Stage1 with a new run id."
         )
 
 
 def _require_trajectory_schema_v2(data: Any, consumer: str) -> None:
-    """Compatibility alias; current formal training still requires schema v3."""
+    """Compatibility alias; current formal training requires schema v4."""
 
     _require_trajectory_schema_v3(data, consumer)
 
@@ -1200,6 +1231,8 @@ def _wcdt_validation_metrics(cfg: Any, model: Any, loader: Any, device: Any, pin
     torch, _DataLoader, _TensorDataset = _require_torch()
     ade: list[float] = []
     fde: list[float] = []
+    critical_actor_ade: list[float] = []
+    critical_actor_fde: list[float] = []
     future_min_distance_errors: list[float] = []
     future_min_distance_abs_errors: list[float] = []
     target_gap_errors: list[float] = []
@@ -1254,6 +1287,17 @@ def _wcdt_validation_metrics(cfg: Any, model: Any, loader: Any, device: Any, pin
                 row_fde = float(np.mean(per_step[:, -1]))
                 ade.append(row_ade)
                 fde.append(row_fde)
+                critical_mask = mask_np[row] * np.isin(role_ids_np[row], [0, 1]).astype(np.float32)
+                critical_errors = _masked_trajectory_errors(
+                    pred_np[row],
+                    target_np[row],
+                    critical_mask,
+                    future_valid_np[row],
+                    ego_future_valid_np[row],
+                )
+                if critical_errors is not None:
+                    critical_actor_ade.append(float(critical_errors[0]))
+                    critical_actor_fde.append(float(critical_errors[1]))
                 confidence_values.append(float(np.mean(max_confidence_np[row][valid])))
                 confidence_fde_values.append(row_fde)
                 uncertainty_values.append(float(np.mean(uncertainty_np[row][valid])))
@@ -1271,6 +1315,8 @@ def _wcdt_validation_metrics(cfg: Any, model: Any, loader: Any, device: Any, pin
         "loss": float(np.mean(val_losses)) if val_losses else 0.0,
         "ade": _summary(ade),
         "fde": _summary(fde),
+        "critical_actor_ade": _summary(critical_actor_ade),
+        "critical_actor_fde": _summary(critical_actor_fde),
         "future_min_distance_error": _summary(future_min_distance_errors),
         "future_min_distance_abs_error": _summary(future_min_distance_abs_errors),
         "target_lane_gap_error": _summary(target_gap_errors),
@@ -1431,7 +1477,7 @@ def _build_wcdt_v2_loader(
         return None
     if indices.size == 0:
         return None
-    _require_trajectory_schema_v3(data, "WcDT v2")
+    _require_trajectory_schema_v3(data, "WcDT v2", cfg)
     batch = build_v2_numpy_batch(
         cfg,
         data["agent_history"],
@@ -1908,6 +1954,9 @@ def _train_wcdt_v2_predictor(
         "loss_version": LOSS_VERSION,
         "trajectory_schema_version": _trajectory_schema_version(data),
         "safety_metric_version": _safety_metric_version(data),
+        "actor_selection_version": _trajectory_string(data, "actor_selection_version"),
+        "actor_selection_config_hash": _trajectory_string(data, "actor_selection_config_hash"),
+        "max_actor_count": int(cfg.prediction.get("wcdt_v2_max_agents", cfg.prediction.max_pred_num)),
         "horizon_steps": int(horizon),
         "history_steps": int(cfg.scenario.history_steps),
         "input_dim": int(INPUT_DIM),
@@ -1949,7 +1998,7 @@ def _build_wcdt_v3_loader(cfg: Any, data: Any, sample_indices: np.ndarray, devic
 
     if not _has_key(data, "agent_history") or data["agent_history"].shape[0] == 0 or sample_indices.size == 0:
         return None
-    _require_trajectory_schema_v3(data, "WcDT v3")
+    _require_trajectory_schema_v3(data, "WcDT v3", cfg)
     batch = build_v3_numpy_batch(
         cfg,
         data["agent_history"],
@@ -2034,6 +2083,8 @@ def _wcdt_v3_validation_metrics(cfg: Any, models: list[Any], loader: Any, device
 
     ade: list[float] = []
     fde: list[float] = []
+    critical_actor_ade: list[float] = []
+    critical_actor_fde: list[float] = []
     future_min_distance_errors: list[float] = []
     future_min_distance_abs_errors: list[float] = []
     target_gap_errors: list[float] = []
@@ -2093,6 +2144,17 @@ def _wcdt_v3_validation_metrics(cfg: Any, models: list[Any], loader: Any, device
                 row_ade, row_fde = errors
                 ade.append(row_ade)
                 fde.append(row_fde)
+                critical_mask = mask_np[row] * np.isin(role_ids_np[row], [0, 1]).astype(np.float32)
+                critical_errors = _masked_trajectory_errors(
+                    pred_np[row],
+                    target_np[row],
+                    critical_mask,
+                    future_valid_np[row],
+                    ego_future_valid_np[row],
+                )
+                if critical_errors is not None:
+                    critical_actor_ade.append(float(critical_errors[0]))
+                    critical_actor_fde.append(float(critical_errors[1]))
                 uncertainty_values.append(float(uncertainty_np[row]))
                 uncertainty_fde_values.append(row_fde)
                 pred_min = _future_min_distance(
@@ -2148,6 +2210,8 @@ def _wcdt_v3_validation_metrics(cfg: Any, models: list[Any], loader: Any, device
         "loss": float(np.mean(val_losses)) if val_losses else 0.0,
         "ade": _summary(ade),
         "fde": _summary(fde),
+        "critical_actor_ade": _summary(critical_actor_ade),
+        "critical_actor_fde": _summary(critical_actor_fde),
         "future_min_distance_error": _summary(future_min_distance_errors),
         "future_min_distance_abs_error": _summary(future_min_distance_abs_errors),
         "target_lane_gap_error": _summary(target_gap_errors),
@@ -2448,6 +2512,9 @@ def _train_wcdt_v3_predictor(
         "loss_version": LOSS_VERSION,
         "trajectory_schema_version": _trajectory_schema_version(data),
         "safety_metric_version": _safety_metric_version(data),
+        "actor_selection_version": _trajectory_string(data, "actor_selection_version"),
+        "actor_selection_config_hash": _trajectory_string(data, "actor_selection_config_hash"),
+        "max_actor_count": int(cfg.prediction.get("wcdt_v3_max_agents", cfg.prediction.max_pred_num)),
         **model_kwargs,
         "ensemble_size": int(ensemble_size),
         "loss_weights": loss_weights,
@@ -2495,7 +2562,7 @@ def run(cfg) -> Path:
     tb = TensorboardLogger(stage_dir / "tensorboard", enabled=bool(cfg.run.get("tensorboard", True)))
     initial_prediction_report_path = stage_dir / "stage2_initial_prediction_report.json"
     data = np.load(input_path, allow_pickle=False)
-    _require_trajectory_schema_v3(data, "Stage2")
+    _require_trajectory_schema_v3(data, "Stage2", cfg)
     stage4_data = np.load(input_stage4_path, allow_pickle=False) if input_stage4_path is not None else None
     risk_data = _merge_risk_buffers(data, stage4_data)
     executed_count = int(data["executed_actions"].shape[0]) if "executed_actions" in data else int(data["actions"].shape[0])
@@ -2531,6 +2598,14 @@ def run(cfg) -> Path:
         "device": str(device),
         "trajectory_schema_version": _trajectory_schema_version(data),
         "safety_metric_version": _safety_metric_version(data),
+        "actor_selection_version": _trajectory_string(data, "actor_selection_version"),
+        "actor_selection_config_hash": _trajectory_string(data, "actor_selection_config_hash"),
+        "actor_selector_overflow_rate": (
+            float(np.mean(np.asarray(data["actor_selector_overflow"], dtype=np.float32)))
+            if _has_key(data, "actor_selector_overflow")
+            and np.asarray(data["actor_selector_overflow"]).size
+            else 0.0
+        ),
         "prediction_train_enabled": bool(cfg.prediction.get("train_enabled", True)),
         "wcdt_v1_train_enabled": bool(cfg.prediction.get("wcdt_v1_train_enabled", False)),
         "wcdt_v2_train_enabled": bool(cfg.prediction.get("wcdt_v2_train_enabled", True)),

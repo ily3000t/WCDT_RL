@@ -421,6 +421,23 @@ def distance_to_taper(config: Any, state: VehicleState | None) -> float:
     return float(config.scenario.get("merge_x", 220.0)) - float(state.x)
 
 
+def merge_corridor_progress(config: Any, state: VehicleState | None) -> float | None:
+    """Return signed longitudinal progress relative to the taper deadline."""
+
+    if state is None:
+        return None
+    edge_id = str(state.edge_id)
+    known_edges = {
+        *ramp_edges(config),
+        *mainline_edges(config),
+        *auxiliary_edges(config),
+        str(config.scenario.get("success_edge", "main_out")),
+    }
+    if edge_id not in known_edges:
+        return None
+    return -float(distance_to_taper(config, state))
+
+
 def distance_to_taper_for_position(
     config: Any,
     x: float,

@@ -4,6 +4,10 @@ from typing import Any
 
 import numpy as np
 
+from safe_rl.prediction.forecast_rollout_bundle import (
+    ForecastRolloutBundle,
+    get_or_build_forecast_rollout_bundle,
+)
 from safe_rl.risk.merge_local import (
     merge_local_stats,
     nearest_future_gap,
@@ -45,26 +49,89 @@ class ForecastFeatureAugmentor:
         if ego is None:
             return np.zeros((self.feature_dim(self.config),), dtype=np.float32)
 
-        prediction = None
-        if self.predictor is not None:
-            try:
-                prediction = self.predictor.predict(context)
-            except Exception:
-                if not bool(self.config.forecast_features.get("allow_heuristic_fallback", False)):
-                    raise
-                prediction = None
-
         source = str(self.config.forecast_features.get("source", "heuristic")).lower()
-        if source == "constant_velocity":
-            features = self._constant_velocity_features(ego, vehicles)
-        elif prediction is not None:
-            features = self._from_prediction(ego, vehicles, prediction)
-        else:
+        try:
+            bundle = get_or_build_forecast_rollout_bundle(
+                self.config,
+                context,
+                None if source == "constant_velocity" else self.predictor,
+            )
+            features = self._from_bundle(ego, bundle)
+        except Exception:
+            if not bool(self.config.forecast_features.get("allow_heuristic_fallback", False)):
+                raise
             features = self._heuristic_features(ego, vehicles)
 
         if bool(self.config.forecast_features.normalize):
             features = self._normalize(features)
         return features.astype(np.float32)
+
+    def _from_bundle(self, ego: Any, bundle: ForecastRolloutBundle) -> np.ndarray:
+        if not bundle.actors:
+            return np.asarray(
+                [50.0, INF_TTC, 0.0, 0.0, bundle.combined_uncertainty, 50.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+                dtype=np.float32,
+            )
+        horizon = int(
+            self.config.forecast_features.get(
+                "horizon_steps",
+                self.config.scenario.forecast_horizon_steps,
+            )
+        )
+        dt = float(self.config.scenario.step_length)
+        ego_rollout = route_aware_constant_velocity_rollout(ego, horizon, dt, self.config)[0]
+        min_distance = 50.0
+        min_ttc = INF_TTC
+        max_drac = 0.0
+        nearest_dx = 0.0
+        nearest_dy = 0.0
+        target_lane_gap = 50.0
+        top_risks: list[float] = []
+        for actor in bundle.actors:
+            actor_min = 50.0
+            for step_idx, other_future in enumerate(actor.trajectory[: len(ego_rollout)]):
+                ego_future = ego_rollout[step_idx]
+                distance = bbox_gap(ego_future, other_future)
+                if distance < min_distance:
+                    min_distance = float(distance)
+                    nearest_dx = float(other_future.x - ego_future.x)
+                    nearest_dy = float(other_future.y - ego_future.y)
+                actor_min = min(actor_min, float(distance))
+                min_ttc = min(min_ttc, relative_ttc(ego_future, other_future))
+                max_drac = max(max_drac, drac(ego_future, other_future))
+            top_risks.append(1.0 / (1.0 + max(0.0, actor_min)))
+        for step_idx, ego_future in enumerate(ego_rollout):
+            step_vehicles = [
+                actor.trajectory[step_idx]
+                for actor in bundle.actors
+                if step_idx < len(actor.trajectory)
+            ]
+            if step_vehicles:
+                target_lane_gap = min(
+                    target_lane_gap,
+                    float(merge_local_stats(ego_future, step_vehicles, self.config).target_lane_gap),
+                )
+        top = np.sort(np.asarray(top_risks, dtype=np.float32))[::-1]
+        top = np.pad(top[:3], (0, max(0, 3 - len(top))), constant_values=0.0)
+        collision_probability = float(
+            min_distance < float(self.config.risk_module.collision_distance_threshold)
+        )
+        return np.asarray(
+            [
+                min_distance,
+                min_ttc,
+                max_drac,
+                collision_probability,
+                float(bundle.combined_uncertainty),
+                target_lane_gap,
+                nearest_dx,
+                nearest_dy,
+                float(top[0]),
+                float(top[1]),
+                float(top[2]),
+            ],
+            dtype=np.float32,
+        )
 
     def _heuristic_features(self, ego, vehicles) -> np.ndarray:
         others = [vehicle for vehicle in vehicles if vehicle.vehicle_id != ego.vehicle_id]

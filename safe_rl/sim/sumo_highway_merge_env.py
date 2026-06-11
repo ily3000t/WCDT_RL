@@ -12,6 +12,7 @@ from typing import Any
 
 import numpy as np
 
+from safe_rl.prediction.actor_selector import select_merge_relevant_actors
 from safe_rl.prediction.forecast_feature_augmentor import ForecastFeatureAugmentor
 from safe_rl.risk.candidate_risk_ranker import CandidateRiskRanker
 from safe_rl.risk.merge_local import is_candidate_legal, merge_local_stats
@@ -912,8 +913,18 @@ class SumoHighwayMergeEnv(gym.Env):
             veto_reason = "forecast_unavailable"
         elif not bool(record.get("forecast_actor_coverage_complete", False)):
             veto_reason = "forecast_actor_coverage"
+        elif bool(record.get("actor_selector_overflow", False)):
+            veto_reason = "actor_selector_overflow"
+        elif bool(record.get("cv_fallback_overflow", False)):
+            veto_reason = "cv_fallback_overflow"
+        elif not bool(record.get("wcdt_required_actor_coverage_complete", False)):
+            veto_reason = "wcdt_relevant_actor_coverage"
+        elif not bool(record.get("forecast_safety_actor_coverage_complete", False)):
+            veto_reason = "forecast_safety_actor_coverage"
         elif not bool(record.get("forecast_gap_consistency_pass", False)):
             veto_reason = "forecast_gap_consistency"
+        elif not bool(record.get("forecast_gap_physical_consistency_pass", False)):
+            veto_reason = "forecast_physical_consistency"
         elif best_action is None or int(best_action.lateral_cmd) != merge_cmd:
             veto_reason = "best_action_not_merge"
         elif not is_candidate_legal(best_action, context):
@@ -1193,8 +1204,41 @@ class SumoHighwayMergeEnv(gym.Env):
                     "forecast_gap_consistency_pass": bool(
                         self._last_task_merge_record.get("forecast_gap_consistency_pass", False)
                     ),
+                    "forecast_gap_physical_consistency_pass": bool(
+                        self._last_task_merge_record.get("forecast_gap_physical_consistency_pass", False)
+                    ),
+                    "forecast_vehicle_identity_consistent": bool(
+                        self._last_task_merge_record.get("forecast_vehicle_identity_consistent", False)
+                    ),
+                    "forecast_front_first_step_progress_error": self._last_task_merge_record.get(
+                        "forecast_front_first_step_progress_error"
+                    ),
+                    "forecast_rear_first_step_progress_error": self._last_task_merge_record.get(
+                        "forecast_rear_first_step_progress_error"
+                    ),
                     "forecast_selected_vehicle_ids": list(
                         self._last_task_merge_record.get("forecast_selected_vehicle_ids", [])
+                    ),
+                    "forecast_wcdt_selected_vehicle_ids": list(
+                        self._last_task_merge_record.get("forecast_wcdt_selected_vehicle_ids", [])
+                    ),
+                    "forecast_cv_fallback_vehicle_ids": list(
+                        self._last_task_merge_record.get("forecast_cv_fallback_vehicle_ids", [])
+                    ),
+                    "forecast_actor_sources": dict(
+                        self._last_task_merge_record.get("forecast_actor_sources", {})
+                    ),
+                    "forecast_actor_relevance": dict(
+                        self._last_task_merge_record.get("forecast_actor_relevance", {})
+                    ),
+                    "forecast_wcdt_uncertainty": self._last_task_merge_record.get(
+                        "forecast_wcdt_uncertainty"
+                    ),
+                    "forecast_cv_fallback_uncertainty": self._last_task_merge_record.get(
+                        "forecast_cv_fallback_uncertainty"
+                    ),
+                    "combined_forecast_uncertainty": self._last_task_merge_record.get(
+                        "combined_forecast_uncertainty"
                     ),
                     "forecast_target_front_vehicle_id": str(
                         self._last_task_merge_record.get("forecast_target_front_vehicle_id", "")
@@ -1216,6 +1260,39 @@ class SumoHighwayMergeEnv(gym.Env):
                     ),
                     "forecast_actor_coverage_complete": bool(
                         self._last_task_merge_record.get("forecast_actor_coverage_complete", False)
+                    ),
+                    "wcdt_required_actor_coverage_complete": bool(
+                        self._last_task_merge_record.get(
+                            "wcdt_required_actor_coverage_complete",
+                            False,
+                        )
+                    ),
+                    "forecast_safety_actor_coverage_complete": bool(
+                        self._last_task_merge_record.get(
+                            "forecast_safety_actor_coverage_complete",
+                            False,
+                        )
+                    ),
+                    "actor_selector_relevant_count": int(
+                        self._last_task_merge_record.get("actor_selector_relevant_count", 0)
+                    ),
+                    "actor_selector_overflow": bool(
+                        self._last_task_merge_record.get("actor_selector_overflow", False)
+                    ),
+                    "actor_selector_dropped_relevant_ids": list(
+                        self._last_task_merge_record.get(
+                            "actor_selector_dropped_relevant_ids",
+                            [],
+                        )
+                    ),
+                    "cv_fallback_overflow": bool(
+                        self._last_task_merge_record.get("cv_fallback_overflow", False)
+                    ),
+                    "cv_fallback_dropped_vehicle_ids": list(
+                        self._last_task_merge_record.get(
+                            "cv_fallback_dropped_vehicle_ids",
+                            [],
+                        )
                     ),
                     "forecast_closest_vehicle_id": str(
                         self._last_task_merge_record.get("forecast_closest_vehicle_id", "")
@@ -1362,6 +1439,27 @@ class SumoHighwayMergeEnv(gym.Env):
         forecast_gap_consistency_pass_count = sum(
             1 for record in forecast_records if record.get("forecast_gap_consistency_pass")
         )
+        wcdt_relevant_coverage_count = sum(
+            1
+            for record in forecast_records
+            if record.get("wcdt_required_actor_coverage_complete")
+        )
+        safety_actor_coverage_count = sum(
+            1
+            for record in forecast_records
+            if record.get("forecast_safety_actor_coverage_complete")
+        )
+        selector_overflow_count = sum(
+            1 for record in forecast_records if record.get("actor_selector_overflow")
+        )
+        cv_fallback_overflow_count = sum(
+            1 for record in forecast_records if record.get("cv_fallback_overflow")
+        )
+        cv_fallback_usage_count = sum(
+            1
+            for record in forecast_records
+            if record.get("forecast_cv_fallback_vehicle_ids")
+        )
         task_backstop_watch_count = sum(
             1 for record in task_available_records if record.get("task_backstop_watch_eligible")
         )
@@ -1480,6 +1578,36 @@ class SumoHighwayMergeEnv(gym.Env):
             "forecast_gap_consistency_pass_rate": (
                 float(forecast_gap_consistency_pass_count / len(forecast_records)) if forecast_records else 0.0
             ),
+            "wcdt_relevant_actor_coverage_count": int(wcdt_relevant_coverage_count),
+            "wcdt_relevant_actor_coverage_rate": (
+                float(wcdt_relevant_coverage_count / len(forecast_records))
+                if forecast_records
+                else 0.0
+            ),
+            "combined_forecast_safety_coverage_count": int(safety_actor_coverage_count),
+            "combined_forecast_safety_coverage_rate": (
+                float(safety_actor_coverage_count / len(forecast_records))
+                if forecast_records
+                else 0.0
+            ),
+            "actor_selector_overflow_count": int(selector_overflow_count),
+            "actor_selector_overflow_rate": (
+                float(selector_overflow_count / len(forecast_records))
+                if forecast_records
+                else 0.0
+            ),
+            "cv_fallback_overflow_count": int(cv_fallback_overflow_count),
+            "cv_fallback_overflow_rate": (
+                float(cv_fallback_overflow_count / len(forecast_records))
+                if forecast_records
+                else 0.0
+            ),
+            "cv_fallback_usage_count": int(cv_fallback_usage_count),
+            "cv_fallback_usage_rate": (
+                float(cv_fallback_usage_count / len(forecast_records))
+                if forecast_records
+                else 0.0
+            ),
             "task_backstop_watch_count": int(task_backstop_watch_count),
             "task_backstop_eligible_count": int(task_backstop_eligible_count),
             "task_backstop_veto_reason_counts": dict(task_backstop_veto_reason_counts),
@@ -1552,21 +1680,7 @@ class SumoHighwayMergeEnv(gym.Env):
         self,
         *,
         include_dimensions: bool = False,
-    ) -> tuple[
-        np.ndarray,
-        np.ndarray,
-        np.ndarray,
-        np.ndarray,
-        np.ndarray,
-        np.ndarray,
-        np.ndarray,
-        np.ndarray,
-        np.ndarray,
-        np.ndarray,
-        np.ndarray,
-        np.ndarray,
-        np.ndarray,
-    ]:
+    ) -> tuple[np.ndarray, ...]:
         """Return padded [sample, agent, time, state] windows from the episode."""
 
         hist = self.history_steps
@@ -1588,7 +1702,15 @@ class SumoHighwayMergeEnv(gym.Env):
                 np.zeros((0, max_agents, horizon), dtype=np.int64),
             )
             if include_dimensions:
-                return (*result, np.full((0, max_agents), 4.8, dtype=np.float32), np.full((0, max_agents), 1.8, dtype=np.float32))
+                return (
+                    *result,
+                    np.full((0, max_agents), 4.8, dtype=np.float32),
+                    np.full((0, max_agents), 1.8, dtype=np.float32),
+                    np.zeros((0, max_agents), dtype=np.float32),
+                    np.zeros((0, max_agents), dtype=np.float32),
+                    np.zeros((0,), dtype=np.int64),
+                    np.zeros((0,), dtype=np.float32),
+                )
             return result
         history_samples: list[np.ndarray] = []
         future_samples: list[np.ndarray] = []
@@ -1603,15 +1725,23 @@ class SumoHighwayMergeEnv(gym.Env):
         future_edge_roles: list[np.ndarray] = []
         agent_lengths: list[np.ndarray] = []
         agent_widths: list[np.ndarray] = []
+        relevance_masks: list[np.ndarray] = []
+        relevance_scores: list[np.ndarray] = []
+        relevant_counts: list[int] = []
+        selector_overflows: list[float] = []
         for end_idx in range(hist, len(frames) - horizon):
             latest = frames[end_idx - 1]
             if self.ego_id not in latest:
                 continue
             ego = latest[self.ego_id]
             agent_ids = [self.ego_id]
-            others = [state for vid, state in latest.items() if vid != self.ego_id]
-            others.sort(key=lambda state: abs(state.x - ego.x) + abs(state.y - ego.y))
-            agent_ids.extend(state.vehicle_id for state in others[: self.top_k])
+            selection = select_merge_relevant_actors(
+                self.config,
+                ego,
+                list(latest.values()),
+                self.top_k,
+            )
+            agent_ids.extend(selection.selected_actor_ids)
             history = np.zeros((max_agents, hist, 5), dtype=np.float32)
             future = np.zeros((max_agents, horizon, 5), dtype=np.float32)
             mask = np.zeros((max_agents,), dtype=np.float32)
@@ -1625,6 +1755,8 @@ class SumoHighwayMergeEnv(gym.Env):
             sample_future_edge_roles = np.zeros((max_agents, horizon), dtype=np.int64)
             sample_agent_lengths = np.full((max_agents,), 4.8, dtype=np.float32)
             sample_agent_widths = np.full((max_agents,), 1.8, dtype=np.float32)
+            sample_relevance_mask = np.zeros((max_agents,), dtype=np.float32)
+            sample_relevance_score = np.zeros((max_agents,), dtype=np.float32)
             for agent_idx, vehicle_id in enumerate(agent_ids[:max_agents]):
                 mask[agent_idx] = 1.0
                 latest_state = latest.get(vehicle_id)
@@ -1633,6 +1765,17 @@ class SumoHighwayMergeEnv(gym.Env):
                     sample_edge_roles[agent_idx] = int(edge_role(self.config, latest_state.edge_id, latest_state.lane_index))
                     sample_agent_lengths[agent_idx] = float(latest_state.length)
                     sample_agent_widths[agent_idx] = float(latest_state.width)
+                    metadata = selection.actor_metadata.get(vehicle_id)
+                    if metadata is not None:
+                        sample_relevance_mask[agent_idx] = float(metadata.relevant)
+                        urgency_gap = max(
+                            0.0,
+                            min(metadata.current_surface_gap, metadata.effective_gap),
+                        )
+                        ttc_score = 0.0 if metadata.ttc >= INF_TTC else 1.0 / (1.0 + metadata.ttc)
+                        sample_relevance_score[agent_idx] = float(
+                            max(1.0 / (1.0 + urgency_gap), ttc_score)
+                        )
                 last_state = None
                 for step_idx, frame in enumerate(frames[end_idx - hist : end_idx]):
                     observed_state = frame.get(vehicle_id)
@@ -1670,6 +1813,10 @@ class SumoHighwayMergeEnv(gym.Env):
             future_edge_roles.append(sample_future_edge_roles)
             agent_lengths.append(sample_agent_lengths)
             agent_widths.append(sample_agent_widths)
+            relevance_masks.append(sample_relevance_mask)
+            relevance_scores.append(sample_relevance_score)
+            relevant_counts.append(int(selection.relevant_count))
+            selector_overflows.append(float(selection.overflow))
         if not history_samples:
             result = (
                 np.zeros((0, max_agents, hist, 5), dtype=np.float32),
@@ -1685,7 +1832,15 @@ class SumoHighwayMergeEnv(gym.Env):
                 np.zeros((0, max_agents, horizon), dtype=np.int64),
             )
             if include_dimensions:
-                return (*result, np.full((0, max_agents), 4.8, dtype=np.float32), np.full((0, max_agents), 1.8, dtype=np.float32))
+                return (
+                    *result,
+                    np.full((0, max_agents), 4.8, dtype=np.float32),
+                    np.full((0, max_agents), 1.8, dtype=np.float32),
+                    np.zeros((0, max_agents), dtype=np.float32),
+                    np.zeros((0, max_agents), dtype=np.float32),
+                    np.zeros((0,), dtype=np.int64),
+                    np.zeros((0,), dtype=np.float32),
+                )
             return result
         result = (
             np.stack(history_samples, axis=0),
@@ -1701,5 +1856,13 @@ class SumoHighwayMergeEnv(gym.Env):
             np.stack(future_edge_roles, axis=0),
         )
         if include_dimensions:
-            return (*result, np.stack(agent_lengths, axis=0), np.stack(agent_widths, axis=0))
+            return (
+                *result,
+                np.stack(agent_lengths, axis=0),
+                np.stack(agent_widths, axis=0),
+                np.stack(relevance_masks, axis=0),
+                np.stack(relevance_scores, axis=0),
+                np.asarray(relevant_counts, dtype=np.int64),
+                np.asarray(selector_overflows, dtype=np.float32),
+            )
         return result

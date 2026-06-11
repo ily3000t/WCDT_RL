@@ -4,6 +4,8 @@ import json
 from pathlib import Path
 
 from safe_rl.prediction.forecast_feature_augmentor import ForecastFeatureAugmentor
+from safe_rl.prediction.actor_selector import actor_selection_config_hash
+from safe_rl.prediction.forecast_rollout_bundle import FORECAST_ROLLOUT_BUNDLE_VERSION
 from safe_rl.pipeline.common import load_stage_config, make_env, parse_config_arg, write_report
 from safe_rl.rl.ppo import train_ppo
 from safe_rl.sim.metrics import SAFETY_METRIC_VERSION
@@ -59,6 +61,9 @@ def _prediction_loss_summary_from_checkpoint(checkpoint: str) -> dict | None:
             "architecture_version": payload.get("architecture_version"),
             "loss_version": payload.get("loss_version"),
             "trajectory_schema_version": payload.get("trajectory_schema_version"),
+            "actor_selection_version": payload.get("actor_selection_version"),
+            "actor_selection_config_hash": payload.get("actor_selection_config_hash"),
+            "max_actor_count": payload.get("max_actor_count"),
             "members": [
                 {
                     "member": int(item.get("member", index)),
@@ -136,6 +141,8 @@ def run(cfg):
     report["safety_metric_version"] = str(
         cfg.risk_module.get("safety_metric_version", SAFETY_METRIC_VERSION)
     )
+    report["forecast_rollout_bundle_version"] = FORECAST_ROLLOUT_BUNDLE_VERSION
+    report["forecast_rollout_bundle_config_hash"] = actor_selection_config_hash(cfg)
     write_report(stage_dir / "stage3_training_report.json", report)
     stage_log("stage3", f"tensorboard={stage_dir / 'tensorboard'}")
     stage_log("stage3", f"report={stage_dir / 'stage3_training_report.json'}")
