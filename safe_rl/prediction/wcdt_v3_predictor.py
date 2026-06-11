@@ -479,10 +479,16 @@ class WcDTV3Predictor:
         batch = build_v3_runtime_batch(self.config, history, str(ego.vehicle_id))
         tensor_batch = tensorize_v3_batch(batch, self._torch, self.device)
         mean, uncertainty = ensemble_predict_v3(self.models, tensor_batch)
+        agent_ids = history.agent_ids(str(ego.vehicle_id))
+        selected_vehicle_ids = [
+            str(agent_ids[int(index)]) if 0 < int(index) < len(agent_ids) else ""
+            for index in batch["selected_indices"].tolist()
+        ]
         return {
             "future_trajectories": mean.detach().cpu().numpy()[0],
             "uncertainty": float(uncertainty.detach().cpu().numpy()[0]),
             "mode_confidence": None,
             "selected_indices": batch["selected_indices"].tolist(),
+            "selected_vehicle_ids": selected_vehicle_ids,
             "checkpoint": self.checkpoint_path,
         }

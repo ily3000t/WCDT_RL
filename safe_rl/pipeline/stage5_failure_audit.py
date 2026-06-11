@@ -144,6 +144,20 @@ def _compact_step_trace(item: dict[str, Any]) -> dict[str, Any]:
         "final_action",
         "raw_action_name",
         "final_action_name",
+        "trace_schema_version",
+        "decision_step",
+        "decision_ego_edge",
+        "decision_ego_lane",
+        "decision_distance_to_taper",
+        "decision_target_front_gap",
+        "decision_target_rear_gap",
+        "decision_task_deadline_urgency",
+        "post_action_step",
+        "post_action_ego_edge",
+        "post_action_ego_lane",
+        "post_action_distance_to_taper",
+        "post_action_target_front_gap",
+        "post_action_target_rear_gap",
         "ego_edge",
         "ego_lane",
         "distance_to_taper",
@@ -155,6 +169,9 @@ def _compact_step_trace(item: dict[str, Any]) -> dict[str, Any]:
         "task_deadline_urgency",
         "forecast_aware_raw_task_risk",
         "forecast_aware_best_task_risk",
+        "forecast_aware_raw_task_cost",
+        "forecast_aware_best_task_cost",
+        "forecast_aware_task_improvement",
         "forecast_aware_best_action",
         "forecast_aware_best_action_name",
         "forecast_aware_would_merge",
@@ -162,6 +179,27 @@ def _compact_step_trace(item: dict[str, Any]) -> dict[str, Any]:
         "forecast_aware_uncertainty",
         "forecast_aware_target_front_gap",
         "forecast_aware_target_rear_gap",
+        "forecast_first_step_target_front_gap",
+        "forecast_first_step_target_rear_gap",
+        "forecast_gap_consistency_pass",
+        "forecast_selected_vehicle_ids",
+        "forecast_target_front_vehicle_id",
+        "forecast_target_rear_vehicle_id",
+        "forecast_target_front_required",
+        "forecast_target_rear_required",
+        "forecast_target_front_covered",
+        "forecast_target_rear_covered",
+        "forecast_actor_coverage_complete",
+        "forecast_closest_vehicle_id",
+        "forecast_front_gap_vehicle_id",
+        "forecast_rear_gap_vehicle_id",
+        "task_backstop_watch_count",
+        "task_backstop_watch_eligible",
+        "task_backstop_eligible",
+        "task_backstop_risk_module_score",
+        "task_backstop_risk_module_uncertainty",
+        "task_backstop_risk_module_pass",
+        "task_backstop_veto_reason",
         "task_replacement",
         "task_replacement_reason",
         "taper_miss",
@@ -171,6 +209,31 @@ def _compact_step_trace(item: dict[str, Any]) -> dict[str, Any]:
         "drac",
     )
     return {key: item.get(key) for key in keys if key in item}
+
+
+def _trace_alignment_summary(step_trace: list[dict[str, Any]], deadline_distance: float) -> dict[str, Any]:
+    errors: list[float] = []
+    for item in step_trace:
+        distance = item.get("decision_distance_to_taper")
+        urgency = item.get("decision_task_deadline_urgency")
+        if distance is None or urgency is None:
+            continue
+        expected = float(
+            min(
+                max(
+                    (float(deadline_distance) - float(distance)) / max(float(deadline_distance), 1.0e-6),
+                    0.0,
+                ),
+                1.0,
+            )
+        )
+        errors.append(abs(float(urgency) - expected))
+    return {
+        "available": bool(errors),
+        "count": len(errors),
+        "max_abs_error": max(errors) if errors else None,
+        "passed": bool(errors) and max(errors) <= 1.0e-6,
+    }
 
 
 def _task_failure_step(step_trace: list[dict[str, Any]], episode: dict[str, Any]) -> int | None:
@@ -268,6 +331,7 @@ def _episode_summary(
     group: str,
     episode: dict[str, Any],
     collision_threshold: float,
+    deadline_distance: float,
 ) -> dict[str, Any]:
     seed = int(episode.get("seed", -1))
     replay_path = replay_dir / f"{group}_seed_{seed}.json"
@@ -288,7 +352,12 @@ def _episode_summary(
         str(item.get("forecast_aware_best_action_name", "")).startswith("left_")
         for item in step_trace_near_failure
     ):
-        classification.append("forecast_aware_merge_available")
+        classification.append("forecast_merge_candidate_observed")
+    if _is_task_failure(episode) and any(
+        bool(item.get("task_backstop_eligible", False))
+        for item in step_trace_near_failure
+    ):
+        classification.append("forecast_backstop_eligible")
     return {
         "run_id": run_id,
         "eval_stage": eval_stage,
@@ -300,6 +369,8 @@ def _episode_summary(
         "failure_classification": classification,
         "first_failure_step": first_step if first_step is not None else "unavailable",
         "step_trace_available": bool(step_trace),
+        "trace_schema_version": int(replay.get("trace_schema_version", 1)) if replay else None,
+        "trace_alignment_summary": _trace_alignment_summary(step_trace, deadline_distance),
         "metrics": {
             "episode_reward": _safe_float(episode.get("episode_reward"), 0.0),
             "merge_success": bool(episode.get("merge_success", False)),
@@ -371,6 +442,7 @@ def build_failure_audit(
     with report_path.open("r", encoding="utf-8") as file:
         report = json.load(file)
     replay_dir = base_dir / "replay"
+    deadline_distance = float(cfg.shield.get("task_backstop_deadline_distance", 120.0))
     failures: dict[str, list[dict[str, Any]]] = {}
     safety_failures: dict[str, list[dict[str, Any]]] = {}
     task_failures: dict[str, list[dict[str, Any]]] = {}
@@ -390,6 +462,7 @@ def build_failure_audit(
                 group=group,
                 episode=episode,
                 collision_threshold=collision_threshold,
+                deadline_distance=deadline_distance,
             )
             for episode in episodes
             if isinstance(episode, dict) and _is_failure(episode, collision_threshold)
@@ -402,6 +475,7 @@ def build_failure_audit(
                 group=group,
                 episode=episode,
                 collision_threshold=collision_threshold,
+                deadline_distance=deadline_distance,
             )
             for episode in episodes
             if isinstance(episode, dict) and _is_task_failure(episode)

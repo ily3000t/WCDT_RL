@@ -259,10 +259,13 @@ shield:
   forecast_task_shadow_enabled: true
   task_backstop_enabled: false
   task_backstop_deadline_distance: 120.0
-  task_backstop_urgency_threshold: 0.5
+  task_backstop_watch_urgency_threshold: 0.40
+  task_backstop_execute_urgency_threshold: 0.50
   task_backstop_consecutive_steps: 2
+  task_backstop_task_risk_margin: 0.05
   task_backstop_safety_risk_threshold: 0.35
   task_backstop_uncertainty_threshold: 0.40
+  task_backstop_max_first_step_gap_jump: 20.0
   prefer_closest_safe_action: true
   filter_illegal_candidates: true
   fallback_action: "decelerate"

@@ -68,7 +68,7 @@ class ForecastAwareTaskScorer:
         raw = decode_action(raw_action)
         horizon = int(self.config.forecast_features.get("horizon_steps", self.config.scenario.forecast_horizon_steps))
         dt = float(self.config.scenario.step_length)
-        other_rollouts, uncertainty, source = self._other_rollouts(context, horizon, dt)
+        other_rollouts, uncertainty, source, selected_vehicle_ids = self._other_rollouts(context, horizon, dt)
         scores = [
             self._candidate_score(
                 action,
@@ -98,24 +98,61 @@ class ForecastAwareTaskScorer:
                 deadline_distance=float(deadline_distance),
                 dt=dt,
             )
-        best = min(scores, key=lambda item: float(item["task_risk"]))
+        best = min(scores, key=lambda item: float(item["task_cost"]))
         best_action = decode_action(int(best["action"]))
         safety_threshold = float(self.config.shield.get("task_backstop_safety_risk_threshold", 0.35))
         uncertainty_threshold = float(self.config.shield.get("task_backstop_uncertainty_threshold", 0.40))
         front_threshold = float(self.config.scenario.get("merge_opportunity_min_front_gap", 12.0))
         rear_threshold = float(self.config.scenario.get("merge_opportunity_min_rear_gap", 12.0))
+        local = context.get("merge_local")
+        target_front_vehicle_id = str(getattr(local, "target_front_vehicle_id", "") or "")
+        target_rear_vehicle_id = str(getattr(local, "target_rear_vehicle_id", "") or "")
+        target_front_required = bool(target_front_vehicle_id)
+        target_rear_required = bool(target_rear_vehicle_id)
+        selected_vehicle_id_set = {str(value) for value in selected_vehicle_ids if str(value)}
+        target_front_covered = not target_front_required or target_front_vehicle_id in selected_vehicle_id_set
+        target_rear_covered = not target_rear_required or target_rear_vehicle_id in selected_vehicle_id_set
+        coverage_complete = bool(target_front_covered and target_rear_covered)
+        max_gap_jump = float(self.config.shield.get("task_backstop_max_first_step_gap_jump", 20.0))
+        current_front_gap = float(getattr(local, "target_front_gap", INF_TTC))
+        current_rear_gap = float(getattr(local, "target_rear_gap", INF_TTC))
+        first_front_gap = float(best["first_step_target_front_gap"])
+        first_rear_gap = float(best["first_step_target_rear_gap"])
+        first_front_vehicle_id = str(best["first_step_target_front_vehicle_id"])
+        first_rear_vehicle_id = str(best["first_step_target_rear_vehicle_id"])
+        front_consistent = bool(
+            not target_front_required
+            or (
+                first_front_vehicle_id == target_front_vehicle_id
+                and abs(first_front_gap - current_front_gap) <= max_gap_jump
+            )
+        )
+        rear_consistent = bool(
+            not target_rear_required
+            or (
+                first_rear_vehicle_id == target_rear_vehicle_id
+                and abs(first_rear_gap - current_rear_gap) <= max_gap_jump
+            )
+        )
+        gap_consistency_pass = bool(coverage_complete and front_consistent and rear_consistent)
         would_merge = bool(
             int(best_action.lateral_cmd) == int(merge_cmd)
             and int(raw.lateral_cmd) != int(merge_cmd)
+            and coverage_complete
+            and gap_consistency_pass
             and float(best["safety_risk"]) <= safety_threshold
             and float(best["target_front_gap"]) >= front_threshold
             and float(best["target_rear_gap"]) >= rear_threshold
             and float(uncertainty) <= uncertainty_threshold
         )
         raw_score = raw_score or best
+        task_improvement = float(raw_score["task_cost"] - best["task_cost"])
         return {
             "forecast_aware_available": True,
             "forecast_aware_source": source,
+            "forecast_aware_raw_task_cost": float(raw_score["task_cost"]),
+            "forecast_aware_best_task_cost": float(best["task_cost"]),
+            "forecast_aware_task_improvement": task_improvement,
             "forecast_aware_raw_task_risk": float(raw_score["task_risk"]),
             "forecast_aware_raw_safety_risk": float(raw_score["safety_risk"]),
             "forecast_aware_best_task_risk": float(best["task_risk"]),
@@ -130,6 +167,20 @@ class ForecastAwareTaskScorer:
             "forecast_aware_future_max_drac": float(best["future_max_drac"]),
             "forecast_aware_target_front_gap": float(best["target_front_gap"]),
             "forecast_aware_target_rear_gap": float(best["target_rear_gap"]),
+            "forecast_first_step_target_front_gap": first_front_gap,
+            "forecast_first_step_target_rear_gap": first_rear_gap,
+            "forecast_gap_consistency_pass": gap_consistency_pass,
+            "forecast_selected_vehicle_ids": list(selected_vehicle_ids),
+            "forecast_target_front_vehicle_id": target_front_vehicle_id,
+            "forecast_target_rear_vehicle_id": target_rear_vehicle_id,
+            "forecast_target_front_required": target_front_required,
+            "forecast_target_rear_required": target_rear_required,
+            "forecast_target_front_covered": target_front_covered,
+            "forecast_target_rear_covered": target_rear_covered,
+            "forecast_actor_coverage_complete": coverage_complete,
+            "forecast_closest_vehicle_id": str(best["closest_vehicle_id"]),
+            "forecast_front_gap_vehicle_id": str(best["front_gap_vehicle_id"]),
+            "forecast_rear_gap_vehicle_id": str(best["rear_gap_vehicle_id"]),
             "forecast_aware_taper_miss_risk": float(best["taper_miss_risk"]),
             "forecast_aware_merge_progress_bonus": float(best["merge_progress_bonus"]),
         }
@@ -138,6 +189,9 @@ class ForecastAwareTaskScorer:
         return {
             "forecast_aware_available": False,
             "forecast_aware_source": source,
+            "forecast_aware_raw_task_cost": None,
+            "forecast_aware_best_task_cost": None,
+            "forecast_aware_task_improvement": None,
             "forecast_aware_raw_task_risk": None,
             "forecast_aware_raw_safety_risk": None,
             "forecast_aware_best_task_risk": None,
@@ -152,6 +206,20 @@ class ForecastAwareTaskScorer:
             "forecast_aware_future_max_drac": None,
             "forecast_aware_target_front_gap": None,
             "forecast_aware_target_rear_gap": None,
+            "forecast_first_step_target_front_gap": None,
+            "forecast_first_step_target_rear_gap": None,
+            "forecast_gap_consistency_pass": False,
+            "forecast_selected_vehicle_ids": [],
+            "forecast_target_front_vehicle_id": "",
+            "forecast_target_rear_vehicle_id": "",
+            "forecast_target_front_required": False,
+            "forecast_target_rear_required": False,
+            "forecast_target_front_covered": False,
+            "forecast_target_rear_covered": False,
+            "forecast_actor_coverage_complete": False,
+            "forecast_closest_vehicle_id": "",
+            "forecast_front_gap_vehicle_id": "",
+            "forecast_rear_gap_vehicle_id": "",
             "forecast_aware_taper_miss_risk": None,
             "forecast_aware_merge_progress_bonus": None,
         }
@@ -161,7 +229,7 @@ class ForecastAwareTaskScorer:
         context: dict[str, Any],
         horizon: int,
         dt: float,
-    ) -> tuple[list[list[VehicleState]], float, str]:
+    ) -> tuple[list[list[VehicleState]], float, str, list[str]]:
         ego = context.get("ego")
         vehicles = [vehicle for vehicle in context.get("vehicles", []) if ego is None or vehicle.vehicle_id != ego.vehicle_id]
         if self.predictor is not None:
@@ -169,10 +237,18 @@ class ForecastAwareTaskScorer:
                 prediction = self.predictor.predict(context)
                 trajectories = _prediction_array(prediction)
                 if trajectories is not None:
+                    rollouts, selected_vehicle_ids = self._prediction_rollouts(
+                        context,
+                        trajectories,
+                        prediction,
+                        horizon,
+                        dt,
+                    )
                     return (
-                        self._prediction_rollouts(context, trajectories, prediction, horizon, dt),
+                        rollouts,
                         _safe_float(prediction.get("uncertainty"), 0.0),
                         "forecast",
+                        selected_vehicle_ids,
                     )
             except Exception:
                 if not bool(self.config.forecast_features.get("allow_heuristic_fallback", False)):
@@ -181,6 +257,7 @@ class ForecastAwareTaskScorer:
             [route_aware_constant_velocity_rollout(vehicle, horizon, dt, self.config)[0] for vehicle in vehicles],
             0.0,
             "constant_velocity",
+            [str(vehicle.vehicle_id) for vehicle in vehicles],
         )
 
     def _prediction_rollouts(
@@ -190,41 +267,43 @@ class ForecastAwareTaskScorer:
         prediction: dict[str, Any],
         horizon: int,
         dt: float,
-    ) -> list[list[VehicleState]]:
+    ) -> tuple[list[list[VehicleState]], list[str]]:
         history = context.get("history")
         latest = context.get("history").latest() if isinstance(history, HistoryBuffer) else {}
         ids = history.agent_ids(str(context["ego"].vehicle_id)) if isinstance(history, HistoryBuffer) and context.get("ego") is not None else []
-        selected = prediction.get("selected_indices")
-        if selected is None:
-            references = [vehicle for vehicle in context.get("vehicles", []) if vehicle.vehicle_id != context.get("ego").vehicle_id]
-        else:
-            references = []
-            for value in list(selected):
+        selected_vehicle_ids = prediction.get("selected_vehicle_ids")
+        if selected_vehicle_ids is None:
+            selected_vehicle_ids = []
+            for value in list(prediction.get("selected_indices") or []):
                 try:
                     idx = int(value)
                 except (TypeError, ValueError):
+                    selected_vehicle_ids.append("")
                     continue
-                if idx <= 0 or idx >= len(ids):
-                    continue
-                ref = latest.get(ids[idx])
-                if ref is not None:
-                    references.append(ref)
+                selected_vehicle_ids.append(str(ids[idx]) if 0 < idx < len(ids) else "")
+        selected_vehicle_ids = [str(value or "") for value in list(selected_vehicle_ids)]
         rollouts: list[list[VehicleState]] = []
-        for actor_idx, traj in enumerate(trajectories[: len(references)]):
-            reference = references[actor_idx]
+        used_vehicle_ids: list[str] = []
+        for actor_idx, traj in enumerate(trajectories):
+            vehicle_id = selected_vehicle_ids[actor_idx] if actor_idx < len(selected_vehicle_ids) else ""
+            reference = latest.get(vehicle_id) if vehicle_id else None
+            if reference is None:
+                continue
             states = trajectory_to_states(
                 traj[:horizon],
                 reference=reference,
                 dt=dt,
-                vehicle_id=f"forecast_{reference.vehicle_id}",
+                vehicle_id=str(reference.vehicle_id),
             )
             if states:
                 rollouts.append(states)
+                used_vehicle_ids.append(str(reference.vehicle_id))
         if not rollouts:
             ego = context.get("ego")
             vehicles = [vehicle for vehicle in context.get("vehicles", []) if ego is None or vehicle.vehicle_id != ego.vehicle_id]
             rollouts = [route_aware_constant_velocity_rollout(vehicle, horizon, dt, self.config)[0] for vehicle in vehicles]
-        return rollouts
+            used_vehicle_ids = [str(vehicle.vehicle_id) for vehicle in vehicles]
+        return rollouts, used_vehicle_ids
 
     def _candidate_score(
         self,
@@ -248,21 +327,40 @@ class ForecastAwareTaskScorer:
         max_drac = 0.0
         front_gap = INF_TTC
         rear_gap = INF_TTC
+        closest_vehicle_id = ""
+        front_gap_vehicle_id = ""
+        rear_gap_vehicle_id = ""
+        first_step_front_gap = INF_TTC
+        first_step_rear_gap = INF_TTC
+        first_step_front_vehicle_id = ""
+        first_step_rear_vehicle_id = ""
         for step_idx, ego_future in enumerate(ego_rollout):
             step_target_vehicles: list[VehicleState] = []
             for rollout in other_rollouts:
                 if not rollout:
                     continue
                 other = rollout[min(step_idx, len(rollout) - 1)]
-                min_distance = min(min_distance, bbox_gap(ego_future, other))
+                candidate_distance = bbox_gap(ego_future, other)
+                if candidate_distance < min_distance:
+                    min_distance = candidate_distance
+                    closest_vehicle_id = str(other.vehicle_id)
                 min_ttc = min(min_ttc, relative_ttc(ego_future, other))
                 max_drac = max(max_drac, drac(ego_future, other))
                 if is_target_lane(self.config, other.edge_id, other.lane_index):
                     step_target_vehicles.append(other)
             if step_target_vehicles:
                 stats = merge_local_stats(ego_future, [ego_future, *step_target_vehicles], self.config)
-                front_gap = min(front_gap, float(stats.target_front_gap))
-                rear_gap = min(rear_gap, float(stats.target_rear_gap))
+                if float(stats.target_front_gap) < front_gap:
+                    front_gap = float(stats.target_front_gap)
+                    front_gap_vehicle_id = str(stats.target_front_vehicle_id)
+                if float(stats.target_rear_gap) < rear_gap:
+                    rear_gap = float(stats.target_rear_gap)
+                    rear_gap_vehicle_id = str(stats.target_rear_vehicle_id)
+                if step_idx == 0:
+                    first_step_front_gap = float(stats.target_front_gap)
+                    first_step_rear_gap = float(stats.target_rear_gap)
+                    first_step_front_vehicle_id = str(stats.target_front_vehicle_id)
+                    first_step_rear_vehicle_id = str(stats.target_rear_vehicle_id)
         if front_gap >= INF_TTC:
             front_gap = float(getattr(context.get("merge_local"), "target_front_gap", INF_TTC))
         if rear_gap >= INF_TTC:
@@ -285,19 +383,17 @@ class ForecastAwareTaskScorer:
             and not taper_miss
             else 0.0
         )
-        task_risk = float(
-            np.clip(
-                0.35 * taper_miss_risk
-                + 0.25 * unsafe_gap_risk
-                + 0.25 * safety_risk
-                + 0.15 * uncertainty_risk
-                - merge_progress_bonus,
-                0.0,
-                1.0,
-            )
+        task_cost = float(
+            0.35 * taper_miss_risk
+            + 0.25 * unsafe_gap_risk
+            + 0.25 * safety_risk
+            + 0.15 * uncertainty_risk
+            - merge_progress_bonus
         )
+        task_risk = float(np.clip(task_cost, 0.0, 1.0))
         return {
             "action": int(action.index),
+            "task_cost": task_cost,
             "task_risk": task_risk,
             "safety_risk": float(safety_risk),
             "future_min_distance": float(min_distance),
@@ -305,6 +401,13 @@ class ForecastAwareTaskScorer:
             "future_max_drac": float(max_drac),
             "target_front_gap": float(front_gap),
             "target_rear_gap": float(rear_gap),
+            "first_step_target_front_gap": float(first_step_front_gap),
+            "first_step_target_rear_gap": float(first_step_rear_gap),
+            "first_step_target_front_vehicle_id": first_step_front_vehicle_id,
+            "first_step_target_rear_vehicle_id": first_step_rear_vehicle_id,
+            "closest_vehicle_id": closest_vehicle_id,
+            "front_gap_vehicle_id": front_gap_vehicle_id,
+            "rear_gap_vehicle_id": rear_gap_vehicle_id,
             "taper_miss_risk": float(taper_miss_risk),
             "merge_progress_bonus": float(merge_progress_bonus),
         }

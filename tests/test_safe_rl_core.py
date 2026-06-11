@@ -102,6 +102,7 @@ from safe_rl.risk.merge_local import (
     candidate_action_risk_samples,
     continuous_risk_target,
     is_candidate_legal,
+    merge_local_stats,
     rollout_ego,
     route_aware_constant_velocity_rollout,
     target_lane_neighbors,
@@ -931,7 +932,11 @@ def test_task_backstop_requires_consecutive_shadow_and_counts_separately():
     cfg.shield["enabled"] = True
     cfg.shield["task_backstop_enabled"] = True
     cfg.shield["task_backstop_consecutive_steps"] = 2
-    env = SumoHighwayMergeEnv(cfg, seed=1, shield=SafetyShield(cfg, _StaticRiskModel({4: 0.1, 5: 0.1, 7: 0.1})))
+    env = SumoHighwayMergeEnv(
+        cfg,
+        seed=1,
+        shield=SafetyShield(cfg, _StaticRiskModel({4: 0.1, 5: 0.1, 6: 0.1, 7: 0.1})),
+    )
     context = _merge_timing_context(cfg, front_gap=30.0, rear_gap=30.0, distance_to_taper=20.0)
     raw = decode_action(5)
     env._record_merge_opportunity(context, raw)
@@ -947,6 +952,128 @@ def test_task_backstop_requires_consecutive_shadow_and_counts_separately():
     report = env.episode_report()
     assert report["task_replacement_count"] == 1
     assert report["actual_replacement_count"] == 0
+
+
+def test_task_backstop_risk_module_veto_blocks_merge():
+    cfg = load_config()
+    cfg.shield["enabled"] = True
+    cfg.shield["task_backstop_enabled"] = True
+    cfg.shield["task_backstop_consecutive_steps"] = 1
+    env = SumoHighwayMergeEnv(
+        cfg,
+        seed=1,
+        shield=SafetyShield(cfg, _StaticRiskModel({6: 0.95})),
+    )
+    context = _merge_timing_context(cfg, front_gap=30.0, rear_gap=30.0, distance_to_taper=20.0)
+    raw = decode_action(5)
+    env._record_merge_opportunity(context, raw)
+    replacement = env._maybe_task_backstop(
+        raw,
+        raw,
+        context,
+        {"raw_action": raw.index, "final_action": raw.index},
+    )
+    assert replacement is None
+    assert not env._last_task_merge_record["task_backstop_risk_module_pass"]
+    assert env._last_task_merge_record["task_backstop_veto_reason"] == "risk_module_risk_score"
+
+
+def test_task_backstop_does_not_require_legacy_current_gap_task_would_merge():
+    cfg = load_config()
+    cfg.shield["enabled"] = True
+    cfg.shield["task_backstop_enabled"] = True
+    cfg.shield["task_backstop_consecutive_steps"] = 1
+    env = SumoHighwayMergeEnv(
+        cfg,
+        seed=1,
+        shield=SafetyShield(cfg, _StaticRiskModel({6: 0.1})),
+    )
+    context = _merge_timing_context(cfg, front_gap=30.0, rear_gap=30.0, distance_to_taper=20.0)
+    raw = decode_action(5)
+    env._record_merge_opportunity(context, raw)
+    env._last_task_merge_record["task_would_merge"] = False
+    replacement = env._maybe_task_backstop(
+        raw,
+        raw,
+        context,
+        {"raw_action": raw.index, "final_action": raw.index},
+    )
+    assert replacement is not None
+    assert replacement["replacement_reason"] == "task_backstop"
+
+
+def test_forecast_task_scorer_requires_current_target_actor_coverage():
+    cfg = load_config()
+    ego = VehicleState("ego", 490.0, 53.8, 0.0, 20.0, 0, "main_aux_0", 190.0, "main_aux")
+    front = VehicleState("front", 510.0, 57.0, 0.0, 20.0, 1, "main_aux_1", 210.0, "main_aux")
+    rear = VehicleState("rear", 470.0, 57.0, 0.0, 20.0, 1, "main_aux_1", 170.0, "main_aux")
+    other = VehicleState("other", 500.0, 60.2, 0.0, 20.0, 2, "main_aux_2", 200.0, "main_aux")
+    history = HistoryBuffer(history_steps=cfg.scenario.history_steps, max_agents=6)
+    history.append([ego, front, rear, other])
+    horizon = int(cfg.forecast_features.horizon_steps)
+    trajectory = np.zeros((1, horizon, 5), dtype=np.float32)
+    trajectory[0, :, 0] = np.linspace(other.x, other.x + 20.0, horizon)
+    trajectory[0, :, 1] = other.y
+    trajectory[0, :, 3] = other.speed
+
+    class _MissingTargetPredictor:
+        def predict(self, _context):
+            return {
+                "future_trajectories": trajectory,
+                "selected_vehicle_ids": ["other"],
+                "uncertainty": 0.01,
+            }
+
+    context = {
+        "ego": ego,
+        "vehicles": [ego, front, rear, other],
+        "history": history,
+        "lane_count": 4,
+        "config": cfg,
+        "merge_local": merge_local_stats(ego, [ego, front, rear, other], cfg),
+    }
+    result = ForecastAwareTaskScorer(cfg, _MissingTargetPredictor()).score(
+        context,
+        decode_action(5),
+        merge_cmd=1,
+        deadline_distance=120.0,
+        urgency=0.8,
+    )
+    assert not result["forecast_actor_coverage_complete"]
+    assert not result["forecast_target_front_covered"]
+    assert not result["forecast_target_rear_covered"]
+    assert not result["forecast_aware_would_merge"]
+
+
+def test_forecast_rollout_vehicle_ids_stay_aligned_across_padding_rows():
+    cfg = load_config()
+    ego = VehicleState("ego", 490.0, 53.8, 0.0, 20.0, 0, "main_aux_0", 190.0, "main_aux")
+    front = VehicleState("front", 510.0, 57.0, 0.0, 20.0, 1, "main_aux_1", 210.0, "main_aux")
+    rear = VehicleState("rear", 470.0, 57.0, 0.0, 20.0, 1, "main_aux_1", 170.0, "main_aux")
+    history = HistoryBuffer(history_steps=cfg.scenario.history_steps, max_agents=6)
+    history.append([ego, front, rear])
+    horizon = 2
+    trajectories = np.zeros((3, horizon, 5), dtype=np.float32)
+    trajectories[0, :, 0] = [511.0, 512.0]
+    trajectories[0, :, 1] = front.y
+    trajectories[1, :, 0] = [999.0, 999.0]
+    trajectories[2, :, 0] = [471.0, 472.0]
+    trajectories[2, :, 1] = rear.y
+    scorer = ForecastAwareTaskScorer(cfg)
+    rollouts, used_ids = scorer._prediction_rollouts(
+        {
+            "ego": ego,
+            "vehicles": [ego, front, rear],
+            "history": history,
+        },
+        trajectories,
+        {"selected_vehicle_ids": ["front", "", "rear"]},
+        horizon,
+        float(cfg.scenario.step_length),
+    )
+    assert used_ids == ["front", "rear"]
+    assert rollouts[0][0].x == pytest.approx(511.0)
+    assert rollouts[1][0].x == pytest.approx(471.0)
 
 
 def test_step_safety_record_includes_forecast_task_trace_fields():
@@ -965,6 +1092,9 @@ def test_step_safety_record_includes_forecast_task_trace_fields():
             "final_action_name": "keep_accelerate",
             "ego_edge": "main_aux",
             "ego_lane": 0,
+            "decision_distance_to_taper": 60.0,
+            "decision_task_deadline_urgency": 0.5,
+            "post_action_distance_to_taper": 50.0,
             "forecast_aware_best_action_name": "left_hold",
             "forecast_aware_best_task_risk": 0.2,
             "forecast_aware_would_merge": True,
@@ -973,6 +1103,8 @@ def test_step_safety_record_includes_forecast_task_trace_fields():
     )
     assert record["ego_edge"] == "main_aux"
     assert record["ego_lane"] == 0
+    assert record["decision_distance_to_taper"] == pytest.approx(60.0)
+    assert record["post_action_distance_to_taper"] == pytest.approx(50.0)
     assert record["forecast_aware_best_action_name"] == "left_hold"
     assert record["forecast_aware_would_merge"]
 

@@ -37,6 +37,8 @@ class MergeLocalStats:
     target_lane_id: int
     target_front_gap: float
     target_rear_gap: float
+    target_front_vehicle_id: str
+    target_rear_vehicle_id: str
     target_front_rel_speed: float
     target_rear_rel_speed: float
     target_lane_gap: float
@@ -55,6 +57,8 @@ class MergeLocalStats:
             "target_lane_id": self.target_lane_id,
             "target_front_gap": self.target_front_gap,
             "target_rear_gap": self.target_rear_gap,
+            "target_front_vehicle_id": self.target_front_vehicle_id,
+            "target_rear_vehicle_id": self.target_rear_vehicle_id,
             "target_front_rel_speed": self.target_front_rel_speed,
             "target_rear_rel_speed": self.target_rear_rel_speed,
             "target_lane_gap": self.target_lane_gap,
@@ -106,11 +110,13 @@ def target_lane_neighbors(
     ego: VehicleState | None,
     vehicles: list[VehicleState],
     config: Any,
-) -> dict[str, float]:
+) -> dict[str, float | str]:
     if ego is None:
         return {
             "front_gap": INF_TTC,
             "rear_gap": INF_TTC,
+            "front_vehicle_id": "",
+            "rear_vehicle_id": "",
             "front_rel_speed": 0.0,
             "rear_rel_speed": 0.0,
         }
@@ -124,6 +130,8 @@ def target_lane_neighbors(
     rear_gap = INF_TTC
     front_rel_speed = 0.0
     rear_rel_speed = 0.0
+    front_vehicle_id = ""
+    rear_vehicle_id = ""
     for vehicle in candidates:
         dx = float(vehicle.x - ego.x)
         gap = _longitudinal_gap(ego, vehicle, dx)
@@ -131,12 +139,16 @@ def target_lane_neighbors(
         if dx >= 0.0 and gap < front_gap:
             front_gap = gap
             front_rel_speed = rel_speed
+            front_vehicle_id = str(vehicle.vehicle_id)
         if dx < 0.0 and gap < rear_gap:
             rear_gap = gap
             rear_rel_speed = rel_speed
+            rear_vehicle_id = str(vehicle.vehicle_id)
     return {
         "front_gap": float(front_gap),
         "rear_gap": float(rear_gap),
+        "front_vehicle_id": front_vehicle_id,
+        "rear_vehicle_id": rear_vehicle_id,
         "front_rel_speed": float(front_rel_speed),
         "rear_rel_speed": float(rear_rel_speed),
     }
@@ -180,6 +192,8 @@ def merge_local_stats(
             target_lane_id=lane,
             target_front_gap=INF_TTC,
             target_rear_gap=INF_TTC,
+            target_front_vehicle_id="",
+            target_rear_vehicle_id="",
             target_front_rel_speed=0.0,
             target_rear_rel_speed=0.0,
             target_lane_gap=INF_TTC,
@@ -205,6 +219,8 @@ def merge_local_stats(
         target_lane_id=target_lane_index(config, taper_edge(config)),
         target_front_gap=float(target["front_gap"]),
         target_rear_gap=float(target["rear_gap"]),
+        target_front_vehicle_id=str(target["front_vehicle_id"]),
+        target_rear_vehicle_id=str(target["rear_vehicle_id"]),
         target_front_rel_speed=float(target["front_rel_speed"]),
         target_rear_rel_speed=float(target["rear_rel_speed"]),
         target_lane_gap=float(target_gap),

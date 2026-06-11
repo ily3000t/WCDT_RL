@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from collections import Counter
+
 import numpy as np
 
 
@@ -122,6 +124,21 @@ def aggregate_episode_reports(reports: list[dict]) -> dict:
         [float(report.get("no_merge_request_before_taper_count", 0)) for report in reports],
         dtype=np.float32,
     )
+    forecast_coverage_rates = np.asarray(
+        [float(report.get("forecast_actor_coverage_complete_rate", 0.0)) for report in reports],
+        dtype=np.float32,
+    )
+    forecast_gap_consistency_rates = np.asarray(
+        [float(report.get("forecast_gap_consistency_pass_rate", 0.0)) for report in reports],
+        dtype=np.float32,
+    )
+    task_backstop_watch_count = int(sum(int(report.get("task_backstop_watch_count", 0)) for report in reports))
+    task_backstop_eligible_count = int(
+        sum(int(report.get("task_backstop_eligible_count", 0)) for report in reports)
+    )
+    task_backstop_veto_reason_counts: Counter[str] = Counter()
+    for report in reports:
+        task_backstop_veto_reason_counts.update(report.get("task_backstop_veto_reason_counts", {}) or {})
     return {
         "episodes": len(reports),
         "collision_rate": float(np.mean(collisions)),
@@ -199,4 +216,9 @@ def aggregate_episode_reports(reports: list[dict]) -> dict:
         ),
         "no_merge_request_before_taper_count": int(np.sum(no_merge_before_taper)),
         "no_merge_request_before_taper_rate": float(np.mean(no_merge_before_taper > 0)),
+        "forecast_actor_coverage_complete_rate": float(np.mean(forecast_coverage_rates)),
+        "forecast_gap_consistency_pass_rate": float(np.mean(forecast_gap_consistency_rates)),
+        "task_backstop_watch_count": task_backstop_watch_count,
+        "task_backstop_eligible_count": task_backstop_eligible_count,
+        "task_backstop_veto_reason_counts": dict(task_backstop_veto_reason_counts),
     }

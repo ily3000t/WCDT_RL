@@ -20,6 +20,28 @@ class SafetyShield:
     def reset_episode_state(self) -> None:
         self._emergency_saturated_count = 0
 
+    def evaluate_candidate(self, action: CandidateAction, context: dict[str, Any]) -> dict[str, Any]:
+        """Evaluate one candidate without mutating Shield episode state."""
+        candidate_legal = bool(is_candidate_legal(action, context))
+        prediction = self.ranker.risk_model.predict(action, context)
+        risk_threshold = float(self.config.shield.risk_threshold)
+        uncertainty_threshold = float(self.config.shield.uncertainty_threshold)
+        if not candidate_legal:
+            veto_reason = "candidate_illegal"
+        elif float(prediction.risk_score) >= risk_threshold:
+            veto_reason = "risk_score"
+        elif float(prediction.risk_uncertainty) >= uncertainty_threshold:
+            veto_reason = "risk_uncertainty"
+        else:
+            veto_reason = ""
+        return {
+            "candidate_legal": candidate_legal,
+            "risk_score": float(prediction.risk_score),
+            "risk_uncertainty": float(prediction.risk_uncertainty),
+            "safety_pass": not veto_reason,
+            "veto_reason": veto_reason,
+        }
+
     def select_action(self, raw_action: CandidateAction, context: dict[str, Any]) -> tuple[CandidateAction, dict[str, Any]]:
         raw_prediction = self.ranker.risk_model.predict(raw_action, context)
         raw_legal = is_candidate_legal(raw_action, context)
