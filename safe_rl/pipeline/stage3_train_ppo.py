@@ -87,6 +87,8 @@ def _prediction_loss_summary_from_checkpoint(checkpoint: str) -> dict | None:
 
 
 def run(cfg):
+    cfg.shield["forecast_task_shadow_enabled"] = False
+    cfg.shield["task_backstop_enabled"] = False
     stage_dir = prepare_run_dir(cfg, "stage3")
     stage_log("stage3", f"run_id={cfg.run.run_id}")
     stage_log("stage3", f"SUMO config={cfg.scenario.sumocfg}")
@@ -97,7 +99,14 @@ def run(cfg):
         f"device={cfg.get('training', {}).get('ppo_device', cfg.get('training', {}).get('device', 'auto'))}",
     )
     stage_log("stage3", f"model_output={stage_dir / str(cfg.stage3.model_name)}")
-    env = make_env(cfg, seed=int(cfg.run.seed), shield_enabled=False)
+    env = make_env(
+        cfg,
+        seed=int(cfg.run.seed),
+        shield_enabled=False,
+        worker_rank=0,
+        num_envs=max(1, int(cfg.get("training", {}).get("ppo_num_envs", 1))),
+        advance_episode_seed=True,
+    )
     try:
         observation_shape = list(env.observation_space.shape)
         prediction_checkpoint = None
@@ -143,6 +152,11 @@ def run(cfg):
     )
     report["forecast_rollout_bundle_version"] = FORECAST_ROLLOUT_BUNDLE_VERSION
     report["forecast_rollout_bundle_config_hash"] = actor_selection_config_hash(cfg)
+    report["sumo_installation"] = {
+        "binary": str(cfg.scenario.get("sumo_binary", "")),
+        "version": str(cfg.scenario.get("sumo_version", "")),
+        "home": str(cfg.scenario.get("sumo_home", "")),
+    }
     write_report(stage_dir / "stage3_training_report.json", report)
     stage_log("stage3", f"tensorboard={stage_dir / 'tensorboard'}")
     stage_log("stage3", f"report={stage_dir / 'stage3_training_report.json'}")

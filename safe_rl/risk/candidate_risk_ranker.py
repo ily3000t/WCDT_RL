@@ -16,10 +16,17 @@ class CandidateRiskRanker:
     def rank(self, raw_action: CandidateAction, context: dict[str, Any]) -> list[tuple[CandidateAction, RiskPrediction, float]]:
         weights = self.config.shield.score_weights
         ranked: list[tuple[CandidateAction, RiskPrediction, float]] = []
-        for action in ACTIONS:
-            if bool(self.config.shield.get("filter_illegal_candidates", True)) and not is_candidate_legal(action, context):
-                continue
-            prediction = self.risk_model.predict(action, context)
+        actions = [
+            action
+            for action in ACTIONS
+            if not bool(self.config.shield.get("filter_illegal_candidates", True))
+            or is_candidate_legal(action, context)
+        ]
+        if hasattr(self.risk_model, "predict_many"):
+            predictions = self.risk_model.predict_many(actions, context)
+        else:
+            predictions = [self.risk_model.predict(action, context) for action in actions]
+        for action, prediction in zip(actions, predictions):
             score = (
                 weights.risk * prediction.risk_score
                 + weights.uncertainty * prediction.risk_uncertainty

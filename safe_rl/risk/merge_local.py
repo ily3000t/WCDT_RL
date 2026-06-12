@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import math
+from contextlib import nullcontext
 from dataclasses import dataclass
 from typing import Any
 
@@ -84,6 +85,20 @@ class CandidateRiskSample:
     boundary_sample: bool
     distance_to_taper: float
     ego_on_auxiliary: bool
+
+
+@dataclass
+class CandidateRolloutContext:
+    ego: VehicleState | None
+    vehicles: list[VehicleState]
+    config: Any
+    horizon_steps: int
+    dt: float
+    current_stats: MergeLocalStats
+    other_rollouts: list[list[VehicleState]]
+    legality: dict[int, bool]
+    ego_rollouts: dict[int, tuple[list[VehicleState], bool]]
+    samples: dict[int, CandidateRiskSample]
 
 
 def merge_x(config: Any) -> float:
@@ -451,37 +466,80 @@ def continuous_risk_target(
     return float(np.clip(score, 0.0, 1.0))
 
 
-def evaluate_candidate_action_risk(action: CandidateAction, context: dict[str, Any]) -> CandidateRiskSample:
+def prepare_candidate_rollout_context(context: dict[str, Any]) -> CandidateRolloutContext:
+    cached = context.get("_candidate_rollout_context")
+    if isinstance(cached, CandidateRolloutContext):
+        return cached
     ego = context.get("ego")
     config = context["config"]
     vehicles = list(context.get("vehicles") or [])
+    horizon_steps = int(config.risk_module.get("collision_horizon_steps", 30))
+    dt = _rollout_dt(config)
+    tracker = context.get("performance_tracker")
+    timer = tracker.measure("candidate_rollout_time") if tracker is not None else nullcontext()
+    with timer:
+        other_rollouts = (
+            [
+                route_aware_constant_velocity_rollout(vehicle, horizon_steps, dt, config)[0]
+                for vehicle in vehicles
+                if ego is None or vehicle.vehicle_id != ego.vehicle_id
+            ]
+            if ego is not None
+            else []
+        )
+    prepared = CandidateRolloutContext(
+        ego=ego,
+        vehicles=vehicles,
+        config=config,
+        horizon_steps=horizon_steps,
+        dt=dt,
+        current_stats=merge_local_stats(ego, vehicles, config),
+        other_rollouts=other_rollouts,
+        legality={action.index: is_candidate_legal(action, context, missing_ego_is_legal=False) for action in ACTIONS},
+        ego_rollouts={},
+        samples={},
+    )
+    context["_candidate_rollout_context"] = prepared
+    return prepared
+
+
+def evaluate_candidate_action_risk(action: CandidateAction, context: dict[str, Any]) -> CandidateRiskSample:
+    prepared = prepare_candidate_rollout_context(context)
+    cached = prepared.samples.get(int(action.index))
+    if cached is not None:
+        return cached
+    ego = prepared.ego
+    config = prepared.config
+    vehicles = prepared.vehicles
     if ego is None:
-        stats = merge_local_stats(None, vehicles, config)
-        return CandidateRiskSample(
+        sample = CandidateRiskSample(
             action=action.index,
             features=np.ones((int(config.risk_module.explicit_feature_dim),), dtype=np.float32),
             overall_risk=1.0,
             risk_types=np.asarray([0.0, 0.0, 0.0, 0.0, 1.0, 0.0], dtype=np.float32),
-            local_stats=stats,
+            local_stats=prepared.current_stats,
             lane_oob=0.0,
             candidate_legal=False,
             traffic_risk=1.0,
             continuous_risk_target=1.0,
             boundary_sample=False,
-            distance_to_taper=stats.merge_distance,
-            ego_on_auxiliary=stats.ego_on_auxiliary,
+            distance_to_taper=prepared.current_stats.merge_distance,
+            ego_on_auxiliary=prepared.current_stats.ego_on_auxiliary,
         )
+        prepared.samples[int(action.index)] = sample
+        return sample
 
-    candidate_legal = is_candidate_legal(action, context, missing_ego_is_legal=False)
+    candidate_legal = prepared.legality[int(action.index)]
     lane_oob = not candidate_legal
-    horizon_steps = int(config.risk_module.get("collision_horizon_steps", 30))
-    dt = _rollout_dt(config)
-    ego_rollout, ego_taper_miss = rollout_ego(ego, action, horizon_steps, dt, config)
-    other_rollouts = [
-        route_aware_constant_velocity_rollout(vehicle, horizon_steps, dt, config)[0]
-        for vehicle in vehicles
-        if vehicle.vehicle_id != ego.vehicle_id
-    ]
+    tracker = context.get("performance_tracker")
+    timer = tracker.measure("candidate_rollout_time") if tracker is not None else nullcontext()
+    with timer:
+        if int(action.index) not in prepared.ego_rollouts:
+            prepared.ego_rollouts[int(action.index)] = rollout_ego(
+                ego, action, prepared.horizon_steps, prepared.dt, config
+            )
+        ego_rollout, ego_taper_miss = prepared.ego_rollouts[int(action.index)]
+    other_rollouts = prepared.other_rollouts
 
     min_distance = INF_TTC
     min_ttc = INF_TTC
@@ -492,7 +550,7 @@ def evaluate_candidate_action_risk(action: CandidateAction, context: dict[str, A
     high_drac = False
     merge_conflict = False
     taper_miss = bool(ego_taper_miss)
-    best_stats = merge_local_stats(ego, vehicles, config)
+    best_stats = prepared.current_stats
     best_gap = best_stats.target_lane_gap
 
     for step_idx, ego_state in enumerate(ego_rollout):
@@ -555,7 +613,7 @@ def evaluate_candidate_action_risk(action: CandidateAction, context: dict[str, A
     )
     traffic_risk = float(np.max(risk_types))
     continuous_target = continuous_risk_target(worst, best_stats, taper_miss=taper_miss)
-    return CandidateRiskSample(
+    sample = CandidateRiskSample(
         action=action.index,
         features=features.astype(np.float32),
         overall_risk=traffic_risk,
@@ -569,10 +627,20 @@ def evaluate_candidate_action_risk(action: CandidateAction, context: dict[str, A
         distance_to_taper=float(best_stats.merge_distance),
         ego_on_auxiliary=bool(best_stats.ego_on_auxiliary),
     )
+    prepared.samples[int(action.index)] = sample
+    return sample
+
+
+def evaluate_candidate_actions(
+    actions: list[CandidateAction] | tuple[CandidateAction, ...],
+    context: dict[str, Any],
+) -> list[CandidateRiskSample]:
+    prepare_candidate_rollout_context(context)
+    return [evaluate_candidate_action_risk(action, context) for action in actions]
 
 
 def candidate_action_risk_samples(context: dict[str, Any]) -> list[CandidateRiskSample]:
-    return [evaluate_candidate_action_risk(action, context) for action in ACTIONS]
+    return evaluate_candidate_actions(ACTIONS, context)
 
 
 def nearest_future_gap(

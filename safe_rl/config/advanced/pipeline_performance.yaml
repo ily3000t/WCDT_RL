@@ -1,0 +1,20 @@
+scenario:
+  traci_subscriptions_enabled: true
+  persistent_sumo_reset: true
+  persistent_sumo_restart_interval: 100
+
+stage1:
+  workers: 6
+  shard_episodes: 25
+  replay_mode: "risk_or_failure"
+  log_every_episodes: 20
+
+training:
+  ppo_num_envs: 4
+  ppo_start_method: "spawn"
+  ppo_worker_torch_threads: 1
+  ppo_main_torch_threads: 4
+
+rl:
+  n_steps: 256
+  batch_size: 64

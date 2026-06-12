@@ -6,8 +6,7 @@ from typing import Any
 
 import numpy as np
 
-from safe_rl.risk.merge_local import evaluate_candidate_action_risk
-from safe_rl.risk.risk_feature_extractor import extract_candidate_features
+from safe_rl.risk.merge_local import evaluate_candidate_action_risk, evaluate_candidate_actions
 from safe_rl.sim.action_space import CandidateAction
 from safe_rl.sim.metrics import SAFETY_METRIC_VERSION
 
@@ -85,6 +84,9 @@ class HeuristicRiskEstimator:
 
     def predict(self, action: CandidateAction, context: dict[str, Any]) -> RiskPrediction:
         candidate = evaluate_candidate_action_risk(action, context)
+        return self.predict_candidate(candidate)
+
+    def predict_candidate(self, candidate: Any) -> RiskPrediction:
         features = candidate.features
         weights = np.asarray([0.30, 0.25, 0.20, 0.50, 0.15, 0.80, 0.05, 0.25], dtype=np.float32)
         score = float(np.clip(np.dot(features, weights), 0.0, 1.0))
@@ -158,24 +160,61 @@ class RiskModuleWrapper:
         )
 
     def predict(self, action: CandidateAction, context: dict[str, Any]) -> RiskPrediction:
-        if self.model is None:
-            return self.estimator.predict(action, context)  # type: ignore[union-attr]
-        features = extract_candidate_features(action, context)
-        with torch.no_grad():
-            explicit = torch.tensor(features, dtype=torch.float32).unsqueeze(0)
-            action_index = torch.tensor([action.index], dtype=torch.long)
-            output = self.model(explicit, action_index)
-        risk_score = float(output["risk_score"].cpu().numpy()[0])
-        if self.apply_temperature and self.temperature > 1.0e-6:
-            clipped = float(np.clip(risk_score, 1.0e-6, 1.0 - 1.0e-6))
-            logit = np.log(clipped / (1.0 - clipped))
-            risk_score = float(1.0 / (1.0 + np.exp(-logit / self.temperature)))
-        return RiskPrediction(
-            risk_score=risk_score,
-            risk_type_logits=output["risk_type_logits"].cpu().numpy()[0],
-            risk_uncertainty=float(output["risk_uncertainty"].cpu().numpy()[0]),
-            explicit_features=features,
-        )
+        return self.predict_many([action], context)[0]
+
+    def predict_many(
+        self,
+        actions: list[CandidateAction] | tuple[CandidateAction, ...],
+        context: dict[str, Any],
+    ) -> list[RiskPrediction]:
+        actions = list(actions)
+        if not actions:
+            return []
+        cache = context.setdefault("_risk_prediction_cache", {})
+        missing = [action for action in actions if (id(self), int(action.index)) not in cache]
+        if missing:
+            tracker = context.get("performance_tracker")
+            started = None
+            if tracker is not None:
+                import time
+
+                started = time.perf_counter()
+            candidates = evaluate_candidate_actions(missing, context)
+            if self.model is None:
+                predictions = [self.estimator.predict_candidate(candidate) for candidate in candidates]  # type: ignore[union-attr]
+            else:
+                features = np.stack([candidate.features for candidate in candidates], axis=0).astype(np.float32)
+                action_indices = np.asarray([action.index for action in missing], dtype=np.int64)
+                with torch.no_grad():
+                    output = self.model(
+                        torch.as_tensor(features, dtype=torch.float32),
+                        torch.as_tensor(action_indices, dtype=torch.long),
+                    )
+                risk_scores = output["risk_score"].detach().cpu().numpy().astype(np.float64)
+                if self.apply_temperature and self.temperature > 1.0e-6:
+                    clipped = np.clip(risk_scores, 1.0e-6, 1.0 - 1.0e-6)
+                    logits = np.log(clipped / (1.0 - clipped))
+                    risk_scores = 1.0 / (1.0 + np.exp(-logits / self.temperature))
+                type_logits = output["risk_type_logits"].detach().cpu().numpy()
+                uncertainties = output["risk_uncertainty"].detach().cpu().numpy()
+                predictions = [
+                    RiskPrediction(
+                        risk_score=float(risk_scores[index]),
+                        risk_type_logits=type_logits[index],
+                        risk_uncertainty=float(uncertainties[index]),
+                        explicit_features=features[index],
+                    )
+                    for index in range(len(missing))
+                ]
+            for action, prediction in zip(missing, predictions):
+                cache[(id(self), int(action.index))] = prediction
+            if tracker is not None and started is not None:
+                import time
+
+                tracker.add_time("risk_forward_time", time.perf_counter() - started)
+                tracker.increment("risk_forwards")
+                tracker.increment("risk_candidates", len(missing))
+        return [cache[(id(self), int(action.index))] for action in actions]
 
 
 def _weighted_mean(values: Any, sample_weight: Any | None = None) -> Any:

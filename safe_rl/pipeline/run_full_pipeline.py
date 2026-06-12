@@ -25,13 +25,18 @@ from safe_rl.utils.config import DEFAULT_CONFIG_PATH, REPO_ROOT, load_config
 from safe_rl.utils.progress import stage_log
 from safe_rl.sim.scenario_snapshot import SCENARIO_SUFFIXES, snapshot_scenario
 from safe_rl.sim.metrics import SAFETY_METRIC_VERSION
+from safe_rl.utils.sumo_installation import (
+    SumoInstallation,
+    resolve_sumo_installation,
+    sumo_subprocess_environment,
+)
 
 
 VALID_FORECAST_SOURCES = ("constant_velocity", "wcdt", "wcdt_v2", "wcdt_v3")
 DEFAULT_FORECAST_SOURCES = ("constant_velocity", "wcdt_v3")
 VALID_FORECAST_PPO_PROFILES = ("default", "safety", "shield_guided", "merge_timing")
 VALID_RUN_MODES = ("new", "resume", "overwrite")
-VALID_PIPELINE_PROFILES = ("default", "smoke")
+VALID_PIPELINE_PROFILES = ("default", "smoke", "performance")
 RUN_ID_PATTERN = re.compile(r"^[A-Za-z0-9._-]+$")
 PIPELINE_STATE_SCHEMA_VERSION = 4
 PIPELINE_TASK_ORDER = (
@@ -99,6 +104,8 @@ def _pipeline_profile_config_path(profile: str) -> Path | None:
         return None
     if profile == "smoke":
         return REPO_ROOT / "safe_rl" / "config" / "advanced" / "pipeline_smoke_fast.yaml"
+    if profile == "performance":
+        return REPO_ROOT / "safe_rl" / "config" / "advanced" / "pipeline_performance.yaml"
     raise ValueError(f"pipeline profile must be one of {VALID_PIPELINE_PROFILES}; got {profile!r}")
 
 
@@ -204,6 +211,8 @@ def _normalize_invocation(
     forecast_ppo_profile: str | None,
     forecast_sources: list[str],
     pipeline_profile: str,
+    stage1_workers: int | None = None,
+    ppo_num_envs: int | None = None,
 ) -> dict[str, Any]:
     profile = str(forecast_ppo_profile or "default").strip().lower()
     if profile not in VALID_FORECAST_PPO_PROFILES:
@@ -219,10 +228,16 @@ def _normalize_invocation(
         "forecast_ppo_profile": profile,
         "forecast_sources": list(forecast_sources),
         "pipeline_profile": normalized_pipeline_profile,
+        "stage1_workers": int(stage1_workers) if stage1_workers is not None else None,
+        "ppo_num_envs": int(ppo_num_envs) if ppo_num_envs is not None else None,
     }
 
 
-def _new_pipeline_state(run_id: str, invocation: dict[str, Any]) -> dict[str, Any]:
+def _new_pipeline_state(
+    run_id: str,
+    invocation: dict[str, Any],
+    sumo_installation: SumoInstallation | None = None,
+) -> dict[str, Any]:
     invocation = dict(invocation)
     invocation.setdefault("pipeline_profile", "default")
     sources = list(invocation["forecast_sources"])
@@ -249,6 +264,7 @@ def _new_pipeline_state(run_id: str, invocation: dict[str, Any]) -> dict[str, An
         "safety_metric_version": SAFETY_METRIC_VERSION,
         "scenario_snapshot_sha256": None,
         "scenario_source_sha256": None,
+        "sumo_installation": sumo_installation.to_dict() if sumo_installation is not None else None,
         "tasks": tasks,
     }
 
@@ -280,7 +296,10 @@ def _load_pipeline_state(path: str | Path) -> dict[str, Any]:
         schema_version = 3
     if schema_version == 3:
         profile = str(state.setdefault("normalized_invocation", {}).setdefault("pipeline_profile", "default"))
+        state["normalized_invocation"].setdefault("stage1_workers", None)
+        state["normalized_invocation"].setdefault("ppo_num_envs", None)
         state.setdefault("pipeline_profile", profile)
+        state.setdefault("sumo_installation", None)
         if "pipeline_profile_config_sha256" not in state:
             if profile != "default":
                 raise ValueError(
@@ -288,6 +307,12 @@ def _load_pipeline_state(path: str | Path) -> dict[str, Any]:
                     "use a new run id or --run-mode overwrite"
                 )
             state["pipeline_profile_config_sha256"] = None
+        state["schema_version"] = PIPELINE_STATE_SCHEMA_VERSION
+        schema_version = PIPELINE_STATE_SCHEMA_VERSION
+    if schema_version == 4:
+        state.setdefault("sumo_installation", None)
+        state.setdefault("normalized_invocation", {}).setdefault("stage1_workers", None)
+        state.setdefault("normalized_invocation", {}).setdefault("ppo_num_envs", None)
         state["schema_version"] = PIPELINE_STATE_SCHEMA_VERSION
         schema_version = PIPELINE_STATE_SCHEMA_VERSION
     elif schema_version != PIPELINE_STATE_SCHEMA_VERSION:
@@ -307,6 +332,8 @@ def _resume_invocation(
     forecast_sources: str | list[str] | tuple[str, ...] | None,
     forecast_source: str | None,
     pipeline_profile: str | None = None,
+    stage1_workers: int | None = None,
+    ppo_num_envs: int | None = None,
 ) -> dict[str, Any]:
     saved = dict(state["normalized_invocation"])
     explicit_sources = forecast_sources is not None or forecast_source is not None
@@ -324,6 +351,8 @@ def _resume_invocation(
         "forecast_ppo_profile": forecast_ppo_profile,
         "forecast_sources": sources if explicit_sources else None,
         "pipeline_profile": pipeline_profile,
+        "stage1_workers": stage1_workers,
+        "ppo_num_envs": ppo_num_envs,
     }
     for key, value in requested.items():
         if value is not None and value != saved.get(key):
@@ -391,7 +420,22 @@ def _validate_completed_outputs(state: dict[str, Any]) -> None:
                 raise ValueError(f"completed task {task_name} output hash changed: {path}")
 
 
-def _validate_resume_state(state: dict[str, Any], cfg: Any) -> None:
+def _sumo_major_minor(installation: dict[str, Any] | None) -> str | None:
+    if not installation:
+        return None
+    version = str(installation.get("sumo_version", ""))
+    for token in version.replace(",", " ").split():
+        stripped = token.strip("vV")
+        if stripped and stripped[0].isdigit():
+            return ".".join(stripped.split(".")[:2])
+    return version or None
+
+
+def _validate_resume_state(
+    state: dict[str, Any],
+    cfg: Any,
+    sumo_installation: SumoInstallation | None = None,
+) -> None:
     if state.get("safety_metric_version") != SAFETY_METRIC_VERSION:
         raise ValueError(
             "safety metric version changed since the run started; use a new run id or --run-mode overwrite"
@@ -413,6 +457,10 @@ def _validate_resume_state(state: dict[str, Any], cfg: Any) -> None:
             raise ValueError("scenario snapshot changed since the run started")
     if source_hash and _scenario_source_sha256(cfg) != source_hash:
         raise ValueError("scenario source changed since the run started; use a new run id or --run-mode overwrite")
+    saved_sumo = state.get("sumo_installation")
+    if saved_sumo and sumo_installation is not None:
+        if _sumo_major_minor(saved_sumo) != sumo_installation.major_minor_version:
+            raise ValueError("SUMO major/minor version changed since the run started; use a new run id or overwrite")
     _validate_completed_outputs(state)
 
 
@@ -571,6 +619,10 @@ def _forecast_payload(
             "allow_heuristic_fallback": False,
         },
         "rl": {"use_wcdt_forecast_features": True},
+        "shield": {
+            "forecast_task_shadow_enabled": False,
+            "task_backstop_enabled": False,
+        },
     }
     profile = str(forecast_ppo_profile or "default").lower()
     if profile not in VALID_FORECAST_PPO_PROFILES:
@@ -625,14 +677,37 @@ def build_generated_configs(
     forecast_sources: str | list[str] | tuple[str, ...] | None = None,
     forecast_source: str | None = None,
     pipeline_profile: str = "default",
+    stage1_workers: int | None = None,
+    ppo_num_envs: int | None = None,
+    sumo_installation: SumoInstallation | None = None,
 ) -> dict[str, Path]:
     generated_dir = Path(generated_dir)
     sources = resolve_forecast_sources(forecast_sources=forecast_sources, forecast_source=forecast_source)
     profile_payload = _pipeline_profile_overrides(pipeline_profile)
+    if ppo_num_envs is not None:
+        profile_payload = _deep_merge(profile_payload, {"training": {"ppo_num_envs": int(ppo_num_envs)}})
+    if sumo_installation is not None:
+        profile_payload = _deep_merge(
+            profile_payload,
+            {
+                "scenario": {
+                    "sumo_binary": sumo_installation.sumo_binary,
+                    "sumo_gui_binary": sumo_installation.sumo_gui_binary,
+                    "netconvert_binary": sumo_installation.netconvert_binary,
+                    "sumo_tools_directory": sumo_installation.tools_directory,
+                    "sumo_home": sumo_installation.sumo_home,
+                    "sumo_version": sumo_installation.sumo_version,
+                }
+            },
+        )
 
     main_payload: dict[str, Any] = _deep_merge(profile_payload, {
         "run": {"run_id": run_id},
         "prediction": _predictor_training_flags(sources),
+        "shield": {
+            "forecast_task_shadow_enabled": False,
+            "task_backstop_enabled": False,
+        },
     })
     if stage1_episodes is not None:
         main_payload = _deep_merge(main_payload, {"stage1": {"episodes": int(stage1_episodes)}})
@@ -640,6 +715,8 @@ def build_generated_configs(
         main_payload = _deep_merge(main_payload, {"stage4": {"episodes": int(stage4_episodes)}})
     if ppo_timesteps is not None:
         main_payload = _deep_merge(main_payload, {"rl": {"total_timesteps": int(ppo_timesteps)}})
+    if stage1_workers is not None:
+        main_payload = _deep_merge(main_payload, {"stage1": {"workers": int(stage1_workers)}})
 
     stage2_stage4_payload: dict[str, Any] = _deep_merge(profile_payload, {
         "run": {"run_id": run_id},
@@ -671,6 +748,7 @@ def build_generated_configs(
     )
     stage5_payload: dict[str, Any] = _deep_merge(profile_payload, {
         "run": {"run_id": run_id},
+        "shield": {"forecast_task_shadow_enabled": True},
         "stage5": {
             "episodes_per_group": requested_stage5_episodes,
             "seeds": list(range(1, requested_stage5_episodes + 1)),
@@ -709,9 +787,9 @@ def _load_stage_cfg(config_path: Path, run_id: str):
     return cfg
 
 
-def _run_subprocess(command: list[str], label: str) -> None:
+def _run_subprocess(command: list[str], label: str, env: dict[str, str] | None = None) -> None:
     stage_log("full", f"{label}: {' '.join(command)}")
-    subprocess.run(command, cwd=REPO_ROOT, check=True)
+    subprocess.run(command, cwd=REPO_ROOT, check=True, env=env)
 
 
 def _sumo_smoke_check(config_path: Path, run_id: str) -> None:
@@ -760,6 +838,8 @@ def run_full_pipeline(
     forecast_sources: str | list[str] | tuple[str, ...] | None = None,
     forecast_source: str | None = None,
     pipeline_profile: str | None = None,
+    stage1_workers: int | None = None,
+    ppo_num_envs: int | None = None,
 ) -> Path:
     run_id = _validate_run_id(run_id)
     run_mode = str(run_mode).strip().lower()
@@ -767,6 +847,8 @@ def run_full_pipeline(
         raise ValueError(f"run mode must be one of {VALID_RUN_MODES}; got {run_mode!r}")
     bootstrap_cfg = load_config()
     bootstrap_cfg.run["run_id"] = run_id
+    sumo_installation = resolve_sumo_installation(bootstrap_cfg.scenario)
+    sumo_env = sumo_subprocess_environment(sumo_installation)
     output_root = _output_root(bootstrap_cfg)
     run_dir = output_root / run_id
     state_path = run_dir / "pipeline_state.json"
@@ -785,8 +867,10 @@ def run_full_pipeline(
             forecast_sources=forecast_sources,
             forecast_source=forecast_source,
             pipeline_profile=pipeline_profile,
+            stage1_workers=stage1_workers,
+            ppo_num_envs=ppo_num_envs,
         )
-        _validate_resume_state(state, bootstrap_cfg)
+        _validate_resume_state(state, bootstrap_cfg, sumo_installation)
         _reset_unfinished_tasks(state)
         _atomic_write_json(state_path, state)
     else:
@@ -800,9 +884,11 @@ def run_full_pipeline(
             forecast_ppo_profile=forecast_ppo_profile,
             forecast_sources=sources,
             pipeline_profile=str(pipeline_profile or "default"),
+            stage1_workers=stage1_workers,
+            ppo_num_envs=ppo_num_envs,
         )
         run_dir = _prepare_new_run_dir(output_root, run_id, run_mode)
-        state = _new_pipeline_state(run_id, invocation)
+        state = _new_pipeline_state(run_id, invocation, sumo_installation)
         _atomic_write_json(state_path, state)
     sources = list(invocation["forecast_sources"])
     generated_dir = run_dir / "generated_configs"
@@ -817,6 +903,9 @@ def run_full_pipeline(
         forecast_ppo_profile=invocation["forecast_ppo_profile"],
         forecast_sources=sources,
         pipeline_profile=invocation["pipeline_profile"],
+        stage1_workers=invocation.get("stage1_workers"),
+        ppo_num_envs=invocation.get("ppo_num_envs"),
+        sumo_installation=sumo_installation,
     )
     main_cfg = _load_stage_cfg(configs["main"], run_id)
 
@@ -825,6 +914,7 @@ def run_full_pipeline(
     stage_log("full", f"forecast_sources={sources}")
     stage_log("full", f"forecast_ppo_profile={invocation['forecast_ppo_profile']}")
     stage_log("full", f"pipeline_profile={invocation['pipeline_profile']}")
+    stage_log("full", f"sumo={sumo_installation.sumo_binary} ({sumo_installation.sumo_version})")
     if invocation["forecast_ppo_timesteps"] is not None:
         stage_log("full", f"forecast_ppo_timesteps={invocation['forecast_ppo_timesteps']}")
     for source in sources:
@@ -833,8 +923,14 @@ def run_full_pipeline(
 
     def _build_network_snapshot() -> None:
         _run_subprocess(
-            [sys.executable, str(REPO_ROOT / "scenarios" / "highway_merge" / "build_network.py")],
+            [
+                sys.executable,
+                str(REPO_ROOT / "scenarios" / "highway_merge" / "build_network.py"),
+                "--netconvert",
+                sumo_installation.netconvert_binary,
+            ],
             "build network",
+            env=sumo_env,
         )
         snapshot_manifest = snapshot_scenario(main_cfg, run_dir)
         state["scenario_snapshot_sha256"] = _sha256(snapshot_manifest)
@@ -923,9 +1019,11 @@ def main() -> None:
         help="Run directory handling: new refuses existing runs, resume continues verified state, overwrite recreates runs.",
     )
     parser.add_argument("--stage1-episodes", type=int, default=None, help="Optional override for Stage1 episodes.")
+    parser.add_argument("--stage1-workers", type=int, default=None, help="Optional Stage1 SUMO worker count.")
     parser.add_argument("--stage4-episodes", type=int, default=None, help="Optional override for Stage4 episodes.")
     parser.add_argument("--stage5-episodes", type=int, default=None, help="Optional override for Stage5 episodes per group.")
     parser.add_argument("--ppo-timesteps", type=int, default=None, help="Optional override for baseline and forecast PPO timesteps.")
+    parser.add_argument("--ppo-num-envs", type=int, default=None, help="Optional PPO vector environment count.")
     parser.add_argument(
         "--forecast-ppo-timesteps",
         type=int,
@@ -958,7 +1056,7 @@ def main() -> None:
         "--pipeline-profile",
         choices=list(VALID_PIPELINE_PROFILES),
         default=None,
-        help="Pipeline profile. Use 'smoke' for a fast end-to-end validation run.",
+        help="Pipeline profile. Use 'smoke' for validation or 'performance' for explicit parallel execution.",
     )
     args = parser.parse_args()
     if args.forecast_source and args.forecast_sources:
@@ -967,9 +1065,11 @@ def main() -> None:
         args.run_id,
         run_mode=args.run_mode,
         stage1_episodes=args.stage1_episodes,
+        stage1_workers=args.stage1_workers,
         stage4_episodes=args.stage4_episodes,
         stage5_episodes=args.stage5_episodes,
         ppo_timesteps=args.ppo_timesteps,
+        ppo_num_envs=args.ppo_num_envs,
         forecast_ppo_timesteps=args.forecast_ppo_timesteps,
         forecast_ppo_profile=args.forecast_ppo_profile,
         forecast_sources=args.forecast_sources,

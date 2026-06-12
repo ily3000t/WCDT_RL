@@ -3,6 +3,8 @@ from __future__ import annotations
 import argparse
 import json
 import math
+import os
+import sys
 from pathlib import Path
 from typing import Any
 
@@ -117,7 +119,20 @@ def make_env(
     reward_risk_checkpoint: str | None = None,
     record_trajectory_samples: bool = False,
     sumo_step_delay_ms: float = 0.0,
+    worker_rank: int = 0,
+    num_envs: int = 1,
+    advance_episode_seed: bool = False,
 ) -> SumoHighwayMergeEnv:
+    sumo_home = cfg.scenario.get("sumo_home")
+    tools_directory = cfg.scenario.get("sumo_tools_directory")
+    if sumo_home:
+        os.environ["SUMO_HOME"] = str(sumo_home)
+        bin_directory = str(Path(str(cfg.scenario.get("sumo_binary", "sumo"))).parent)
+        current_path = os.environ.get("PATH", "")
+        if bin_directory.lower() not in current_path.lower():
+            os.environ["PATH"] = f"{bin_directory}{os.pathsep}{current_path}"
+    if tools_directory and str(tools_directory) not in sys.path:
+        sys.path.append(str(tools_directory))
     shield = None
     if shield_enabled if shield_enabled is not None else bool(cfg.shield.enabled):
         risk_model = RiskModuleWrapper(cfg, checkpoint=risk_checkpoint)
@@ -147,6 +162,9 @@ def make_env(
         reward_risk_model=reward_risk_model,
         record_trajectory_samples=record_trajectory_samples,
         sumo_step_delay_ms=sumo_step_delay_ms,
+        worker_rank=worker_rank,
+        num_envs=num_envs,
+        advance_episode_seed=advance_episode_seed,
     )
 
 

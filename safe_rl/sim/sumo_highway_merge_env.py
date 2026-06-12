@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import math
 import os
-import shutil
 import sys
 import time
 import uuid
@@ -37,6 +36,7 @@ from safe_rl.sim.scenario_semantics import (
     target_lane_mapping,
 )
 from safe_rl.sim.types import StepMetrics, VehicleState
+from safe_rl.utils.performance import PerformanceTracker
 
 
 class SumoHighwayMergeEnv(gym.Env):
@@ -58,9 +58,17 @@ class SumoHighwayMergeEnv(gym.Env):
         reward_risk_model: Any | None = None,
         record_trajectory_samples: bool = False,
         sumo_step_delay_ms: float = 0.0,
+        worker_rank: int = 0,
+        num_envs: int = 1,
+        advance_episode_seed: bool = False,
     ):
         self.config = config
-        self.seed_value = int(seed if seed is not None else config.run.seed)
+        self._base_seed = int(seed if seed is not None else config.run.seed)
+        self.seed_value = self._base_seed
+        self.worker_rank = int(worker_rank)
+        self.num_envs = max(1, int(num_envs))
+        self.advance_episode_seed = bool(advance_episode_seed)
+        self._reset_count = 0
         self.ego_id = config.scenario.ego_id
         self.step_length = float(config.scenario.step_length)
         self.control_interval_steps = int(config.scenario.control_interval_steps)
@@ -114,6 +122,14 @@ class SumoHighwayMergeEnv(gym.Env):
         self._task_missed_consecutive_count = 0
         self._task_backstop_consecutive_count = 0
         self._task_replacements: list[dict[str, Any]] = []
+        self.performance = PerformanceTracker()
+        self._decision_context_cache: dict[str, Any] | None = None
+        self._lane_count_cache: dict[str, int] = {}
+        self._subscribed_vehicle_ids: set[str] = set()
+        self._subscription_fallback_count = 0
+        self._subscription_error_count = 0
+        self._sumo_reload_count = 0
+        self._sumo_restart_count = 0
 
     def _import_traci(self):
         if self._traci_module is not None:
@@ -131,13 +147,14 @@ class SumoHighwayMergeEnv(gym.Env):
 
     def _add_sumo_tools_path(self) -> None:
         candidates: list[Path] = []
+        configured_tools = self.config.scenario.get("sumo_tools_directory")
+        if configured_tools:
+            candidates.append(Path(str(configured_tools)))
         if os.environ.get("SUMO_HOME"):
             candidates.append(Path(os.environ["SUMO_HOME"]) / "tools")
-        sumo_binary = str(self.config.scenario.get("sumo_binary", "sumo"))
-        resolved = shutil.which(sumo_binary) or (sumo_binary if Path(sumo_binary).exists() else "")
-        if resolved:
-            candidates.append(Path(resolved).resolve().parents[1] / "tools")
-        candidates.append(Path(r"E:/Program Files/sumo-1.22.0/tools"))
+        sumo_binary = Path(str(self.config.scenario.get("sumo_binary", "sumo")))
+        if sumo_binary.is_absolute() and sumo_binary.exists():
+            candidates.append(sumo_binary.resolve().parents[1] / "tools")
         for candidate in candidates:
             if candidate.is_dir() and str(candidate) not in sys.path:
                 sys.path.append(str(candidate))
@@ -145,9 +162,26 @@ class SumoHighwayMergeEnv(gym.Env):
     def reset(self, *, seed: int | None = None, options: dict[str, Any] | None = None):
         if seed is not None:
             self.seed_value = int(seed)
-        self._close_sumo()
-        self._start_sumo()
+            if self._reset_count == 0:
+                self._base_seed = int(seed) - self.worker_rank
+        elif self.advance_episode_seed:
+            self.seed_value = self._base_seed + self.worker_rank + self._reset_count * self.num_envs
+        persistent = bool(self.config.scenario.get("persistent_sumo_reset", False))
+        restart_interval = max(1, int(self.config.scenario.get("persistent_sumo_restart_interval", 100)))
+        should_reload = self._traci is not None and persistent and self._reset_count % restart_interval != 0
+        if should_reload:
+            try:
+                self._reload_sumo()
+            except Exception:
+                self._close_sumo()
+                self._start_sumo()
+        else:
+            self._close_sumo()
+            self._start_sumo()
+        self._reset_count += 1
         self.history.clear()
+        self._invalidate_decision_cache()
+        self._lane_count_cache.clear()
         self._episode_step = 0
         self._episode_metrics.clear()
         self._ego_speeds.clear()
@@ -179,6 +213,7 @@ class SumoHighwayMergeEnv(gym.Env):
             self._configure_ego_control()
             states = self._collect_states()
             self.history.append(states)
+            self._invalidate_decision_cache()
             self._trajectory_frames.append({state.vehicle_id: state for state in states})
             if self.ego_id in self.history.latest():
                 break
@@ -214,11 +249,11 @@ class SumoHighwayMergeEnv(gym.Env):
             collision = collision or self._ego_in_collision()
             states = self._collect_states()
             self.history.append(states)
+            self._invalidate_decision_cache()
             if self.record_trajectory_samples:
                 self._trajectory_frames.append({state.vehicle_id: state for state in states})
 
         ego = self._get_ego()
-        states = self._collect_states()
         metrics = compute_step_metrics(
             ego,
             states,
@@ -281,10 +316,30 @@ class SumoHighwayMergeEnv(gym.Env):
 
     def _start_sumo(self) -> None:
         traci = self._import_traci()
-        sumocfg = str(Path(self.config.scenario.sumocfg).resolve())
         sumo_binary = self.config.scenario.get("sumo_binary", "sumo")
-        cmd = [
-            sumo_binary,
+        cmd = [sumo_binary, *self._sumo_load_args()]
+        retries = int(self.config.scenario.get("sumo_start_retries", 5))
+        delay = float(self.config.scenario.get("sumo_start_retry_delay", 0.25))
+        last_error: Exception | None = None
+        with self.performance.measure("sumo_start_or_load_time"):
+            for attempt in range(max(1, retries)):
+                try:
+                    self._conn_label = f"safe_rl_{uuid.uuid4().hex[:8]}"
+                    traci.start(cmd, label=self._conn_label, numRetries=20)
+                    self._traci = traci.getConnection(self._conn_label)
+                    self._sumo_restart_count += 1
+                    self.performance.increment("sumo_restarts")
+                    self._reset_subscription_state()
+                    return
+                except Exception as exc:
+                    last_error = exc
+                    self._cleanup_failed_traci_start(traci)
+                    time.sleep(delay * (attempt + 1))
+        raise RuntimeError(f"Failed to start SUMO after {retries} attempts: {last_error}") from last_error
+
+    def _sumo_load_args(self) -> list[str]:
+        sumocfg = str(Path(self.config.scenario.sumocfg).resolve())
+        return [
             "-c",
             sumocfg,
             "--seed",
@@ -296,20 +351,15 @@ class SumoHighwayMergeEnv(gym.Env):
             "--collision.action",
             "warn",
         ]
-        retries = int(self.config.scenario.get("sumo_start_retries", 5))
-        delay = float(self.config.scenario.get("sumo_start_retry_delay", 0.25))
-        last_error: Exception | None = None
-        for attempt in range(max(1, retries)):
-            try:
-                self._conn_label = f"safe_rl_{uuid.uuid4().hex[:8]}"
-                traci.start(cmd, label=self._conn_label, numRetries=20)
-                self._traci = traci.getConnection(self._conn_label)
-                return
-            except Exception as exc:
-                last_error = exc
-                self._cleanup_failed_traci_start(traci)
-                time.sleep(delay * (attempt + 1))
-        raise RuntimeError(f"Failed to start SUMO after {retries} attempts: {last_error}") from last_error
+
+    def _reload_sumo(self) -> None:
+        if self._traci is None or not hasattr(self._traci, "load"):
+            raise RuntimeError("TraCI connection does not support load()")
+        with self.performance.measure("sumo_start_or_load_time"):
+            self._traci.load(self._sumo_load_args())
+        self._sumo_reload_count += 1
+        self.performance.increment("sumo_reloads")
+        self._reset_subscription_state()
 
     def _cleanup_failed_traci_start(self, traci_module: Any) -> None:
         try:
@@ -336,23 +386,109 @@ class SumoHighwayMergeEnv(gym.Env):
         except Exception:
             pass
         self._traci = None
+        self._reset_subscription_state()
 
     def _simulation_step(self) -> None:
-        self._traci.simulationStep()
+        with self.performance.measure("simulation_step_time"):
+            self._traci.simulationStep()
+        self._refresh_vehicle_subscriptions()
         if self.sumo_step_delay_ms > 0:
             time.sleep(self.sumo_step_delay_ms / 1000.0)
 
     def _collect_states(self) -> list[VehicleState]:
+        with self.performance.measure("state_collection_time"):
+            return self._collect_states_impl()
+
+    def _reset_subscription_state(self) -> None:
+        self._subscribed_vehicle_ids.clear()
+
+    def _subscription_variables(self) -> list[int]:
+        constants = getattr(self._traci_module, "constants", None)
+        names = (
+            "VAR_POSITION",
+            "VAR_ANGLE",
+            "VAR_LANE_ID",
+            "VAR_LANE_INDEX",
+            "VAR_SPEED",
+            "VAR_ACCELERATION",
+            "VAR_LANEPOSITION",
+            "VAR_ROAD_ID",
+            "VAR_LENGTH",
+            "VAR_WIDTH",
+        )
+        return [int(getattr(constants, name)) for name in names if constants is not None and hasattr(constants, name)]
+
+    def _refresh_vehicle_subscriptions(self) -> None:
+        if self._traci is None or not bool(self.config.scenario.get("traci_subscriptions_enabled", True)):
+            return
+        vehicle_api = self._traci.vehicle
+        try:
+            current_ids = set(str(item) for item in vehicle_api.getIDList())
+            variables = self._subscription_variables()
+            for vehicle_id in sorted(current_ids - self._subscribed_vehicle_ids):
+                vehicle_api.subscribe(vehicle_id, variables)
+            self._subscribed_vehicle_ids.intersection_update(current_ids)
+            self._subscribed_vehicle_ids.update(current_ids)
+        except Exception:
+            self._subscription_error_count += 1
+            self.performance.increment("traci_subscription_errors")
+
+    def _state_from_getters(self, vehicle_id: str) -> VehicleState:
+        vehicle_api = self._traci.vehicle
+        x, y = vehicle_api.getPosition(vehicle_id)
+        sumo_angle = vehicle_api.getAngle(vehicle_id)
+        self._subscription_fallback_count += 1
+        self.performance.increment("traci_getter_fallbacks")
+        return VehicleState(
+            vehicle_id=vehicle_id,
+            x=float(x),
+            y=float(y),
+            heading=float(math.radians(90.0 - sumo_angle)),
+            speed=float(vehicle_api.getSpeed(vehicle_id)),
+            lane_index=int(vehicle_api.getLaneIndex(vehicle_id)),
+            lane_id=str(vehicle_api.getLaneID(vehicle_id)),
+            lane_pos=float(vehicle_api.getLanePosition(vehicle_id)),
+            edge_id=str(vehicle_api.getRoadID(vehicle_id)),
+            length=float(vehicle_api.getLength(vehicle_id)),
+            width=float(vehicle_api.getWidth(vehicle_id)),
+            accel=float(vehicle_api.getAcceleration(vehicle_id)),
+        )
+
+    def _collect_states_impl(self) -> list[VehicleState]:
         states: list[VehicleState] = []
         vehicle_api = self._traci.vehicle
-        for vehicle_id in vehicle_api.getIDList():
-            x, y = vehicle_api.getPosition(vehicle_id)
-            sumo_angle = vehicle_api.getAngle(vehicle_id)
-            heading = math.radians(90.0 - sumo_angle)
-            lane_id = vehicle_api.getLaneID(vehicle_id)
-            lane_index = int(vehicle_api.getLaneIndex(vehicle_id))
-            speed = float(vehicle_api.getSpeed(vehicle_id))
-            accel = float(vehicle_api.getAcceleration(vehicle_id))
+        vehicle_ids = sorted(str(item) for item in vehicle_api.getIDList())
+        use_subscriptions = bool(self.config.scenario.get("traci_subscriptions_enabled", True))
+        if use_subscriptions:
+            self._refresh_vehicle_subscriptions()
+        all_results: dict[str, Any] = {}
+        if use_subscriptions:
+            try:
+                all_results = vehicle_api.getAllSubscriptionResults() or {}
+            except Exception:
+                self._subscription_error_count += 1
+                self.performance.increment("traci_subscription_errors")
+        constants = getattr(self._traci_module, "constants", None)
+        for vehicle_id in vehicle_ids:
+            result = all_results.get(vehicle_id) if use_subscriptions else None
+            if not result or constants is None:
+                states.append(self._state_from_getters(vehicle_id))
+                continue
+            try:
+                x, y = result[getattr(constants, "VAR_POSITION")]
+                sumo_angle = result[getattr(constants, "VAR_ANGLE")]
+                lane_id = str(result[getattr(constants, "VAR_LANE_ID")])
+                lane_index = int(result[getattr(constants, "VAR_LANE_INDEX")])
+                speed = float(result[getattr(constants, "VAR_SPEED")])
+                accel = float(result[getattr(constants, "VAR_ACCELERATION")])
+                lane_pos = float(result[getattr(constants, "VAR_LANEPOSITION")])
+                edge_id = str(result[getattr(constants, "VAR_ROAD_ID")])
+                length = float(result[getattr(constants, "VAR_LENGTH")])
+                width = float(result[getattr(constants, "VAR_WIDTH")])
+                heading = math.radians(90.0 - float(sumo_angle))
+            except (KeyError, TypeError, ValueError):
+                states.append(self._state_from_getters(vehicle_id))
+                continue
             states.append(
                 VehicleState(
                     vehicle_id=vehicle_id,
@@ -362,10 +498,10 @@ class SumoHighwayMergeEnv(gym.Env):
                     speed=speed,
                     lane_index=lane_index,
                     lane_id=lane_id,
-                    lane_pos=float(vehicle_api.getLanePosition(vehicle_id)),
-                    edge_id=str(vehicle_api.getRoadID(vehicle_id)),
-                    length=float(vehicle_api.getLength(vehicle_id)),
-                    width=float(vehicle_api.getWidth(vehicle_id)),
+                    lane_pos=lane_pos,
+                    edge_id=edge_id,
+                    length=length,
+                    width=width,
                     accel=accel,
                 )
             )
@@ -472,12 +608,16 @@ class SumoHighwayMergeEnv(gym.Env):
         return lane_oob
 
     def _lane_count(self, edge_id: str) -> int:
+        if edge_id in self._lane_count_cache:
+            return self._lane_count_cache[edge_id]
         try:
-            return int(self._traci.edge.getLaneNumber(edge_id))
+            count = int(self._traci.edge.getLaneNumber(edge_id))
         except Exception:
             latest = self.history.latest()
             same_edge = [state.lane_index for state in latest.values() if state.edge_id == edge_id]
-            return max(same_edge) + 1 if same_edge else 1
+            count = max(same_edge) + 1 if same_edge else 1
+        self._lane_count_cache[edge_id] = count
+        return count
 
     def _build_observation(self) -> np.ndarray:
         latest = self.history.latest()
@@ -661,8 +801,13 @@ class SumoHighwayMergeEnv(gym.Env):
         if raw_action is None or context is None or self.reward_risk_model is None or self.reward_ranker is None:
             return 0.0, debug
 
-        raw_prediction = self.reward_risk_model.predict(raw_action, context)
         ranked = self.reward_ranker.rank(raw_action, context)
+        raw_prediction = next(
+            (prediction for action, prediction, _score in ranked if action.index == raw_action.index),
+            None,
+        )
+        if raw_prediction is None:
+            raw_prediction = self.reward_risk_model.predict(raw_action, context)
         best_action, best_prediction = (raw_action, raw_prediction)
         if ranked:
             best_action, best_prediction, _score = min(ranked, key=lambda item: item[1].risk_score)
@@ -1342,11 +1487,13 @@ class SumoHighwayMergeEnv(gym.Env):
         return info
 
     def get_risk_context(self) -> dict[str, Any]:
+        if self._decision_context_cache is not None:
+            return self._decision_context_cache
         latest = self.history.latest()
         ego = latest.get(self.ego_id)
         vehicles = list(latest.values())
         local = merge_local_stats(ego, vehicles, self.config)
-        return {
+        context = {
             "ego": ego,
             "vehicles": vehicles,
             "history": self.history,
@@ -1366,7 +1513,13 @@ class SumoHighwayMergeEnv(gym.Env):
             ) if ego is not None else None,
             "merge_local": local,
             "curriculum_profile": self._curriculum_profile,
+            "performance_tracker": self.performance,
         }
+        self._decision_context_cache = context
+        return context
+
+    def _invalidate_decision_cache(self) -> None:
+        self._decision_context_cache = None
 
     def episode_report(self) -> dict[str, Any]:
         collisions = [metric.collision for metric in self._episode_metrics]
@@ -1653,6 +1806,16 @@ class SumoHighwayMergeEnv(gym.Env):
             ),
             "no_merge_request_before_taper": bool(no_merge_request_before_taper),
             "no_merge_request_before_taper_count": int(no_merge_request_before_taper),
+            "performance": self.performance.summary(
+                steps=int(self._episode_step),
+                episodes=1,
+                extra={
+                    "sumo_restarts": int(self._sumo_restart_count),
+                    "sumo_reloads": int(self._sumo_reload_count),
+                    "subscription_fallback_count": int(self._subscription_fallback_count),
+                    "subscription_error_count": int(self._subscription_error_count),
+                },
+            ),
         }
 
     def _shield_guided_reward_summary(self) -> dict[str, Any]:

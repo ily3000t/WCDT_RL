@@ -11,6 +11,10 @@ training:
   ppo_device: "cpu"
   forecast_runtime_device: "cpu"
   diagnostics_device: "auto"
+  ppo_num_envs: 1
+  ppo_start_method: "spawn"
+  ppo_worker_torch_threads: 1
+  ppo_main_torch_threads: 4
   pin_memory: true
   num_workers: 0
   persistent_workers: true
@@ -27,6 +31,9 @@ scenario:
   sumo_binary: "sumo"
   sumo_start_retries: 5
   sumo_start_retry_delay: 0.25
+  traci_subscriptions_enabled: true
+  persistent_sumo_reset: false
+  persistent_sumo_restart_interval: 100
   step_length: 0.1
   episode_seconds: 80.0
   control_interval_steps: 5
@@ -289,6 +296,10 @@ shield:
 
 stage1:
   episodes: 500
+  workers: 1
+  shard_episodes: 25
+  replay_mode: "risk_or_failure"
+  log_every_episodes: 20
   action_sampling: "mixed"
   sampling_probs:
     random: 0.10

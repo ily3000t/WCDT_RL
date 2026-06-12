@@ -1,5 +1,9 @@
 from __future__ import annotations
 
+import json
+import multiprocessing as mp
+import shutil
+from concurrent.futures import ProcessPoolExecutor
 from pathlib import Path
 
 import numpy as np
@@ -14,10 +18,72 @@ from safe_rl.risk.merge_local import candidate_action_risk_samples, candidate_sa
 from safe_rl.risk.risk_aggregator import aggregate_episode_reports
 from safe_rl.risk.stage1_sampling import configured_sampling_probs, sampling_summary, select_stage1_action
 from safe_rl.sim.metrics import SAFETY_METRIC_VERSION
-from safe_rl.utils.config import prepare_run_dir
-from safe_rl.utils.io import append_jsonl
+from safe_rl.utils.config import clone_with_overrides, prepare_run_dir
 from safe_rl.utils.progress import TensorboardLogger, progress_iter, stage_log
 from safe_rl.utils.replay import write_replay_file
+from safe_rl.utils.performance import PerformanceTracker
+
+
+TRANSITION_KEYS = {
+    "observations",
+    "executed_actions",
+    "next_observations",
+    "rewards",
+    "dones",
+    "transition_episode_id",
+    "transition_episode_step",
+    "target_lane_gap",
+    "ramp_local_risk",
+    "merge_zone_risk",
+    "taper_miss",
+    "distance_to_taper",
+    "ego_on_auxiliary",
+    "curriculum_profiles",
+    "sampling_modes",
+}
+CANDIDATE_KEYS = {
+    "actions",
+    "risk_features",
+    "overall_risk",
+    "risk_types",
+    "lane_oob_risk",
+    "candidate_legal",
+    "traffic_risk",
+    "continuous_risk_target",
+    "boundary_sample",
+    "risk_sample_weight",
+    "episode_id",
+    "candidate_transition_id",
+    "candidate_episode_step",
+    "candidate_raw_action",
+    "candidate_target_lane_gap",
+    "candidate_ramp_local_risk",
+    "candidate_merge_zone_risk",
+    "candidate_taper_miss",
+    "candidate_distance_to_taper",
+    "candidate_ego_on_auxiliary",
+}
+TRAJECTORY_KEYS = {
+    "agent_history",
+    "agent_future",
+    "agent_mask",
+    "agent_lane_index",
+    "agent_edge_role",
+    "agent_length",
+    "agent_width",
+    "agent_history_valid_mask",
+    "agent_future_valid_mask",
+    "agent_history_lane_index",
+    "agent_history_edge_role",
+    "agent_future_lane_index",
+    "agent_future_edge_role",
+    "agent_relevance_mask",
+    "agent_relevance_score",
+    "actor_selector_relevant_count",
+    "actor_selector_overflow",
+    "trajectory_episode_id",
+    "trajectory_window_end_step",
+}
 
 
 def _array_summary(values: list[float]) -> dict:
@@ -34,14 +100,276 @@ def _array_summary(values: list[float]) -> dict:
     }
 
 
+def _should_write_replay(cfg, episode_report: dict) -> bool:
+    if not bool(cfg.stage1.get("replay_enabled", True)) or not bool(cfg.run.get("replay", True)):
+        return False
+    mode = str(cfg.stage1.get("replay_mode", "risk_or_failure")).strip().lower()
+    if mode == "all":
+        return True
+    failed = bool(
+        episode_report.get("collision")
+        or episode_report.get("near_miss")
+        or episode_report.get("taper_miss")
+        or episode_report.get("safety_violation")
+    )
+    if mode == "failures_only":
+        return failed
+    return bool(failed or episode_report.get("_stage1_boundary_or_extreme", False))
+
+
+def _stage1_worker_entry(cfg, worker_id: int, shard_index: int, episode_ids: list[int], worker_root: str) -> str:
+    worker_cfg = clone_with_overrides(
+        cfg,
+        {
+            "run": {
+                "run_id": f"worker_{worker_id:03d}_shard_{shard_index:04d}",
+                "output_root": str(Path(worker_root).resolve()),
+                "tensorboard": False,
+            },
+            "stage1": {
+                "workers": 1,
+                "_worker_mode": True,
+                "episode_ids": [int(item) for item in episode_ids],
+                "episodes": len(episode_ids),
+                "audit_enabled": False,
+                "audit_gate": {"enabled": False},
+            },
+        },
+    )
+    return str(_run_serial(worker_cfg))
+
+
+def _concatenate_shards(shard_paths: list[Path], output: Path) -> dict[str, np.ndarray]:
+    loaded = [dict(np.load(path, allow_pickle=False)) for path in shard_paths]
+    keys = sorted(set().union(*(payload.keys() for payload in loaded)))
+    merged: dict[str, np.ndarray] = {}
+    for key in keys:
+        arrays = [payload[key] for payload in loaded if key in payload]
+        if key in TRANSITION_KEYS | CANDIDATE_KEYS | TRAJECTORY_KEYS:
+            merged[key] = np.concatenate(arrays, axis=0) if arrays else np.zeros((0,), dtype=np.float32)
+        else:
+            merged[key] = np.asarray(arrays[0])
+
+    transition_count = int(np.asarray(merged.get("transition_episode_id", [])).shape[0])
+    if transition_count:
+        transition_order = np.lexsort(
+            (
+                np.asarray(merged["transition_episode_step"], dtype=np.int64),
+                np.asarray(merged["transition_episode_id"], dtype=np.int64),
+            )
+        )
+        for key in TRANSITION_KEYS:
+            if key in merged and merged[key].shape[0] == transition_count:
+                merged[key] = merged[key][transition_order]
+
+    candidate_count = int(np.asarray(merged.get("episode_id", [])).shape[0])
+    if candidate_count:
+        candidate_order = np.lexsort(
+            (
+                np.asarray(merged["actions"], dtype=np.int64),
+                np.asarray(merged["candidate_episode_step"], dtype=np.int64),
+                np.asarray(merged["episode_id"], dtype=np.int64),
+            )
+        )
+        for key in CANDIDATE_KEYS:
+            if key in merged and merged[key].shape[0] == candidate_count:
+                merged[key] = merged[key][candidate_order]
+        transition_lookup = {
+            (int(episode), int(step)): index
+            for index, (episode, step) in enumerate(
+                zip(merged["transition_episode_id"], merged["transition_episode_step"])
+            )
+        }
+        merged["candidate_transition_id"] = np.asarray(
+            [
+                transition_lookup[(int(episode), int(step))]
+                for episode, step in zip(merged["episode_id"], merged["candidate_episode_step"])
+            ],
+            dtype=np.int64,
+        )
+
+    trajectory_count = int(np.asarray(merged.get("trajectory_episode_id", [])).shape[0])
+    if trajectory_count:
+        trajectory_order = np.lexsort(
+            (
+                np.asarray(merged["trajectory_window_end_step"], dtype=np.int64),
+                np.asarray(merged["trajectory_episode_id"], dtype=np.int64),
+            )
+        )
+        for key in TRAJECTORY_KEYS:
+            if key in merged and merged[key].shape[0] == trajectory_count:
+                merged[key] = merged[key][trajectory_order]
+    np.savez_compressed(output, **merged)
+    return merged
+
+
+def _aggregate_worker_performance(
+    worker_reports: list[dict],
+    parent_summary: dict,
+    *,
+    episodes: int,
+    transition_count: int,
+) -> dict:
+    worker_performance = [dict(item.get("performance", {}) or {}) for item in worker_reports]
+    result = dict(parent_summary)
+    operation_counts: dict[str, int] = {}
+    timing_keys = (
+        "sumo_start_or_load_time",
+        "simulation_step_time",
+        "state_collection_time",
+        "candidate_rollout_time",
+        "risk_forward_time",
+        "forecast_inference_time",
+        "replay_io_time",
+    )
+    for key in timing_keys:
+        result[key] = float(sum(float(item.get(key, 0.0)) for item in worker_performance))
+    for item in worker_performance:
+        for key, value in dict(item.get("operation_counts", {}) or {}).items():
+            operation_counts[key] = operation_counts.get(key, 0) + int(value)
+    result["operation_counts"] = operation_counts
+    wall_time = float(result.get("wall_time", 0.0))
+    result["steps_per_second"] = float(transition_count / wall_time) if wall_time > 0.0 else 0.0
+    result["episodes_per_hour"] = float(episodes * 3600.0 / wall_time) if wall_time > 0.0 else 0.0
+    result["worker_count"] = len(worker_performance)
+    result["worker_cpu_time_is_aggregate"] = True
+    return result
+
+
+def _run_parallel(cfg, workers: int) -> Path:
+    stage_dir = prepare_run_dir(cfg, "stage1")
+    tracker = PerformanceTracker()
+    episode_ids = list(range(int(cfg.stage1.episodes)))
+    worker_count = min(max(1, int(workers)), max(1, len(episode_ids)))
+    shard_size = max(1, int(cfg.stage1.get("shard_episodes", 25)))
+    assignments = [episode_ids[rank::worker_count] for rank in range(worker_count)]
+    tasks: list[tuple[int, int, list[int]]] = []
+    for worker_id, assigned in enumerate(assignments):
+        for shard_index, start in enumerate(range(0, len(assigned), shard_size)):
+            tasks.append((worker_id, shard_index, assigned[start : start + shard_size]))
+    worker_root = stage_dir / "_worker_runs"
+    worker_root.mkdir(parents=True, exist_ok=True)
+    stage_log(
+        "stage1",
+        f"parallel workers={worker_count} shards={len(tasks)} shard_episodes={shard_size}",
+    )
+    context = mp.get_context("spawn")
+    with ProcessPoolExecutor(max_workers=worker_count, mp_context=context) as executor:
+        futures = [
+            executor.submit(
+                _stage1_worker_entry,
+                cfg,
+                worker_id,
+                shard_index,
+                shard_episodes,
+                str(worker_root),
+            )
+            for worker_id, shard_index, shard_episodes in tasks
+        ]
+        shard_paths = [Path(future.result()) for future in futures]
+    shard_paths.sort(key=lambda path: str(path))
+    output = stage_dir / str(cfg.stage1.output_name)
+    merged = _concatenate_shards(shard_paths, output)
+
+    reports: list[dict] = []
+    events: list[dict] = []
+    replay_dir = stage_dir / "replay"
+    replay_dir.mkdir(parents=True, exist_ok=True)
+    worker_reports: list[dict] = []
+    for shard_path in shard_paths:
+        shard_stage = shard_path.parent
+        episode_report_path = shard_stage / "stage1_episode_reports.json"
+        if episode_report_path.exists():
+            with episode_report_path.open("r", encoding="utf-8") as file:
+                reports.extend(json.load(file).get("episodes", []))
+        worker_report_path = shard_stage / "stage1_report.json"
+        if worker_report_path.exists():
+            with worker_report_path.open("r", encoding="utf-8") as file:
+                worker_reports.append(json.load(file))
+        event_path = shard_stage / "risk_events.jsonl"
+        if event_path.exists():
+            with event_path.open("r", encoding="utf-8") as file:
+                events.extend(json.loads(line) for line in file if line.strip())
+        for replay in (shard_stage / "replay").glob("*.json"):
+            shutil.copy2(replay, replay_dir / replay.name)
+    reports.sort(key=lambda item: int(item.get("seed", 0)))
+    events.sort(key=lambda item: (int(item.get("episode", 0)), int(item.get("step", 0)), int(item.get("action", 0))))
+    events_path = stage_dir / "risk_events.jsonl"
+    with events_path.open("w", encoding="utf-8") as file:
+        for event in events:
+            file.write(json.dumps(event, ensure_ascii=False, allow_nan=False) + "\n")
+
+    audit_report = audit_stage1_buffer(output, stage_dir / "audit") if bool(cfg.stage1.get("audit_enabled", True)) else None
+    candidate_legal = np.asarray(merged.get("candidate_legal", []), dtype=np.float32) > 0.5
+    continuous = np.asarray(merged.get("continuous_risk_target", []), dtype=np.float32)
+    legal_continuous = continuous[candidate_legal] if continuous.size else continuous
+    coverage = _continuous_risk_coverage(legal_continuous)
+    legal_boundary_count = int(np.sum((legal_continuous >= 0.20) & (legal_continuous < 0.80)))
+    audit_gate = _stage1_audit_gate(cfg, int(continuous.size), legal_boundary_count, coverage)
+    transition_count = int(np.asarray(merged.get("executed_actions", [])).shape[0])
+    parent_performance = tracker.summary(episodes=len(episode_ids))
+    performance = _aggregate_worker_performance(
+        worker_reports,
+        parent_performance,
+        episodes=len(episode_ids),
+        transition_count=transition_count,
+    )
+    report = {
+        "stage": "stage1",
+        "run_id": cfg.run.run_id,
+        "sumo_installation": {
+            "binary": str(cfg.scenario.get("sumo_binary", "")),
+            "version": str(cfg.scenario.get("sumo_version", "")),
+            "home": str(cfg.scenario.get("sumo_home", "")),
+        },
+        "parallel_workers": int(worker_count),
+        "shard_count": int(len(shard_paths)),
+        "shards": [str(path) for path in shard_paths],
+        "buffer": str(output),
+        "events": str(events_path),
+        "replay_dir": str(replay_dir),
+        "audit": str(stage_dir / "audit" / "stage1_data_audit.json") if audit_report else None,
+        "transition_count": transition_count,
+        "candidate_risk_sample_count": int(np.asarray(merged.get("actions", [])).shape[0]),
+        "trajectory_sample_count": int(np.asarray(merged.get("agent_history", [])).shape[0]),
+        "continuous_risk": {**coverage, "legal_summary": _array_summary(legal_continuous.tolist())},
+        "audit_gate": audit_gate,
+        "metrics": aggregate_episode_reports(reports),
+        "performance": performance,
+        "worker_performance": [item.get("performance", {}) for item in worker_reports],
+    }
+    tb = TensorboardLogger(stage_dir / "tensorboard", enabled=bool(cfg.run.get("tensorboard", True)))
+    for episode_report in reports:
+        episode_index = int(episode_report.get("seed", int(cfg.run.seed))) - int(cfg.run.seed)
+        tb.scalar("stage1/episode_reward", float(episode_report.get("episode_reward", 0.0)), episode_index)
+        tb.scalar("stage1/collision", float(episode_report.get("collision", False)), episode_index)
+        tb.scalar("stage1/near_miss", float(episode_report.get("near_miss", False)), episode_index)
+        tb.scalar("stage1/min_distance", float(episode_report.get("min_distance", 0.0)), episode_index)
+    tb.close()
+    write_report(stage_dir / "stage1_episode_reports.json", {"episodes": reports})
+    write_report(stage_dir / "stage1_report.json", report)
+    if not bool(audit_gate.get("passed", True)):
+        raise RuntimeError(f"Stage1 audit gate failed: {audit_gate}")
+    return output
+
+
 def run(cfg) -> Path:
+    cfg.shield["forecast_task_shadow_enabled"] = False
+    cfg.shield["task_backstop_enabled"] = False
+    workers = max(1, int(cfg.stage1.get("workers", 1)))
+    if workers > 1 and not bool(cfg.stage1.get("_worker_mode", False)):
+        return _run_parallel(cfg, workers)
+    return _run_serial(cfg)
+
+
+def _run_serial(cfg) -> Path:
     stage_dir = prepare_run_dir(cfg, "stage1")
     stage_log("stage1", f"run_id={cfg.run.run_id}")
     stage_log("stage1", f"SUMO config={cfg.scenario.sumocfg}")
     stage_log("stage1", f"SUMO binary={cfg.scenario.sumo_binary}, episodes={cfg.stage1.episodes}")
     stage_log("stage1", f"output_dir={stage_dir}")
     tb = TensorboardLogger(stage_dir / "tensorboard", enabled=bool(cfg.run.get("tensorboard", True)))
-    rng = np.random.default_rng(int(cfg.run.seed))
+    tracker = PerformanceTracker()
     transitions: dict[str, list] = {
         "observations": [],
         "actions": [],
@@ -60,8 +388,10 @@ def run(cfg) -> Path:
         "risk_sample_weight": [],
         "episode_id": [],
         "candidate_transition_id": [],
+        "candidate_episode_step": [],
         "candidate_raw_action": [],
         "transition_episode_id": [],
+        "transition_episode_step": [],
         "candidate_target_lane_gap": [],
         "candidate_ramp_local_risk": [],
         "candidate_merge_zone_risk": [],
@@ -94,25 +424,38 @@ def run(cfg) -> Path:
     relevance_scores: list[np.ndarray] = []
     selector_relevant_counts: list[np.ndarray] = []
     selector_overflows: list[np.ndarray] = []
+    trajectory_episode_ids: list[np.ndarray] = []
+    trajectory_window_end_steps: list[np.ndarray] = []
     reports: list[dict] = []
     events_path = stage_dir / "risk_events.jsonl"
     replay_dir = stage_dir / "replay"
     if events_path.exists():
         events_path.unlink()
 
+    episode_ids = [
+        int(item)
+        for item in cfg.stage1.get("episode_ids", list(range(int(cfg.stage1.episodes))))
+    ]
     env = make_env(cfg, seed=int(cfg.run.seed), shield_enabled=False, record_trajectory_samples=True)
+    events_file = events_path.open("a", encoding="utf-8", buffering=1024 * 1024)
     try:
-        for episode in progress_iter(range(int(cfg.stage1.episodes)), desc="Stage1 episodes"):
+        for episode in progress_iter(episode_ids, desc="Stage1 episodes"):
             episode_seed = int(cfg.run.seed) + episode
-            stage_log("stage1", f"episode={episode} seed={episode_seed} reset SUMO")
+            if episode % max(1, int(cfg.stage1.get("log_every_episodes", 20))) == 0:
+                stage_log("stage1", f"episode={episode} seed={episode_seed} reset SUMO")
+            rng = np.random.default_rng(np.random.SeedSequence([int(cfg.run.seed), int(episode)]))
             obs, _info = env.reset(seed=episode_seed)
             terminated = truncated = False
             episode_actions: list[int] = []
             episode_reward = 0.0
+            episode_boundary_or_extreme = False
             while not (terminated or truncated):
                 context = env.get_risk_context()
                 action, sampling_mode = select_stage1_action(cfg, rng, context)
                 candidate_samples = candidate_action_risk_samples(context)
+                episode_boundary_or_extreme = episode_boundary_or_extreme or any(
+                    float(sample.continuous_risk_target) >= 0.20 for sample in candidate_samples
+                )
                 candidate_by_action = {sample.action: sample for sample in candidate_samples}
                 local = merge_local_stats(context.get("ego"), list(context.get("vehicles") or []), cfg)
                 next_obs, reward, terminated, truncated, info = env.step(action)
@@ -124,6 +467,7 @@ def run(cfg) -> Path:
                 transitions["rewards"].append(reward)
                 transitions["dones"].append(float(terminated or truncated))
                 transitions["transition_episode_id"].append(episode)
+                transitions["transition_episode_step"].append(int(info.get("step", 0)))
                 transitions["target_lane_gap"].append(local.target_lane_gap)
                 transitions["ramp_local_risk"].append(float(local.ramp_local_risk))
                 transitions["merge_zone_risk"].append(float(local.merge_zone_risk))
@@ -146,6 +490,7 @@ def run(cfg) -> Path:
                     transitions["risk_sample_weight"].append(candidate_sample_weight(sample))
                     transitions["episode_id"].append(episode)
                     transitions["candidate_transition_id"].append(transition_id)
+                    transitions["candidate_episode_step"].append(int(info.get("step", 0)))
                     transitions["candidate_raw_action"].append(action)
                     transitions["candidate_target_lane_gap"].append(sample.local_stats.target_lane_gap)
                     transitions["candidate_ramp_local_risk"].append(float(sample.local_stats.ramp_local_risk))
@@ -172,10 +517,10 @@ def run(cfg) -> Path:
                 )
                 actual_overall = float(np.max(actual_risk_types))
                 if actual_overall > 0 or executed_candidate_risk > 0:
-                    append_jsonl(
-                        events_path,
-                        json_ready(
-                            {
+                    events_file.write(
+                        json.dumps(
+                            json_ready(
+                                {
                                 "episode": episode,
                                 "step": info.get("step"),
                                 "action": action,
@@ -194,30 +539,35 @@ def run(cfg) -> Path:
                                 "target_front_gap": local.target_front_gap,
                                 "target_rear_gap": local.target_rear_gap,
                                 "done_reason": info.get("done_reason"),
-                            }
-                        ),
+                                }
+                            ),
+                            ensure_ascii=False,
+                            allow_nan=False,
+                        )
+                        + "\n"
                     )
                 obs = next_obs
             episode_report = env.episode_report()
             episode_report["episode_reward"] = episode_reward
+            episode_report["_stage1_boundary_or_extreme"] = bool(episode_boundary_or_extreme)
             reports.append(episode_report)
             tb.scalar("stage1/episode_reward", episode_reward, episode)
             tb.scalar("stage1/collision", float(episode_report.get("collision", False)), episode)
             tb.scalar("stage1/near_miss", float(episode_report.get("near_miss", False)), episode)
             tb.scalar("stage1/min_distance", float(episode_report.get("min_distance", 0.0)), episode)
-            if bool(cfg.stage1.get("replay_enabled", True)) and bool(cfg.run.get("replay", True)):
-                write_replay_file(
-                    replay_dir / f"episode_{episode:04d}.json",
-                    run_id=str(cfg.run.run_id),
-                    stage="stage1",
-                    episode=episode,
-                    seed=episode_seed,
-                    actions=episode_actions,
-                    shield_enabled=False,
-                    safety_metric_version=SAFETY_METRIC_VERSION,
-                    notes={"episode_report": episode_report},
-                )
-                stage_log("stage1", f"episode={episode} replay={replay_dir / f'episode_{episode:04d}.json'}")
+            if _should_write_replay(cfg, episode_report):
+                with tracker.measure("replay_io_time"):
+                    write_replay_file(
+                        replay_dir / f"episode_{episode:04d}.json",
+                        run_id=str(cfg.run.run_id),
+                        stage="stage1",
+                        episode=episode,
+                        seed=episode_seed,
+                        actions=episode_actions,
+                        shield_enabled=False,
+                        safety_metric_version=SAFETY_METRIC_VERSION,
+                        notes={"episode_report": episode_report},
+                    )
             (
                 hist,
                 fut,
@@ -255,11 +605,18 @@ def run(cfg) -> Path:
                 relevance_scores.append(sample_relevance_score)
                 selector_relevant_counts.append(sample_selector_relevant_count)
                 selector_overflows.append(sample_selector_overflow)
+                sample_count = int(hist.shape[0])
+                trajectory_episode_ids.append(np.full((sample_count,), episode, dtype=np.int64))
+                trajectory_window_end_steps.append(
+                    np.arange(sample_count, dtype=np.int64) + int(cfg.scenario.history_steps)
+                )
     finally:
+        events_file.close()
         env.close()
 
     output = stage_dir / str(cfg.stage1.output_name)
-    np.savez_compressed(
+    save_npz = np.savez if bool(cfg.stage1.get("_worker_mode", False)) else np.savez_compressed
+    save_npz(
         output,
         **{key: np.asarray(value) for key, value in transitions.items()},
         agent_history=np.concatenate(history_samples, axis=0) if history_samples else np.zeros((0, 1, 1, 5)),
@@ -319,6 +676,16 @@ def run(cfg) -> Path:
             if selector_overflows
             else np.zeros((0,), dtype=np.float32)
         ),
+        trajectory_episode_id=(
+            np.concatenate(trajectory_episode_ids, axis=0)
+            if trajectory_episode_ids
+            else np.zeros((0,), dtype=np.int64)
+        ),
+        trajectory_window_end_step=(
+            np.concatenate(trajectory_window_end_steps, axis=0)
+            if trajectory_window_end_steps
+            else np.zeros((0,), dtype=np.int64)
+        ),
     )
     audit_report = None
     if bool(cfg.stage1.get("audit_enabled", True)):
@@ -342,6 +709,11 @@ def run(cfg) -> Path:
     report = {
         "stage": "stage1",
         "run_id": cfg.run.run_id,
+        "sumo_installation": {
+            "binary": str(cfg.scenario.get("sumo_binary", "")),
+            "version": str(cfg.scenario.get("sumo_version", "")),
+            "home": str(cfg.scenario.get("sumo_home", "")),
+        },
         "buffer": str(output),
         "events": str(events_path),
         "replay_dir": str(replay_dir),
@@ -447,7 +819,15 @@ def run(cfg) -> Path:
         },
         "audit_gate": audit_gate,
         "metrics": aggregate_episode_reports(reports),
+        "performance": {
+            **tracker.summary(episodes=len(episode_ids)),
+            **env.performance.summary(
+                steps=int(sum(int(item.get("steps", 0)) for item in reports)),
+                episodes=len(episode_ids),
+            ),
+        },
     }
+    write_report(stage_dir / "stage1_episode_reports.json", {"episodes": reports})
     write_report(stage_dir / "stage1_report.json", report)
     tb.close()
     stage_log("stage1", f"buffer={output}")

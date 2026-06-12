@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import time
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -346,5 +347,10 @@ def get_or_build_forecast_rollout_bundle(
     )
     cache = context.setdefault("_forecast_rollout_bundle_cache", {})
     if key not in cache:
+        started = time.perf_counter()
         cache[key] = build_forecast_rollout_bundle(cfg, context, predictor)
+        tracker = context.get("performance_tracker")
+        if tracker is not None:
+            tracker.add_time("forecast_inference_time", time.perf_counter() - started)
+            tracker.increment("forecast_forwards")
     return cache[key]

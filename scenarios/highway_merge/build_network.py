@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 
-import os
+import argparse
 import subprocess
 import sys
 import json
@@ -12,24 +12,13 @@ if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
 from safe_rl.sim.scenario_validation import validate_scenario_geometry
-
-def _detect_netconvert() -> str:
-    env_home = os.environ.get("SUMO_HOME", "")
-    candidates = []
-    if env_home:
-        candidates.append(Path(env_home) / "bin" / "netconvert.exe")
-        candidates.append(Path(env_home) / "bin" / "netconvert")
-
-    # User-provided default path in this project context.
-    candidates.append(Path(r"E:/Program Files/sumo-1.22.0/bin/netconvert.exe"))
-
-    for candidate in candidates:
-        if candidate.is_file():
-            return str(candidate)
-    return "netconvert"
+from safe_rl.utils.sumo_installation import resolve_sumo_installation
 
 
 def main():
+    parser = argparse.ArgumentParser(description="Build the highway merge SUMO network.")
+    parser.add_argument("--netconvert", default=None, help="Absolute netconvert executable path.")
+    args = parser.parse_args()
     root = Path(__file__).resolve().parent
     net_file = root / "highway_merge.net.xml"
     cfg_file = root / "highway_merge.sumocfg"
@@ -38,7 +27,7 @@ def main():
     con_file = root / "highway_merge.con.xml"
     validation_report_file = root / "scenario_geometry_check.json"
 
-    netconvert = _detect_netconvert()
+    netconvert = str(args.netconvert or resolve_sumo_installation({"sumo_binary": "sumo"}).netconvert_binary)
     cmd = [
         netconvert,
         "--node-files", str(node_file),

@@ -43,10 +43,15 @@ class SafetyShield:
         }
 
     def select_action(self, raw_action: CandidateAction, context: dict[str, Any]) -> tuple[CandidateAction, dict[str, Any]]:
-        raw_prediction = self.ranker.risk_model.predict(raw_action, context)
         raw_legal = is_candidate_legal(raw_action, context)
         counts = candidate_legality_counts(context)
         ranked = self.ranker.rank(raw_action, context)
+        raw_prediction = next(
+            (prediction for action, prediction, _score in ranked if action.index == raw_action.index),
+            None,
+        )
+        if raw_prediction is None:
+            raw_prediction = self.ranker.risk_model.predict(raw_action, context)
         best_candidate = ranked[0] if ranked else None
         best_prediction = best_candidate[1] if best_candidate is not None else raw_prediction
         activation_threshold = float(

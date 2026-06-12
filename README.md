@@ -42,7 +42,7 @@ conda env create -f environment.yml
 conda activate WcDT
 ```
 
-需要安装 SUMO，并保证 `sumo`、`netconvert` 在 `PATH` 中。当前代码也会自动尝试从 `SUMO_HOME/tools` 和 `sumo.exe` 同级目录推导 TraCI 路径。
+需要安装 SUMO。Full runner 会在启动任何 Stage 前统一解析并固定 `sumo`、`sumo-gui`、`netconvert` 和 `tools` 路径，优先级为：配置中的绝对 `scenario.sumo_binary`、`SUMO_HOME/bin`、系统 `PATH`、Windows 常见安装目录。解析结果和 SUMO 版本会写入 `pipeline_state.json`、场景 snapshot 和各阶段报告；`resume` 遇到 SUMO major/minor 版本漂移会拒绝继续。
 
 Windows PowerShell 示例：
 
@@ -386,6 +386,59 @@ E:\Programs\EnvAnaconda3\envs\pytorch\python.exe -m safe_rl.pipeline.run_full_pi
 ```
 
 profile 名称和配置 hash 会写入 `pipeline_state.json`，`resume` 时必须一致。smoke 仅用于接口验证，不允许将 v3 标记为可晋级。
+
+### 并行 performance profile
+
+默认配置继续使用单个 Stage1 worker 和单个 PPO environment，保证旧实验不会静默改变。需要加速正式实验时，显式使用 `--pipeline-profile performance`：
+
+```powershell
+E:\Programs\EnvAnaconda3\envs\pytorch\python.exe -m safe_rl.pipeline.run_full_pipeline `
+  --run-id safe_rl_right_onramp_perf_v3_001 `
+  --run-mode new `
+  --pipeline-profile performance `
+  --stage1-episodes 1000 `
+  --ppo-timesteps 100000 `
+  --forecast-ppo-timesteps 100000 `
+  --forecast-sources constant_velocity,wcdt_v3 `
+  --forecast-ppo-profile merge_timing
+```
+
+该 profile 默认启用：
+
+```text
+Stage1 workers: 6
+Stage1 shard size: 25 episodes
+PPO environments: 4 (SubprocVecEnv, Windows spawn)
+PPO n_steps: 256 per environment
+PPO rollout size: 4 x 256 = 1024
+Persistent SUMO reload: enabled
+TraCI vehicle subscriptions: enabled
+```
+
+`total_timesteps` 仍表示所有 PPO environment 合计的 transition 数，不会再乘以 environment 数。每个 worker 将 PyTorch/OMP/MKL 限制为单线程，主 PPO 进程默认使用 4 个线程。forecast predictor 和 reward Risk Module 会在每个 PPO worker 中独立加载；Stage3 report 会给出基于 checkpoint 文件大小的内存下界估算。内存不足时可显式降为 2 个环境：
+
+```powershell
+--ppo-num-envs 2
+```
+
+Stage1 worker 数也可独立覆盖：
+
+```powershell
+--stage1-workers 4
+```
+
+CLI 参数优先于 profile。并行 Stage1 使用 episode 独立 seed/RNG、worker NPZ shard 和稳定合并顺序；PPO 并行会改变 transition 到达顺序，因此 performance run 属于新的训练配置，不能与旧单环境 checkpoint 视为位级等价。训练期会关闭 forecast-aware task shadow/backstop，Stage5 和 failure audit 仍会开启 shadow 诊断。
+
+运行正式实验前，可比较串行与并行热点：
+
+```powershell
+E:\Programs\EnvAnaconda3\envs\pytorch\python.exe -m safe_rl.tools.benchmark_pipeline_hotpaths `
+  --stage1-episodes 50 `
+  --ppo-timesteps 4096 `
+  --profiles default,performance
+```
+
+报告包含 Stage1 episodes/hour、PPO fps、TraCI fallback、Risk/forecast forward 次数、SUMO restart/reload 和各热点耗时。当前优化不改变 `step_length`、control interval、预测 horizon 或候选动作数量。Libsumo 和并行 checkpoint evaluation 暂未启用。
 
 ### Predictor 分支与 legacy 兼容
 

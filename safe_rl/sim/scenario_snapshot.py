@@ -38,6 +38,13 @@ def snapshot_scenario(cfg: Any, run_dir: str | Path) -> Path:
         {
             "scenario_name": str(cfg.scenario.get("name", "highway_merge")),
             "source": str(source.resolve()),
+            "sumo_installation": {
+                "sumo_binary": str(cfg.scenario.get("sumo_binary", "")),
+                "sumo_gui_binary": str(cfg.scenario.get("sumo_gui_binary", "")),
+                "netconvert_binary": str(cfg.scenario.get("netconvert_binary", "")),
+                "sumo_home": str(cfg.scenario.get("sumo_home", "")),
+                "sumo_version": str(cfg.scenario.get("sumo_version", "")),
+            },
             "files": files,
         },
     )

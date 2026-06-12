@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import os
 import shutil
+import time
 from pathlib import Path
 from typing import Any
 
@@ -101,10 +103,10 @@ def _evaluate_model_for_safety(model: Any, config: Any, seeds: list[int]) -> dic
 
     reports: list[dict[str, Any]] = []
     rewards: list[float] = []
-    for seed in seeds:
-        env = make_env(config, seed=int(seed), shield_enabled=False)
-        total_reward = 0.0
-        try:
+    env = make_env(config, seed=int(seeds[0] if seeds else config.run.seed), shield_enabled=False)
+    try:
+        for seed in seeds:
+            total_reward = 0.0
             obs, _info = env.reset(seed=int(seed))
             terminated = truncated = False
             while not (terminated or truncated):
@@ -116,8 +118,8 @@ def _evaluate_model_for_safety(model: Any, config: Any, seeds: list[int]) -> dic
             report["merge_success"] = _info.get("done_reason") == "merge_success"
             reports.append(report)
             rewards.append(total_reward)
-        finally:
-            env.close()
+    finally:
+        env.close()
     metrics = aggregate_episode_reports(reports)
     metrics["average_reward"] = float(np.mean(rewards)) if rewards else 0.0
     metrics["merge_success_rate"] = float(np.mean([float(item.get("merge_success", False)) for item in reports])) if reports else 0.0
@@ -157,7 +159,7 @@ class _SafetyEvalCallback:
                 return True
 
             def _on_training_end(self) -> None:
-                if self.eval_seeds:
+                if self.eval_seeds and self._last_eval_step != int(self.num_timesteps):
                     self._run_eval("final")
 
             def _run_eval(self, kind: str) -> None:
@@ -187,6 +189,65 @@ class _SafetyEvalCallback:
         self.callback = SafetyEvalCallback(config, output_path)
 
 
+def _configure_torch_threads(thread_count: int) -> None:
+    os.environ["OMP_NUM_THREADS"] = str(max(1, int(thread_count)))
+    os.environ["MKL_NUM_THREADS"] = str(max(1, int(thread_count)))
+    try:
+        import torch
+
+        torch.set_num_threads(max(1, int(thread_count)))
+        try:
+            torch.set_num_interop_threads(1)
+        except RuntimeError:
+            pass
+    except ImportError:
+        pass
+
+
+def _build_ppo_worker_env(config: Any, rank: int, num_envs: int):
+    from safe_rl.pipeline.common import make_env
+
+    threads = int(config.get("training", {}).get("ppo_worker_torch_threads", 1))
+    _configure_torch_threads(threads)
+    return make_env(
+        config,
+        seed=int(config.run.seed) + int(rank),
+        shield_enabled=False,
+        worker_rank=int(rank),
+        num_envs=int(num_envs),
+        advance_episode_seed=True,
+    )
+
+
+def _worker_model_memory_estimate(config: Any, num_envs: int) -> dict[str, Any]:
+    configured_paths = {
+        "forecast_checkpoint": config.get("forecast_features", {}).get("checkpoint"),
+        "reward_risk_checkpoint": config.get("rl", {}).get("shield_guided_reward", {}).get("risk_checkpoint"),
+    }
+    payloads: dict[str, dict[str, Any]] = {}
+    per_worker_bytes = 0
+    for name, configured in configured_paths.items():
+        if not configured:
+            continue
+        path = Path(str(configured)).expanduser()
+        if not path.is_absolute():
+            path = Path.cwd() / path
+        size = int(path.stat().st_size) if path.exists() and path.is_file() else 0
+        payloads[name] = {
+            "path": str(path.resolve()),
+            "exists": bool(path.exists()),
+            "checkpoint_bytes": size,
+        }
+        per_worker_bytes += size
+    return {
+        "method": "checkpoint_file_size_lower_bound",
+        "payloads": payloads,
+        "per_worker_checkpoint_bytes": int(per_worker_bytes),
+        "all_workers_checkpoint_bytes": int(per_worker_bytes * max(1, int(num_envs))),
+        "note": "Runtime RAM can exceed checkpoint file size because each worker loads independent model objects.",
+    }
+
+
 def train_ppo(
     config: Any,
     env: SumoHighwayMergeEnv,
@@ -195,11 +256,24 @@ def train_ppo(
 ) -> dict:
     PPO = _require_sb3()
     from stable_baselines3.common.callbacks import BaseCallback
-    try:
+    num_envs = max(1, int(config.get("training", {}).get("ppo_num_envs", 1)))
+    main_threads = int(config.get("training", {}).get("ppo_main_torch_threads", 4))
+    _configure_torch_threads(main_threads)
+    if num_envs > 1:
+        from stable_baselines3.common.vec_env import SubprocVecEnv, VecMonitor
+
+        env.close()
+        start_method = str(config.get("training", {}).get("ppo_start_method", "spawn"))
+        factories = [
+            (lambda rank=rank: _build_ppo_worker_env(config, rank, num_envs))
+            for rank in range(num_envs)
+        ]
+        env = VecMonitor(SubprocVecEnv(factories, start_method=start_method))
+    else:
         from stable_baselines3.common.monitor import Monitor
+
         env = Monitor(env)
-    except Exception:
-        pass
+    started = time.perf_counter()
     model = PPO(
         "MlpPolicy",
         env,
@@ -225,11 +299,17 @@ def train_ppo(
     if bool(config.stage3.get("eval_enabled", False)):
         safety_callback = _SafetyEvalCallback(BaseCallback, config, output_path).callback
         callback = safety_callback
-    model.learn(
-        total_timesteps=int(config.rl.total_timesteps),
-        tb_log_name=str(config.stage3.get("tensorboard_log_name", "ppo")),
-        callback=callback,
-    )
+    try:
+        model.learn(
+            total_timesteps=int(config.rl.total_timesteps),
+            tb_log_name=str(config.stage3.get("tensorboard_log_name", "ppo")),
+            callback=callback,
+        )
+    except Exception:
+        env.close()
+        raise
+    finally:
+        training_wall_time = time.perf_counter() - started
     model.save(str(final_path))
     checkpoint_selection: dict[str, Any]
     if safety_callback is not None and getattr(safety_callback, "best_record", None) is not None and best_path.exists():
@@ -272,7 +352,18 @@ def train_ppo(
         "checkpoint_selection_metric": selection_metric,
         "tensorboard": str(tensorboard_dir) if tensorboard_dir else None,
         "device": str(model.device),
+        "ppo_num_envs": int(num_envs),
+        "ppo_n_steps_per_env": int(config.rl.n_steps),
+        "ppo_rollout_size": int(num_envs * int(config.rl.n_steps)),
+        "ppo_worker_torch_threads": int(config.get("training", {}).get("ppo_worker_torch_threads", 1)),
+        "ppo_main_torch_threads": int(main_threads),
+        "ppo_worker_model_memory_estimate": _worker_model_memory_estimate(config, num_envs),
+        "wall_time": float(training_wall_time),
+        "steps_per_second": (
+            float(int(config.rl.total_timesteps) / training_wall_time) if training_wall_time > 0.0 else 0.0
+        ),
     }
+    env.close()
     return report
 
 
