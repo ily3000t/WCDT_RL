@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import multiprocessing as mp
 import shutil
+import time
 from concurrent.futures import ProcessPoolExecutor
 from pathlib import Path
 
@@ -22,6 +23,13 @@ from safe_rl.utils.config import clone_with_overrides, prepare_run_dir
 from safe_rl.utils.progress import TensorboardLogger, progress_iter, stage_log
 from safe_rl.utils.replay import write_replay_file
 from safe_rl.utils.performance import PerformanceTracker
+from safe_rl.utils.stage1_dataset import (
+    STAGE1_BUFFER_SCHEMA_VERSION,
+    STAGE1_FORMAT_VERSION,
+    merge_stage1_shards,
+    open_stage1_dataset,
+    write_stage1_dataset,
+)
 
 
 TRANSITION_KEYS = {
@@ -32,6 +40,7 @@ TRANSITION_KEYS = {
     "dones",
     "transition_episode_id",
     "transition_episode_step",
+    "transition_episode_seed",
     "target_lane_gap",
     "ramp_local_risk",
     "merge_zone_risk",
@@ -53,6 +62,7 @@ CANDIDATE_KEYS = {
     "boundary_sample",
     "risk_sample_weight",
     "episode_id",
+    "candidate_episode_seed",
     "candidate_transition_id",
     "candidate_episode_step",
     "candidate_raw_action",
@@ -83,6 +93,8 @@ TRAJECTORY_KEYS = {
     "actor_selector_overflow",
     "trajectory_episode_id",
     "trajectory_window_end_step",
+    "trajectory_decision_index",
+    "trajectory_episode_seed",
 }
 
 
@@ -117,90 +129,119 @@ def _should_write_replay(cfg, episode_report: dict) -> bool:
     return bool(failed or episode_report.get("_stage1_boundary_or_extreme", False))
 
 
-def _stage1_worker_entry(cfg, worker_id: int, shard_index: int, episode_ids: list[int], worker_root: str) -> str:
-    worker_cfg = clone_with_overrides(
+def _stage1_dataset_metadata(cfg) -> dict:
+    return {
+        "trajectory_schema_version": 4,
+        "episode_seed_schedule": str(
+            cfg.get("run", {}).get("episode_seed_schedule", "fixed_legacy")
+        ),
+        "vehicle_state_ordering_version": str(
+            cfg.get("scenario", {}).get(
+                "vehicle_state_ordering_version",
+                "unspecified_legacy",
+            )
+        ),
+        "safety_metric_version": SAFETY_METRIC_VERSION,
+        "actor_selection_version": ACTOR_SELECTION_VERSION,
+        "actor_selection_config_hash": actor_selection_config_hash(cfg),
+        "sumo_installation_fingerprint": dict(
+            cfg.get("scenario", {}).get("sumo_installation_fingerprint", {}) or {}
+        ),
+    }
+
+
+def _stage1_worker_entry(
+    cfg,
+    worker_id: int,
+    episode_ids: list[int],
+    shard_size: int,
+    worker_root: str,
+    worker_count: int,
+) -> dict:
+    started = time.perf_counter()
+    env = make_env(
         cfg,
-        {
-            "run": {
-                "run_id": f"worker_{worker_id:03d}_shard_{shard_index:04d}",
-                "output_root": str(Path(worker_root).resolve()),
-                "tensorboard": False,
-            },
-            "stage1": {
-                "workers": 1,
-                "_worker_mode": True,
-                "episode_ids": [int(item) for item in episode_ids],
-                "episodes": len(episode_ids),
-                "audit_enabled": False,
-                "audit_gate": {"enabled": False},
-            },
-        },
+        seed=int(cfg.run.seed),
+        shield_enabled=False,
+        record_trajectory_samples=True,
+        worker_rank=int(worker_id),
+        num_envs=int(worker_count),
+        advance_episode_seed=False,
     )
-    return str(_run_serial(worker_cfg))
-
-
-def _concatenate_shards(shard_paths: list[Path], output: Path) -> dict[str, np.ndarray]:
-    loaded = [dict(np.load(path, allow_pickle=False)) for path in shard_paths]
-    keys = sorted(set().union(*(payload.keys() for payload in loaded)))
-    merged: dict[str, np.ndarray] = {}
-    for key in keys:
-        arrays = [payload[key] for payload in loaded if key in payload]
-        if key in TRANSITION_KEYS | CANDIDATE_KEYS | TRAJECTORY_KEYS:
-            merged[key] = np.concatenate(arrays, axis=0) if arrays else np.zeros((0,), dtype=np.float32)
-        else:
-            merged[key] = np.asarray(arrays[0])
-
-    transition_count = int(np.asarray(merged.get("transition_episode_id", [])).shape[0])
-    if transition_count:
-        transition_order = np.lexsort(
-            (
-                np.asarray(merged["transition_episode_step"], dtype=np.int64),
-                np.asarray(merged["transition_episode_id"], dtype=np.int64),
+    shard_paths: list[str] = []
+    shard_reports: list[str] = []
+    episode_count = 0
+    control_decisions = 0
+    simulation_steps = 0
+    try:
+        for shard_index, start in enumerate(range(0, len(episode_ids), shard_size)):
+            shard_episode_ids = episode_ids[start : start + shard_size]
+            worker_cfg = clone_with_overrides(
+                cfg,
+                {
+                    "run": {
+                        "run_id": f"worker_{worker_id:03d}_shard_{shard_index:04d}",
+                        "output_root": str(Path(worker_root).resolve()),
+                        "tensorboard": False,
+                    },
+                    "stage1": {
+                        "workers": 1,
+                        "_worker_mode": True,
+                        "episode_ids": [int(item) for item in shard_episode_ids],
+                        "episodes": len(shard_episode_ids),
+                        "audit_enabled": False,
+                        "audit_gate": {"enabled": False},
+                    },
+                },
             )
-        )
-        for key in TRANSITION_KEYS:
-            if key in merged and merged[key].shape[0] == transition_count:
-                merged[key] = merged[key][transition_order]
+            shard_path = _run_serial(worker_cfg, env=env, close_env=False)
+            shard_paths.append(str(shard_path))
+            shard_report_path = shard_path.parent / "stage1_report.json"
+            shard_reports.append(str(shard_report_path))
+            if shard_report_path.exists():
+                with shard_report_path.open("r", encoding="utf-8") as file:
+                    report = json.load(file)
+                episode_count += len(shard_episode_ids)
+                control_decisions += int(report.get("transition_count", 0))
+                episode_report_path = shard_path.parent / "stage1_episode_reports.json"
+                with episode_report_path.open("r", encoding="utf-8") as file:
+                    episode_reports = json.load(file).get("episodes", [])
+                simulation_steps += int(
+                    sum(int(item.get("steps", 0)) for item in episode_reports)
+                )
+    finally:
+        env.close()
+    wall_time = time.perf_counter() - started
+    return {
+        "worker_id": int(worker_id),
+        "shard_paths": shard_paths,
+        "shard_reports": shard_reports,
+        "wall_time": float(wall_time),
+        "episode_count": int(episode_count),
+        "control_decisions": int(control_decisions),
+        "simulation_steps": int(simulation_steps),
+        "performance": env.performance.summary(
+            steps=simulation_steps,
+            episodes=episode_count,
+        ),
+    }
 
-    candidate_count = int(np.asarray(merged.get("episode_id", [])).shape[0])
-    if candidate_count:
-        candidate_order = np.lexsort(
-            (
-                np.asarray(merged["actions"], dtype=np.int64),
-                np.asarray(merged["candidate_episode_step"], dtype=np.int64),
-                np.asarray(merged["episode_id"], dtype=np.int64),
-            )
-        )
-        for key in CANDIDATE_KEYS:
-            if key in merged and merged[key].shape[0] == candidate_count:
-                merged[key] = merged[key][candidate_order]
-        transition_lookup = {
-            (int(episode), int(step)): index
-            for index, (episode, step) in enumerate(
-                zip(merged["transition_episode_id"], merged["transition_episode_step"])
-            )
-        }
-        merged["candidate_transition_id"] = np.asarray(
-            [
-                transition_lookup[(int(episode), int(step))]
-                for episode, step in zip(merged["episode_id"], merged["candidate_episode_step"])
-            ],
-            dtype=np.int64,
-        )
 
-    trajectory_count = int(np.asarray(merged.get("trajectory_episode_id", [])).shape[0])
-    if trajectory_count:
-        trajectory_order = np.lexsort(
-            (
-                np.asarray(merged["trajectory_window_end_step"], dtype=np.int64),
-                np.asarray(merged["trajectory_episode_id"], dtype=np.int64),
-            )
-        )
-        for key in TRAJECTORY_KEYS:
-            if key in merged and merged[key].shape[0] == trajectory_count:
-                merged[key] = merged[key][trajectory_order]
-    np.savez_compressed(output, **merged)
-    return merged
+def _concatenate_shards(shard_paths: list[Path], output: Path, cfg=None):
+    metadata = _stage1_dataset_metadata(cfg) if cfg is not None else {
+        "trajectory_schema_version": 4,
+        "episode_seed_schedule": "fixed_legacy",
+        "vehicle_state_ordering_version": "unspecified_legacy",
+    }
+    merge_stage1_shards(
+        shard_paths,
+        output,
+        transition_keys=TRANSITION_KEYS,
+        candidate_keys=CANDIDATE_KEYS,
+        trajectory_keys=TRAJECTORY_KEYS,
+        metadata=metadata,
+    )
+    return open_stage1_dataset(output)
 
 
 def _aggregate_worker_performance(
@@ -223,16 +264,50 @@ def _aggregate_worker_performance(
         "replay_io_time",
     )
     for key in timing_keys:
-        result[key] = float(sum(float(item.get(key, 0.0)) for item in worker_performance))
+        summed = float(
+            sum(float(item.get(key, 0.0)) for item in worker_performance)
+        )
+        result[f"worker_{key}_sum"] = summed
+        result[key] = summed
     for item in worker_performance:
         for key, value in dict(item.get("operation_counts", {}) or {}).items():
             operation_counts[key] = operation_counts.get(key, 0) + int(value)
     result["operation_counts"] = operation_counts
     wall_time = float(result.get("wall_time", 0.0))
-    result["steps_per_second"] = float(transition_count / wall_time) if wall_time > 0.0 else 0.0
-    result["episodes_per_hour"] = float(episodes * 3600.0 / wall_time) if wall_time > 0.0 else 0.0
+    worker_times = [float(item.get("wall_time", 0.0)) for item in worker_reports]
+    worker_time_sum = float(sum(worker_times))
+    worker_max_time = float(max(worker_times, default=0.0))
+    simulation_steps = int(sum(int(item.get("simulation_steps", 0)) for item in worker_reports))
+    result["worker_time_sum"] = worker_time_sum
+    result["worker_max_time"] = worker_max_time
+    result["aggregate_control_decisions_per_second"] = (
+        float(transition_count / wall_time) if wall_time > 0.0 else 0.0
+    )
+    result["aggregate_simulation_steps_per_second"] = (
+        float(simulation_steps / wall_time) if wall_time > 0.0 else 0.0
+    )
+    result["per_worker_control_decisions_per_second"] = [
+        (
+            float(item.get("control_decisions", 0)) / float(item.get("wall_time", 1.0))
+            if float(item.get("wall_time", 0.0)) > 0.0
+            else 0.0
+        )
+        for item in worker_reports
+    ]
+    result["per_worker_episodes_per_hour"] = [
+        (
+            float(item.get("episode_count", 0)) * 3600.0 / float(item.get("wall_time", 1.0))
+            if float(item.get("wall_time", 0.0)) > 0.0
+            else 0.0
+        )
+        for item in worker_reports
+    ]
+    result["steps_per_second"] = result["aggregate_control_decisions_per_second"]
+    result["episodes_per_hour"] = (
+        float(episodes * 3600.0 / wall_time) if wall_time > 0.0 else 0.0
+    )
     result["worker_count"] = len(worker_performance)
-    result["worker_cpu_time_is_aggregate"] = True
+    result["worker_hotpath_time_denominator"] = "worker_time_sum"
     return result
 
 
@@ -243,15 +318,11 @@ def _run_parallel(cfg, workers: int) -> Path:
     worker_count = min(max(1, int(workers)), max(1, len(episode_ids)))
     shard_size = max(1, int(cfg.stage1.get("shard_episodes", 25)))
     assignments = [episode_ids[rank::worker_count] for rank in range(worker_count)]
-    tasks: list[tuple[int, int, list[int]]] = []
-    for worker_id, assigned in enumerate(assignments):
-        for shard_index, start in enumerate(range(0, len(assigned), shard_size)):
-            tasks.append((worker_id, shard_index, assigned[start : start + shard_size]))
     worker_root = stage_dir / "_worker_runs"
     worker_root.mkdir(parents=True, exist_ok=True)
     stage_log(
         "stage1",
-        f"parallel workers={worker_count} shards={len(tasks)} shard_episodes={shard_size}",
+        f"parallel workers={worker_count} shard_episodes={shard_size}",
     )
     context = mp.get_context("spawn")
     with ProcessPoolExecutor(max_workers=worker_count, mp_context=context) as executor:
@@ -260,32 +331,35 @@ def _run_parallel(cfg, workers: int) -> Path:
                 _stage1_worker_entry,
                 cfg,
                 worker_id,
-                shard_index,
-                shard_episodes,
+                assigned,
+                shard_size,
                 str(worker_root),
+                worker_count,
             )
-            for worker_id, shard_index, shard_episodes in tasks
+            for worker_id, assigned in enumerate(assignments)
         ]
-        shard_paths = [Path(future.result()) for future in futures]
+        worker_results = [future.result() for future in futures]
+        shard_paths = [
+            Path(path)
+            for result in worker_results
+            for path in result.get("shard_paths", [])
+        ]
     shard_paths.sort(key=lambda path: str(path))
     output = stage_dir / str(cfg.stage1.output_name)
-    merged = _concatenate_shards(shard_paths, output)
+    merge_started = time.perf_counter()
+    merged = _concatenate_shards(shard_paths, output, cfg)
+    merge_io_time = time.perf_counter() - merge_started
 
     reports: list[dict] = []
     events: list[dict] = []
     replay_dir = stage_dir / "replay"
     replay_dir.mkdir(parents=True, exist_ok=True)
-    worker_reports: list[dict] = []
     for shard_path in shard_paths:
         shard_stage = shard_path.parent
         episode_report_path = shard_stage / "stage1_episode_reports.json"
         if episode_report_path.exists():
             with episode_report_path.open("r", encoding="utf-8") as file:
                 reports.extend(json.load(file).get("episodes", []))
-        worker_report_path = shard_stage / "stage1_report.json"
-        if worker_report_path.exists():
-            with worker_report_path.open("r", encoding="utf-8") as file:
-                worker_reports.append(json.load(file))
         event_path = shard_stage / "risk_events.jsonl"
         if event_path.exists():
             with event_path.open("r", encoding="utf-8") as file:
@@ -309,11 +383,12 @@ def _run_parallel(cfg, workers: int) -> Path:
     transition_count = int(np.asarray(merged.get("executed_actions", [])).shape[0])
     parent_performance = tracker.summary(episodes=len(episode_ids))
     performance = _aggregate_worker_performance(
-        worker_reports,
+        worker_results,
         parent_performance,
         episodes=len(episode_ids),
         transition_count=transition_count,
     )
+    performance["merge_io_time"] = float(merge_io_time)
     report = {
         "stage": "stage1",
         "run_id": cfg.run.run_id,
@@ -336,7 +411,17 @@ def _run_parallel(cfg, workers: int) -> Path:
         "audit_gate": audit_gate,
         "metrics": aggregate_episode_reports(reports),
         "performance": performance,
-        "worker_performance": [item.get("performance", {}) for item in worker_reports],
+        "worker_performance": worker_results,
+        "stage1_buffer_schema_version": STAGE1_BUFFER_SCHEMA_VERSION,
+        "episode_seed_schedule": str(
+            cfg.get("run", {}).get("episode_seed_schedule", "fixed_legacy")
+        ),
+        "vehicle_state_ordering_version": str(
+            cfg.get("scenario", {}).get(
+                "vehicle_state_ordering_version",
+                "unspecified_legacy",
+            )
+        ),
     }
     tb = TensorboardLogger(stage_dir / "tensorboard", enabled=bool(cfg.run.get("tensorboard", True)))
     for episode_report in reports:
@@ -348,21 +433,35 @@ def _run_parallel(cfg, workers: int) -> Path:
     tb.close()
     write_report(stage_dir / "stage1_episode_reports.json", {"episodes": reports})
     write_report(stage_dir / "stage1_report.json", report)
+    merged.close()
+    if bool(cfg.stage1.get("cleanup_worker_shards", True)):
+        shutil.rmtree(worker_root, ignore_errors=True)
     if not bool(audit_gate.get("passed", True)):
         raise RuntimeError(f"Stage1 audit gate failed: {audit_gate}")
     return output
 
 
 def run(cfg) -> Path:
+    output_format = str(cfg.stage1.get("output_format", "")).strip()
+    if output_format != STAGE1_FORMAT_VERSION:
+        raise ValueError(
+            "stage1.output_format must be "
+            f"{STAGE1_FORMAT_VERSION!r}; received {output_format!r}"
+        )
     cfg.shield["forecast_task_shadow_enabled"] = False
     cfg.shield["task_backstop_enabled"] = False
     workers = max(1, int(cfg.stage1.get("workers", 1)))
-    if workers > 1 and not bool(cfg.stage1.get("_worker_mode", False)):
+    if not bool(cfg.stage1.get("_worker_mode", False)):
         return _run_parallel(cfg, workers)
     return _run_serial(cfg)
 
 
-def _run_serial(cfg) -> Path:
+def _run_serial(
+    cfg,
+    *,
+    env=None,
+    close_env: bool = True,
+) -> Path:
     stage_dir = prepare_run_dir(cfg, "stage1")
     stage_log("stage1", f"run_id={cfg.run.run_id}")
     stage_log("stage1", f"SUMO config={cfg.scenario.sumocfg}")
@@ -392,6 +491,7 @@ def _run_serial(cfg) -> Path:
         "candidate_raw_action": [],
         "transition_episode_id": [],
         "transition_episode_step": [],
+        "transition_episode_seed": [],
         "candidate_target_lane_gap": [],
         "candidate_ramp_local_risk": [],
         "candidate_merge_zone_risk": [],
@@ -406,6 +506,7 @@ def _run_serial(cfg) -> Path:
         "ego_on_auxiliary": [],
         "curriculum_profiles": [],
         "sampling_modes": [],
+        "candidate_episode_seed": [],
     }
     history_samples: list[np.ndarray] = []
     future_samples: list[np.ndarray] = []
@@ -426,6 +527,8 @@ def _run_serial(cfg) -> Path:
     selector_overflows: list[np.ndarray] = []
     trajectory_episode_ids: list[np.ndarray] = []
     trajectory_window_end_steps: list[np.ndarray] = []
+    trajectory_decision_indices: list[np.ndarray] = []
+    trajectory_episode_seeds: list[np.ndarray] = []
     reports: list[dict] = []
     events_path = stage_dir / "risk_events.jsonl"
     replay_dir = stage_dir / "replay"
@@ -436,7 +539,14 @@ def _run_serial(cfg) -> Path:
         int(item)
         for item in cfg.stage1.get("episode_ids", list(range(int(cfg.stage1.episodes))))
     ]
-    env = make_env(cfg, seed=int(cfg.run.seed), shield_enabled=False, record_trajectory_samples=True)
+    owns_env = env is None
+    if env is None:
+        env = make_env(
+            cfg,
+            seed=int(cfg.run.seed),
+            shield_enabled=False,
+            record_trajectory_samples=True,
+        )
     events_file = events_path.open("a", encoding="utf-8", buffering=1024 * 1024)
     try:
         for episode in progress_iter(episode_ids, desc="Stage1 episodes"):
@@ -468,6 +578,7 @@ def _run_serial(cfg) -> Path:
                 transitions["dones"].append(float(terminated or truncated))
                 transitions["transition_episode_id"].append(episode)
                 transitions["transition_episode_step"].append(int(info.get("step", 0)))
+                transitions["transition_episode_seed"].append(episode_seed)
                 transitions["target_lane_gap"].append(local.target_lane_gap)
                 transitions["ramp_local_risk"].append(float(local.ramp_local_risk))
                 transitions["merge_zone_risk"].append(float(local.merge_zone_risk))
@@ -489,6 +600,7 @@ def _run_serial(cfg) -> Path:
                     transitions["boundary_sample"].append(float(sample.boundary_sample))
                     transitions["risk_sample_weight"].append(candidate_sample_weight(sample))
                     transitions["episode_id"].append(episode)
+                    transitions["candidate_episode_seed"].append(episode_seed)
                     transitions["candidate_transition_id"].append(transition_id)
                     transitions["candidate_episode_step"].append(int(info.get("step", 0)))
                     transitions["candidate_raw_action"].append(action)
@@ -548,6 +660,11 @@ def _run_serial(cfg) -> Path:
                     )
                 obs = next_obs
             episode_report = env.episode_report()
+            episode_report["episode_index"] = int(episode)
+            episode_report["episode_seed"] = int(episode_seed)
+            episode_report["episode_seed_schedule"] = str(
+                cfg.get("run", {}).get("episode_seed_schedule", "fixed_legacy")
+            )
             episode_report["episode_reward"] = episode_reward
             episode_report["_stage1_boundary_or_extreme"] = bool(episode_boundary_or_extreme)
             reports.append(episode_report)
@@ -587,6 +704,7 @@ def _run_serial(cfg) -> Path:
                 sample_selector_relevant_count,
                 sample_selector_overflow,
             ) = env.trajectory_window_samples(include_dimensions=True)
+            trajectory_metadata = env.trajectory_window_metadata()
             if hist.shape[0] > 0:
                 history_samples.append(hist)
                 future_samples.append(fut)
@@ -608,84 +726,160 @@ def _run_serial(cfg) -> Path:
                 sample_count = int(hist.shape[0])
                 trajectory_episode_ids.append(np.full((sample_count,), episode, dtype=np.int64))
                 trajectory_window_end_steps.append(
-                    np.arange(sample_count, dtype=np.int64) + int(cfg.scenario.history_steps)
+                    np.asarray(
+                        trajectory_metadata.get("trajectory_window_end_step"),
+                        dtype=np.int64,
+                    )
+                )
+                trajectory_decision_indices.append(
+                    np.asarray(
+                        trajectory_metadata.get("trajectory_decision_index"),
+                        dtype=np.int64,
+                    )
+                )
+                trajectory_episode_seeds.append(
+                    np.asarray(
+                        trajectory_metadata.get("trajectory_episode_seed"),
+                        dtype=np.int64,
+                    )
                 )
     finally:
         events_file.close()
-        env.close()
+        if owns_env or close_env:
+            env.close()
 
     output = stage_dir / str(cfg.stage1.output_name)
-    save_npz = np.savez if bool(cfg.stage1.get("_worker_mode", False)) else np.savez_compressed
-    save_npz(
-        output,
+    output_arrays = {
         **{key: np.asarray(value) for key, value in transitions.items()},
-        agent_history=np.concatenate(history_samples, axis=0) if history_samples else np.zeros((0, 1, 1, 5)),
-        agent_future=np.concatenate(future_samples, axis=0) if future_samples else np.zeros((0, 1, 1, 5)),
-        agent_mask=np.concatenate(agent_masks, axis=0) if agent_masks else np.zeros((0, 1)),
-        agent_lane_index=np.concatenate(agent_lane_indices, axis=0) if agent_lane_indices else np.zeros((0, 1), dtype=np.int64),
-        agent_edge_role=np.concatenate(agent_edge_roles, axis=0) if agent_edge_roles else np.zeros((0, 1), dtype=np.int64),
-        trajectory_schema_version=np.asarray(4, dtype=np.int64),
-        safety_metric_version=np.asarray(SAFETY_METRIC_VERSION),
-        actor_selection_version=np.asarray(ACTOR_SELECTION_VERSION),
-        actor_selection_config_hash=np.asarray(actor_selection_config_hash(cfg)),
-        agent_length=np.concatenate(agent_lengths, axis=0) if agent_lengths else np.full((0, 1), 4.8),
-        agent_width=np.concatenate(agent_widths, axis=0) if agent_widths else np.full((0, 1), 1.8),
-        agent_history_valid_mask=(
-            np.concatenate(history_valid_masks, axis=0) if history_valid_masks else np.zeros((0, 1, 1))
+        "agent_history": (
+            np.concatenate(history_samples, axis=0)
+            if history_samples
+            else np.zeros((0, 1, 1, 5), dtype=np.float32)
         ),
-        agent_future_valid_mask=(
-            np.concatenate(future_valid_masks, axis=0) if future_valid_masks else np.zeros((0, 1, 1))
+        "agent_future": (
+            np.concatenate(future_samples, axis=0)
+            if future_samples
+            else np.zeros((0, 1, 1, 5), dtype=np.float32)
         ),
-        agent_history_lane_index=(
+        "agent_mask": (
+            np.concatenate(agent_masks, axis=0)
+            if agent_masks
+            else np.zeros((0, 1), dtype=np.float32)
+        ),
+        "agent_lane_index": (
+            np.concatenate(agent_lane_indices, axis=0)
+            if agent_lane_indices
+            else np.zeros((0, 1), dtype=np.int64)
+        ),
+        "agent_edge_role": (
+            np.concatenate(agent_edge_roles, axis=0)
+            if agent_edge_roles
+            else np.zeros((0, 1), dtype=np.int64)
+        ),
+        "stage1_buffer_schema_version": np.asarray(
+            STAGE1_BUFFER_SCHEMA_VERSION,
+            dtype=np.int64,
+        ),
+        "trajectory_schema_version": np.asarray(4, dtype=np.int64),
+        "safety_metric_version": np.asarray(SAFETY_METRIC_VERSION),
+        "actor_selection_version": np.asarray(ACTOR_SELECTION_VERSION),
+        "actor_selection_config_hash": np.asarray(actor_selection_config_hash(cfg)),
+        "episode_seed_schedule": np.asarray(
+            str(cfg.get("run", {}).get("episode_seed_schedule", "fixed_legacy"))
+        ),
+        "vehicle_state_ordering_version": np.asarray(
+            str(
+                cfg.get("scenario", {}).get(
+                    "vehicle_state_ordering_version",
+                    "unspecified_legacy",
+                )
+            )
+        ),
+        "agent_length": (
+            np.concatenate(agent_lengths, axis=0)
+            if agent_lengths
+            else np.full((0, 1), 4.8, dtype=np.float32)
+        ),
+        "agent_width": (
+            np.concatenate(agent_widths, axis=0)
+            if agent_widths
+            else np.full((0, 1), 1.8, dtype=np.float32)
+        ),
+        "agent_history_valid_mask": (
+            np.concatenate(history_valid_masks, axis=0)
+            if history_valid_masks
+            else np.zeros((0, 1, 1), dtype=np.float32)
+        ),
+        "agent_future_valid_mask": (
+            np.concatenate(future_valid_masks, axis=0)
+            if future_valid_masks
+            else np.zeros((0, 1, 1), dtype=np.float32)
+        ),
+        "agent_history_lane_index": (
             np.concatenate(history_lane_indices, axis=0)
             if history_lane_indices
             else np.full((0, 1, 1), -1, dtype=np.int64)
         ),
-        agent_history_edge_role=(
+        "agent_history_edge_role": (
             np.concatenate(history_edge_roles, axis=0)
             if history_edge_roles
             else np.zeros((0, 1, 1), dtype=np.int64)
         ),
-        agent_future_lane_index=(
+        "agent_future_lane_index": (
             np.concatenate(future_lane_indices, axis=0)
             if future_lane_indices
             else np.full((0, 1, 1), -1, dtype=np.int64)
         ),
-        agent_future_edge_role=(
+        "agent_future_edge_role": (
             np.concatenate(future_edge_roles, axis=0)
             if future_edge_roles
             else np.zeros((0, 1, 1), dtype=np.int64)
         ),
-        agent_relevance_mask=(
+        "agent_relevance_mask": (
             np.concatenate(relevance_masks, axis=0)
             if relevance_masks
             else np.zeros((0, 1), dtype=np.float32)
         ),
-        agent_relevance_score=(
+        "agent_relevance_score": (
             np.concatenate(relevance_scores, axis=0)
             if relevance_scores
             else np.zeros((0, 1), dtype=np.float32)
         ),
-        actor_selector_relevant_count=(
+        "actor_selector_relevant_count": (
             np.concatenate(selector_relevant_counts, axis=0)
             if selector_relevant_counts
             else np.zeros((0,), dtype=np.int64)
         ),
-        actor_selector_overflow=(
+        "actor_selector_overflow": (
             np.concatenate(selector_overflows, axis=0)
             if selector_overflows
             else np.zeros((0,), dtype=np.float32)
         ),
-        trajectory_episode_id=(
+        "trajectory_episode_id": (
             np.concatenate(trajectory_episode_ids, axis=0)
             if trajectory_episode_ids
             else np.zeros((0,), dtype=np.int64)
         ),
-        trajectory_window_end_step=(
+        "trajectory_window_end_step": (
             np.concatenate(trajectory_window_end_steps, axis=0)
             if trajectory_window_end_steps
             else np.zeros((0,), dtype=np.int64)
         ),
+        "trajectory_decision_index": (
+            np.concatenate(trajectory_decision_indices, axis=0)
+            if trajectory_decision_indices
+            else np.zeros((0,), dtype=np.int64)
+        ),
+        "trajectory_episode_seed": (
+            np.concatenate(trajectory_episode_seeds, axis=0)
+            if trajectory_episode_seeds
+            else np.zeros((0,), dtype=np.int64)
+        ),
+    }
+    write_stage1_dataset(
+        output,
+        output_arrays,
+        metadata=_stage1_dataset_metadata(cfg),
     )
     audit_report = None
     if bool(cfg.stage1.get("audit_enabled", True)):
@@ -722,6 +916,16 @@ def _run_serial(cfg) -> Path:
         "transition_count": len(transitions["executed_actions"]),
         "candidate_risk_sample_count": len(transitions["actions"]),
         "trajectory_sample_count": int(sum(item.shape[0] for item in history_samples)),
+        "stage1_buffer_schema_version": STAGE1_BUFFER_SCHEMA_VERSION,
+        "episode_seed_schedule": str(
+            cfg.get("run", {}).get("episode_seed_schedule", "fixed_legacy")
+        ),
+        "vehicle_state_ordering_version": str(
+            cfg.get("scenario", {}).get(
+                "vehicle_state_ordering_version",
+                "unspecified_legacy",
+            )
+        ),
         "trajectory_schema": {
             "version": 4,
             "safety_metric_version": SAFETY_METRIC_VERSION,

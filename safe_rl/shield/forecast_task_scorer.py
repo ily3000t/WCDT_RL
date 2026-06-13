@@ -10,10 +10,9 @@ from safe_rl.prediction.forecast_rollout_bundle import (
 )
 from safe_rl.prediction.trajectory_postprocess import trajectory_to_states
 from safe_rl.risk.merge_local import (
+    get_cached_ego_rollout,
     is_candidate_legal,
     merge_local_stats,
-    prepare_candidate_rollout_context,
-    rollout_ego,
 )
 from safe_rl.sim.action_space import ACTIONS, CandidateAction, decode_action
 from safe_rl.sim.metrics import INF_TTC, bbox_gap, drac, relative_ttc
@@ -365,15 +364,12 @@ class ForecastAwareTaskScorer:
         if ego is None:
             return None
         horizon = int(self.config.forecast_features.get("horizon_steps", self.config.scenario.forecast_horizon_steps))
-        prepared = prepare_candidate_rollout_context(context)
-        if prepared.horizon_steps == horizon and abs(prepared.dt - dt) <= 1.0e-9:
-            if int(action.index) not in prepared.ego_rollouts:
-                prepared.ego_rollouts[int(action.index)] = rollout_ego(
-                    ego, action, horizon, dt, self.config
-                )
-            ego_rollout, taper_miss = prepared.ego_rollouts[int(action.index)]
-        else:
-            ego_rollout, taper_miss = rollout_ego(ego, action, horizon, dt, self.config)
+        ego_rollout, taper_miss = get_cached_ego_rollout(
+            context,
+            action,
+            horizon_steps=horizon,
+            dt=dt,
+        )
         min_distance = INF_TTC
         min_ttc = INF_TTC
         max_drac = 0.0

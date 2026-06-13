@@ -460,6 +460,18 @@ def load_v2_ensemble(config: Any, checkpoint: str | Path, device: Any | None = N
             "WcDT v2 actor_selection_config_hash mismatch: "
             f"checkpoint={checkpoint_selection_hash!r}, runtime={configured_selection_hash!r}"
         )
+    checkpoint_ordering = str(payload.get("vehicle_state_ordering_version", ""))
+    configured_ordering = str(
+        config.scenario.get(
+            "vehicle_state_ordering_version",
+            "unspecified_legacy",
+        )
+    )
+    if checkpoint_ordering != configured_ordering:
+        raise ValueError(
+            "WcDT v2 vehicle_state_ordering_version mismatch: "
+            f"checkpoint={checkpoint_ordering!r}, runtime={configured_ordering!r}"
+        )
     max_actor_count = int(payload.get("max_actor_count", -1))
     configured_max_actor_count = int(
         config.prediction.get("wcdt_v2_max_agents", config.prediction.max_pred_num)

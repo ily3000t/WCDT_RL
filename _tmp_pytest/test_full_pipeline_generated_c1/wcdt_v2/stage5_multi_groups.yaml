@@ -1,5 +1,7 @@
 run:
   run_id: safe_rl_test_run
+shield:
+  forecast_task_shadow_enabled: true
 stage5:
   episodes_per_group: 20
   seeds:

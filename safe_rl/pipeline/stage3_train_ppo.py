@@ -152,11 +152,18 @@ def run(cfg):
     )
     report["forecast_rollout_bundle_version"] = FORECAST_ROLLOUT_BUNDLE_VERSION
     report["forecast_rollout_bundle_config_hash"] = actor_selection_config_hash(cfg)
-    report["sumo_installation"] = {
-        "binary": str(cfg.scenario.get("sumo_binary", "")),
-        "version": str(cfg.scenario.get("sumo_version", "")),
-        "home": str(cfg.scenario.get("sumo_home", "")),
-    }
+    report["episode_seed_schedule"] = str(
+        cfg.get("run", {}).get("episode_seed_schedule", "fixed_legacy")
+    )
+    report["vehicle_state_ordering_version"] = str(
+        cfg.scenario.get(
+            "vehicle_state_ordering_version",
+            "unspecified_legacy",
+        )
+    )
+    report["sumo_installation"] = dict(
+        cfg.scenario.get("sumo_installation_fingerprint", {}) or {}
+    )
     write_report(stage_dir / "stage3_training_report.json", report)
     stage_log("stage3", f"tensorboard={stage_dir / 'tensorboard'}")
     stage_log("stage3", f"report={stage_dir / 'stage3_training_report.json'}")

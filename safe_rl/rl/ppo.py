@@ -189,6 +189,50 @@ class _SafetyEvalCallback:
         self.callback = SafetyEvalCallback(config, output_path)
 
 
+def _episode_seed_trace_record(
+    info: dict[str, Any],
+    *,
+    env_rank: int,
+    timestep: int,
+) -> dict[str, int | str] | None:
+    if "episode_seed" not in info or "episode_index" not in info:
+        return None
+    return {
+        "env_rank": int(env_rank),
+        "episode_seed": int(info["episode_seed"]),
+        "episode_index": int(info["episode_index"]),
+        "episode_seed_schedule": str(
+            info.get("episode_seed_schedule", "fixed_legacy")
+        ),
+        "completed_at_timestep": int(timestep),
+    }
+
+
+class _EpisodeSeedTraceCallback:
+    def __init__(self, base_callback: Any) -> None:
+        class EpisodeSeedTraceCallback(base_callback):
+            def __init__(self) -> None:
+                super().__init__()
+                self.records: list[dict[str, int | str]] = []
+
+            def _on_step(self) -> bool:
+                dones = np.asarray(self.locals.get("dones", []), dtype=bool).reshape(-1)
+                infos = list(self.locals.get("infos", []))
+                for env_rank, done in enumerate(dones):
+                    if not bool(done) or env_rank >= len(infos):
+                        continue
+                    record = _episode_seed_trace_record(
+                        dict(infos[env_rank] or {}),
+                        env_rank=env_rank,
+                        timestep=int(self.num_timesteps),
+                    )
+                    if record is not None:
+                        self.records.append(record)
+                return True
+
+        self.callback = EpisodeSeedTraceCallback()
+
+
 def _configure_torch_threads(thread_count: int) -> None:
     os.environ["OMP_NUM_THREADS"] = str(max(1, int(thread_count)))
     os.environ["MKL_NUM_THREADS"] = str(max(1, int(thread_count)))
@@ -211,7 +255,7 @@ def _build_ppo_worker_env(config: Any, rank: int, num_envs: int):
     _configure_torch_threads(threads)
     return make_env(
         config,
-        seed=int(config.run.seed) + int(rank),
+        seed=int(config.run.seed),
         shield_enabled=False,
         worker_rank=int(rank),
         num_envs=int(num_envs),
@@ -255,7 +299,7 @@ def train_ppo(
     tensorboard_dir: str | Path | None = None,
 ) -> dict:
     PPO = _require_sb3()
-    from stable_baselines3.common.callbacks import BaseCallback
+    from stable_baselines3.common.callbacks import BaseCallback, CallbackList
     num_envs = max(1, int(config.get("training", {}).get("ppo_num_envs", 1)))
     main_threads = int(config.get("training", {}).get("ppo_main_torch_threads", 4))
     _configure_torch_threads(main_threads)
@@ -286,6 +330,7 @@ def train_ppo(
         vf_coef=float(config.rl.vf_coef),
         tensorboard_log=str(tensorboard_dir) if tensorboard_dir else None,
         device=_training_device(config),
+        seed=int(config.run.seed),
         verbose=1,
     )
     output_path = Path(output_path)
@@ -295,10 +340,12 @@ def train_ppo(
     selection_weights = _checkpoint_selection_weights(config)
     selection_metric = _checkpoint_selection_formula(selection_weights)
     safety_callback = None
-    callback = None
+    seed_trace_callback = _EpisodeSeedTraceCallback(BaseCallback).callback
+    callbacks = [seed_trace_callback]
     if bool(config.stage3.get("eval_enabled", False)):
         safety_callback = _SafetyEvalCallback(BaseCallback, config, output_path).callback
-        callback = safety_callback
+        callbacks.append(safety_callback)
+    callback = callbacks[0] if len(callbacks) == 1 else CallbackList(callbacks)
     try:
         model.learn(
             total_timesteps=int(config.rl.total_timesteps),
@@ -310,6 +357,20 @@ def train_ppo(
         raise
     finally:
         training_wall_time = time.perf_counter() - started
+    seed_trace_records = list(seed_trace_callback.records)
+    training_episode_seeds = [
+        int(record["episode_seed"]) for record in seed_trace_records
+    ]
+    duplicate_seed_count = len(training_episode_seeds) - len(set(training_episode_seeds))
+    seed_schedule = str(
+        config.get("run", {}).get("episode_seed_schedule", "fixed_legacy")
+    )
+    if seed_schedule == "incrementing_v1" and duplicate_seed_count:
+        env.close()
+        raise RuntimeError(
+            "PPO training produced duplicate episode seeds under incrementing_v1: "
+            f"duplicate_count={duplicate_seed_count}"
+        )
     model.save(str(final_path))
     checkpoint_selection: dict[str, Any]
     if safety_callback is not None and getattr(safety_callback, "best_record", None) is not None and best_path.exists():
@@ -339,13 +400,20 @@ def train_ppo(
             "selection_metric": selection_metric if bool(config.stage3.get("eval_enabled", False)) else None,
         }
     write_json(selection_report_path, checkpoint_selection)
+    requested_total_timesteps = int(config.rl.total_timesteps)
+    actual_total_timesteps = int(model.num_timesteps)
+    rollout_quantum = int(num_envs * int(config.rl.n_steps))
     report = {
         "model_path": str(output_path),
         "final_model_path": str(final_path),
         "best_safety_model_path": str(best_path) if best_path.exists() else None,
         "checkpoint_selection_report": str(selection_report_path),
         "checkpoint_selection": checkpoint_selection,
-        "total_timesteps": int(config.rl.total_timesteps),
+        "total_timesteps": actual_total_timesteps,
+        "requested_total_timesteps": requested_total_timesteps,
+        "actual_total_timesteps": actual_total_timesteps,
+        "rollout_quantum": rollout_quantum,
+        "timesteps_rounded_up": bool(actual_total_timesteps > requested_total_timesteps),
         "reward_profile": str(config.rl.get("reward_profile", "default")),
         "checkpoint_selection_profile": selection_profile,
         "checkpoint_selection_weights": selection_weights,
@@ -360,7 +428,18 @@ def train_ppo(
         "ppo_worker_model_memory_estimate": _worker_model_memory_estimate(config, num_envs),
         "wall_time": float(training_wall_time),
         "steps_per_second": (
-            float(int(config.rl.total_timesteps) / training_wall_time) if training_wall_time > 0.0 else 0.0
+            float(actual_total_timesteps / training_wall_time) if training_wall_time > 0.0 else 0.0
+        ),
+        "episode_seed_schedule": seed_schedule,
+        "training_episode_count": int(len(seed_trace_records)),
+        "training_episode_seed_unique_count": int(len(set(training_episode_seeds))),
+        "training_episode_seed_duplicate_count": int(duplicate_seed_count),
+        "training_episode_seed_records": seed_trace_records,
+        "vehicle_state_ordering_version": str(
+            config.get("scenario", {}).get(
+                "vehicle_state_ordering_version",
+                "unspecified_legacy",
+            )
         ),
     }
     env.close()

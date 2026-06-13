@@ -1,5 +1,13 @@
 run:
   run_id: safe_rl_test_run
+prediction:
+  train_enabled: true
+  wcdt_v1_train_enabled: false
+  wcdt_v2_train_enabled: false
+  wcdt_v3_train_enabled: true
+shield:
+  forecast_task_shadow_enabled: false
+  task_backstop_enabled: false
 stage1:
   episodes: 2
 rl:

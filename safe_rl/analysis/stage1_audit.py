@@ -7,6 +7,7 @@ from typing import Any
 import numpy as np
 
 from safe_rl.utils.io import write_json
+from safe_rl.utils.stage1_dataset import open_stage1_dataset
 
 
 RISK_TYPE_NAMES = ["collision", "near_miss", "low_ttc", "high_drac", "merge_conflict", "taper_miss"]
@@ -58,7 +59,7 @@ def audit_stage1_buffer(buffer_path: str | Path, output_dir: str | Path) -> dict
     buffer_path = Path(buffer_path)
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
-    data = np.load(buffer_path, allow_pickle=False)
+    data = open_stage1_dataset(buffer_path)
 
     actions = data["actions"].astype(np.int64)
     rewards = data["rewards"].astype(np.float32)
@@ -108,6 +109,11 @@ def audit_stage1_buffer(buffer_path: str | Path, output_dir: str | Path) -> dict
     }
     report = {
         "buffer": str(buffer_path),
+        "stage1_buffer_schema_version": (
+            int(np.asarray(data["stage1_buffer_schema_version"]).reshape(-1)[0])
+            if "stage1_buffer_schema_version" in data
+            else None
+        ),
         "trajectory_schema_version": (
             int(np.asarray(data["trajectory_schema_version"]).reshape(-1)[0])
             if "trajectory_schema_version" in data
@@ -191,6 +197,10 @@ def audit_stage1_buffer(buffer_path: str | Path, output_dir: str | Path) -> dict
             writer.writerow([action, count])
 
     _try_write_plots(output_dir, actions, continuous_risk, rewards)
+    report["stage1_storage_format"] = (
+        "legacy_npz" if data.legacy_npz_format else str(data.manifest.get("format_version"))
+    )
+    data.close()
     return report
 
 

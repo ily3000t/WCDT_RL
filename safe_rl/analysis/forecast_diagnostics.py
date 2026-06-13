@@ -42,6 +42,7 @@ from safe_rl.sim.scenario_semantics import (
     ramp_edges,
     taper_edge,
 )
+from safe_rl.utils.stage1_dataset import open_stage1_dataset
 from safe_rl.sim.types import VehicleState
 from safe_rl.utils.config import clone_with_overrides
 
@@ -1521,7 +1522,7 @@ def run_forecast_diagnostics(
     stage5_path = stage_file(cfg, "stage5", "formal_paired_eval_report.json")
     output_dir = base_run / "stage5" / "diagnostics"
     output_dir.mkdir(parents=True, exist_ok=True)
-    data = np.load(stage1_path, allow_pickle=False)
+    data = open_stage1_dataset(stage1_path)
     history = data["agent_history"]
     future = data["agent_future"]
     mask = data["agent_mask"]
@@ -1775,4 +1776,5 @@ def run_forecast_diagnostics(
     report["forecast_conclusion"] = _forecast_conclusion(report)
     output_path = output_dir / "forecast_diagnostics.json"
     write_report(output_path, report)
+    data.close()
     return output_path

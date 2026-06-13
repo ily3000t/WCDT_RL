@@ -125,6 +125,18 @@ class RiskModuleWrapper:
                 raise ValueError(
                     f"unsupported Risk Module safety_metric_version={metric_version!r}; expected {expected!r}"
                 )
+            checkpoint_ordering = str(payload.get("vehicle_state_ordering_version", ""))
+            configured_ordering = str(
+                self.config.scenario.get(
+                    "vehicle_state_ordering_version",
+                    "unspecified_legacy",
+                )
+            )
+            if checkpoint_ordering != configured_ordering:
+                raise ValueError(
+                    "Risk Module vehicle_state_ordering_version mismatch: "
+                    f"checkpoint={checkpoint_ordering!r}, runtime={configured_ordering!r}"
+                )
         state = payload["model_state_dict"] if isinstance(payload, dict) and "model_state_dict" in payload else payload
         model = RiskModule(
             explicit_dim=int(self.config.risk_module.explicit_feature_dim),
@@ -154,6 +166,12 @@ class RiskModuleWrapper:
                 "model_state_dict": self.model.state_dict(),
                 "safety_metric_version": str(
                     self.config.risk_module.get("safety_metric_version", SAFETY_METRIC_VERSION)
+                ),
+                "vehicle_state_ordering_version": str(
+                    self.config.scenario.get(
+                        "vehicle_state_ordering_version",
+                        "unspecified_legacy",
+                    )
                 ),
             },
             checkpoint,

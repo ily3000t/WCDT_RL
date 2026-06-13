@@ -34,6 +34,7 @@ from safe_rl.pipeline.run_full_pipeline import (
     _reset_unfinished_tasks,
     _resume_invocation,
     _run_pipeline_task,
+    _scenario_source_sha256,
     _validate_completed_outputs,
     _validate_resume_state,
     _validate_run_id,
@@ -112,7 +113,14 @@ from safe_rl.risk.risk_aggregator import aggregate_episode_reports
 from safe_rl.risk.risk_module import RiskModuleWrapper, RiskPrediction, risk_loss
 from safe_rl.risk.stage1_sampling import _merge_heuristic_action, configured_sampling_probs, sampling_summary, select_stage1_action
 from safe_rl.rl.evaluation import _step_safety_record, validate_model_env_observation_shape
-from safe_rl.rl.ppo import _checkpoint_selection_score, _checkpoint_selection_weights, _safety_score, _training_device
+from safe_rl.rl.ppo import (
+    _EpisodeSeedTraceCallback,
+    _checkpoint_selection_score,
+    _checkpoint_selection_weights,
+    _episode_seed_trace_record,
+    _safety_score,
+    _training_device,
+)
 from safe_rl.pipeline.stage3_train_ppo import _prediction_loss_summary, _prediction_loss_summary_from_checkpoint
 from safe_rl.shield.forecast_task_scorer import ForecastAwareTaskScorer
 from safe_rl.shield.safety_shield import SafetyShield
@@ -137,6 +145,7 @@ from safe_rl.sim.scenario_snapshot import snapshot_scenario
 from safe_rl.sim.sumo_highway_merge_env import SumoHighwayMergeEnv
 from safe_rl.sim.types import StepMetrics, VehicleState
 from safe_rl.utils.config import load_config
+from safe_rl.utils.sumo_installation import SumoInstallation
 from safe_rl.utils.io import write_json
 
 
@@ -1464,6 +1473,15 @@ def test_trajectory_window_future_missing_state_is_zero_and_masked():
     ]
     frames.extend({"ego": ego} for _ in range(horizon))
     env._trajectory_frames = frames
+    env._trajectory_frame_metadata = [
+        {
+            "simulation_step": 100 + index,
+            "decision_index": 200 + index,
+            "episode_seed": 300,
+        }
+        for index in range(len(frames))
+    ]
+    env.seed_value = 300
     (
         _history,
         future,
@@ -1481,6 +1499,15 @@ def test_trajectory_window_future_missing_state_is_zero_and_masked():
     assert future_valid_mask[0, 1, 0] == 1.0
     assert future_valid_mask[0, 1, 1] == 0.0
     assert np.count_nonzero(future[0, 1, 1:]) == 0
+    assert future.shape[0] == 2
+    assert env._last_trajectory_window_metadata["trajectory_window_end_step"].tolist() == [
+        101,
+        102,
+    ]
+    assert env._last_trajectory_window_metadata["trajectory_decision_index"].tolist() == [
+        201,
+        202,
+    ]
 
 
 def test_wcdt_v2_actor_selection_prioritizes_merge_local_agents():
@@ -2523,7 +2550,7 @@ def test_runner_loads_schema_v1_state_with_disabled_v3_task(tmp_path):
         encoding="utf-8",
     )
     state = _load_pipeline_state(state_path)
-    assert state["schema_version"] == 4
+    assert state["schema_version"] == 5
     assert state["normalized_invocation"]["pipeline_profile"] == "default"
     assert state["pipeline_profile"] == "default"
     assert state["pipeline_profile_config_sha256"] is None
@@ -2568,6 +2595,151 @@ def test_runner_resume_validates_pipeline_profile_hash():
     state["pipeline_profile_config_sha256"] = "changed"
     with pytest.raises(ValueError, match="pipeline profile config changed"):
         _validate_resume_state(state, cfg)
+
+
+def test_scenario_source_hash_excludes_generated_net_xml(tmp_path):
+    cfg = load_config()
+    cfg.scenario["root"] = str(tmp_path)
+    source_files = {
+        "highway_merge.nod.xml": "<nodes/>",
+        "highway_merge.edg.xml": "<edges/>",
+        "highway_merge.con.xml": "<connections/>",
+        "highway_merge.rou.xml": "<routes/>",
+        "highway_merge.sumocfg": "<configuration/>",
+    }
+    for name, content in source_files.items():
+        (tmp_path / name).write_text(content, encoding="utf-8")
+    net_path = tmp_path / "highway_merge.net.xml"
+    net_path.write_text("generated on 2026-06-12 14:11:41", encoding="utf-8")
+    first = _scenario_source_sha256(cfg)
+    net_path.write_text("generated on 2026-06-13 10:00:00", encoding="utf-8")
+    assert _scenario_source_sha256(cfg) == first
+    (tmp_path / "highway_merge.edg.xml").write_text("<edges changed='1'/>", encoding="utf-8")
+    assert _scenario_source_sha256(cfg) != first
+
+
+def test_training_episode_seed_trace_uses_terminal_episode_info():
+    record = _episode_seed_trace_record(
+        {
+            "episode_seed": 103,
+            "episode_index": 7,
+            "episode_seed_schedule": "incrementing_v1",
+        },
+        env_rank=3,
+        timestep=4096,
+    )
+    assert record == {
+        "env_rank": 3,
+        "episode_seed": 103,
+        "episode_index": 7,
+        "episode_seed_schedule": "incrementing_v1",
+        "completed_at_timestep": 4096,
+    }
+    assert _episode_seed_trace_record({}, env_rank=0, timestep=1) is None
+
+    class FakeBaseCallback:
+        def __init__(self):
+            self.locals = {}
+            self.num_timesteps = 0
+
+    callback = _EpisodeSeedTraceCallback(FakeBaseCallback).callback
+    callback.num_timesteps = 128
+    callback.locals = {
+        "dones": np.asarray([True, False]),
+        "infos": [
+            {
+                "episode_seed": 11,
+                "episode_index": 2,
+                "episode_seed_schedule": "incrementing_v1",
+            },
+            {
+                "episode_seed": 12,
+                "episode_index": 2,
+                "episode_seed_schedule": "incrementing_v1",
+            },
+        ],
+    }
+    assert callback._on_step() is True
+    assert callback.records == [
+        {
+            "env_rank": 0,
+            "episode_seed": 11,
+            "episode_index": 2,
+            "episode_seed_schedule": "incrementing_v1",
+            "completed_at_timestep": 128,
+        }
+    ]
+
+
+def _test_sumo_installation(
+    tmp_path: Path,
+    *,
+    root_name: str = "sumo",
+    binary_hash: str = "sumo-hash",
+    netconvert_hash: str = "netconvert-hash",
+) -> SumoInstallation:
+    root = tmp_path / root_name
+    return SumoInstallation(
+        sumo_binary=str(root / "bin" / "sumo.exe"),
+        sumo_gui_binary=str(root / "bin" / "sumo-gui.exe"),
+        netconvert_binary=str(root / "bin" / "netconvert.exe"),
+        tools_directory=str(root / "tools"),
+        sumo_home=str(root),
+        sumo_version="Eclipse SUMO sumo Version 1.22.0",
+        netconvert_version="Eclipse SUMO netconvert Version 1.22.0",
+        sumo_binary_sha256=binary_hash,
+        netconvert_binary_sha256=netconvert_hash,
+        traci_module_path=str(root / "tools" / "traci" / "__init__.py"),
+        traci_version="protocol_21",
+    )
+
+
+def test_runner_resume_rejects_sumo_installation_path_drift(tmp_path):
+    cfg = load_config()
+    invocation = {
+        "stage1_episodes": None,
+        "stage4_episodes": None,
+        "stage5_episodes": None,
+        "ppo_timesteps": None,
+        "forecast_ppo_timesteps": None,
+        "forecast_ppo_profile": "default",
+        "forecast_sources": ["constant_velocity"],
+    }
+    state = _new_pipeline_state("safe_rl_test", invocation)
+    saved = _test_sumo_installation(tmp_path, root_name="saved")
+    state["sumo_installation"] = saved.to_dict()
+    current = _test_sumo_installation(tmp_path, root_name="current")
+    with pytest.raises(ValueError, match="SUMO installation field changed"):
+        _validate_resume_state(state, cfg, current)
+
+
+def test_runner_resume_reports_binary_hash_drift_without_replacing_fingerprint(tmp_path):
+    cfg = load_config()
+    invocation = {
+        "stage1_episodes": None,
+        "stage4_episodes": None,
+        "stage5_episodes": None,
+        "ppo_timesteps": None,
+        "forecast_ppo_timesteps": None,
+        "forecast_ppo_profile": "default",
+        "forecast_sources": ["constant_velocity"],
+    }
+    state = _new_pipeline_state("safe_rl_test", invocation)
+    saved = _test_sumo_installation(tmp_path)
+    state["sumo_installation"] = saved.to_dict()
+    current = _test_sumo_installation(
+        tmp_path,
+        binary_hash="changed-sumo-hash",
+        netconvert_hash="changed-netconvert-hash",
+    )
+    _validate_resume_state(state, cfg, current)
+    diagnostics = state["resume_diagnostics"]
+    assert diagnostics["binary_hash_changed"] is True
+    assert set(diagnostics["binary_hash_changes"]) == {
+        "sumo_binary_sha256",
+        "netconvert_binary_sha256",
+    }
+    assert state["sumo_installation"]["sumo_binary_sha256"] == "sumo-hash"
 
 
 def test_runner_pipeline_task_records_outputs_and_skips_completed(tmp_path):

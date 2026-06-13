@@ -12,3 +12,6 @@ rl:
   shield_guided_reward:
     risk_checkpoint: safe_rl_output/runs/safe_rl_test_run/stage2/risk_module.pt
   total_timesteps: 100000
+shield:
+  forecast_task_shadow_enabled: false
+  task_backstop_enabled: false

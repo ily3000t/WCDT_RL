@@ -39,6 +39,21 @@ from safe_rl.sim.types import StepMetrics, VehicleState
 from safe_rl.utils.performance import PerformanceTracker
 
 
+def scheduled_episode_seed(
+    base_seed: int,
+    worker_rank: int,
+    episode_index: int,
+    num_envs: int,
+) -> int:
+    """Return the versioned incrementing-v1 training seed."""
+
+    return (
+        int(base_seed)
+        + int(worker_rank)
+        + int(episode_index) * max(1, int(num_envs))
+    )
+
+
 class SumoHighwayMergeEnv(gym.Env):
     """Gymnasium-compatible SUMO highway-merge environment.
 
@@ -69,6 +84,8 @@ class SumoHighwayMergeEnv(gym.Env):
         self.num_envs = max(1, int(num_envs))
         self.advance_episode_seed = bool(advance_episode_seed)
         self._reset_count = 0
+        self._episode_index = 0
+        self._active_episode_index = -1
         self.ego_id = config.scenario.ego_id
         self.step_length = float(config.scenario.step_length)
         self.control_interval_steps = int(config.scenario.control_interval_steps)
@@ -100,6 +117,8 @@ class SumoHighwayMergeEnv(gym.Env):
         self._traci = None
         self._conn_label = f"safe_rl_{uuid.uuid4().hex[:8]}"
         self._episode_step = 0
+        self._decision_index = 0
+        self._simulation_step_index = 0
         self._last_ego_speed = 0.0
         self._last_ego_x = 0.0
         self._episode_metrics: list[StepMetrics] = []
@@ -108,6 +127,8 @@ class SumoHighwayMergeEnv(gym.Env):
         self._reward_debug_records: list[dict[str, Any]] = []
         self._last_reward_debug: dict[str, Any] = {}
         self._trajectory_frames: list[dict[str, VehicleState]] = []
+        self._trajectory_frame_metadata: list[dict[str, int]] = []
+        self._last_trajectory_window_metadata: dict[str, np.ndarray] = {}
         self._last_done_reason = ""
         self._curriculum_profile = "disabled"
         self._curriculum_applied = False
@@ -142,6 +163,19 @@ class SumoHighwayMergeEnv(gym.Env):
                 "Running SumoHighwayMergeEnv requires SUMO Python tools. "
                 "Install/configure traci and sumolib, or activate the SAFE_RL environment."
             ) from exc
+        expected_path = str(
+            dict(self.config.scenario.get("sumo_installation_fingerprint", {}) or {}).get(
+                "traci_module_path",
+                "",
+            )
+        )
+        if expected_path:
+            loaded_path = Path(str(getattr(traci, "__file__", ""))).resolve()
+            if loaded_path != Path(expected_path).resolve():
+                raise RuntimeError(
+                    "TraCI module does not match the selected SUMO installation: "
+                    f"loaded={loaded_path}, expected={Path(expected_path).resolve()}"
+                )
         self._traci_module = traci
         return traci
 
@@ -156,16 +190,33 @@ class SumoHighwayMergeEnv(gym.Env):
         if sumo_binary.is_absolute() and sumo_binary.exists():
             candidates.append(sumo_binary.resolve().parents[1] / "tools")
         for candidate in candidates:
-            if candidate.is_dir() and str(candidate) not in sys.path:
-                sys.path.append(str(candidate))
+            if candidate.is_dir():
+                resolved = str(candidate.resolve())
+                sys.path[:] = [
+                    item
+                    for item in sys.path
+                    if str(Path(item).resolve()) != resolved
+                ]
+                sys.path.insert(0, resolved)
+                break
 
     def reset(self, *, seed: int | None = None, options: dict[str, Any] | None = None):
         if seed is not None:
             self.seed_value = int(seed)
-            if self._reset_count == 0:
-                self._base_seed = int(seed) - self.worker_rank
+            self._active_episode_index = int(self._episode_index)
+            if self.advance_episode_seed:
+                self._episode_index += 1
         elif self.advance_episode_seed:
-            self.seed_value = self._base_seed + self.worker_rank + self._reset_count * self.num_envs
+            self._active_episode_index = int(self._episode_index)
+            self.seed_value = scheduled_episode_seed(
+                self._base_seed,
+                self.worker_rank,
+                self._active_episode_index,
+                self.num_envs,
+            )
+            self._episode_index += 1
+        else:
+            self._active_episode_index = 0
         persistent = bool(self.config.scenario.get("persistent_sumo_reset", False))
         restart_interval = max(1, int(self.config.scenario.get("persistent_sumo_restart_interval", 100)))
         should_reload = self._traci is not None and persistent and self._reset_count % restart_interval != 0
@@ -183,12 +234,16 @@ class SumoHighwayMergeEnv(gym.Env):
         self._invalidate_decision_cache()
         self._lane_count_cache.clear()
         self._episode_step = 0
+        self._decision_index = 0
+        self._simulation_step_index = 0
         self._episode_metrics.clear()
         self._ego_speeds.clear()
         self._interventions.clear()
         self._reward_debug_records.clear()
         self._last_reward_debug = {}
         self._trajectory_frames.clear()
+        self._trajectory_frame_metadata.clear()
+        self._last_trajectory_window_metadata = {}
         self._last_done_reason = ""
         self._curriculum_profile = self._select_curriculum_profile()
         self._curriculum_applied = False
@@ -214,7 +269,7 @@ class SumoHighwayMergeEnv(gym.Env):
             states = self._collect_states()
             self.history.append(states)
             self._invalidate_decision_cache()
-            self._trajectory_frames.append({state.vehicle_id: state for state in states})
+            self._append_trajectory_frame(states, decision_index=-1)
             if self.ego_id in self.history.latest():
                 break
 
@@ -224,6 +279,7 @@ class SumoHighwayMergeEnv(gym.Env):
         return self._build_observation(), self._info()
 
     def step(self, action):
+        decision_index = int(self._decision_index)
         raw_action = decode_action(int(action))
         final_action = raw_action
         intervention = None
@@ -232,6 +288,7 @@ class SumoHighwayMergeEnv(gym.Env):
         if self.shield is not None and self.shield.enabled:
             final_action, intervention = self.shield.select_action(raw_action, context)
             intervention["step"] = int(self._episode_step)
+            intervention["decision_index"] = decision_index
             self._interventions.append(intervention)
         task_replacement = self._maybe_task_backstop(raw_action, final_action, context, intervention)
         if task_replacement is not None:
@@ -251,7 +308,7 @@ class SumoHighwayMergeEnv(gym.Env):
             self.history.append(states)
             self._invalidate_decision_cache()
             if self.record_trajectory_samples:
-                self._trajectory_frames.append({state.vehicle_id: state for state in states})
+                self._append_trajectory_frame(states, decision_index=decision_index)
 
         ego = self._get_ego()
         metrics = compute_step_metrics(
@@ -307,8 +364,10 @@ class SumoHighwayMergeEnv(gym.Env):
         info["final_action"] = int(final_action.index)
         info["raw_action_name"] = str(raw_action.name)
         info["final_action_name"] = str(final_action.name)
+        info["decision_index"] = decision_index
         self._last_ego_speed = ego.speed if ego else 0.0
         self._last_ego_x = ego.x if ego else self._last_ego_x
+        self._decision_index += 1
         return obs, float(reward), bool(terminated), bool(truncated), info
 
     def close(self):
@@ -391,6 +450,7 @@ class SumoHighwayMergeEnv(gym.Env):
     def _simulation_step(self) -> None:
         with self.performance.measure("simulation_step_time"):
             self._traci.simulationStep()
+        self._simulation_step_index += 1
         self._refresh_vehicle_subscriptions()
         if self.sumo_step_delay_ms > 0:
             time.sleep(self.sumo_step_delay_ms / 1000.0)
@@ -864,7 +924,13 @@ class SumoHighwayMergeEnv(gym.Env):
         }
         return total_penalty, debug
 
-    def _task_merge_shadow(self, context: dict[str, Any] | None, raw_action: Any | None) -> dict[str, Any]:
+    def _task_merge_shadow(
+        self,
+        context: dict[str, Any] | None,
+        raw_action: Any | None,
+        *,
+        update_counters: bool = True,
+    ) -> dict[str, Any]:
         debug: dict[str, Any] = {
             "available": False,
             "task_merge_opportunity": False,
@@ -907,7 +973,8 @@ class SumoHighwayMergeEnv(gym.Env):
         local = context.get("merge_local")
         merge_cmd = self._merge_lateral_cmd(ego)
         if ego is None or local is None or merge_cmd == 0:
-            self._task_missed_consecutive_count = 0
+            if update_counters:
+                self._task_missed_consecutive_count = 0
             return debug
 
         deadline_distance = float(
@@ -934,10 +1001,16 @@ class SumoHighwayMergeEnv(gym.Env):
             >= float(self.config.scenario.get("merge_opportunity_min_rear_gap", 12.0))
         )
         missed = bool(safe_gap and int(raw_action.lateral_cmd) != merge_cmd)
-        if missed:
-            self._task_missed_consecutive_count += 1
-        else:
-            self._task_missed_consecutive_count = 0
+        if update_counters:
+            if missed:
+                self._task_missed_consecutive_count += 1
+            else:
+                self._task_missed_consecutive_count = 0
+        missed_count = (
+            int(self._task_missed_consecutive_count)
+            if update_counters
+            else int(self._task_missed_consecutive_count + int(missed))
+        )
         debug.update(
             {
                 "available": True,
@@ -947,7 +1020,7 @@ class SumoHighwayMergeEnv(gym.Env):
                 "task_deadline_urgency": urgency,
                 "task_safe_merge_action": str(safe_action.name) if safe_action is not None else "",
                 "task_safe_merge_action_index": int(safe_action.index) if safe_action is not None else None,
-                "task_consecutive_missed_count": int(self._task_missed_consecutive_count),
+                "task_consecutive_missed_count": missed_count,
                 "distance_to_taper": distance,
                 "decision_distance_to_taper": distance,
                 "decision_target_front_gap": float(local.target_front_gap),
@@ -1148,10 +1221,13 @@ class SumoHighwayMergeEnv(gym.Env):
         context: dict[str, Any] | None,
     ) -> tuple[float, dict[str, Any]]:
         cfg = self.config.rl.get("merge_timing_reward", {})
-        record = (
-            self._last_task_merge_record
-            if int(self._last_task_merge_record.get("step", -1)) == int(self._episode_step)
-            else self._task_merge_shadow(context, raw_action)
+        # The task shadow mutates consecutive counters and must run exactly once
+        # per control decision. Reward calculation only consumes that immutable
+        # decision record after the action has been executed.
+        record = self._last_task_merge_record or self._task_merge_shadow(
+            context,
+            raw_action,
+            update_counters=False,
         )
         urgency = float(record.get("task_deadline_urgency", 0.0) or 0.0)
         grace = int(cfg.get("consecutive_missed_grace", 2))
@@ -1206,7 +1282,8 @@ class SumoHighwayMergeEnv(gym.Env):
             self._first_merge_request_distance_to_taper = float(local.merge_distance)
         task_record = self._task_merge_shadow(context, raw_action)
         task_record["step"] = int(self._episode_step)
-        task_record["decision_step"] = int(self._episode_step)
+        task_record["decision_step"] = int(self._decision_index)
+        task_record["decision_index"] = int(self._decision_index)
         task_record["trace_schema_version"] = 2
         self._last_task_merge_record = task_record
         self._task_merge_records.append(task_record)
@@ -1238,7 +1315,13 @@ class SumoHighwayMergeEnv(gym.Env):
     ) -> dict[str, Any]:
         info: dict[str, Any] = {
             "seed": self.seed_value,
+            "episode_seed": self.seed_value,
+            "episode_index": int(self._active_episode_index),
+            "episode_seed_schedule": str(
+                self.config.get("run", {}).get("episode_seed_schedule", "fixed_legacy")
+            ),
             "step": self._episode_step,
+            "decision_index": int(self._decision_index),
             "done_reason": done_reason,
             "intervention": intervention,
             "safety_metric_version": str(
@@ -1521,6 +1604,21 @@ class SumoHighwayMergeEnv(gym.Env):
     def _invalidate_decision_cache(self) -> None:
         self._decision_context_cache = None
 
+    def _append_trajectory_frame(
+        self,
+        states: list[VehicleState],
+        *,
+        decision_index: int,
+    ) -> None:
+        self._trajectory_frames.append({state.vehicle_id: state for state in states})
+        self._trajectory_frame_metadata.append(
+            {
+                "simulation_step": int(self._simulation_step_index),
+                "decision_index": int(decision_index),
+                "episode_seed": int(self.seed_value),
+            }
+        )
+
     def episode_report(self) -> dict[str, Any]:
         collisions = [metric.collision for metric in self._episode_metrics]
         geometric_overlaps = [metric.geometric_overlap for metric in self._episode_metrics]
@@ -1690,6 +1788,11 @@ class SumoHighwayMergeEnv(gym.Env):
         ]
         return {
             "seed": self.seed_value,
+            "episode_seed": self.seed_value,
+            "episode_index": int(self._active_episode_index),
+            "episode_seed_schedule": str(
+                self.config.get("run", {}).get("episode_seed_schedule", "fixed_legacy")
+            ),
             "safety_metric_version": str(
                 self.config.risk_module.get("safety_metric_version", SAFETY_METRIC_VERSION)
             ),
@@ -1697,6 +1800,7 @@ class SumoHighwayMergeEnv(gym.Env):
             "done_reason": self._last_done_reason,
             "taper_miss": self._last_done_reason == "taper_miss",
             "steps": self._episode_step,
+            "control_decisions": int(self._decision_index),
             "completion_time": completion_time,
             "collision": any(collisions),
             "geometric_overlap": any(geometric_overlaps),
@@ -1720,7 +1824,7 @@ class SumoHighwayMergeEnv(gym.Env):
             "actual_replacement_count": replacement_count,
             "actual_replacement_rate": float(replacement_count / len(self._interventions)) if self._interventions else 0.0,
             "task_replacement_count": int(task_replacement_count),
-            "task_replacement_rate": float(task_replacement_count / max(self._episode_step, 1)),
+            "task_replacement_rate": float(task_replacement_count / max(self._decision_index, 1)),
             "mean_task_replacements": float(task_replacement_count),
             "task_replacement_records": task_replacement_records,
             "forecast_actor_coverage_complete_count": int(forecast_coverage_complete_count),
@@ -1850,6 +1954,12 @@ class SumoHighwayMergeEnv(gym.Env):
         horizon = int(self.config.scenario.forecast_horizon_steps)
         max_agents = self.top_k + 1
         frames = self._trajectory_frames
+        frame_metadata = getattr(self, "_trajectory_frame_metadata", [])
+        self._last_trajectory_window_metadata = {
+            "trajectory_window_end_step": np.zeros((0,), dtype=np.int64),
+            "trajectory_decision_index": np.zeros((0,), dtype=np.int64),
+            "trajectory_episode_seed": np.zeros((0,), dtype=np.int64),
+        }
         if len(frames) < hist + horizon:
             result = (
                 np.zeros((0, max_agents, hist, 5), dtype=np.float32),
@@ -1892,7 +2002,10 @@ class SumoHighwayMergeEnv(gym.Env):
         relevance_scores: list[np.ndarray] = []
         relevant_counts: list[int] = []
         selector_overflows: list[float] = []
-        for end_idx in range(hist, len(frames) - horizon):
+        window_end_steps: list[int] = []
+        window_decision_indices: list[int] = []
+        window_episode_seeds: list[int] = []
+        for end_idx in range(hist, len(frames) - horizon + 1):
             latest = frames[end_idx - 1]
             if self.ego_id not in latest:
                 continue
@@ -1980,6 +2093,12 @@ class SumoHighwayMergeEnv(gym.Env):
             relevance_scores.append(sample_relevance_score)
             relevant_counts.append(int(selection.relevant_count))
             selector_overflows.append(float(selection.overflow))
+            metadata = frame_metadata[end_idx - 1] if end_idx - 1 < len(frame_metadata) else {}
+            window_end_steps.append(int(metadata.get("simulation_step", -1)))
+            window_decision_indices.append(int(metadata.get("decision_index", -1)))
+            window_episode_seeds.append(
+                int(metadata.get("episode_seed", getattr(self, "seed_value", -1)))
+            )
         if not history_samples:
             result = (
                 np.zeros((0, max_agents, hist, 5), dtype=np.float32),
@@ -2018,6 +2137,11 @@ class SumoHighwayMergeEnv(gym.Env):
             np.stack(future_lane_indices, axis=0),
             np.stack(future_edge_roles, axis=0),
         )
+        self._last_trajectory_window_metadata = {
+            "trajectory_window_end_step": np.asarray(window_end_steps, dtype=np.int64),
+            "trajectory_decision_index": np.asarray(window_decision_indices, dtype=np.int64),
+            "trajectory_episode_seed": np.asarray(window_episode_seeds, dtype=np.int64),
+        }
         if include_dimensions:
             return (
                 *result,
@@ -2029,3 +2153,9 @@ class SumoHighwayMergeEnv(gym.Env):
                 np.asarray(selector_overflows, dtype=np.float32),
             )
         return result
+
+    def trajectory_window_metadata(self) -> dict[str, np.ndarray]:
+        return {
+            key: np.asarray(value).copy()
+            for key, value in self._last_trajectory_window_metadata.items()
+        }

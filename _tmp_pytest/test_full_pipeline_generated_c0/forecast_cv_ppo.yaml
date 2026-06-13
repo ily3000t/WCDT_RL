@@ -9,3 +9,6 @@ forecast_features:
 rl:
   use_wcdt_forecast_features: true
   total_timesteps: 128
+shield:
+  forecast_task_shadow_enabled: false
+  task_backstop_enabled: false

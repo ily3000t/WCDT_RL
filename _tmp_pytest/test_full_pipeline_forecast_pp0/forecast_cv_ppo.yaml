@@ -10,3 +10,6 @@ rl:
   use_wcdt_forecast_features: true
   reward_profile: safety_forecast
   total_timesteps: 100000
+shield:
+  forecast_task_shadow_enabled: false
+  task_backstop_enabled: false

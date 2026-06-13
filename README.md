@@ -42,7 +42,7 @@ conda env create -f environment.yml
 conda activate WcDT
 ```
 
-需要安装 SUMO。Full runner 会在启动任何 Stage 前统一解析并固定 `sumo`、`sumo-gui`、`netconvert` 和 `tools` 路径，优先级为：配置中的绝对 `scenario.sumo_binary`、`SUMO_HOME/bin`、系统 `PATH`、Windows 常见安装目录。解析结果和 SUMO 版本会写入 `pipeline_state.json`、场景 snapshot 和各阶段报告；`resume` 遇到 SUMO major/minor 版本漂移会拒绝继续。
+需要安装 SUMO。Full runner 会在启动任何 Stage 前选择一个安装根目录，并只从该根目录解析 `bin/sumo`、`bin/sumo-gui`、`bin/netconvert` 和 `tools/traci`，不会把不同安装的二进制或 Python TraCI 混用。安装选择优先级为：配置中的绝对 `scenario.sumo_binary`、`SUMO_HOME/bin`、系统 `PATH`、Windows 常见安装目录。显式绝对路径一旦不存在会立即报错，不会静默回退到另一套 SUMO。解析后的 tools 会插入 `sys.path` 首位，并统一注入所有 worker。路径、版本、TraCI 来源和二进制 SHA256 会写入 `pipeline_state.json`、场景 snapshot 和各阶段报告；`resume` 对安装路径、SUMO major/minor、TraCI 来源和实验语义版本漂移会拒绝继续，路径与版本不变但二进制 hash 变化时只记录诊断警告。
 
 Windows PowerShell 示例：
 
@@ -116,7 +116,8 @@ python -m safe_rl.pipeline.stage1_risk_probe --run-id $RUN_ID
 主要输出：
 
 ```text
-safe_rl_output/runs/<run_id>/stage1/risk_probe_buffer.npz
+safe_rl_output/runs/<run_id>/stage1/risk_probe_buffer/manifest.json
+safe_rl_output/runs/<run_id>/stage1/risk_probe_buffer/arrays/*.npy
 safe_rl_output/runs/<run_id>/stage1/risk_events.jsonl
 safe_rl_output/runs/<run_id>/stage1/stage1_report.json
 safe_rl_output/runs/<run_id>/stage1/audit/stage1_data_audit.json
@@ -171,7 +172,7 @@ Stage2 还会训练独立的 `wcdt_v2` residual-over-CV predictor。它不覆盖
 
 `wcdt_v3` 是当前默认预测主线。它继续使用 route-aware CV residual 和 3-model ensemble，但加入历史轨迹 Transformer、逐时刻 lane/edge-role embedding、车辆角色 embedding 和 actor self-attention。Transformer 使用 history timestep mask，历史缺失填充值不会参与 attention。WcDT v2 保留为显式 ablation，并与 v3 共用 `merge_safety_v3_masked` loss，保证结构消融口径一致。
 
-新的 Stage1 trajectory buffer 使用 `trajectory_schema_version=2`，并保存 history/future timestep mask 以及逐时刻 lane/edge-role metadata。正式 v2/v3 训练只接受 schema v2 新数据；旧 buffer 仅允许 diagnostics 兼容读取并标记 `legacy_unmasked_buffer=true`。
+新的 Stage1 主存储格式是 `manifest_npy_v1`：`stage1_buffer_schema_version=5`、`trajectory_schema_version=4`。每个数组单独保存为可 mmap 的 `.npy`，manifest 记录 dtype、shape、SHA256、seed schedule、车辆排序版本和 SUMO 安装指纹。`resume` 会重新检查每个 NPY 的存在性、dtype、shape 和 SHA256，而不只比较 manifest。`stage1.output_format` 目前只接受 `manifest_npy_v1`，其他值会在采集前明确失败。trajectory 数据保存 history/future timestep mask、逐时刻 lane/edge-role metadata、真实 window end step、decision index 和 episode seed。正式 v2/v3 训练只接受新 schema；旧 `risk_probe_buffer.npz` 继续只读兼容，但不参与严格并行复现结论。
 
 WcDT v1、v2 和 v3 使用独立 batch size：默认分别为 `16`、`32` 和 `16`。初始 Stage2 会额外保留 `risk_module_initial.pt` 与 `stage2_initial_training_report.json`；Stage4 后重训 Risk Module 时继续更新最终 `risk_module.pt`，不会覆盖初始快照。
 
@@ -188,7 +189,7 @@ Stage4 采集完成后，如果要把 on-policy failure buffer 合并回 Risk Mo
 python -m safe_rl.pipeline.stage2_train_prediction_risk --run-id $RUN_ID --config safe_rl\config\advanced\stage2_with_stage4.yaml
 ```
 
-该配置会读取同一 run 下的 `stage1/risk_probe_buffer.npz` 和 `stage4/on_policy_failure_buffer.npz`，Risk Module 使用两者拼接后的风险样本训练；WcDT predictor 仍优先使用 Stage1 的 trajectory windows。
+该配置会读取同一 run 下的 `stage1/risk_probe_buffer/manifest.json` 与 `arrays/*.npy`，并与 `stage4/on_policy_failure_buffer.npz` 的风险样本合并训练 Risk Module；WcDT predictor 仍优先使用 Stage1 的 trajectory windows。历史 run 的 `stage1/risk_probe_buffer.npz` 仅作为只读兼容输入。
 
 ### Stage3：PPO 强化学习训练
 
@@ -370,7 +371,7 @@ python -m safe_rl.pipeline.run_full_pipeline --run-id safe_rl_right_onramp_maskf
 python -m safe_rl.pipeline.run_full_pipeline --run-id safe_rl_right_onramp_maskfix_v3_001 --run-mode overwrite --stage1-episodes 1000 --ppo-timesteps 100000 --forecast-ppo-timesteps 100000 --forecast-sources constant_velocity,wcdt_v2,wcdt_v3 --forecast-ppo-profile shield_guided
 ```
 
-`resume` 会校验默认配置、场景 snapshot、当前场景文件和已完成任务产物；任何 hash 漂移都会拒绝静默续跑。各 Stage 的独立命令仍保留，仅建议用于调试和定向重跑。
+`resume` 会校验默认配置、pipeline profile、场景 snapshot/source、已完成任务产物、SUMO/TraCI 安装路径，以及 `episode_seed_schedule`、车辆排序版本和 Stage1 存储格式。场景 source hash 只覆盖手写 `.nod/.edg/.con/.rou/.sumocfg`，排除含生成时间戳的 `.net.xml`；snapshot 仍保存并哈希 `.net.xml`。语义或路径漂移会拒绝静默续跑；相同路径与版本下的二进制 hash 变化会写入 `resume_diagnostics`，提示使用新 run id。各 Stage 的独立命令仍保留，仅建议用于调试和定向重跑。
 
 ### 轻量 smoke profile
 
@@ -415,7 +416,9 @@ Persistent SUMO reload: enabled
 TraCI vehicle subscriptions: enabled
 ```
 
-`total_timesteps` 仍表示所有 PPO environment 合计的 transition 数，不会再乘以 environment 数。每个 worker 将 PyTorch/OMP/MKL 限制为单线程，主 PPO 进程默认使用 4 个线程。forecast predictor 和 reward Risk Module 会在每个 PPO worker 中独立加载；Stage3 report 会给出基于 checkpoint 文件大小的内存下界估算。内存不足时可显式降为 2 个环境：
+`total_timesteps` 仍表示所有 PPO environment 合计的 transition 请求数，不会再乘以 environment 数。SB3 会按 `num_envs * n_steps` 的 rollout quantum 向上取整，Stage3 report 同时记录 `requested_total_timesteps`、`actual_total_timesteps`、`rollout_quantum` 和 `timesteps_rounded_up`，吞吐率使用实际步数计算。每个 worker 将 PyTorch/OMP/MKL 限制为单线程，主 PPO 进程默认使用 4 个线程。forecast predictor 和 reward Risk Module 会在每个 PPO worker 中独立加载；Stage3 report 会给出基于 checkpoint 文件大小的内存下界估算。内存不足时可显式降为 2 个环境：
+
+Stage3 report 还会记录每个已完成训练 episode 的 `env_rank / episode_index / episode_seed / completed_at_timestep`，并给出唯一 seed 数和重复 seed 数；`incrementing_v1` 下检测到重复 seed 会拒绝产出该次训练结果。
 
 ```powershell
 --ppo-num-envs 2
@@ -427,7 +430,13 @@ Stage1 worker 数也可独立覆盖：
 --stage1-workers 4
 ```
 
-CLI 参数优先于 profile。并行 Stage1 使用 episode 独立 seed/RNG、worker NPZ shard 和稳定合并顺序；PPO 并行会改变 transition 到达顺序，因此 performance run 属于新的训练配置，不能与旧单环境 checkpoint 视为位级等价。训练期会关闭 forecast-aware task shadow/backstop，Stage5 和 failure audit 仍会开启 shadow 诊断。
+CLI 参数优先于 profile。Stage1 与 PPO 使用版本化 `incrementing_v1` seed schedule：
+
+```text
+episode_seed = base_seed + worker_rank + episode_index * num_envs
+```
+
+Stage5 的显式 `reset(seed=X)` 始终精确使用 `X`。并行 Stage1 使用 episode 独立 seed/RNG、长驻 worker 和未压缩 NPY shard；parent 通过两遍扫描和 `open_memmap()` 流式合并到最终 Manifest + NPY dataset，不执行全 shard `np.concatenate()` 或 `np.savez_compressed()`。PPO 并行会改变 transition 到达顺序，因此 performance run 属于新的训练配置，不能与旧单环境 checkpoint 视为位级等价。训练期会关闭 forecast-aware task shadow/backstop，Stage5 和 failure audit 仍会开启 shadow 诊断。
 
 运行正式实验前，可比较串行与并行热点：
 
@@ -438,7 +447,7 @@ E:\Programs\EnvAnaconda3\envs\pytorch\python.exe -m safe_rl.tools.benchmark_pipe
   --profiles default,performance
 ```
 
-报告包含 Stage1 episodes/hour、PPO fps、TraCI fallback、Risk/forecast forward 次数、SUMO restart/reload 和各热点耗时。当前优化不改变 `step_length`、control interval、预测 horizon 或候选动作数量。Libsumo 和并行 checkpoint evaluation 暂未启用。
+报告区分 parent `wall_time`、`worker_time_sum`、`worker_max_time`、aggregate/per-worker control decisions per second、simulation steps per second、episodes per hour 和 merge I/O time。热点占比只相对于 `worker_time_sum` 计算，不用 worker 时间总和冒充 wall time。报告还包含 PPO fps、TraCI fallback、Risk/forecast forward 次数和 SUMO restart/reload。当前优化不改变 `step_length`、control interval、预测 horizon 或候选动作数量。Libsumo 和并行 checkpoint evaluation 暂未启用。
 
 ### Predictor 分支与 legacy 兼容
 
@@ -646,7 +655,7 @@ episode / epoch / seed 进度
 
 ```text
 [stage2] run_id=safe_rl_highway_merge_001
-[stage2] input_stage1=...\stage1\risk_probe_buffer.npz
+[stage2] input_stage1=...\stage1\risk_probe_buffer\manifest.json
 [stage2] transition_count=12345
 Stage2 risk epochs:  30%|...
 [stage2] risk epoch=3/10 loss=0.421337

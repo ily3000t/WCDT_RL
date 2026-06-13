@@ -4,7 +4,6 @@ import argparse
 import json
 import math
 import os
-import sys
 from pathlib import Path
 from typing import Any
 
@@ -16,6 +15,12 @@ from safe_rl.risk.risk_module import RiskModuleWrapper
 from safe_rl.shield.safety_shield import SafetyShield
 from safe_rl.sim.sumo_highway_merge_env import SumoHighwayMergeEnv
 from safe_rl.utils.config import ConfigDict, REPO_ROOT, load_config, prepare_run_dir
+from safe_rl.utils.sumo_installation import (
+    configure_sumo_python,
+    resolve_sumo_installation,
+    sumo_installation_from_config,
+    sumo_subprocess_environment,
+)
 
 
 def parse_config_arg(description: str) -> argparse.Namespace:
@@ -123,16 +128,22 @@ def make_env(
     num_envs: int = 1,
     advance_episode_seed: bool = False,
 ) -> SumoHighwayMergeEnv:
-    sumo_home = cfg.scenario.get("sumo_home")
-    tools_directory = cfg.scenario.get("sumo_tools_directory")
-    if sumo_home:
-        os.environ["SUMO_HOME"] = str(sumo_home)
-        bin_directory = str(Path(str(cfg.scenario.get("sumo_binary", "sumo"))).parent)
-        current_path = os.environ.get("PATH", "")
-        if bin_directory.lower() not in current_path.lower():
-            os.environ["PATH"] = f"{bin_directory}{os.pathsep}{current_path}"
-    if tools_directory and str(tools_directory) not in sys.path:
-        sys.path.append(str(tools_directory))
+    installation = (
+        sumo_installation_from_config(cfg.scenario)
+        if cfg.scenario.get("sumo_installation_fingerprint")
+        else resolve_sumo_installation(cfg.scenario)
+    )
+    configure_sumo_python(installation)
+    environment = sumo_subprocess_environment(installation)
+    for key in ("SUMO_HOME", "PATH", "PYTHONPATH"):
+        os.environ[key] = environment[key]
+    cfg.scenario["sumo_binary"] = installation.sumo_binary
+    cfg.scenario["sumo_gui_binary"] = installation.sumo_gui_binary
+    cfg.scenario["netconvert_binary"] = installation.netconvert_binary
+    cfg.scenario["sumo_tools_directory"] = installation.tools_directory
+    cfg.scenario["sumo_home"] = installation.sumo_home
+    cfg.scenario["sumo_version"] = installation.sumo_version
+    cfg.scenario["sumo_installation_fingerprint"] = installation.to_dict()
     shield = None
     if shield_enabled if shield_enabled is not None else bool(cfg.shield.enabled):
         risk_model = RiskModuleWrapper(cfg, checkpoint=risk_checkpoint)

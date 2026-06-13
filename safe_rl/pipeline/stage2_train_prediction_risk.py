@@ -21,6 +21,10 @@ from safe_rl.sim.scenario_semantics import (
 )
 from safe_rl.utils.config import prepare_run_dir
 from safe_rl.utils.progress import TensorboardLogger, progress_iter, stage_log
+from safe_rl.utils.stage1_dataset import (
+    STAGE1_BUFFER_SCHEMA_VERSION,
+    open_stage1_dataset,
+)
 
 
 def _require_torch():
@@ -226,6 +230,12 @@ def _trajectory_schema_version(data: Any) -> int:
     return int(np.asarray(data["trajectory_schema_version"]).reshape(-1)[0])
 
 
+def _stage1_buffer_schema_version(data: Any) -> int:
+    if not _has_key(data, "stage1_buffer_schema_version"):
+        return 0
+    return int(np.asarray(data["stage1_buffer_schema_version"]).reshape(-1)[0])
+
+
 def _safety_metric_version(data: Any) -> str:
     if not _has_key(data, "safety_metric_version"):
         return ""
@@ -265,24 +275,51 @@ def _require_trajectory_schema_v3(data: Any, consumer: str, cfg: Any | None = No
         "agent_relevance_score",
         "actor_selector_relevant_count",
         "actor_selector_overflow",
+        "stage1_buffer_schema_version",
+        "episode_seed_schedule",
+        "vehicle_state_ordering_version",
     }
     missing = sorted(key for key in required if not _has_key(data, key))
     metric_version = _safety_metric_version(data)
     selection_version = _trajectory_string(data, "actor_selection_version")
     selection_hash = _trajectory_string(data, "actor_selection_config_hash")
     expected_hash = actor_selection_config_hash(cfg) if cfg is not None else selection_hash
+    buffer_schema_version = _stage1_buffer_schema_version(data)
+    seed_schedule = _trajectory_string(data, "episode_seed_schedule")
+    ordering_version = _trajectory_string(data, "vehicle_state_ordering_version")
+    expected_seed_schedule = (
+        str(cfg.get("run", {}).get("episode_seed_schedule", "fixed_legacy"))
+        if cfg is not None
+        else seed_schedule
+    )
+    expected_ordering = (
+        str(
+            cfg.get("scenario", {}).get(
+                "vehicle_state_ordering_version",
+                "unspecified_legacy",
+            )
+        )
+        if cfg is not None
+        else ordering_version
+    )
     if (
         version < 4
+        or buffer_schema_version < STAGE1_BUFFER_SCHEMA_VERSION
         or missing
         or metric_version != SAFETY_METRIC_VERSION
         or selection_version != ACTOR_SELECTION_VERSION
         or selection_hash != expected_hash
+        or seed_schedule != expected_seed_schedule
+        or ordering_version != expected_ordering
     ):
         raise ValueError(
             f"{consumer} training requires trajectory_schema_version>=4, "
             f"safety_metric_version={SAFETY_METRIC_VERSION!r}; found version={version}, "
             f"safety_metric_version={metric_version!r}, actor_selection_version={selection_version!r}, "
             f"actor_selection_config_hash={selection_hash!r}, expected_hash={expected_hash!r}, "
+            f"stage1_buffer_schema_version={buffer_schema_version}, "
+            f"episode_seed_schedule={seed_schedule!r}, expected_seed_schedule={expected_seed_schedule!r}, "
+            f"vehicle_state_ordering_version={ordering_version!r}, expected_ordering={expected_ordering!r}, "
             f"missing={missing}. Re-run Stage1 with a new run id."
         )
 
@@ -893,6 +930,15 @@ def _train_risk_module(
             "temperature": float(runtime_temperature),
             "apply_temperature": bool(apply_runtime_temperature),
             "safety_metric_version": SAFETY_METRIC_VERSION,
+            "vehicle_state_ordering_version": str(
+                cfg.scenario.get(
+                    "vehicle_state_ordering_version",
+                    "unspecified_legacy",
+                )
+            ),
+            "episode_seed_schedule": str(
+                cfg.get("run", {}).get("episode_seed_schedule", "fixed_legacy")
+            ),
         },
         checkpoint,
     )
@@ -1953,9 +1999,19 @@ def _train_wcdt_v2_predictor(
         "architecture_version": ARCHITECTURE_VERSION,
         "loss_version": LOSS_VERSION,
         "trajectory_schema_version": _trajectory_schema_version(data),
+        "stage1_buffer_schema_version": _stage1_buffer_schema_version(data),
+        "stage1_storage_format": (
+            "legacy_npz"
+            if data.legacy_npz_format
+            else str(data.manifest.get("format_version"))
+        ),
         "safety_metric_version": _safety_metric_version(data),
         "actor_selection_version": _trajectory_string(data, "actor_selection_version"),
         "actor_selection_config_hash": _trajectory_string(data, "actor_selection_config_hash"),
+        "vehicle_state_ordering_version": _trajectory_string(
+            data,
+            "vehicle_state_ordering_version",
+        ),
         "max_actor_count": int(cfg.prediction.get("wcdt_v2_max_agents", cfg.prediction.max_pred_num)),
         "horizon_steps": int(horizon),
         "history_steps": int(cfg.scenario.history_steps),
@@ -2514,6 +2570,10 @@ def _train_wcdt_v3_predictor(
         "safety_metric_version": _safety_metric_version(data),
         "actor_selection_version": _trajectory_string(data, "actor_selection_version"),
         "actor_selection_config_hash": _trajectory_string(data, "actor_selection_config_hash"),
+        "vehicle_state_ordering_version": _trajectory_string(
+            data,
+            "vehicle_state_ordering_version",
+        ),
         "max_actor_count": int(cfg.prediction.get("wcdt_v3_max_agents", cfg.prediction.max_pred_num)),
         **model_kwargs,
         "ensemble_size": int(ensemble_size),
@@ -2561,7 +2621,7 @@ def run(cfg) -> Path:
         stage_log("stage2", f"device={device}")
     tb = TensorboardLogger(stage_dir / "tensorboard", enabled=bool(cfg.run.get("tensorboard", True)))
     initial_prediction_report_path = stage_dir / "stage2_initial_prediction_report.json"
-    data = np.load(input_path, allow_pickle=False)
+    data = open_stage1_dataset(input_path)
     _require_trajectory_schema_v3(data, "Stage2", cfg)
     stage4_data = np.load(input_stage4_path, allow_pickle=False) if input_stage4_path is not None else None
     risk_data = _merge_risk_buffers(data, stage4_data)
@@ -2600,6 +2660,11 @@ def run(cfg) -> Path:
         "safety_metric_version": _safety_metric_version(data),
         "actor_selection_version": _trajectory_string(data, "actor_selection_version"),
         "actor_selection_config_hash": _trajectory_string(data, "actor_selection_config_hash"),
+        "vehicle_state_ordering_version": _trajectory_string(
+            data,
+            "vehicle_state_ordering_version",
+        ),
+        "episode_seed_schedule": _trajectory_string(data, "episode_seed_schedule"),
         "actor_selector_overflow_rate": (
             float(np.mean(np.asarray(data["actor_selector_overflow"], dtype=np.float32)))
             if _has_key(data, "actor_selector_overflow")
@@ -2676,6 +2741,9 @@ def run(cfg) -> Path:
         report["initial_training_report"] = str(initial_training_report_path)
     write_report(stage_dir / "stage2_training_report.json", report)
     tb.close()
+    data.close()
+    if stage4_data is not None:
+        stage4_data.close()
     stage_log("stage2", f"report={stage_dir / 'stage2_training_report.json'}")
     return stage_dir
 

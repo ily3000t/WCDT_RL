@@ -2,6 +2,7 @@ run:
   output_root: "safe_rl_output/runs"
   run_id: null
   seed: 1
+  episode_seed_schedule: "incrementing_v1"
   tensorboard: true
   replay: true
 
@@ -34,6 +35,7 @@ scenario:
   traci_subscriptions_enabled: true
   persistent_sumo_reset: false
   persistent_sumo_restart_interval: 100
+  vehicle_state_ordering_version: "lexicographic_id_v1"
   step_length: 0.1
   episode_seconds: 80.0
   control_interval_steps: 5
@@ -306,7 +308,10 @@ stage1:
     merge_heuristic: 0.60
     risk_seek: 0.30
   random_action_probability: 1.0
-  output_name: "risk_probe_buffer.npz"
+  output_name: "risk_probe_buffer"
+  output_format: "manifest_npy_v1"
+  buffer_schema_version: 5
+  cleanup_worker_shards: true
   audit_enabled: true
   audit_gate:
     enabled: true

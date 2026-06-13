@@ -8,3 +8,6 @@ forecast_features:
   allow_heuristic_fallback: false
 rl:
   use_wcdt_forecast_features: true
+shield:
+  forecast_task_shadow_enabled: false
+  task_backstop_enabled: false

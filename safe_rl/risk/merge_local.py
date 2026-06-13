@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import math
+import hashlib
+import json
 from contextlib import nullcontext
 from dataclasses import dataclass
 from typing import Any
@@ -88,17 +90,30 @@ class CandidateRiskSample:
 
 
 @dataclass
-class CandidateRolloutContext:
+class EgoRolloutCache:
+    entries: dict[tuple[int, int, float, str], tuple[list[VehicleState], bool]]
+
+
+@dataclass
+class RiskCandidateRolloutContext:
     ego: VehicleState | None
     vehicles: list[VehicleState]
     config: Any
     horizon_steps: int
     dt: float
     current_stats: MergeLocalStats
-    other_rollouts: list[list[VehicleState]]
+    risk_surrounding_cv_rollouts: list[list[VehicleState]]
     legality: dict[int, bool]
-    ego_rollouts: dict[int, tuple[list[VehicleState], bool]]
     samples: dict[int, CandidateRiskSample]
+
+    @property
+    def other_rollouts(self) -> list[list[VehicleState]]:
+        return self.risk_surrounding_cv_rollouts
+
+
+# Compatibility alias for external imports. The semantic name above makes the
+# CV-only Risk path explicit.
+CandidateRolloutContext = RiskCandidateRolloutContext
 
 
 def merge_x(config: Any) -> float:
@@ -466,9 +481,55 @@ def continuous_risk_target(
     return float(np.clip(score, 0.0, 1.0))
 
 
-def prepare_candidate_rollout_context(context: dict[str, Any]) -> CandidateRolloutContext:
+def _ego_rollout_config_hash(config: Any) -> str:
+    payload = {
+        "lane_change_duration": float(config.scenario.get("lane_change_duration", 1.0)),
+        "control_interval_steps": int(config.scenario.control_interval_steps),
+        "step_length": float(config.scenario.step_length),
+        "taper_edge": str(config.scenario.get("taper_edge", "")),
+        "auxiliary_lane_by_edge": dict(
+            config.scenario.get("auxiliary_lane_by_edge", {}) or {}
+        ),
+        "target_lane_by_edge": dict(config.scenario.get("target_lane_by_edge", {}) or {}),
+    }
+    encoded = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def get_cached_ego_rollout(
+    context: dict[str, Any],
+    action: CandidateAction,
+    *,
+    horizon_steps: int,
+    dt: float,
+) -> tuple[list[VehicleState], bool]:
+    ego = context.get("ego")
+    if ego is None:
+        return [], False
+    cache = context.get("_ego_rollout_cache")
+    if not isinstance(cache, EgoRolloutCache):
+        cache = EgoRolloutCache(entries={})
+        context["_ego_rollout_cache"] = cache
+    key = (
+        int(action.index),
+        int(horizon_steps),
+        round(float(dt), 9),
+        _ego_rollout_config_hash(context["config"]),
+    )
+    if key not in cache.entries:
+        cache.entries[key] = rollout_ego(
+            ego,
+            action,
+            int(horizon_steps),
+            float(dt),
+            context["config"],
+        )
+    return cache.entries[key]
+
+
+def prepare_candidate_rollout_context(context: dict[str, Any]) -> RiskCandidateRolloutContext:
     cached = context.get("_candidate_rollout_context")
-    if isinstance(cached, CandidateRolloutContext):
+    if isinstance(cached, RiskCandidateRolloutContext):
         return cached
     ego = context.get("ego")
     config = context["config"]
@@ -487,16 +548,15 @@ def prepare_candidate_rollout_context(context: dict[str, Any]) -> CandidateRollo
             if ego is not None
             else []
         )
-    prepared = CandidateRolloutContext(
+    prepared = RiskCandidateRolloutContext(
         ego=ego,
         vehicles=vehicles,
         config=config,
         horizon_steps=horizon_steps,
         dt=dt,
         current_stats=merge_local_stats(ego, vehicles, config),
-        other_rollouts=other_rollouts,
+        risk_surrounding_cv_rollouts=other_rollouts,
         legality={action.index: is_candidate_legal(action, context, missing_ego_is_legal=False) for action in ACTIONS},
-        ego_rollouts={},
         samples={},
     )
     context["_candidate_rollout_context"] = prepared
@@ -534,12 +594,13 @@ def evaluate_candidate_action_risk(action: CandidateAction, context: dict[str, A
     tracker = context.get("performance_tracker")
     timer = tracker.measure("candidate_rollout_time") if tracker is not None else nullcontext()
     with timer:
-        if int(action.index) not in prepared.ego_rollouts:
-            prepared.ego_rollouts[int(action.index)] = rollout_ego(
-                ego, action, prepared.horizon_steps, prepared.dt, config
-            )
-        ego_rollout, ego_taper_miss = prepared.ego_rollouts[int(action.index)]
-    other_rollouts = prepared.other_rollouts
+        ego_rollout, ego_taper_miss = get_cached_ego_rollout(
+            context,
+            action,
+            horizon_steps=prepared.horizon_steps,
+            dt=prepared.dt,
+        )
+    other_rollouts = prepared.risk_surrounding_cv_rollouts
 
     min_distance = INF_TTC
     min_ttc = INF_TTC

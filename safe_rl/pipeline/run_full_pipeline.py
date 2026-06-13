@@ -23,12 +23,18 @@ from safe_rl.pipeline import (
 )
 from safe_rl.utils.config import DEFAULT_CONFIG_PATH, REPO_ROOT, load_config
 from safe_rl.utils.progress import stage_log
-from safe_rl.sim.scenario_snapshot import SCENARIO_SUFFIXES, snapshot_scenario
+from safe_rl.sim.scenario_snapshot import SCENARIO_SOURCE_SUFFIXES, snapshot_scenario
 from safe_rl.sim.metrics import SAFETY_METRIC_VERSION
 from safe_rl.utils.sumo_installation import (
     SumoInstallation,
+    configure_sumo_python,
     resolve_sumo_installation,
     sumo_subprocess_environment,
+)
+from safe_rl.utils.stage1_dataset import (
+    STAGE1_FORMAT_VERSION,
+    stage1_dataset_manifest_hash,
+    validate_stage1_dataset,
 )
 
 
@@ -38,7 +44,7 @@ VALID_FORECAST_PPO_PROFILES = ("default", "safety", "shield_guided", "merge_timi
 VALID_RUN_MODES = ("new", "resume", "overwrite")
 VALID_PIPELINE_PROFILES = ("default", "smoke", "performance")
 RUN_ID_PATTERN = re.compile(r"^[A-Za-z0-9._-]+$")
-PIPELINE_STATE_SCHEMA_VERSION = 4
+PIPELINE_STATE_SCHEMA_VERSION = 5
 PIPELINE_TASK_ORDER = (
     "network_snapshot",
     "stage1",
@@ -65,6 +71,21 @@ def _sha256(path: str | Path) -> str:
         for chunk in iter(lambda: file.read(65536), b""):
             digest.update(chunk)
     return digest.hexdigest()
+
+
+def _artifact_sha256(path: str | Path) -> str:
+    candidate = Path(path)
+    if candidate.is_file():
+        return _sha256(candidate)
+    if candidate.is_dir() and (candidate / "manifest.json").exists():
+        return stage1_dataset_manifest_hash(candidate)
+    if candidate.is_dir():
+        digest = hashlib.sha256()
+        for child in sorted(item for item in candidate.rglob("*") if item.is_file()):
+            digest.update(child.relative_to(candidate).as_posix().encode("utf-8"))
+            digest.update(_sha256(child).encode("ascii"))
+        return digest.hexdigest()
+    raise FileNotFoundError(candidate)
 
 
 def _atomic_write_json(path: str | Path, payload: dict[str, Any]) -> Path:
@@ -169,7 +190,7 @@ def _scenario_source_sha256(cfg: Any) -> str:
     source = Path(cfg.scenario.root).resolve()
     digest = hashlib.sha256()
     for path in sorted(source.iterdir(), key=lambda item: item.name):
-        if not path.is_file() or not path.name.endswith(SCENARIO_SUFFIXES):
+        if not path.is_file() or not path.name.endswith(SCENARIO_SOURCE_SUFFIXES):
             continue
         digest.update(path.name.encode("utf-8"))
         digest.update(_sha256(path).encode("ascii"))
@@ -237,11 +258,24 @@ def _new_pipeline_state(
     run_id: str,
     invocation: dict[str, Any],
     sumo_installation: SumoInstallation | None = None,
+    cfg: Any | None = None,
 ) -> dict[str, Any]:
     invocation = dict(invocation)
     invocation.setdefault("pipeline_profile", "default")
     sources = list(invocation["forecast_sources"])
     pipeline_profile = str(invocation.get("pipeline_profile", "default"))
+    episode_seed_schedule = str(
+        (cfg or {}).get("run", {}).get("episode_seed_schedule", "incrementing_v1")
+    )
+    vehicle_state_ordering_version = str(
+        (cfg or {}).get("scenario", {}).get(
+            "vehicle_state_ordering_version",
+            "lexicographic_id_v1",
+        )
+    )
+    stage1_storage_format = str(
+        (cfg or {}).get("stage1", {}).get("output_format", "manifest_npy_v1")
+    )
     tasks = {}
     for task_name in PIPELINE_TASK_ORDER:
         enabled = _task_enabled(task_name, sources)
@@ -262,6 +296,9 @@ def _new_pipeline_state(
         "pipeline_profile_config_sha256": _pipeline_profile_config_sha256(pipeline_profile),
         "default_config_sha256": _sha256(DEFAULT_CONFIG_PATH),
         "safety_metric_version": SAFETY_METRIC_VERSION,
+        "episode_seed_schedule": episode_seed_schedule,
+        "vehicle_state_ordering_version": vehicle_state_ordering_version,
+        "stage1_storage_format": stage1_storage_format,
         "scenario_snapshot_sha256": None,
         "scenario_source_sha256": None,
         "sumo_installation": sumo_installation.to_dict() if sumo_installation is not None else None,
@@ -307,14 +344,24 @@ def _load_pipeline_state(path: str | Path) -> dict[str, Any]:
                     "use a new run id or --run-mode overwrite"
                 )
             state["pipeline_profile_config_sha256"] = None
+        state.setdefault("episode_seed_schedule", "fixed_legacy")
+        state.setdefault("vehicle_state_ordering_version", "unspecified_legacy")
+        state.setdefault("stage1_storage_format", "legacy_npz")
+        state.setdefault("resume_diagnostics", {})
         state["schema_version"] = PIPELINE_STATE_SCHEMA_VERSION
         schema_version = PIPELINE_STATE_SCHEMA_VERSION
     if schema_version == 4:
         state.setdefault("sumo_installation", None)
         state.setdefault("normalized_invocation", {}).setdefault("stage1_workers", None)
         state.setdefault("normalized_invocation", {}).setdefault("ppo_num_envs", None)
+        state.setdefault("episode_seed_schedule", "fixed_legacy")
+        state.setdefault("vehicle_state_ordering_version", "unspecified_legacy")
+        state.setdefault("stage1_storage_format", "legacy_npz")
+        state.setdefault("resume_diagnostics", {})
         state["schema_version"] = PIPELINE_STATE_SCHEMA_VERSION
         schema_version = PIPELINE_STATE_SCHEMA_VERSION
+    if schema_version == 5:
+        state.setdefault("resume_diagnostics", {})
     elif schema_version != PIPELINE_STATE_SCHEMA_VERSION:
         raise ValueError(f"unsupported pipeline state schema: {state.get('schema_version')}")
     return state
@@ -414,8 +461,17 @@ def _validate_completed_outputs(state: dict[str, Any]) -> None:
             path = Path(value)
             if not path.exists():
                 raise FileNotFoundError(f"completed task {task_name} is missing output: {path}")
+            manifest_path = path / "manifest.json" if path.is_dir() else None
+            if manifest_path is not None and manifest_path.exists():
+                try:
+                    with manifest_path.open("r", encoding="utf-8") as file:
+                        manifest = json.load(file)
+                except (OSError, json.JSONDecodeError) as exc:
+                    raise ValueError(f"invalid completed artifact manifest: {manifest_path}") from exc
+                if str(manifest.get("format_version", "")) == STAGE1_FORMAT_VERSION:
+                    validate_stage1_dataset(path, verify_hashes=True)
             expected = task.get("output_hashes", {}).get(str(path))
-            actual = _sha256(path)
+            actual = _artifact_sha256(path)
             if expected != actual:
                 raise ValueError(f"completed task {task_name} output hash changed: {path}")
 
@@ -461,6 +517,47 @@ def _validate_resume_state(
     if saved_sumo and sumo_installation is not None:
         if _sumo_major_minor(saved_sumo) != sumo_installation.major_minor_version:
             raise ValueError("SUMO major/minor version changed since the run started; use a new run id or overwrite")
+        strict_fields = (
+            "sumo_home",
+            "sumo_binary",
+            "netconvert_binary",
+            "traci_module_path",
+        )
+        for field in strict_fields:
+            if str(saved_sumo.get(field, "")) != str(getattr(sumo_installation, field)):
+                raise ValueError(
+                    f"SUMO installation field changed ({field}); use a new run id or overwrite"
+                )
+        hash_changes = {
+            field: {
+                "saved": str(saved_sumo.get(field, "")),
+                "current": str(getattr(sumo_installation, field)),
+            }
+            for field in ("sumo_binary_sha256", "netconvert_binary_sha256")
+            if str(saved_sumo.get(field, "")) != str(getattr(sumo_installation, field))
+        }
+        state.setdefault("resume_diagnostics", {})["binary_hash_changed"] = bool(hash_changes)
+        if hash_changes:
+            state["resume_diagnostics"]["binary_hash_changes"] = hash_changes
+    semantic_values = {
+        "episode_seed_schedule": str(
+            cfg.get("run", {}).get("episode_seed_schedule", "fixed_legacy")
+        ),
+        "vehicle_state_ordering_version": str(
+            cfg.get("scenario", {}).get(
+                "vehicle_state_ordering_version",
+                "unspecified_legacy",
+            )
+        ),
+        "stage1_storage_format": str(
+            cfg.get("stage1", {}).get("output_format", "legacy_npz")
+        ),
+    }
+    for field, current in semantic_values.items():
+        if str(state.get(field, "")) != current:
+            raise ValueError(
+                f"{field} changed since the run started; use a new run id or overwrite"
+            )
     _validate_completed_outputs(state)
 
 
@@ -513,7 +610,10 @@ def _run_pipeline_task(
         raise FileNotFoundError(f"task {task_name} did not produce required outputs: {missing}")
     task["status"] = "completed"
     task["completed_at"] = _utc_now()
-    task["output_hashes"] = {str(path.resolve()): _sha256(path) for path in required_outputs}
+    task["output_hashes"] = {
+        str(path.resolve()): _artifact_sha256(path)
+        for path in required_outputs
+    }
     _atomic_write_json(state_path, state)
     return True
 
@@ -697,6 +797,8 @@ def build_generated_configs(
                     "sumo_tools_directory": sumo_installation.tools_directory,
                     "sumo_home": sumo_installation.sumo_home,
                     "sumo_version": sumo_installation.sumo_version,
+                    "netconvert_version": sumo_installation.netconvert_version,
+                    "sumo_installation_fingerprint": sumo_installation.to_dict(),
                 }
             },
         )
@@ -848,6 +950,7 @@ def run_full_pipeline(
     bootstrap_cfg = load_config()
     bootstrap_cfg.run["run_id"] = run_id
     sumo_installation = resolve_sumo_installation(bootstrap_cfg.scenario)
+    configure_sumo_python(sumo_installation)
     sumo_env = sumo_subprocess_environment(sumo_installation)
     output_root = _output_root(bootstrap_cfg)
     run_dir = output_root / run_id
@@ -888,7 +991,7 @@ def run_full_pipeline(
             ppo_num_envs=ppo_num_envs,
         )
         run_dir = _prepare_new_run_dir(output_root, run_id, run_mode)
-        state = _new_pipeline_state(run_id, invocation, sumo_installation)
+        state = _new_pipeline_state(run_id, invocation, sumo_installation, bootstrap_cfg)
         _atomic_write_json(state_path, state)
     sources = list(invocation["forecast_sources"])
     generated_dir = run_dir / "generated_configs"

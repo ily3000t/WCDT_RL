@@ -1,8 +1,12 @@
 from __future__ import annotations
 
+import hashlib
+import importlib
 import os
+import re
 import shutil
 import subprocess
+import sys
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any
@@ -17,6 +21,10 @@ class SumoInstallation:
     sumo_home: str
     sumo_version: str
     netconvert_version: str
+    sumo_binary_sha256: str
+    netconvert_binary_sha256: str
+    traci_module_path: str
+    traci_version: str
 
     def to_dict(self) -> dict[str, str]:
         return asdict(self)
@@ -45,6 +53,28 @@ def _version(binary: Path) -> str:
         return "unknown"
 
 
+def _sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as file:
+        while chunk := file.read(1024 * 1024):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _traci_version(tools: Path) -> tuple[str, str]:
+    module_path = (tools / "traci" / "__init__.py").resolve()
+    if not module_path.exists():
+        raise FileNotFoundError(f"SUMO TraCI package does not exist: {module_path}")
+    constants_path = tools / "traci" / "constants.py"
+    version = "unknown"
+    if constants_path.exists():
+        text = constants_path.read_text(encoding="utf-8", errors="ignore")
+        match = re.search(r"^TRACI_VERSION\s*=\s*(\d+)", text, flags=re.MULTILINE)
+        if match:
+            version = f"protocol_{match.group(1)}"
+    return str(module_path), version
+
+
 def _windows_candidate_homes() -> list[Path]:
     if os.name != "nt":
         return []
@@ -57,7 +87,15 @@ def _windows_candidate_homes() -> list[Path]:
 def _resolve_binary(value: str | Path | None, name: str) -> Path | None:
     if value:
         configured = Path(str(value))
-        if configured.is_absolute() and configured.exists():
+        if configured.is_absolute():
+            if not configured.exists():
+                raise FileNotFoundError(
+                    f"Configured {name} binary does not exist: {configured}"
+                )
+            if not configured.is_file():
+                raise FileNotFoundError(
+                    f"Configured {name} binary is not a file: {configured}"
+                )
             return configured.resolve()
     sumo_home = os.environ.get("SUMO_HOME")
     if sumo_home:
@@ -82,22 +120,51 @@ def resolve_sumo_installation(scenario_cfg: Any) -> SumoInstallation:
             "set SUMO_HOME, or add SUMO/bin to PATH."
         )
     home = sumo_binary.parent.parent
-    sumo_gui = _resolve_binary(home / "bin" / ("sumo-gui.exe" if os.name == "nt" else "sumo-gui"), "sumo-gui")
-    netconvert = _resolve_binary(home / "bin" / ("netconvert.exe" if os.name == "nt" else "netconvert"), "netconvert")
-    if netconvert is None:
+    executable_suffix = ".exe" if os.name == "nt" else ""
+    sumo_gui = (home / "bin" / f"sumo-gui{executable_suffix}").resolve()
+    netconvert = (home / "bin" / f"netconvert{executable_suffix}").resolve()
+    if not netconvert.exists():
         raise FileNotFoundError(f"netconvert was not found next to SUMO installation: {home}")
     tools = home / "tools"
     if not tools.is_dir():
         raise FileNotFoundError(f"SUMO tools directory does not exist: {tools}")
+    traci_module_path, traci_version = _traci_version(tools)
     return SumoInstallation(
         sumo_binary=str(sumo_binary),
-        sumo_gui_binary=str(sumo_gui or ""),
+        sumo_gui_binary=str(sumo_gui) if sumo_gui.exists() else "",
         netconvert_binary=str(netconvert),
         tools_directory=str(tools.resolve()),
         sumo_home=str(home.resolve()),
         sumo_version=_version(sumo_binary),
         netconvert_version=_version(netconvert),
+        sumo_binary_sha256=_sha256(sumo_binary),
+        netconvert_binary_sha256=_sha256(netconvert),
+        traci_module_path=traci_module_path,
+        traci_version=traci_version,
     )
+
+
+def sumo_installation_from_config(scenario_cfg: Any) -> SumoInstallation:
+    fingerprint = dict(scenario_cfg.get("sumo_installation_fingerprint", {}) or {})
+    if fingerprint:
+        return SumoInstallation(**{field: str(fingerprint.get(field, "")) for field in SumoInstallation.__dataclass_fields__})
+    return resolve_sumo_installation(scenario_cfg)
+
+
+def configure_sumo_python(installation: SumoInstallation) -> None:
+    tools = str(Path(installation.tools_directory).resolve())
+    expected_module = Path(installation.traci_module_path).resolve()
+    loaded = sys.modules.get("traci")
+    if loaded is not None:
+        loaded_path = Path(str(getattr(loaded, "__file__", ""))).resolve()
+        if loaded_path != expected_module:
+            raise RuntimeError(
+                "TraCI was imported from a different SUMO installation: "
+                f"loaded={loaded_path}, expected={expected_module}"
+            )
+    sys.path[:] = [entry for entry in sys.path if str(Path(entry).resolve()) != tools]
+    sys.path.insert(0, tools)
+    importlib.invalidate_caches()
 
 
 def sumo_subprocess_environment(installation: SumoInstallation) -> dict[str, str]:
@@ -107,4 +174,9 @@ def sumo_subprocess_environment(installation: SumoInstallation) -> dict[str, str
     bin_directory = str(Path(installation.sumo_binary).parent)
     if bin_directory.lower() not in current_path.lower():
         env["PATH"] = f"{bin_directory}{os.pathsep}{current_path}"
+    current_python_path = env.get("PYTHONPATH", "")
+    tools = installation.tools_directory
+    env["PYTHONPATH"] = (
+        f"{tools}{os.pathsep}{current_python_path}" if current_python_path else tools
+    )
     return env

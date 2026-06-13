@@ -6,14 +6,39 @@ from types import SimpleNamespace
 import numpy as np
 import yaml
 
-from safe_rl.pipeline.run_full_pipeline import build_generated_configs
-from safe_rl.pipeline.stage1_risk_probe import _aggregate_worker_performance, _concatenate_shards
+from safe_rl.pipeline.run_full_pipeline import (
+    _artifact_sha256,
+    _new_pipeline_state,
+    _validate_completed_outputs,
+    build_generated_configs,
+)
+from safe_rl.pipeline.stage1_risk_probe import (
+    _aggregate_worker_performance,
+    _concatenate_shards,
+    run as run_stage1,
+)
+from safe_rl.prediction.forecast_rollout_bundle import build_forecast_rollout_bundle
 from safe_rl.rl.ppo import _worker_model_memory_estimate
-from safe_rl.risk.merge_local import candidate_action_risk_samples
-from safe_rl.sim.sumo_highway_merge_env import SumoHighwayMergeEnv
+from safe_rl.risk.merge_local import (
+    candidate_action_risk_samples,
+    prepare_candidate_rollout_context,
+)
+from safe_rl.sim.sumo_highway_merge_env import (
+    SumoHighwayMergeEnv,
+    scheduled_episode_seed,
+)
 from safe_rl.sim.types import VehicleState
 from safe_rl.utils.config import load_config
-from safe_rl.utils.sumo_installation import resolve_sumo_installation
+from safe_rl.utils.stage1_dataset import (
+    open_stage1_dataset,
+    validate_stage1_dataset,
+    write_stage1_dataset,
+)
+from safe_rl.utils.sumo_installation import (
+    SumoInstallation,
+    configure_sumo_python,
+    resolve_sumo_installation,
+)
 
 
 def _state(
@@ -82,6 +107,76 @@ def test_candidate_rollout_reuses_surrounding_vehicle_rollouts(monkeypatch):
     assert calls["count"] == 2
     candidate_action_risk_samples(context)
     assert calls["count"] == 2
+
+
+def test_episode_seed_schedule_is_unique_across_parallel_envs():
+    base_seed = 17
+    for num_envs in (1, 2, 4):
+        seeds = {
+            scheduled_episode_seed(base_seed, rank, episode, num_envs)
+            for episode in range(10)
+            for rank in range(num_envs)
+        }
+        assert len(seeds) == 10 * num_envs
+        assert min(seeds) == base_seed
+        assert max(seeds) == base_seed + 10 * num_envs - 1
+
+
+def test_explicit_reset_seed_does_not_apply_parallel_schedule(monkeypatch):
+    cfg = load_config()
+    env = SumoHighwayMergeEnv(
+        cfg,
+        seed=10,
+        worker_rank=3,
+        num_envs=4,
+        advance_episode_seed=False,
+    )
+    monkeypatch.setattr(env, "_close_sumo", lambda: None)
+    monkeypatch.setattr(env, "_start_sumo", lambda: None)
+    monkeypatch.setattr(env, "_simulation_step", lambda: None)
+    monkeypatch.setattr(env, "_apply_curriculum_perturbation", lambda: None)
+    monkeypatch.setattr(env, "_configure_ego_control", lambda: None)
+    monkeypatch.setattr(env, "_collect_states", lambda: [])
+    monkeypatch.setattr(env, "_build_observation", lambda: np.zeros(env.observation_space.shape))
+    observation, info = env.reset(seed=1234)
+    assert observation.shape == env.observation_space.shape
+    assert env.seed_value == 1234
+    assert info["episode_seed"] == 1234
+
+
+def test_risk_cv_rollout_and_forecast_bundle_do_not_share_surrounding_trajectories():
+    cfg = load_config()
+    cfg.forecast_features["source"] = "wcdt_v3"
+    ego = _state("ego", x=100.0, lane=0)
+    front = _state("front", x=125.0, lane=1)
+    context = {"ego": ego, "vehicles": [ego, front], "lane_count": 4, "config": cfg}
+    risk_context = prepare_candidate_rollout_context(context)
+
+    horizon = int(cfg.forecast_features.horizon_steps)
+    predicted = np.zeros((1, horizon, 2), dtype=np.float32)
+    predicted[0, :, 0] = np.linspace(500.0, 520.0, horizon)
+    predicted[0, :, 1] = front.y
+
+    class Predictor:
+        checkpoint_path = "synthetic-wcdt-v3"
+
+        def predict(self, _context):
+            return {
+                "future_trajectories": predicted,
+                "selected_vehicle_ids": ["front"],
+                "forecast_source": "wcdt_v3",
+                "uncertainty": 0.2,
+            }
+
+    bundle = build_forecast_rollout_bundle(cfg, context, Predictor())
+    forecast_actor = bundle.actor_by_id("front")
+    assert forecast_actor is not None
+    assert forecast_actor.source == "wcdt_v3"
+    assert not np.isclose(
+        risk_context.risk_surrounding_cv_rollouts[0][0].x,
+        forecast_actor.trajectory[0].x,
+    )
+    assert risk_context.risk_surrounding_cv_rollouts is not bundle.rollout_lists()
 
 
 def test_decision_context_cache_is_invalidated_explicitly():
@@ -176,12 +271,123 @@ def test_stage1_shard_merge_is_stable_and_rebuilds_candidate_ids(tmp_path):
         candidate_transition_id=np.asarray([0, 0]),
         **metadata,
     )
-    output = tmp_path / "merged.npz"
+    output = tmp_path / "merged"
     merged = _concatenate_shards([shard_a, shard_b], output)
     assert merged["transition_episode_id"].tolist() == [1, 2]
     assert merged["episode_id"].tolist() == [1, 1, 2, 2]
     assert merged["actions"].tolist() == [0, 1, 0, 1]
     assert merged["candidate_transition_id"].tolist() == [0, 0, 1, 1]
+    assert (output / "manifest.json").exists()
+    merged.close()
+
+
+def test_stage1_shard_merge_does_not_use_full_array_concatenate(tmp_path, monkeypatch):
+    shard_paths = []
+    for episode_id in (2, 1):
+        shard = tmp_path / f"shard_{episode_id}.npz"
+        np.savez(
+            shard,
+            transition_episode_id=np.asarray([episode_id]),
+            transition_episode_step=np.asarray([5]),
+            executed_actions=np.asarray([episode_id]),
+            episode_id=np.asarray([episode_id, episode_id]),
+            candidate_episode_step=np.asarray([5, 5]),
+            actions=np.asarray([1, 0]),
+            candidate_transition_id=np.asarray([0, 0]),
+            trajectory_schema_version=np.asarray(4, dtype=np.int64),
+            safety_metric_version=np.asarray("oriented_box_v1"),
+        )
+        shard_paths.append(shard)
+
+    def reject_concatenate(*_args, **_kwargs):
+        raise AssertionError("streaming shard merge must not concatenate complete arrays")
+
+    monkeypatch.setattr(np, "concatenate", reject_concatenate)
+    output = tmp_path / "streamed"
+    merged = _concatenate_shards(shard_paths, output)
+    assert merged["transition_episode_id"].tolist() == [1, 2]
+    merged.close()
+
+
+def test_manifest_dataset_and_legacy_npz_expose_same_array_semantics(tmp_path):
+    legacy = tmp_path / "legacy.npz"
+    arrays = {
+        "transition_episode_id": np.asarray([1, 2], dtype=np.int64),
+        "observations": np.arange(6, dtype=np.float32).reshape(2, 3),
+    }
+    np.savez(legacy, **arrays)
+    shard = tmp_path / "shard.npz"
+    np.savez(
+        shard,
+        transition_episode_id=arrays["transition_episode_id"],
+        transition_episode_step=np.asarray([1, 1]),
+        executed_actions=np.asarray([0, 1]),
+        observations=arrays["observations"],
+    )
+    output = tmp_path / "manifest"
+    merged = _concatenate_shards([shard], output)
+    old = open_stage1_dataset(legacy)
+    try:
+        assert merged.legacy_npz_format is False
+        assert old.legacy_npz_format is True
+        np.testing.assert_array_equal(merged["transition_episode_id"], old["transition_episode_id"])
+        np.testing.assert_array_equal(merged["observations"], old["observations"])
+    finally:
+        merged.close()
+        old.close()
+
+
+def test_stage1_dataset_array_damage_is_detected_by_resume_validation(tmp_path):
+    output = tmp_path / "risk_probe_buffer"
+    write_stage1_dataset(
+        output,
+        {
+            "transition_episode_id": np.asarray([1, 2], dtype=np.int64),
+            "observations": np.arange(6, dtype=np.float32).reshape(2, 3),
+        },
+        metadata={
+            "trajectory_schema_version": 4,
+            "episode_seed_schedule": "incrementing_v1",
+        },
+    )
+    validate_stage1_dataset(output)
+    invocation = {
+        "stage1_episodes": 2,
+        "stage4_episodes": None,
+        "stage5_episodes": None,
+        "ppo_timesteps": None,
+        "forecast_ppo_timesteps": None,
+        "forecast_ppo_profile": "default",
+        "forecast_sources": ["constant_velocity"],
+    }
+    state = _new_pipeline_state("test_run", invocation)
+    task = state["tasks"]["stage1"]
+    task["status"] = "completed"
+    task["required_outputs"] = [str(output)]
+    task["output_hashes"] = {str(output): _artifact_sha256(output)}
+
+    observations = np.load(output / "arrays" / "observations.npy", mmap_mode="r+")
+    observations[0, 0] = 999.0
+    observations.flush()
+    mmap_handle = getattr(observations, "_mmap", None)
+    if mmap_handle is not None:
+        mmap_handle.close()
+
+    with np.testing.assert_raises_regex(ValueError, "Stage1 array hash changed"):
+        _validate_completed_outputs(state)
+
+
+def test_stage1_rejects_unsupported_output_format(monkeypatch):
+    cfg = load_config()
+    cfg.stage1["output_format"] = "legacy_npz"
+    monkeypatch.setattr(
+        "safe_rl.pipeline.stage1_risk_probe._run_parallel",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("collection must not start")
+        ),
+    )
+    with np.testing.assert_raises_regex(ValueError, "stage1.output_format"):
+        run_stage1(cfg)
 
 
 def test_parallel_stage1_performance_is_aggregated_at_top_level():
@@ -247,6 +453,9 @@ def test_sumo_resolver_uses_explicit_installation_without_project_path_fallback(
     tools_dir = home / "tools"
     bin_dir.mkdir(parents=True)
     tools_dir.mkdir()
+    (tools_dir / "traci").mkdir()
+    (tools_dir / "traci" / "__init__.py").write_text("", encoding="utf-8")
+    (tools_dir / "traci" / "constants.py").write_text("TRACI_VERSION = 21\n", encoding="utf-8")
     sumo = bin_dir / "sumo.exe"
     netconvert = bin_dir / "netconvert.exe"
     sumo.write_bytes(b"")
@@ -266,6 +475,12 @@ def test_sumo_resolver_prefers_sumo_home_over_path(tmp_path, monkeypatch):
     for candidate in (home, path_home):
         (candidate / "bin").mkdir(parents=True)
         (candidate / "tools").mkdir()
+        (candidate / "tools" / "traci").mkdir()
+        (candidate / "tools" / "traci" / "__init__.py").write_text("", encoding="utf-8")
+        (candidate / "tools" / "traci" / "constants.py").write_text(
+            "TRACI_VERSION = 21\n",
+            encoding="utf-8",
+        )
         for name in ("sumo.exe", "netconvert.exe"):
             (candidate / "bin" / name).write_bytes(b"")
     import safe_rl.utils.sumo_installation as installation
@@ -279,3 +494,63 @@ def test_sumo_resolver_prefers_sumo_home_over_path(tmp_path, monkeypatch):
     monkeypatch.setattr(installation, "_version", lambda path: f"{path.stem} 1.22.0")
     resolved = resolve_sumo_installation({"sumo_binary": "sumo"})
     assert Path(resolved.sumo_binary) == (home / "bin" / "sumo.exe").resolve()
+
+
+def test_sumo_resolver_does_not_take_netconvert_from_another_installation(
+    tmp_path,
+    monkeypatch,
+):
+    selected = tmp_path / "selected"
+    other = tmp_path / "other"
+    (selected / "bin").mkdir(parents=True)
+    (selected / "tools" / "traci").mkdir(parents=True)
+    (selected / "tools" / "traci" / "__init__.py").write_text("", encoding="utf-8")
+    (selected / "bin" / "sumo.exe").write_bytes(b"sumo")
+    (other / "bin").mkdir(parents=True)
+    (other / "bin" / "netconvert.exe").write_bytes(b"netconvert")
+    monkeypatch.setattr(
+        "safe_rl.utils.sumo_installation.shutil.which",
+        lambda name: str(other / "bin" / "netconvert.exe") if "netconvert" in name else None,
+    )
+    with np.testing.assert_raises(FileNotFoundError):
+        resolve_sumo_installation({"sumo_binary": str(selected / "bin" / "sumo.exe")})
+
+
+def test_sumo_resolver_rejects_missing_explicit_absolute_path(tmp_path, monkeypatch):
+    fallback = tmp_path / "fallback"
+    (fallback / "bin").mkdir(parents=True)
+    (fallback / "tools" / "traci").mkdir(parents=True)
+    (fallback / "bin" / "sumo.exe").write_bytes(b"sumo")
+    (fallback / "bin" / "netconvert.exe").write_bytes(b"netconvert")
+    (fallback / "tools" / "traci" / "__init__.py").write_text("", encoding="utf-8")
+    monkeypatch.setenv("SUMO_HOME", str(fallback))
+    missing = tmp_path / "missing" / "sumo.exe"
+    with np.testing.assert_raises_regex(FileNotFoundError, "Configured sumo binary"):
+        resolve_sumo_installation({"sumo_binary": str(missing.resolve())})
+
+
+def test_configure_sumo_python_rejects_preloaded_traci_from_other_installation(
+    tmp_path,
+    monkeypatch,
+):
+    tools = tmp_path / "sumo" / "tools"
+    expected = tools / "traci" / "__init__.py"
+    expected.parent.mkdir(parents=True)
+    expected.write_text("", encoding="utf-8")
+    installation = SumoInstallation(
+        sumo_binary=str(tmp_path / "sumo" / "bin" / "sumo.exe"),
+        sumo_gui_binary="",
+        netconvert_binary=str(tmp_path / "sumo" / "bin" / "netconvert.exe"),
+        tools_directory=str(tools),
+        sumo_home=str(tmp_path / "sumo"),
+        sumo_version="SUMO 1.22.0",
+        netconvert_version="netconvert 1.22.0",
+        sumo_binary_sha256="a",
+        netconvert_binary_sha256="b",
+        traci_module_path=str(expected),
+        traci_version="protocol_21",
+    )
+    wrong = SimpleNamespace(__file__=str(tmp_path / "other" / "traci" / "__init__.py"))
+    monkeypatch.setitem(__import__("sys").modules, "traci", wrong)
+    with np.testing.assert_raises(RuntimeError):
+        configure_sumo_python(installation)
