@@ -230,8 +230,17 @@ class ForecastFeatureAugmentor:
         dt = float(self.config.scenario.step_length)
         horizon = int(min(trajectories.shape[-2], self.config.forecast_features.get("horizon_steps", trajectories.shape[-2])))
         ego_rollout = route_aware_constant_velocity_rollout(ego, horizon, dt, self.config)[0]
-        target_lane_gap = forecast_target_lane_gap_from_trajectories(ego_rollout, trajectories, self.config)
         references = [vehicle for vehicle in vehicles if vehicle.vehicle_id != ego.vehicle_id]
+        target_lane_gap = (
+            50.0
+            if references
+            else forecast_target_lane_gap_from_trajectories(
+                ego_rollout,
+                trajectories,
+                self.config,
+            )
+        )
+        actor_rollouts: list[list[Any]] = []
         for actor_idx, traj in enumerate(trajectories):
             agent_min = 50.0
             reference = references[actor_idx] if actor_idx < len(references) else None
@@ -240,7 +249,9 @@ class ForecastFeatureAugmentor:
                 reference=reference,
                 dt=dt,
                 vehicle_id=f"pred_{actor_idx}",
+                config=self.config,
             )
+            actor_rollouts.append(predicted_states)
             for step_idx, other_future in enumerate(predicted_states):
                 ego_future = ego_rollout[min(step_idx, len(ego_rollout) - 1)]
                 dx = float(other_future.x - ego_future.x)
@@ -254,6 +265,18 @@ class ForecastFeatureAugmentor:
                 min_ttc = min(min_ttc, relative_ttc(ego_future, other_future))
                 max_drac = max(max_drac, drac(ego_future, other_future))
             top_risks.append(1.0 / (1.0 + agent_min))
+        if references:
+            for step_idx, ego_future in enumerate(ego_rollout):
+                step_vehicles = [
+                    rollout[step_idx]
+                    for rollout in actor_rollouts
+                    if step_idx < len(rollout)
+                ]
+                if step_vehicles:
+                    target_lane_gap = min(
+                        target_lane_gap,
+                        float(merge_local_stats(ego_future, step_vehicles, self.config).target_lane_gap),
+                    )
         top = np.sort(np.asarray(top_risks, dtype=np.float32))[::-1]
         top = np.pad(top[:3], (0, max(0, 3 - len(top))), constant_values=0.0)
         confidence = prediction.get("mode_confidence")

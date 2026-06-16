@@ -6,6 +6,7 @@ from pathlib import Path
 from safe_rl.prediction.forecast_feature_augmentor import ForecastFeatureAugmentor
 from safe_rl.prediction.actor_selector import actor_selection_config_hash
 from safe_rl.prediction.forecast_rollout_bundle import FORECAST_ROLLOUT_BUNDLE_VERSION
+from safe_rl.prediction.trajectory_postprocess import TRAJECTORY_POSTPROCESS_VERSION
 from safe_rl.pipeline.common import load_stage_config, make_env, parse_config_arg, write_report
 from safe_rl.rl.ppo import train_ppo
 from safe_rl.sim.metrics import SAFETY_METRIC_VERSION
@@ -123,7 +124,11 @@ def run(cfg):
         env.close()
     report["stage"] = "stage3"
     report["forecast_features_enabled"] = bool(cfg.forecast_features.enabled or cfg.rl.use_wcdt_forecast_features)
-    report["forecast_source"] = str(cfg.forecast_features.get("source", ""))
+    report["forecast_source"] = (
+        str(cfg.forecast_features.get("source", ""))
+        if report["forecast_features_enabled"]
+        else None
+    )
     report["prediction_checkpoint"] = prediction_checkpoint
     report["prediction_loss_summary"] = _prediction_loss_summary(prediction_checkpoint, report["forecast_source"])
     report["predictor_summary"] = report["prediction_loss_summary"]
@@ -152,6 +157,7 @@ def run(cfg):
     )
     report["forecast_rollout_bundle_version"] = FORECAST_ROLLOUT_BUNDLE_VERSION
     report["forecast_rollout_bundle_config_hash"] = actor_selection_config_hash(cfg)
+    report["trajectory_postprocess_version"] = TRAJECTORY_POSTPROCESS_VERSION
     report["episode_seed_schedule"] = str(
         cfg.get("run", {}).get("episode_seed_schedule", "fixed_legacy")
     )

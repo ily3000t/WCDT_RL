@@ -11,14 +11,17 @@ from safe_rl.prediction.actor_selector import (
     actor_relevance_config,
     select_merge_relevant_actors,
 )
-from safe_rl.prediction.trajectory_postprocess import trajectory_to_states
+from safe_rl.prediction.trajectory_postprocess import (
+    TRAJECTORY_POSTPROCESS_VERSION,
+    trajectory_to_states,
+)
 from safe_rl.risk.merge_local import merge_local_stats, route_aware_constant_velocity_rollout
 from safe_rl.sim.metrics import INF_TTC, bbox_gap, drac, relative_ttc
 from safe_rl.sim.scenario_semantics import is_auxiliary_edge, is_ramp_edge
 from safe_rl.sim.types import VehicleState
 
 
-FORECAST_ROLLOUT_BUNDLE_VERSION = "forecast_rollout_bundle_v1"
+FORECAST_ROLLOUT_BUNDLE_VERSION = "hybrid_bundle_v2"
 
 
 def _prediction_array(prediction: dict[str, Any]) -> np.ndarray | None:
@@ -59,6 +62,8 @@ class ForecastRolloutBundle:
     safety_required_vehicle_ids: list[str]
     wcdt_required_actor_coverage_complete: bool
     forecast_safety_actor_coverage_complete: bool
+    critical_wcdt_coverage_complete: bool
+    combined_critical_coverage_complete: bool
     actor_selector_overflow: bool
     cv_fallback_overflow: bool
     cv_fallback_dropped_vehicle_ids: list[str]
@@ -74,6 +79,7 @@ class ForecastRolloutBundle:
     def trace_fields(self) -> dict[str, Any]:
         return {
             "forecast_rollout_bundle_version": self.version,
+            "trajectory_postprocess_version": TRAJECTORY_POSTPROCESS_VERSION,
             "forecast_wcdt_selected_vehicle_ids": list(self.wcdt_selected_vehicle_ids),
             "forecast_cv_fallback_vehicle_ids": list(self.cv_fallback_vehicle_ids),
             "forecast_actor_sources": dict(self.actor_sources),
@@ -87,6 +93,21 @@ class ForecastRolloutBundle:
                 self.forecast_safety_actor_coverage_complete
             ),
             "actor_selector_relevant_count": int(self.selection_result.relevant_count),
+            "critical_actor_count": int(self.selection_result.critical_count),
+            "contextual_actor_count": int(self.selection_result.contextual_count),
+            "critical_actor_overflow": bool(self.selection_result.critical_overflow),
+            "critical_dropped_actor_ids": list(
+                self.selection_result.dropped_critical_ids
+            ),
+            "contextual_actor_truncated_count": int(
+                len(self.selection_result.contextual_truncated_ids)
+            ),
+            "critical_wcdt_coverage_complete": bool(
+                self.critical_wcdt_coverage_complete
+            ),
+            "combined_critical_coverage_complete": bool(
+                self.combined_critical_coverage_complete
+            ),
             "actor_selector_overflow": bool(self.actor_selector_overflow),
             "actor_selector_dropped_relevant_ids": list(
                 self.selection_result.dropped_relevant_ids
@@ -182,6 +203,7 @@ def _selected_prediction_rollouts(
             reference=reference,
             dt=dt,
             vehicle_id=vehicle_id,
+            config=cfg,
         )
         if not states:
             continue
@@ -302,13 +324,18 @@ def build_forecast_rollout_bundle(
         actor.relevance_reasons = tuple(item.relevance_reasons if item else ())
     actors = [*predicted_actors, *fallback_actors]
     actor_ids = {actor.vehicle_id for actor in actors}
-    wcdt_required_complete = bool(
-        not selection.overflow
-        and all(vehicle_id in selected_ids for vehicle_id in selection.relevant_actor_ids)
+    critical_wcdt_complete = bool(
+        not selection.critical_overflow
+        and all(vehicle_id in selected_ids for vehicle_id in selection.critical_actor_ids)
     )
+    wcdt_required_complete = critical_wcdt_complete
     safety_complete = bool(
         not cv_fallback_overflow
         and all(vehicle_id in actor_ids for vehicle_id in safety_required)
+    )
+    combined_critical_complete = bool(
+        not cv_fallback_overflow
+        and all(vehicle_id in actor_ids for vehicle_id in selection.critical_actor_ids)
     )
     cv_uncertainty = max(
         (actor.uncertainty for actor in fallback_actors),
@@ -329,6 +356,8 @@ def build_forecast_rollout_bundle(
         safety_required_vehicle_ids=list(safety_required),
         wcdt_required_actor_coverage_complete=wcdt_required_complete,
         forecast_safety_actor_coverage_complete=safety_complete,
+        critical_wcdt_coverage_complete=critical_wcdt_complete,
+        combined_critical_coverage_complete=combined_critical_complete,
         actor_selector_overflow=bool(selection.overflow),
         cv_fallback_overflow=bool(cv_fallback_overflow),
         cv_fallback_dropped_vehicle_ids=list(dropped_fallback),

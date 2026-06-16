@@ -18,6 +18,10 @@ class VehicleState:
     length: float = 4.8
     width: float = 1.8
     accel: float = 0.0
+    route_position_valid: bool = True
+    projection_distance: float = 0.0
+    projection_ambiguity_margin: float = float("inf")
+    projection_failure_reason: str = ""
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)

@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import math
-from dataclasses import replace
+from dataclasses import dataclass, replace
 from functools import lru_cache
 from pathlib import Path
 from typing import Any
@@ -16,6 +16,18 @@ EDGE_ROLE_RAMP = 1
 EDGE_ROLE_AUXILIARY = 2
 EDGE_ROLE_MAINLINE = 3
 EDGE_ROLE_TARGET = 4
+
+
+@dataclass(frozen=True)
+class RouteProjection:
+    edge_id: str
+    lane_index: int
+    lane_id: str
+    lane_pos: float
+    valid: bool
+    projection_distance: float
+    ambiguity_margin: float
+    failure_reason: str = ""
 
 
 def _scenario_list(config: Any, key: str, default: list[str]) -> list[str]:
@@ -312,6 +324,134 @@ def infer_route_position(
             best_lane_pos = float(lane_pos)
             best_distance = float(distance)
     return best_edge, best_lane_pos
+
+
+def _projection_candidates(
+    config: Any,
+    previous: VehicleState,
+) -> list[tuple[str, int, bool]]:
+    """Return current and route-reachable lane candidates.
+
+    The boolean marks candidates that preserve the previous route/lane
+    continuity and therefore may resolve a geometric projection tie.
+    """
+
+    net_file = str(config.scenario.get("net_file", ""))
+    geometry = _net_lane_geometry(net_file) if net_file else {}
+    current_edge = str(previous.edge_id)
+    current_lane = int(previous.lane_index)
+    candidates: list[tuple[str, int, bool]] = []
+
+    def add(edge_id: str, lane_index: int, preferred: bool) -> None:
+        item = (str(edge_id), int(lane_index), bool(preferred))
+        if item not in candidates and int(lane_index) in geometry.get(str(edge_id), {}):
+            candidates.append(item)
+
+    add(current_edge, current_lane, True)
+    for lane_index in sorted(geometry.get(current_edge, {})):
+        if abs(int(lane_index) - current_lane) <= 1:
+            add(current_edge, int(lane_index), int(lane_index) == current_lane)
+
+    outgoing = next_edge(config, current_edge)
+    if outgoing is not None:
+        for edge_id, lane_index, _preferred in list(candidates):
+            if edge_id != current_edge:
+                continue
+            connected = connected_lane_index(config, current_edge, lane_index, outgoing)
+            if connected is not None:
+                add(
+                    outgoing,
+                    int(connected),
+                    lane_index == current_lane,
+                )
+        connected = connected_lane_index(config, current_edge, current_lane, outgoing)
+        if connected is not None:
+            add(outgoing, int(connected), True)
+    return candidates
+
+
+def project_route_position(
+    config: Any,
+    x: float,
+    y: float,
+    previous: VehicleState,
+) -> RouteProjection:
+    settings = config.prediction.get("route_projection", {})
+    max_distance = float(settings.get("max_projection_distance", 2.5))
+    ambiguity_threshold = float(settings.get("ambiguity_margin", 0.25))
+    scored: list[tuple[float, str, int, float, bool]] = []
+    for edge_id, lane_index, preferred in _projection_candidates(config, previous):
+        geometry = _lane_geometry(config, edge_id, lane_index)
+        if geometry is None:
+            continue
+        lane_pos, distance = _nearest_distance_on_shape(
+            geometry["points"],
+            float(x),
+            float(y),
+        )
+        scored.append(
+            (
+                float(distance),
+                str(edge_id),
+                int(lane_index),
+                float(lane_pos),
+                bool(preferred),
+            )
+        )
+    if not scored:
+        return RouteProjection(
+            edge_id=str(previous.edge_id),
+            lane_index=int(previous.lane_index),
+            lane_id=str(previous.lane_id),
+            lane_pos=float(previous.lane_pos),
+            valid=False,
+            projection_distance=INF_TTC,
+            ambiguity_margin=0.0,
+            failure_reason="no_reachable_lane_candidate",
+        )
+    scored.sort(key=lambda item: (item[0], item[1], item[2]))
+    best = scored[0]
+    second_distance = scored[1][0] if len(scored) > 1 else INF_TTC
+    ambiguity_margin = float(second_distance - best[0])
+    if ambiguity_margin < ambiguity_threshold:
+        tied = [item for item in scored if item[0] - best[0] < ambiguity_threshold]
+        preferred = [item for item in tied if item[4]]
+        if len(preferred) == 1:
+            best = preferred[0]
+            remaining = [item for item in scored if item != best]
+            second_distance = remaining[0][0] if remaining else INF_TTC
+            ambiguity_margin = float(abs(second_distance - best[0]))
+        elif len(tied) > 1:
+            return RouteProjection(
+                edge_id=str(best[1]),
+                lane_index=int(best[2]),
+                lane_id=f"{best[1]}_{best[2]}",
+                lane_pos=float(best[3]),
+                valid=False,
+                projection_distance=float(best[0]),
+                ambiguity_margin=ambiguity_margin,
+                failure_reason="ambiguous_lane_projection",
+            )
+    if best[0] > max_distance:
+        return RouteProjection(
+            edge_id=str(best[1]),
+            lane_index=int(best[2]),
+            lane_id=f"{best[1]}_{best[2]}",
+            lane_pos=float(best[3]),
+            valid=False,
+            projection_distance=float(best[0]),
+            ambiguity_margin=ambiguity_margin,
+            failure_reason="projection_distance_exceeded",
+        )
+    return RouteProjection(
+        edge_id=str(best[1]),
+        lane_index=int(best[2]),
+        lane_id=f"{best[1]}_{best[2]}",
+        lane_pos=float(best[3]),
+        valid=True,
+        projection_distance=float(best[0]),
+        ambiguity_margin=ambiguity_margin,
+    )
 
 
 def lane_center_at_x(

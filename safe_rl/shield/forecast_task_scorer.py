@@ -123,44 +123,100 @@ class ForecastAwareTaskScorer:
         first_rear_gap = float(best["first_step_target_rear_gap"])
         first_front_vehicle_id = str(best["first_step_target_front_vehicle_id"])
         first_rear_vehicle_id = str(best["first_step_target_rear_vehicle_id"])
-        front_consistent = bool(
-            not target_front_required
-            or (
-                first_front_vehicle_id == target_front_vehicle_id
-                and abs(first_front_gap - current_front_gap) <= max_gap_jump
-            )
-        )
-        rear_consistent = bool(
-            not target_rear_required
-            or (
-                first_rear_vehicle_id == target_rear_vehicle_id
-                and abs(first_rear_gap - current_rear_gap) <= max_gap_jump
-            )
-        )
-        front_progress_error, front_progress_pass = self._first_step_progress_consistency(
+        front_continuity = self._first_step_route_consistency(
             bundle,
             target_front_vehicle_id,
             dt,
         )
-        rear_progress_error, rear_progress_pass = self._first_step_progress_consistency(
+        rear_continuity = self._first_step_route_consistency(
             bundle,
             target_rear_vehicle_id,
             dt,
         )
-        identity_consistent = bool(
-            front_consistent
-            and rear_consistent
-            and (not target_front_required or first_front_vehicle_id == target_front_vehicle_id)
-            and (not target_rear_required or first_rear_vehicle_id == target_rear_vehicle_id)
+        first_front_covered = (
+            (not target_front_required and not first_front_vehicle_id)
+            or (
+                bool(first_front_vehicle_id)
+                and first_front_vehicle_id in combined_vehicle_id_set
+            )
         )
+        first_rear_covered = (
+            (not target_rear_required and not first_rear_vehicle_id)
+            or (
+                bool(first_rear_vehicle_id)
+                and first_rear_vehicle_id in combined_vehicle_id_set
+            )
+        )
+        front_turnover = bool(
+            target_front_required
+            and first_front_vehicle_id
+            and first_front_vehicle_id != target_front_vehicle_id
+        )
+        rear_turnover = bool(
+            target_rear_required
+            and first_rear_vehicle_id
+            and first_rear_vehicle_id != target_rear_vehicle_id
+        )
+        identity_turnover = bool(front_turnover or rear_turnover)
+        first_ids_distinct = bool(
+            not first_front_vehicle_id
+            or not first_rear_vehicle_id
+            or first_front_vehicle_id != first_rear_vehicle_id
+        )
+        identity_turnover_valid = bool(
+            first_front_covered
+            and first_rear_covered
+            and first_ids_distinct
+            and first_front_gap >= 0.0
+            and first_rear_gap >= 0.0
+        )
+        front_gap_jump_pass = bool(
+            not target_front_required
+            or front_turnover
+            or abs(first_front_gap - current_front_gap) <= max_gap_jump
+        )
+        rear_gap_jump_pass = bool(
+            not target_rear_required
+            or rear_turnover
+            or abs(first_rear_gap - current_rear_gap) <= max_gap_jump
+        )
+        route_position_valid = bool(
+            front_continuity["route_position_valid"]
+            and rear_continuity["route_position_valid"]
+        )
+        gap_consistency_checkable = bool(
+            coverage_complete
+            and front_continuity["checkable"]
+            and rear_continuity["checkable"]
+            and first_front_covered
+            and first_rear_covered
+        )
+        failure_reasons: list[str] = []
+        if not coverage_complete:
+            failure_reasons.append("forecast_safety_coverage")
+        if not front_continuity["checkable"] or not rear_continuity["checkable"]:
+            failure_reasons.append("current_actor_uncheckable")
+        if not route_position_valid:
+            failure_reasons.append("route_position_invalid")
+        if not first_front_covered or not first_rear_covered:
+            failure_reasons.append("first_step_actor_uncovered")
+        if not identity_turnover_valid:
+            failure_reasons.append("identity_turnover_invalid")
+        if not front_gap_jump_pass or not rear_gap_jump_pass:
+            failure_reasons.append("gap_jump")
+        if not front_continuity["pass"] or not rear_continuity["pass"]:
+            failure_reasons.append("route_progress")
         physical_consistency_pass = bool(
-            identity_consistent and front_progress_pass and rear_progress_pass
+            route_position_valid
+            and front_continuity["pass"]
+            and rear_continuity["pass"]
+            and identity_turnover_valid
         )
         gap_consistency_pass = bool(
-            coverage_complete
-            and front_consistent
-            and rear_consistent
+            gap_consistency_checkable
             and physical_consistency_pass
+            and front_gap_jump_pass
+            and rear_gap_jump_pass
         )
         would_merge = bool(
             int(best_action.lateral_cmd) == int(merge_cmd)
@@ -200,10 +256,33 @@ class ForecastAwareTaskScorer:
             "forecast_first_step_target_front_gap": first_front_gap,
             "forecast_first_step_target_rear_gap": first_rear_gap,
             "forecast_gap_consistency_pass": gap_consistency_pass,
+            "forecast_gap_consistency_checkable": gap_consistency_checkable,
+            "forecast_gap_consistency_checkable_count": int(gap_consistency_checkable),
+            "forecast_gap_consistency_pass_count": int(gap_consistency_pass),
+            "forecast_gap_consistency_failure_reason": (
+                "ok" if gap_consistency_pass else ",".join(dict.fromkeys(failure_reasons))
+            ),
             "forecast_gap_physical_consistency_pass": physical_consistency_pass,
-            "forecast_vehicle_identity_consistent": identity_consistent,
-            "forecast_front_first_step_progress_error": front_progress_error,
-            "forecast_rear_first_step_progress_error": rear_progress_error,
+            "forecast_vehicle_identity_consistent": not identity_turnover,
+            "forecast_identity_turnover": identity_turnover,
+            "forecast_identity_turnover_valid": identity_turnover_valid,
+            "forecast_current_front_progress_pass": bool(front_continuity["pass"]),
+            "forecast_current_rear_progress_pass": bool(rear_continuity["pass"]),
+            "forecast_first_front_covered": first_front_covered,
+            "forecast_first_rear_covered": first_rear_covered,
+            "forecast_front_gap_jump_pass": front_gap_jump_pass,
+            "forecast_rear_gap_jump_pass": rear_gap_jump_pass,
+            "forecast_route_position_valid": route_position_valid,
+            "forecast_projection_distance": max(
+                float(front_continuity["projection_distance"]),
+                float(rear_continuity["projection_distance"]),
+            ),
+            "forecast_projection_ambiguity_margin": min(
+                float(front_continuity["ambiguity_margin"]),
+                float(rear_continuity["ambiguity_margin"]),
+            ),
+            "forecast_front_first_step_progress_error": front_continuity["error"],
+            "forecast_rear_first_step_progress_error": rear_continuity["error"],
             "forecast_selected_vehicle_ids": list(selected_vehicle_ids),
             "forecast_target_front_vehicle_id": target_front_vehicle_id,
             "forecast_target_rear_vehicle_id": target_rear_vehicle_id,
@@ -248,8 +327,23 @@ class ForecastAwareTaskScorer:
             "forecast_first_step_target_front_gap": None,
             "forecast_first_step_target_rear_gap": None,
             "forecast_gap_consistency_pass": False,
+            "forecast_gap_consistency_checkable": False,
+            "forecast_gap_consistency_checkable_count": 0,
+            "forecast_gap_consistency_pass_count": 0,
+            "forecast_gap_consistency_failure_reason": "forecast_unavailable",
             "forecast_gap_physical_consistency_pass": False,
             "forecast_vehicle_identity_consistent": False,
+            "forecast_identity_turnover": False,
+            "forecast_identity_turnover_valid": False,
+            "forecast_current_front_progress_pass": False,
+            "forecast_current_rear_progress_pass": False,
+            "forecast_first_front_covered": False,
+            "forecast_first_rear_covered": False,
+            "forecast_front_gap_jump_pass": False,
+            "forecast_rear_gap_jump_pass": False,
+            "forecast_route_position_valid": False,
+            "forecast_projection_distance": None,
+            "forecast_projection_ambiguity_margin": None,
             "forecast_front_first_step_progress_error": None,
             "forecast_rear_first_step_progress_error": None,
             "forecast_selected_vehicle_ids": [],
@@ -283,21 +377,44 @@ class ForecastAwareTaskScorer:
             "forecast_aware_merge_progress_bonus": None,
         }
 
-    def _first_step_progress_consistency(
+    def _first_step_route_consistency(
         self,
         bundle: ForecastRolloutBundle,
         vehicle_id: str,
         dt: float,
-    ) -> tuple[float | None, bool]:
+    ) -> dict[str, Any]:
         if not vehicle_id:
-            return None, True
+            return {
+                "error": None,
+                "pass": True,
+                "checkable": True,
+                "route_position_valid": True,
+                "projection_distance": 0.0,
+                "ambiguity_margin": float("inf"),
+            }
         actor = bundle.actor_by_id(vehicle_id)
         if actor is None or actor.current_state is None or not actor.trajectory:
-            return None, False
+            return {
+                "error": None,
+                "pass": False,
+                "checkable": False,
+                "route_position_valid": False,
+                "projection_distance": float("inf"),
+                "ambiguity_margin": 0.0,
+            }
+        first_state = actor.trajectory[0]
+        route_position_valid = bool(first_state.route_position_valid)
         current_progress = merge_corridor_progress(self.config, actor.current_state)
-        first_progress = merge_corridor_progress(self.config, actor.trajectory[0])
+        first_progress = merge_corridor_progress(self.config, first_state)
         if current_progress is None or first_progress is None:
-            return None, False
+            return {
+                "error": None,
+                "pass": False,
+                "checkable": False,
+                "route_position_valid": route_position_valid,
+                "projection_distance": float(first_state.projection_distance),
+                "ambiguity_margin": float(first_state.projection_ambiguity_margin),
+            }
         expected = (
             float(actor.current_state.speed) * float(dt)
             + 0.5 * float(actor.current_state.accel) * float(dt) * float(dt)
@@ -305,7 +422,14 @@ class ForecastAwareTaskScorer:
         actual = float(first_progress - current_progress)
         error = abs(actual - expected)
         tolerance = max(2.0, 0.5 * abs(expected))
-        return float(error), bool(error <= tolerance)
+        return {
+            "error": float(error),
+            "pass": bool(route_position_valid and error <= tolerance),
+            "checkable": route_position_valid,
+            "route_position_valid": route_position_valid,
+            "projection_distance": float(first_state.projection_distance),
+            "ambiguity_margin": float(first_state.projection_ambiguity_margin),
+        }
 
     def _prediction_rollouts(
         self,
@@ -342,6 +466,7 @@ class ForecastAwareTaskScorer:
                 reference=reference,
                 dt=dt,
                 vehicle_id=vehicle_id,
+                config=self.config,
             )
             if states:
                 rollouts.append(states)

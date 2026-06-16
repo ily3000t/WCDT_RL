@@ -395,7 +395,7 @@ def run(cfg) -> Path:
             )
             group_reports[group.name]["forecast_checkpoint"] = str(group_cfg.forecast_features.get("checkpoint", ""))
         else:
-            group_reports[group.name]["forecast_source"] = ""
+            group_reports[group.name]["forecast_source"] = None
             group_reports[group.name]["forecast_checkpoint"] = ""
         group_reports[group.name]["shield_overrides"] = dict(group.get("shield_overrides", {}) or {})
         group_reports[group.name]["risk_module_overrides"] = dict(group.get("risk_module_overrides", {}) or {})

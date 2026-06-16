@@ -34,14 +34,14 @@ MODEL_ROLE_EXPLANATIONS: dict[str, dict[str, str | bool]] = {
     "ppo": {
         "role": "baseline_policy",
         "observation": "52D base observation",
-        "forecast_source": "none",
+        "forecast_source": None,
         "shield_enabled": False,
         "meaning": "Baseline PPO policy without forecast features or Shield.",
     },
     "ppo_shield": {
         "role": "trusted_shield_mainline",
         "observation": "52D base observation",
-        "forecast_source": "none",
+        "forecast_source": None,
         "shield_enabled": True,
         "meaning": "Baseline PPO policy with Risk Module Shield action replacement enabled.",
     },
@@ -338,6 +338,9 @@ def _wcdt_v3_candidate_summary(group_reports: dict[str, dict]) -> dict[str, Any]
         "merge_success_not_worse_than_reference": _metric(v3, "merge_success_rate")
         >= _metric(reference, "merge_success_rate"),
         "completion_time_not_degraded_vs_reference": _metric(v3, "completion_time_mean") <= completion_limit,
+        "gap_consistency_checkable": _metric(v3, "forecast_gap_consistency_checkable_rate") >= 0.95,
+        "gap_consistency_pass": _metric(v3, "forecast_gap_consistency_pass_rate") >= 0.99,
+        "critical_actor_overflow_acceptable": _metric(v3, "critical_actor_overflow_rate", 1.0) <= 0.01,
         "shield_fallback_rate_zero": _metric(v3_shield, "fallback_rate", 1.0) == 0.0,
         "shield_emergency_fallback_not_worse_than_reference": _metric(v3_shield, "emergency_fallback_rate", 1.0)
         <= _metric(reference_shield, "emergency_fallback_rate", 0.0),
@@ -525,7 +528,11 @@ def run(cfg, episodes: int = 50) -> Path:
             tensorboard=tb,
             tensorboard_step_offset=group_idx * max(1, len(seeds)),
         )
-        report["forecast_source"] = str(group.get("forecast_source", "")) if bool(group.forecast_features) else ""
+        report["forecast_source"] = (
+            str(group.get("forecast_source", ""))
+            if bool(group.forecast_features)
+            else None
+        )
         report["forecast_checkpoint"] = str(group.get("forecast_checkpoint", "")) if bool(group.forecast_features) else ""
         group_reports[str(group.name)] = report
     tb.close()

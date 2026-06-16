@@ -124,34 +124,66 @@ def aggregate_episode_reports(reports: list[dict]) -> dict:
         [float(report.get("no_merge_request_before_taper_count", 0)) for report in reports],
         dtype=np.float32,
     )
-    forecast_coverage_rates = np.asarray(
-        [float(report.get("forecast_actor_coverage_complete_rate", 0.0)) for report in reports],
-        dtype=np.float32,
+    forecast_record_count = int(
+        sum(int(report.get("forecast_record_count", 0)) for report in reports)
     )
-    forecast_gap_consistency_rates = np.asarray(
-        [float(report.get("forecast_gap_consistency_pass_rate", 0.0)) for report in reports],
-        dtype=np.float32,
+    forecast_coverage_complete_count = int(
+        sum(int(report.get("forecast_actor_coverage_complete_count", 0)) for report in reports)
     )
-    wcdt_relevant_coverage_rates = np.asarray(
-        [float(report.get("wcdt_relevant_actor_coverage_rate", 0.0)) for report in reports],
-        dtype=np.float32,
+    forecast_gap_checkable_count = int(
+        sum(
+            int(report.get("forecast_gap_consistency_checkable_count", 0))
+            for report in reports
+        )
     )
-    combined_safety_coverage_rates = np.asarray(
-        [float(report.get("combined_forecast_safety_coverage_rate", 0.0)) for report in reports],
-        dtype=np.float32,
+    forecast_gap_pass_count = int(
+        sum(
+            int(report.get("forecast_gap_consistency_pass_count", 0))
+            for report in reports
+        )
     )
-    selector_overflow_rates = np.asarray(
-        [float(report.get("actor_selector_overflow_rate", 0.0)) for report in reports],
-        dtype=np.float32,
+    wcdt_relevant_coverage_count = int(
+        sum(int(report.get("wcdt_relevant_actor_coverage_count", 0)) for report in reports)
     )
-    cv_fallback_overflow_rates = np.asarray(
-        [float(report.get("cv_fallback_overflow_rate", 0.0)) for report in reports],
-        dtype=np.float32,
+    combined_safety_coverage_count = int(
+        sum(int(report.get("combined_forecast_safety_coverage_count", 0)) for report in reports)
     )
-    cv_fallback_usage_rates = np.asarray(
-        [float(report.get("cv_fallback_usage_rate", 0.0)) for report in reports],
-        dtype=np.float32,
+    selector_overflow_count = int(
+        sum(int(report.get("actor_selector_overflow_count", 0)) for report in reports)
     )
+    critical_overflow_count = int(
+        sum(int(report.get("critical_actor_overflow_count", report.get("actor_selector_overflow_count", 0))) for report in reports)
+    )
+    critical_wcdt_coverage_count = int(
+        sum(int(report.get("critical_wcdt_coverage_count", 0)) for report in reports)
+    )
+    combined_critical_coverage_count = int(
+        sum(int(report.get("combined_critical_coverage_count", 0)) for report in reports)
+    )
+    cv_fallback_overflow_count = int(
+        sum(int(report.get("cv_fallback_overflow_count", 0)) for report in reports)
+    )
+    cv_fallback_usage_count = int(
+        sum(int(report.get("cv_fallback_usage_count", 0)) for report in reports)
+    )
+    reward_component_names = (
+        "progress_reward",
+        "speed_reward",
+        "terminal_reward",
+        "lane_oob_penalty",
+        "safety_penalty",
+        "safety_forecast_shaping",
+        "shield_guided_shaping",
+        "merge_timing_shaping",
+        "total_episode_reward",
+    )
+    reward_component_means = {
+        name: float(np.mean([float(report.get(name, 0.0)) for report in reports]))
+        for name in reward_component_names
+    }
+    raw_lane_oob_count = int(sum(int(report.get("raw_action_lane_oob_count", 0)) for report in reports))
+    final_lane_oob_count = int(sum(int(report.get("final_action_lane_oob_count", 0)) for report in reports))
+    prevented_lane_oob_count = int(sum(int(report.get("prevented_lane_oob_count", 0)) for report in reports))
     task_backstop_watch_count = int(sum(int(report.get("task_backstop_watch_count", 0)) for report in reports))
     task_backstop_eligible_count = int(
         sum(int(report.get("task_backstop_eligible_count", 0)) for report in reports)
@@ -187,6 +219,14 @@ def aggregate_episode_reports(reports: list[dict]) -> dict:
         "mean_shield_calls": float(np.mean(shield_calls)),
         "actual_replacement_rate": float(np.mean(replacements > 0)),
         "mean_actual_replacements": float(np.mean(replacements)),
+        "actual_replacement_rate_semantics": "episodes_with_replacement_rate",
+        "episodes_with_replacement_rate": float(np.mean(replacements > 0)),
+        "replacement_per_shield_call_rate": (
+            float(np.sum(replacements) / np.sum(shield_calls))
+            if np.sum(shield_calls) > 0
+            else 0.0
+        ),
+        "mean_replacements_per_episode": float(np.mean(replacements)),
         "task_replacement_rate": float(np.mean(task_replacements > 0)),
         "mean_task_replacements": float(np.mean(task_replacements)),
         "task_replacement_count": int(np.sum(task_replacements)),
@@ -236,13 +276,77 @@ def aggregate_episode_reports(reports: list[dict]) -> dict:
         ),
         "no_merge_request_before_taper_count": int(np.sum(no_merge_before_taper)),
         "no_merge_request_before_taper_rate": float(np.mean(no_merge_before_taper > 0)),
-        "forecast_actor_coverage_complete_rate": float(np.mean(forecast_coverage_rates)),
-        "forecast_gap_consistency_pass_rate": float(np.mean(forecast_gap_consistency_rates)),
-        "wcdt_relevant_actor_coverage_rate": float(np.mean(wcdt_relevant_coverage_rates)),
-        "combined_forecast_safety_coverage_rate": float(np.mean(combined_safety_coverage_rates)),
-        "actor_selector_overflow_rate": float(np.mean(selector_overflow_rates)),
-        "cv_fallback_overflow_rate": float(np.mean(cv_fallback_overflow_rates)),
-        "cv_fallback_usage_rate": float(np.mean(cv_fallback_usage_rates)),
+        "forecast_actor_coverage_complete_count": forecast_coverage_complete_count,
+        "forecast_actor_coverage_complete_rate": (
+            float(forecast_coverage_complete_count / forecast_record_count)
+            if forecast_record_count
+            else 0.0
+        ),
+        "forecast_record_count": forecast_record_count,
+        "forecast_gap_consistency_checkable_count": forecast_gap_checkable_count,
+        "forecast_gap_consistency_pass_count": forecast_gap_pass_count,
+        "forecast_gap_consistency_checkable_rate": (
+            float(forecast_gap_checkable_count / forecast_record_count)
+            if forecast_record_count
+            else 0.0
+        ),
+        "forecast_gap_consistency_pass_rate": (
+            float(forecast_gap_pass_count / forecast_gap_checkable_count)
+            if forecast_gap_checkable_count
+            else 0.0
+        ),
+        "wcdt_relevant_actor_coverage_count": wcdt_relevant_coverage_count,
+        "wcdt_relevant_actor_coverage_rate": (
+            float(wcdt_relevant_coverage_count / forecast_record_count)
+            if forecast_record_count
+            else 0.0
+        ),
+        "combined_forecast_safety_coverage_count": combined_safety_coverage_count,
+        "combined_forecast_safety_coverage_rate": (
+            float(combined_safety_coverage_count / forecast_record_count)
+            if forecast_record_count
+            else 0.0
+        ),
+        "actor_selector_overflow_count": selector_overflow_count,
+        "actor_selector_overflow_rate": (
+            float(selector_overflow_count / forecast_record_count)
+            if forecast_record_count
+            else 0.0
+        ),
+        "critical_actor_overflow_count": critical_overflow_count,
+        "critical_actor_overflow_rate": (
+            float(critical_overflow_count / forecast_record_count)
+            if forecast_record_count
+            else 0.0
+        ),
+        "critical_wcdt_coverage_count": critical_wcdt_coverage_count,
+        "critical_wcdt_coverage_rate": (
+            float(critical_wcdt_coverage_count / forecast_record_count)
+            if forecast_record_count
+            else 0.0
+        ),
+        "combined_critical_coverage_count": combined_critical_coverage_count,
+        "combined_critical_coverage_rate": (
+            float(combined_critical_coverage_count / forecast_record_count)
+            if forecast_record_count
+            else 0.0
+        ),
+        "cv_fallback_overflow_count": cv_fallback_overflow_count,
+        "cv_fallback_overflow_rate": (
+            float(cv_fallback_overflow_count / forecast_record_count)
+            if forecast_record_count
+            else 0.0
+        ),
+        "cv_fallback_usage_count": cv_fallback_usage_count,
+        "cv_fallback_usage_rate": (
+            float(cv_fallback_usage_count / forecast_record_count)
+            if forecast_record_count
+            else 0.0
+        ),
+        "raw_action_lane_oob_count": raw_lane_oob_count,
+        "final_action_lane_oob_count": final_lane_oob_count,
+        "prevented_lane_oob_count": prevented_lane_oob_count,
+        **reward_component_means,
         "task_backstop_watch_count": task_backstop_watch_count,
         "task_backstop_eligible_count": task_backstop_eligible_count,
         "task_backstop_veto_reason_counts": dict(task_backstop_veto_reason_counts),

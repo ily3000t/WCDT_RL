@@ -8,6 +8,7 @@ from typing import Any
 from safe_rl.risk.merge_local import merge_local_stats
 from safe_rl.sim.metrics import INF_TTC, bbox_gap
 from safe_rl.sim.scenario_semantics import (
+    distance_to_taper,
     is_auxiliary_edge,
     is_ramp_edge,
     is_target_lane,
@@ -16,7 +17,7 @@ from safe_rl.sim.scenario_semantics import (
 from safe_rl.sim.types import VehicleState
 
 
-ACTOR_SELECTION_VERSION = "merge_relevance_v1"
+ACTOR_SELECTION_VERSION = "merge_relevance_v2"
 
 
 def _plain(value: Any) -> Any:
@@ -38,6 +39,7 @@ def actor_relevance_config(cfg: Any) -> dict[str, Any]:
         "ttc_threshold": float(configured.get("ttc_threshold", 5.0)),
         "local_actor_distance": float(configured.get("local_actor_distance", 45.0)),
         "nearest_conflict_distance": float(configured.get("nearest_conflict_distance", 30.0)),
+        "critical_taper_distance": float(configured.get("critical_taper_distance", 120.0)),
         "cv_fallback_max_actors": int(configured.get("cv_fallback_max_actors", 12)),
         "cv_uncertainty_base": float(configured.get("cv_uncertainty_base", 0.25)),
         "cv_uncertainty_accel_scale": float(configured.get("cv_uncertainty_accel_scale", 0.05)),
@@ -68,6 +70,9 @@ class ActorRelevance:
     relevance_reasons: tuple[str, ...]
     selection_priority: tuple[float, ...]
     relevant: bool
+    relevance_class: str = "non_relevant"
+    critical: bool = False
+    contextual: bool = False
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -83,6 +88,13 @@ class ActorSelectionResult:
     actor_metadata: dict[str, ActorRelevance]
     version: str
     config_hash: str
+    critical_actor_ids: tuple[str, ...] = ()
+    contextual_actor_ids: tuple[str, ...] = ()
+    dropped_critical_ids: tuple[str, ...] = ()
+    contextual_truncated_ids: tuple[str, ...] = ()
+    critical_count: int = 0
+    contextual_count: int = 0
+    critical_overflow: bool = False
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -91,6 +103,13 @@ class ActorSelectionResult:
             "dropped_relevant_ids": list(self.dropped_relevant_ids),
             "relevant_count": int(self.relevant_count),
             "overflow": bool(self.overflow),
+            "critical_actor_ids": list(self.critical_actor_ids),
+            "contextual_actor_ids": list(self.contextual_actor_ids),
+            "dropped_critical_ids": list(self.dropped_critical_ids),
+            "contextual_truncated_ids": list(self.contextual_truncated_ids),
+            "critical_count": int(self.critical_count),
+            "contextual_count": int(self.contextual_count),
+            "critical_overflow": bool(self.critical_overflow),
             "actor_metadata": {
                 vehicle_id: metadata.to_dict()
                 for vehicle_id, metadata in self.actor_metadata.items()
@@ -130,7 +149,7 @@ def _priority(metadata: ActorRelevance) -> tuple[float, ...]:
         "other": 4.0,
     }
     return (
-        0.0 if metadata.relevant else 1.0,
+        {"critical": 0.0, "contextual": 1.0}.get(metadata.relevance_class, 2.0),
         role_priority.get(metadata.role, 4.0),
         metadata.ttc if metadata.ttc < INF_TTC else INF_TTC,
         metadata.effective_gap,
@@ -161,6 +180,9 @@ def select_merge_relevant_actors(
     base: dict[str, ActorRelevance] = {}
     nearest_id = ""
     nearest_gap = INF_TTC
+    lowest_ttc_id = ""
+    lowest_ttc = INF_TTC
+    ego_taper_distance = float(distance_to_taper(cfg, ego))
     for actor in vehicles:
         actor_progress = merge_corridor_progress(cfg, actor)
         signed_gap = (
@@ -192,6 +214,9 @@ def select_merge_relevant_actors(
             if closing_speed > 1.0e-6
             else INF_TTC
         )
+        if ttc < lowest_ttc:
+            lowest_ttc = float(ttc)
+            lowest_ttc_id = str(actor.vehicle_id)
         role = _role(cfg, actor, target_front_id, target_rear_id)
         reasons: list[str] = []
         if surface_gap <= settings["current_gap_distance"]:
@@ -215,6 +240,8 @@ def select_merge_relevant_actors(
             relevance_reasons=tuple(reasons),
             selection_priority=(),
             relevant=relevant,
+            relevance_class="contextual" if relevant else "non_relevant",
+            contextual=relevant,
         )
         base[str(actor.vehicle_id)] = metadata
 
@@ -227,30 +254,90 @@ def select_merge_relevant_actors(
                 "role": "nearest_conflict" if item.role == "other" else item.role,
                 "relevance_reasons": reasons,
                 "relevant": True,
+                "relevance_class": "critical",
+                "critical": True,
+                "contextual": False,
+            }
+        )
+
+    if lowest_ttc_id and lowest_ttc < INF_TTC:
+        item = base[lowest_ttc_id]
+        reasons = tuple(dict.fromkeys([*item.relevance_reasons, "lowest_ttc"]))
+        base[lowest_ttc_id] = ActorRelevance(
+            **{
+                **item.to_dict(),
+                "relevance_reasons": reasons,
+                "relevant": True,
+                "relevance_class": "critical",
+                "critical": True,
+                "contextual": False,
             }
         )
 
     metadata_map: dict[str, ActorRelevance] = {}
     for vehicle_id, item in base.items():
-        priority = _priority(item)
+        reasons = set(item.relevance_reasons)
+        critical = bool(
+            item.critical
+            or (item.role in {"target_front", "target_rear"} and item.relevant)
+            or "ttc" in reasons
+            or "effective_gap" in reasons
+            or "nearest_conflict" in reasons
+            or "lowest_ttc" in reasons
+            or (
+                item.role in {"auxiliary_local", "ramp_local"}
+                and item.relevant
+                and ego_taper_distance <= settings["critical_taper_distance"]
+            )
+        )
+        relevance_class = (
+            "critical"
+            if critical
+            else ("contextual" if item.relevant else "non_relevant")
+        )
+        normalized = ActorRelevance(
+            **{
+                **item.to_dict(),
+                "critical": critical,
+                "contextual": relevance_class == "contextual",
+                "relevance_class": relevance_class,
+            }
+        )
+        priority = _priority(normalized)
         metadata_map[vehicle_id] = ActorRelevance(
-            **{**item.to_dict(), "selection_priority": priority}
+            **{**normalized.to_dict(), "selection_priority": priority}
         )
     ordered = sorted(
         metadata_map.values(),
         key=lambda item: (*item.selection_priority, item.vehicle_id),
     )
-    relevant = [item for item in ordered if item.relevant]
+    critical = [item for item in ordered if item.critical]
+    contextual = [item for item in ordered if item.contextual]
+    relevant = [*critical, *contextual]
     selected = ordered[: max(0, int(max_actors))]
     selected_ids = tuple(item.vehicle_id for item in selected)
     dropped = tuple(item.vehicle_id for item in relevant if item.vehicle_id not in selected_ids)
+    dropped_critical = tuple(
+        item.vehicle_id for item in critical if item.vehicle_id not in selected_ids
+    )
+    contextual_truncated = tuple(
+        item.vehicle_id for item in contextual if item.vehicle_id not in selected_ids
+    )
+    critical_overflow = len(critical) > int(max_actors)
     return ActorSelectionResult(
         selected_actor_ids=selected_ids,
         relevant_actor_ids=tuple(item.vehicle_id for item in relevant),
         dropped_relevant_ids=dropped,
         relevant_count=len(relevant),
-        overflow=len(relevant) > int(max_actors),
+        overflow=critical_overflow,
         actor_metadata=metadata_map,
         version=str(settings["version"]),
         config_hash=actor_selection_config_hash(cfg),
+        critical_actor_ids=tuple(item.vehicle_id for item in critical),
+        contextual_actor_ids=tuple(item.vehicle_id for item in contextual),
+        dropped_critical_ids=dropped_critical,
+        contextual_truncated_ids=contextual_truncated,
+        critical_count=len(critical),
+        contextual_count=len(contextual),
+        critical_overflow=critical_overflow,
     )

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import math
 import os
 import sys
@@ -52,6 +53,32 @@ def scheduled_episode_seed(
         + int(worker_rank)
         + int(episode_index) * max(1, int(num_envs))
     )
+
+
+def _actor_metadata_json(selection: Any, vehicle_ids: tuple[str, ...] | list[str]) -> str:
+    rows: list[dict[str, Any]] = []
+    for vehicle_id in vehicle_ids:
+        metadata = selection.actor_metadata.get(str(vehicle_id))
+        if metadata is None:
+            continue
+        rows.append(
+            {
+                "vehicle_id": str(vehicle_id),
+                "role": str(metadata.role),
+                "route_progress": metadata.route_progress,
+                "signed_longitudinal_gap": metadata.signed_longitudinal_gap,
+                "current_surface_gap": float(metadata.current_surface_gap),
+                "closing_speed": float(metadata.closing_speed),
+                "effective_gap": float(metadata.effective_gap),
+                "ttc": float(metadata.ttc),
+                "relevance_reasons": list(metadata.relevance_reasons),
+                "relevance_class": str(metadata.relevance_class),
+                "critical": bool(metadata.critical),
+                "contextual": bool(metadata.contextual),
+                "selection_priority": [float(item) for item in metadata.selection_priority],
+            }
+        )
+    return json.dumps(rows, ensure_ascii=False, sort_keys=True, allow_nan=False)
 
 
 class SumoHighwayMergeEnv(gym.Env):
@@ -126,6 +153,10 @@ class SumoHighwayMergeEnv(gym.Env):
         self._interventions: list[dict[str, Any]] = []
         self._reward_debug_records: list[dict[str, Any]] = []
         self._last_reward_debug: dict[str, Any] = {}
+        self._reward_component_records: list[dict[str, float]] = []
+        self._raw_action_lane_oob_count = 0
+        self._final_action_lane_oob_count = 0
+        self._prevented_lane_oob_count = 0
         self._trajectory_frames: list[dict[str, VehicleState]] = []
         self._trajectory_frame_metadata: list[dict[str, int]] = []
         self._last_trajectory_window_metadata: dict[str, np.ndarray] = {}
@@ -241,6 +272,10 @@ class SumoHighwayMergeEnv(gym.Env):
         self._interventions.clear()
         self._reward_debug_records.clear()
         self._last_reward_debug = {}
+        self._reward_component_records.clear()
+        self._raw_action_lane_oob_count = 0
+        self._final_action_lane_oob_count = 0
+        self._prevented_lane_oob_count = 0
         self._trajectory_frames.clear()
         self._trajectory_frame_metadata.clear()
         self._last_trajectory_window_metadata = {}
@@ -295,6 +330,11 @@ class SumoHighwayMergeEnv(gym.Env):
             final_action = decode_action(int(task_replacement["final_action"]))
             self._task_replacements.append(task_replacement)
 
+        raw_action_lane_oob = self._action_lane_oob(raw_action)
+        final_action_lane_oob = self._action_lane_oob(final_action)
+        self._raw_action_lane_oob_count += int(raw_action_lane_oob)
+        self._final_action_lane_oob_count += int(final_action_lane_oob)
+        self._prevented_lane_oob_count += int(raw_action_lane_oob and not final_action_lane_oob)
         lane_oob = self._apply_action(final_action)
         prev_ego = self._get_ego()
         prev_x = prev_ego.x if prev_ego else self._last_ego_x
@@ -364,6 +404,10 @@ class SumoHighwayMergeEnv(gym.Env):
         info["final_action"] = int(final_action.index)
         info["raw_action_name"] = str(raw_action.name)
         info["final_action_name"] = str(final_action.name)
+        info["raw_action_lane_oob"] = bool(raw_action_lane_oob)
+        info["final_action_lane_oob"] = bool(final_action_lane_oob)
+        info["prevented_lane_oob"] = bool(raw_action_lane_oob and not final_action_lane_oob)
+        info["reward_components"] = dict(self._reward_component_records[-1]) if self._reward_component_records else {}
         info["decision_index"] = decision_index
         self._last_ego_speed = ego.speed if ego else 0.0
         self._last_ego_x = ego.x if ego else self._last_ego_x
@@ -667,6 +711,13 @@ class SumoHighwayMergeEnv(gym.Env):
                 )
         return lane_oob
 
+    def _action_lane_oob(self, action) -> bool:
+        ego = self._get_ego()
+        if ego is None:
+            return True
+        target_lane = int(ego.lane_index) + int(action.lateral_cmd)
+        return bool(target_lane < 0 or target_lane >= self._lane_count(ego.edge_id))
+
     def _lane_count(self, edge_id: str) -> int:
         if edge_id in self._lane_count_cache:
             return self._lane_count_cache[edge_id]
@@ -776,31 +827,38 @@ class SumoHighwayMergeEnv(gym.Env):
         risk_context: dict[str, Any] | None = None,
     ) -> float:
         reward_cfg = self.config.rl.reward
-        reward = 0.0
+        progress_reward = 0.0
+        speed_reward = 0.0
+        terminal_reward = 0.0
+        lane_oob_penalty = 0.0
+        safety_penalty = 0.0
+        safety_forecast_shaping = 0.0
+        shield_guided_shaping = 0.0
+        merge_timing_shaping = 0.0
         self._last_reward_debug = {}
         if ego is not None:
-            reward += reward_cfg.progress * max(0.0, ego.x - prev_x)
-            reward += reward_cfg.speed * min(ego.speed, 33.33)
+            progress_reward = float(reward_cfg.progress * max(0.0, ego.x - prev_x))
+            speed_reward = float(reward_cfg.speed * min(ego.speed, 33.33))
         if done_reason == "merge_success":
-            reward += reward_cfg.merge_success
+            terminal_reward += float(reward_cfg.merge_success)
         if metrics.collision:
-            reward += reward_cfg.collision
+            safety_penalty += float(reward_cfg.collision)
         if metrics.near_miss:
-            reward += reward_cfg.near_miss
+            safety_penalty += float(reward_cfg.near_miss)
         if metrics.low_ttc:
-            reward += reward_cfg.low_ttc
+            safety_penalty += float(reward_cfg.low_ttc)
         if metrics.high_drac:
-            reward += reward_cfg.high_drac
+            safety_penalty += float(reward_cfg.high_drac)
         if metrics.hard_brake:
-            reward += reward_cfg.hard_brake
+            safety_penalty += float(reward_cfg.hard_brake)
         if metrics.lane_oob:
-            reward += reward_cfg.lane_oob
+            lane_oob_penalty = float(reward_cfg.lane_oob)
         reward_profile = str(self.config.rl.get("reward_profile", "default"))
         if reward_profile in {"safety_forecast", "shield_guided_forecast", "merge_timing_forecast"}:
-            reward += self._safety_forecast_reward_adjustment(ego, metrics)
+            safety_forecast_shaping = self._safety_forecast_reward_adjustment(ego, metrics)
         if reward_profile in {"shield_guided_forecast", "merge_timing_forecast"}:
             shield_penalty, reward_debug = self._shield_guided_reward_adjustment(raw_action, risk_context)
-            reward += shield_penalty
+            shield_guided_shaping = float(shield_penalty)
             self._last_reward_debug = reward_debug
             self._reward_debug_records.append(reward_debug)
         if reward_profile == "merge_timing_forecast":
@@ -810,8 +868,31 @@ class SumoHighwayMergeEnv(gym.Env):
                 raw_action,
                 risk_context,
             )
-            reward += timing_adjustment
+            merge_timing_shaping = float(timing_adjustment)
             self._last_reward_debug = {**self._last_reward_debug, **timing_debug}
+        reward = float(
+            progress_reward
+            + speed_reward
+            + terminal_reward
+            + lane_oob_penalty
+            + safety_penalty
+            + safety_forecast_shaping
+            + shield_guided_shaping
+            + merge_timing_shaping
+        )
+        components = {
+            "progress_reward": progress_reward,
+            "speed_reward": speed_reward,
+            "terminal_reward": terminal_reward,
+            "lane_oob_penalty": lane_oob_penalty,
+            "safety_penalty": safety_penalty,
+            "safety_forecast_shaping": float(safety_forecast_shaping),
+            "shield_guided_shaping": shield_guided_shaping,
+            "merge_timing_shaping": merge_timing_shaping,
+            "total_episode_reward": reward,
+        }
+        self._reward_component_records.append(components)
+        self._last_reward_debug = {**self._last_reward_debug, **components}
         return float(reward)
 
     def _safety_forecast_reward_adjustment(self, ego: VehicleState | None, metrics: StepMetrics) -> float:
@@ -959,6 +1040,7 @@ class SumoHighwayMergeEnv(gym.Env):
             "forecast_aware_safety_risk": None,
             "forecast_actor_coverage_complete": False,
             "forecast_gap_consistency_pass": False,
+            "forecast_gap_consistency_checkable": False,
             "task_backstop_watch_count": int(self._task_backstop_consecutive_count),
             "task_backstop_watch_eligible": False,
             "task_backstop_eligible": False,
@@ -1432,11 +1514,47 @@ class SumoHighwayMergeEnv(gym.Env):
                     "forecast_gap_consistency_pass": bool(
                         self._last_task_merge_record.get("forecast_gap_consistency_pass", False)
                     ),
+                    "forecast_gap_consistency_checkable": bool(
+                        self._last_task_merge_record.get(
+                            "forecast_gap_consistency_checkable",
+                            False,
+                        )
+                    ),
+                    "forecast_gap_consistency_failure_reason": str(
+                        self._last_task_merge_record.get(
+                            "forecast_gap_consistency_failure_reason",
+                            "",
+                        )
+                    ),
                     "forecast_gap_physical_consistency_pass": bool(
                         self._last_task_merge_record.get("forecast_gap_physical_consistency_pass", False)
                     ),
                     "forecast_vehicle_identity_consistent": bool(
                         self._last_task_merge_record.get("forecast_vehicle_identity_consistent", False)
+                    ),
+                    "forecast_identity_turnover": bool(
+                        self._last_task_merge_record.get(
+                            "forecast_identity_turnover",
+                            False,
+                        )
+                    ),
+                    "forecast_identity_turnover_valid": bool(
+                        self._last_task_merge_record.get(
+                            "forecast_identity_turnover_valid",
+                            False,
+                        )
+                    ),
+                    "forecast_route_position_valid": bool(
+                        self._last_task_merge_record.get(
+                            "forecast_route_position_valid",
+                            False,
+                        )
+                    ),
+                    "forecast_projection_distance": self._last_task_merge_record.get(
+                        "forecast_projection_distance"
+                    ),
+                    "forecast_projection_ambiguity_margin": self._last_task_merge_record.get(
+                        "forecast_projection_ambiguity_margin"
                     ),
                     "forecast_front_first_step_progress_error": self._last_task_merge_record.get(
                         "forecast_front_first_step_progress_error"
@@ -1506,6 +1624,42 @@ class SumoHighwayMergeEnv(gym.Env):
                     ),
                     "actor_selector_overflow": bool(
                         self._last_task_merge_record.get("actor_selector_overflow", False)
+                    ),
+                    "critical_actor_count": int(
+                        self._last_task_merge_record.get("critical_actor_count", 0)
+                    ),
+                    "contextual_actor_count": int(
+                        self._last_task_merge_record.get("contextual_actor_count", 0)
+                    ),
+                    "critical_actor_overflow": bool(
+                        self._last_task_merge_record.get(
+                            "critical_actor_overflow",
+                            False,
+                        )
+                    ),
+                    "critical_dropped_actor_ids": list(
+                        self._last_task_merge_record.get(
+                            "critical_dropped_actor_ids",
+                            [],
+                        )
+                    ),
+                    "contextual_actor_truncated_count": int(
+                        self._last_task_merge_record.get(
+                            "contextual_actor_truncated_count",
+                            0,
+                        )
+                    ),
+                    "critical_wcdt_coverage_complete": bool(
+                        self._last_task_merge_record.get(
+                            "critical_wcdt_coverage_complete",
+                            False,
+                        )
+                    ),
+                    "combined_critical_coverage_complete": bool(
+                        self._last_task_merge_record.get(
+                            "combined_critical_coverage_complete",
+                            False,
+                        )
                     ),
                     "actor_selector_dropped_relevant_ids": list(
                         self._last_task_merge_record.get(
@@ -1690,6 +1844,17 @@ class SumoHighwayMergeEnv(gym.Env):
         forecast_gap_consistency_pass_count = sum(
             1 for record in forecast_records if record.get("forecast_gap_consistency_pass")
         )
+        forecast_gap_consistency_checkable_count = sum(
+            1
+            for record in forecast_records
+            if record.get("forecast_gap_consistency_checkable")
+        )
+        forecast_gap_failure_reason_counts = Counter(
+            str(record.get("forecast_gap_consistency_failure_reason", ""))
+            for record in forecast_records
+            if str(record.get("forecast_gap_consistency_failure_reason", ""))
+            not in {"", "ok"}
+        )
         wcdt_relevant_coverage_count = sum(
             1
             for record in forecast_records
@@ -1702,6 +1867,19 @@ class SumoHighwayMergeEnv(gym.Env):
         )
         selector_overflow_count = sum(
             1 for record in forecast_records if record.get("actor_selector_overflow")
+        )
+        critical_overflow_count = sum(
+            1 for record in forecast_records if record.get("critical_actor_overflow")
+        )
+        critical_wcdt_coverage_count = sum(
+            1
+            for record in forecast_records
+            if record.get("critical_wcdt_coverage_complete")
+        )
+        combined_critical_coverage_count = sum(
+            1
+            for record in forecast_records
+            if record.get("combined_critical_coverage_complete")
         )
         cv_fallback_overflow_count = sum(
             1 for record in forecast_records if record.get("cv_fallback_overflow")
@@ -1786,6 +1964,20 @@ class SumoHighwayMergeEnv(gym.Env):
             }
             for item in self._interventions
         ]
+        reward_component_totals = {
+            name: float(sum(record.get(name, 0.0) for record in self._reward_component_records))
+            for name in (
+                "progress_reward",
+                "speed_reward",
+                "terminal_reward",
+                "lane_oob_penalty",
+                "safety_penalty",
+                "safety_forecast_shaping",
+                "shield_guided_shaping",
+                "merge_timing_shaping",
+                "total_episode_reward",
+            )
+        }
         return {
             "seed": self.seed_value,
             "episode_seed": self.seed_value,
@@ -1823,17 +2015,49 @@ class SumoHighwayMergeEnv(gym.Env):
             "shield_call_count": len(self._interventions),
             "actual_replacement_count": replacement_count,
             "actual_replacement_rate": float(replacement_count / len(self._interventions)) if self._interventions else 0.0,
+            "actual_replacement_rate_semantics": "replacement_per_shield_call_rate",
+            "episodes_with_replacement_rate": float(replacement_count > 0),
+            "replacement_per_shield_call_rate": (
+                float(replacement_count / len(self._interventions))
+                if self._interventions
+                else 0.0
+            ),
+            "mean_replacements_per_episode": float(replacement_count),
+            "raw_action_lane_oob": bool(self._raw_action_lane_oob_count > 0),
+            "final_action_lane_oob": bool(self._final_action_lane_oob_count > 0),
+            "raw_action_lane_oob_count": int(self._raw_action_lane_oob_count),
+            "final_action_lane_oob_count": int(self._final_action_lane_oob_count),
+            "prevented_lane_oob_count": int(self._prevented_lane_oob_count),
+            "reward_components": reward_component_totals,
+            **reward_component_totals,
             "task_replacement_count": int(task_replacement_count),
             "task_replacement_rate": float(task_replacement_count / max(self._decision_index, 1)),
             "mean_task_replacements": float(task_replacement_count),
             "task_replacement_records": task_replacement_records,
             "forecast_actor_coverage_complete_count": int(forecast_coverage_complete_count),
+            "forecast_record_count": int(len(forecast_records)),
             "forecast_actor_coverage_complete_rate": (
                 float(forecast_coverage_complete_count / len(forecast_records)) if forecast_records else 0.0
             ),
             "forecast_gap_consistency_pass_count": int(forecast_gap_consistency_pass_count),
+            "forecast_gap_consistency_checkable_count": int(
+                forecast_gap_consistency_checkable_count
+            ),
+            "forecast_gap_consistency_checkable_rate": (
+                float(forecast_gap_consistency_checkable_count / len(forecast_records))
+                if forecast_records
+                else 0.0
+            ),
             "forecast_gap_consistency_pass_rate": (
-                float(forecast_gap_consistency_pass_count / len(forecast_records)) if forecast_records else 0.0
+                float(
+                    forecast_gap_consistency_pass_count
+                    / forecast_gap_consistency_checkable_count
+                )
+                if forecast_gap_consistency_checkable_count
+                else 0.0
+            ),
+            "forecast_gap_consistency_failure_reason_counts": dict(
+                forecast_gap_failure_reason_counts
             ),
             "wcdt_relevant_actor_coverage_count": int(wcdt_relevant_coverage_count),
             "wcdt_relevant_actor_coverage_rate": (
@@ -1850,6 +2074,26 @@ class SumoHighwayMergeEnv(gym.Env):
             "actor_selector_overflow_count": int(selector_overflow_count),
             "actor_selector_overflow_rate": (
                 float(selector_overflow_count / len(forecast_records))
+                if forecast_records
+                else 0.0
+            ),
+            "critical_actor_overflow_count": int(critical_overflow_count),
+            "critical_actor_overflow_rate": (
+                float(critical_overflow_count / len(forecast_records))
+                if forecast_records
+                else 0.0
+            ),
+            "critical_wcdt_coverage_count": int(critical_wcdt_coverage_count),
+            "critical_wcdt_coverage_rate": (
+                float(critical_wcdt_coverage_count / len(forecast_records))
+                if forecast_records
+                else 0.0
+            ),
+            "combined_critical_coverage_count": int(
+                combined_critical_coverage_count
+            ),
+            "combined_critical_coverage_rate": (
+                float(combined_critical_coverage_count / len(forecast_records))
                 if forecast_records
                 else 0.0
             ),
@@ -1959,6 +2203,12 @@ class SumoHighwayMergeEnv(gym.Env):
             "trajectory_window_end_step": np.zeros((0,), dtype=np.int64),
             "trajectory_decision_index": np.zeros((0,), dtype=np.int64),
             "trajectory_episode_seed": np.zeros((0,), dtype=np.int64),
+            "critical_actor_count": np.zeros((0,), dtype=np.int64),
+            "contextual_actor_count": np.zeros((0,), dtype=np.int64),
+            "critical_actor_overflow": np.zeros((0,), dtype=np.float32),
+            "contextual_actor_truncated_count": np.zeros((0,), dtype=np.int64),
+            "critical_actor_metadata_json": np.zeros((0,), dtype="<U2"),
+            "dropped_critical_actor_metadata_json": np.zeros((0,), dtype="<U2"),
         }
         if len(frames) < hist + horizon:
             result = (
@@ -2005,6 +2255,12 @@ class SumoHighwayMergeEnv(gym.Env):
         window_end_steps: list[int] = []
         window_decision_indices: list[int] = []
         window_episode_seeds: list[int] = []
+        critical_actor_counts: list[int] = []
+        contextual_actor_counts: list[int] = []
+        critical_actor_overflows: list[float] = []
+        contextual_actor_truncated_counts: list[int] = []
+        critical_actor_metadata_json: list[str] = []
+        dropped_critical_actor_metadata_json: list[str] = []
         for end_idx in range(hist, len(frames) - horizon + 1):
             latest = frames[end_idx - 1]
             if self.ego_id not in latest:
@@ -2093,6 +2349,18 @@ class SumoHighwayMergeEnv(gym.Env):
             relevance_scores.append(sample_relevance_score)
             relevant_counts.append(int(selection.relevant_count))
             selector_overflows.append(float(selection.overflow))
+            critical_actor_counts.append(int(selection.critical_count))
+            contextual_actor_counts.append(int(selection.contextual_count))
+            critical_actor_overflows.append(float(selection.critical_overflow))
+            contextual_actor_truncated_counts.append(
+                int(len(selection.contextual_truncated_ids))
+            )
+            critical_actor_metadata_json.append(
+                _actor_metadata_json(selection, selection.critical_actor_ids)
+            )
+            dropped_critical_actor_metadata_json.append(
+                _actor_metadata_json(selection, selection.dropped_critical_ids)
+            )
             metadata = frame_metadata[end_idx - 1] if end_idx - 1 < len(frame_metadata) else {}
             window_end_steps.append(int(metadata.get("simulation_step", -1)))
             window_decision_indices.append(int(metadata.get("decision_index", -1)))
@@ -2141,6 +2409,22 @@ class SumoHighwayMergeEnv(gym.Env):
             "trajectory_window_end_step": np.asarray(window_end_steps, dtype=np.int64),
             "trajectory_decision_index": np.asarray(window_decision_indices, dtype=np.int64),
             "trajectory_episode_seed": np.asarray(window_episode_seeds, dtype=np.int64),
+            "critical_actor_count": np.asarray(critical_actor_counts, dtype=np.int64),
+            "contextual_actor_count": np.asarray(contextual_actor_counts, dtype=np.int64),
+            "critical_actor_overflow": np.asarray(
+                critical_actor_overflows,
+                dtype=np.float32,
+            ),
+            "contextual_actor_truncated_count": np.asarray(
+                contextual_actor_truncated_counts,
+                dtype=np.int64,
+            ),
+            "critical_actor_metadata_json": np.asarray(
+                critical_actor_metadata_json,
+            ),
+            "dropped_critical_actor_metadata_json": np.asarray(
+                dropped_critical_actor_metadata_json,
+            ),
         }
         if include_dimensions:
             return (

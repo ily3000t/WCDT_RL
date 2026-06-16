@@ -9,6 +9,7 @@ import numpy as np
 
 from safe_rl.pipeline.common import latest_stage_file, load_stage_config, parse_config_arg, write_report
 from safe_rl.prediction.forecast_feature_augmentor import forecast_target_lane_gap_from_trajectories
+from safe_rl.prediction.trajectory_postprocess import TRAJECTORY_POSTPROCESS_VERSION
 from safe_rl.sim.metrics import SAFETY_METRIC_VERSION, trajectory_min_obb_gap
 from safe_rl.sim.scenario_semantics import (
     EDGE_ROLE_AUXILIARY,
@@ -275,6 +276,10 @@ def _require_trajectory_schema_v3(data: Any, consumer: str, cfg: Any | None = No
         "agent_relevance_score",
         "actor_selector_relevant_count",
         "actor_selector_overflow",
+        "critical_actor_count",
+        "contextual_actor_count",
+        "critical_actor_overflow",
+        "contextual_actor_truncated_count",
         "stage1_buffer_schema_version",
         "episode_seed_schedule",
         "vehicle_state_ordering_version",
@@ -1091,8 +1096,13 @@ def _wcdt_v2_early_stopping_step(
     return bool(improved), int(stale_epochs), should_stop
 
 
-def _wcdt_v2_vs_cv_summary(cv_metrics: dict[str, Any] | None, v2_metrics: dict[str, Any] | None) -> dict[str, Any]:
-    if not isinstance(cv_metrics, dict) or not isinstance(v2_metrics, dict):
+def _prediction_vs_cv_summary(
+    cv_metrics: dict[str, Any] | None,
+    prediction_metrics: dict[str, Any] | None,
+    *,
+    source_name: str,
+) -> dict[str, Any]:
+    if not isinstance(cv_metrics, dict) or not isinstance(prediction_metrics, dict):
         return {"available": False}
 
     def _stat(metrics: dict[str, Any], name: str, stat: str = "mean") -> float | None:
@@ -1110,21 +1120,35 @@ def _wcdt_v2_vs_cv_summary(cv_metrics: dict[str, Any] | None, v2_metrics: dict[s
     comparisons = {}
     for name in metric_names:
         cv_value = _stat(cv_metrics, name)
-        v2_value = _stat(v2_metrics, name)
+        prediction_value = _stat(prediction_metrics, name)
         comparisons[name] = {
             "cv": cv_value,
-            "wcdt_v2": v2_value,
-            "delta": float(v2_value - cv_value) if cv_value is not None and v2_value is not None else None,
+            source_name: prediction_value,
+            "delta": (
+                float(prediction_value - cv_value)
+                if cv_value is not None and prediction_value is not None
+                else None
+            ),
         }
     return {
         "available": True,
+        "source_name": source_name,
         "metrics": comparisons,
-        "uncertainty_std": _stat(v2_metrics, "uncertainty", "std"),
-        "uncertainty_fde_correlation": float(v2_metrics.get("uncertainty_fde_correlation", 0.0)),
+        "uncertainty_std": _stat(prediction_metrics, "uncertainty", "std"),
+        "uncertainty_fde_correlation": float(
+            prediction_metrics.get("uncertainty_fde_correlation", 0.0)
+        ),
         "uncertainty_future_min_distance_abs_error_correlation": float(
-            v2_metrics.get("uncertainty_future_min_distance_abs_error_correlation", 0.0)
+            prediction_metrics.get("uncertainty_future_min_distance_abs_error_correlation", 0.0)
         ),
     }
+
+
+def _wcdt_v2_vs_cv_summary(
+    cv_metrics: dict[str, Any] | None,
+    v2_metrics: dict[str, Any] | None,
+) -> dict[str, Any]:
+    return _prediction_vs_cv_summary(cv_metrics, v2_metrics, source_name="wcdt_v2")
 
 
 def _wcdt_data_dict(cfg: Any, pred_his, pred_future, pred_mask, pred_feat, other_his, other_feat, other_mask, lane_list, device):
@@ -1986,7 +2010,11 @@ def _train_wcdt_v2_predictor(
     if val_loader is not None:
         ensemble_validation["val_score"] = _prediction_val_score(ensemble_validation, cfg)
         validation_history.append(ensemble_validation)
-    vs_cv_summary = _wcdt_v2_vs_cv_summary(cv_baseline, ensemble_validation)
+    vs_cv_summary = _prediction_vs_cv_summary(
+        cv_baseline,
+        ensemble_validation,
+        source_name="wcdt_v2",
+    )
     checkpoint = stage_dir / "wcdt_v2_predictor.pt"
     best_checkpoint = stage_dir / "wcdt_v2_predictor_best.pt"
     payload = {
@@ -2008,6 +2036,8 @@ def _train_wcdt_v2_predictor(
         "safety_metric_version": _safety_metric_version(data),
         "actor_selection_version": _trajectory_string(data, "actor_selection_version"),
         "actor_selection_config_hash": _trajectory_string(data, "actor_selection_config_hash"),
+        "trajectory_postprocess_version": TRAJECTORY_POSTPROCESS_VERSION,
+        "route_projection_config": dict(cfg.prediction.get("route_projection", {}) or {}),
         "vehicle_state_ordering_version": _trajectory_string(
             data,
             "vehicle_state_ordering_version",
@@ -2554,7 +2584,11 @@ def _train_wcdt_v3_predictor(
     if val_loader is not None:
         ensemble_validation["val_score"] = _prediction_val_score(ensemble_validation, cfg)
         validation_history.append(ensemble_validation)
-    vs_cv_summary = _wcdt_v2_vs_cv_summary(cv_baseline, ensemble_validation)
+    vs_cv_summary = _prediction_vs_cv_summary(
+        cv_baseline,
+        ensemble_validation,
+        source_name="wcdt_v3",
+    )
     checkpoint = stage_dir / "wcdt_v3_predictor.pt"
     best_checkpoint = stage_dir / "wcdt_v3_predictor_best.pt"
     payload = {
@@ -2570,6 +2604,8 @@ def _train_wcdt_v3_predictor(
         "safety_metric_version": _safety_metric_version(data),
         "actor_selection_version": _trajectory_string(data, "actor_selection_version"),
         "actor_selection_config_hash": _trajectory_string(data, "actor_selection_config_hash"),
+        "trajectory_postprocess_version": TRAJECTORY_POSTPROCESS_VERSION,
+        "route_projection_config": dict(cfg.prediction.get("route_projection", {}) or {}),
         "vehicle_state_ordering_version": _trajectory_string(
             data,
             "vehicle_state_ordering_version",

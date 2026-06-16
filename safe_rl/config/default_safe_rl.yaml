@@ -133,13 +133,19 @@ prediction:
     patience: 10
     min_delta: 0.0001
     warmup_epochs: 5
+  route_projection:
+    version: "route_projection_v2"
+    max_projection_distance: 2.5
+    ambiguity_margin: 0.25
+    low_motion_heading_distance: 0.05
   actor_relevance:
-    version: "merge_relevance_v1"
+    version: "merge_relevance_v2"
     current_gap_distance: 45.0
     effective_gap_distance: 35.0
     ttc_threshold: 5.0
     local_actor_distance: 45.0
     nearest_conflict_distance: 30.0
+    critical_taper_distance: 120.0
     cv_fallback_max_actors: 12
     cv_uncertainty_base: 0.25
     cv_uncertainty_accel_scale: 0.05

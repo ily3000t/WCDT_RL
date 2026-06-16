@@ -582,7 +582,8 @@ def test_forecast_feature_summary_reports_gap_min_distance_equal_rate():
         dtype=np.float32,
     )
     summary = _feature_source_summary({"wcdt_v2": features})
-    assert summary["runtime_diagnostics_feature_semantics_consistent"]
+    assert not summary["runtime_diagnostics_feature_semantics_consistent"]
+    assert not summary["runtime_diagnostics_feature_parity"]["available"]
     assert summary["sources"]["wcdt_v2"]["features"]["forecast_merge_gap"]["count"] == 2
     assert summary["highlight"]["wcdt_v2"]["forecast_uncertainty"]["mean"] == pytest.approx(0.15)
     assert summary["forecast_merge_gap_equals_min_distance_rate"]["wcdt_v2"] == pytest.approx(0.5)
@@ -737,7 +738,8 @@ def test_forecast_conclusion_marks_v3_candidate_only_when_it_beats_v2():
     conclusion = _forecast_conclusion(report)
     assert conclusion["wcdt_v3_prediction_quality_pass"]
     assert conclusion["wcdt_v3_uncertainty_quality_pass"]
-    assert conclusion["wcdt_v3_candidate_for_promotion"]
+    assert not conclusion["wcdt_v3_candidate_for_promotion"]
+    assert conclusion["promotion_reason"] == "insufficient_formal_evidence"
 
 
 def test_forecast_conclusion_allows_v3_when_both_models_lack_rear_gap_samples():
@@ -766,7 +768,7 @@ def test_forecast_conclusion_allows_v3_when_both_models_lack_rear_gap_samples():
     }
     conclusion = _forecast_conclusion(report)
     assert conclusion["wcdt_v3_prediction_quality_pass"]
-    assert conclusion["wcdt_v3_candidate_for_promotion"]
+    assert not conclusion["wcdt_v3_candidate_for_promotion"]
 
 
 class _StaticRiskModel:
@@ -3073,6 +3075,9 @@ def _fake_group(
             "emergency_fallback_rate": float(emergency_fallbacks > 0.0),
             "mean_emergency_fallbacks": emergency_fallbacks,
             "emergency_fallback_count": int(emergency_fallbacks),
+            "forecast_gap_consistency_checkable_rate": 1.0,
+            "forecast_gap_consistency_pass_rate": 1.0,
+            "critical_actor_overflow_rate": 0.0,
         },
     }
 

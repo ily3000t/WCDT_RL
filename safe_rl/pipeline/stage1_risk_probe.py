@@ -14,6 +14,8 @@ from safe_rl.prediction.actor_selector import (
     ACTOR_SELECTION_VERSION,
     actor_selection_config_hash,
 )
+from safe_rl.prediction.forecast_rollout_bundle import FORECAST_ROLLOUT_BUNDLE_VERSION
+from safe_rl.prediction.trajectory_postprocess import TRAJECTORY_POSTPROCESS_VERSION
 from safe_rl.pipeline.common import json_ready, load_stage_config, make_env, parse_config_arg, write_report
 from safe_rl.risk.merge_local import candidate_action_risk_samples, candidate_sample_weight, merge_local_stats
 from safe_rl.risk.risk_aggregator import aggregate_episode_reports
@@ -91,6 +93,12 @@ TRAJECTORY_KEYS = {
     "agent_relevance_score",
     "actor_selector_relevant_count",
     "actor_selector_overflow",
+    "critical_actor_count",
+    "contextual_actor_count",
+    "critical_actor_overflow",
+    "contextual_actor_truncated_count",
+    "critical_actor_metadata_json",
+    "dropped_critical_actor_metadata_json",
     "trajectory_episode_id",
     "trajectory_window_end_step",
     "trajectory_decision_index",
@@ -144,6 +152,9 @@ def _stage1_dataset_metadata(cfg) -> dict:
         "safety_metric_version": SAFETY_METRIC_VERSION,
         "actor_selection_version": ACTOR_SELECTION_VERSION,
         "actor_selection_config_hash": actor_selection_config_hash(cfg),
+        "trajectory_postprocess_version": TRAJECTORY_POSTPROCESS_VERSION,
+        "forecast_rollout_bundle_version": FORECAST_ROLLOUT_BUNDLE_VERSION,
+        "route_projection_config": dict(cfg.prediction.get("route_projection", {}) or {}),
         "sumo_installation_fingerprint": dict(
             cfg.get("scenario", {}).get("sumo_installation_fingerprint", {}) or {}
         ),
@@ -525,6 +536,12 @@ def _run_serial(
     relevance_scores: list[np.ndarray] = []
     selector_relevant_counts: list[np.ndarray] = []
     selector_overflows: list[np.ndarray] = []
+    critical_actor_counts: list[np.ndarray] = []
+    contextual_actor_counts: list[np.ndarray] = []
+    critical_actor_overflows: list[np.ndarray] = []
+    contextual_actor_truncated_counts: list[np.ndarray] = []
+    critical_actor_metadata_json: list[np.ndarray] = []
+    dropped_critical_actor_metadata_json: list[np.ndarray] = []
     trajectory_episode_ids: list[np.ndarray] = []
     trajectory_window_end_steps: list[np.ndarray] = []
     trajectory_decision_indices: list[np.ndarray] = []
@@ -723,6 +740,40 @@ def _run_serial(
                 relevance_scores.append(sample_relevance_score)
                 selector_relevant_counts.append(sample_selector_relevant_count)
                 selector_overflows.append(sample_selector_overflow)
+                critical_actor_counts.append(
+                    np.asarray(
+                        trajectory_metadata.get("critical_actor_count"),
+                        dtype=np.int64,
+                    )
+                )
+                contextual_actor_counts.append(
+                    np.asarray(
+                        trajectory_metadata.get("contextual_actor_count"),
+                        dtype=np.int64,
+                    )
+                )
+                critical_actor_overflows.append(
+                    np.asarray(
+                        trajectory_metadata.get("critical_actor_overflow"),
+                        dtype=np.float32,
+                    )
+                )
+                contextual_actor_truncated_counts.append(
+                    np.asarray(
+                        trajectory_metadata.get("contextual_actor_truncated_count"),
+                        dtype=np.int64,
+                    )
+                )
+                critical_actor_metadata_json.append(
+                    np.asarray(
+                        trajectory_metadata.get("critical_actor_metadata_json"),
+                    )
+                )
+                dropped_critical_actor_metadata_json.append(
+                    np.asarray(
+                        trajectory_metadata.get("dropped_critical_actor_metadata_json"),
+                    )
+                )
                 sample_count = int(hist.shape[0])
                 trajectory_episode_ids.append(np.full((sample_count,), episode, dtype=np.int64))
                 trajectory_window_end_steps.append(
@@ -784,6 +835,8 @@ def _run_serial(
         "safety_metric_version": np.asarray(SAFETY_METRIC_VERSION),
         "actor_selection_version": np.asarray(ACTOR_SELECTION_VERSION),
         "actor_selection_config_hash": np.asarray(actor_selection_config_hash(cfg)),
+        "trajectory_postprocess_version": np.asarray(TRAJECTORY_POSTPROCESS_VERSION),
+        "forecast_rollout_bundle_version": np.asarray(FORECAST_ROLLOUT_BUNDLE_VERSION),
         "episode_seed_schedule": np.asarray(
             str(cfg.get("run", {}).get("episode_seed_schedule", "fixed_legacy"))
         ),
@@ -854,6 +907,36 @@ def _run_serial(
             np.concatenate(selector_overflows, axis=0)
             if selector_overflows
             else np.zeros((0,), dtype=np.float32)
+        ),
+        "critical_actor_count": (
+            np.concatenate(critical_actor_counts, axis=0)
+            if critical_actor_counts
+            else np.zeros((0,), dtype=np.int64)
+        ),
+        "contextual_actor_count": (
+            np.concatenate(contextual_actor_counts, axis=0)
+            if contextual_actor_counts
+            else np.zeros((0,), dtype=np.int64)
+        ),
+        "critical_actor_overflow": (
+            np.concatenate(critical_actor_overflows, axis=0)
+            if critical_actor_overflows
+            else np.zeros((0,), dtype=np.float32)
+        ),
+        "contextual_actor_truncated_count": (
+            np.concatenate(contextual_actor_truncated_counts, axis=0)
+            if contextual_actor_truncated_counts
+            else np.zeros((0,), dtype=np.int64)
+        ),
+        "critical_actor_metadata_json": (
+            np.concatenate(critical_actor_metadata_json, axis=0)
+            if critical_actor_metadata_json
+            else np.zeros((0,), dtype="<U2")
+        ),
+        "dropped_critical_actor_metadata_json": (
+            np.concatenate(dropped_critical_actor_metadata_json, axis=0)
+            if dropped_critical_actor_metadata_json
+            else np.zeros((0,), dtype="<U2")
         ),
         "trajectory_episode_id": (
             np.concatenate(trajectory_episode_ids, axis=0)
@@ -931,11 +1014,43 @@ def _run_serial(
             "safety_metric_version": SAFETY_METRIC_VERSION,
             "actor_selection_version": ACTOR_SELECTION_VERSION,
             "actor_selection_config_hash": actor_selection_config_hash(cfg),
+            "trajectory_postprocess_version": TRAJECTORY_POSTPROCESS_VERSION,
+            "forecast_rollout_bundle_version": FORECAST_ROLLOUT_BUNDLE_VERSION,
             "actor_selector_overflow_rate": (
                 float(np.mean(np.concatenate(selector_overflows, axis=0)))
                 if selector_overflows
                 else 0.0
             ),
+            "critical_actor_overflow_rate": (
+                float(np.mean(np.concatenate(critical_actor_overflows, axis=0)))
+                if critical_actor_overflows
+                else 0.0
+            ),
+            "critical_wcdt_coverage": (
+                float(
+                    np.mean(
+                        np.concatenate(critical_actor_overflows, axis=0)
+                        <= 0
+                    )
+                )
+                if critical_actor_overflows
+                else 0.0
+            ),
+            "critical_actor_count": _array_summary(
+                np.concatenate(critical_actor_counts, axis=0).astype(np.float32).tolist()
+                if critical_actor_counts
+                else []
+            ),
+            "contextual_actor_count": _array_summary(
+                np.concatenate(contextual_actor_counts, axis=0).astype(np.float32).tolist()
+                if contextual_actor_counts
+                else []
+            ),
+            "contextual_actor_truncated_count": int(
+                np.sum(np.concatenate(contextual_actor_truncated_counts, axis=0))
+            )
+            if contextual_actor_truncated_counts
+            else 0,
             **trajectory_coverage,
         },
         "action_sampling": {
