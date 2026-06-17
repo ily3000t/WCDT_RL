@@ -55,6 +55,27 @@ def scheduled_episode_seed(
     )
 
 
+def configured_trajectory_actor_capacity(config: Any) -> int:
+    """Return non-ego actor slots needed by enabled trajectory predictors."""
+
+    scenario_top_k = int(config.scenario.get("top_k_neighbors", 5))
+    prediction_cfg = config.get("prediction", {}) or {}
+    capacities = [scenario_top_k]
+    train_enabled = bool(prediction_cfg.get("train_enabled", True))
+    if train_enabled and bool(prediction_cfg.get("wcdt_v2_train_enabled", False)):
+        capacities.append(int(prediction_cfg.get("wcdt_v2_max_agents", scenario_top_k)))
+    if train_enabled and bool(prediction_cfg.get("wcdt_v3_train_enabled", False)):
+        capacities.append(int(prediction_cfg.get("wcdt_v3_max_agents", scenario_top_k)))
+    forecast_cfg = config.get("forecast_features", {}) or {}
+    if bool(forecast_cfg.get("enabled", False)):
+        source = str(forecast_cfg.get("source", "")).lower()
+        if source == "wcdt_v2":
+            capacities.append(int(prediction_cfg.get("wcdt_v2_max_agents", scenario_top_k)))
+        elif source == "wcdt_v3":
+            capacities.append(int(prediction_cfg.get("wcdt_v3_max_agents", scenario_top_k)))
+    return max(1, max(int(value) for value in capacities))
+
+
 def _actor_metadata_json(selection: Any, vehicle_ids: tuple[str, ...] | list[str]) -> str:
     rows: list[dict[str, Any]] = []
     for vehicle_id in vehicle_ids:
@@ -118,6 +139,7 @@ class SumoHighwayMergeEnv(gym.Env):
         self.control_interval_steps = int(config.scenario.control_interval_steps)
         self.episode_steps = int(float(config.scenario.episode_seconds) / self.step_length)
         self.top_k = int(config.scenario.top_k_neighbors)
+        self.trajectory_actor_capacity = configured_trajectory_actor_capacity(config)
         self.history_steps = int(config.scenario.history_steps)
         self.forecast_enabled = bool(config.forecast_features.enabled or config.rl.use_wcdt_forecast_features)
         self.forecast_augmentor = forecast_augmentor
@@ -139,7 +161,10 @@ class SumoHighwayMergeEnv(gym.Env):
             dtype=np.float32,
         )
 
-        self.history = HistoryBuffer(self.history_steps, max_agents=self.top_k + 1)
+        self.history = HistoryBuffer(
+            self.history_steps,
+            max_agents=max(self.top_k, self.trajectory_actor_capacity) + 1,
+        )
         self._traci_module = None
         self._traci = None
         self._conn_label = f"safe_rl_{uuid.uuid4().hex[:8]}"
@@ -2196,7 +2221,8 @@ class SumoHighwayMergeEnv(gym.Env):
 
         hist = self.history_steps
         horizon = int(self.config.scenario.forecast_horizon_steps)
-        max_agents = self.top_k + 1
+        trajectory_actor_capacity = int(getattr(self, "trajectory_actor_capacity", self.top_k))
+        max_agents = trajectory_actor_capacity + 1
         frames = self._trajectory_frames
         frame_metadata = getattr(self, "_trajectory_frame_metadata", [])
         self._last_trajectory_window_metadata = {
@@ -2271,7 +2297,7 @@ class SumoHighwayMergeEnv(gym.Env):
                 self.config,
                 ego,
                 list(latest.values()),
-                self.top_k,
+                trajectory_actor_capacity,
             )
             agent_ids.extend(selection.selected_actor_ids)
             history = np.zeros((max_agents, hist, 5), dtype=np.float32)

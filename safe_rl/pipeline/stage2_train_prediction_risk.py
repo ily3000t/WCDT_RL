@@ -253,6 +253,12 @@ def _trajectory_string(data: Any, key: str) -> str:
     return str(value)
 
 
+def _trajectory_int(data: Any, key: str, default: int = 0) -> int:
+    if not _has_key(data, key):
+        return int(default)
+    return int(np.asarray(data[key]).reshape(-1)[0])
+
+
 def _require_trajectory_schema_v3(data: Any, consumer: str, cfg: Any | None = None) -> None:
     from safe_rl.prediction.actor_selector import (
         ACTOR_SELECTION_VERSION,
@@ -283,6 +289,8 @@ def _require_trajectory_schema_v3(data: Any, consumer: str, cfg: Any | None = No
         "stage1_buffer_schema_version",
         "episode_seed_schedule",
         "vehicle_state_ordering_version",
+        "trajectory_actor_capacity",
+        "trajectory_max_agent_count",
     }
     missing = sorted(key for key in required if not _has_key(data, key))
     metric_version = _safety_metric_version(data)
@@ -2033,6 +2041,16 @@ def _train_wcdt_v2_predictor(
             if data.legacy_npz_format
             else str(data.manifest.get("format_version"))
         ),
+        "trajectory_actor_capacity": _trajectory_int(
+            data,
+            "trajectory_actor_capacity",
+            int(cfg.prediction.get("wcdt_v2_max_agents", cfg.prediction.max_pred_num)),
+        ),
+        "trajectory_max_agent_count": _trajectory_int(
+            data,
+            "trajectory_max_agent_count",
+            int(cfg.prediction.get("wcdt_v2_max_agents", cfg.prediction.max_pred_num)) + 1,
+        ),
         "safety_metric_version": _safety_metric_version(data),
         "actor_selection_version": _trajectory_string(data, "actor_selection_version"),
         "actor_selection_config_hash": _trajectory_string(data, "actor_selection_config_hash"),
@@ -2601,6 +2619,17 @@ def _train_wcdt_v3_predictor(
         "architecture_version": ARCHITECTURE_VERSION,
         "loss_version": LOSS_VERSION,
         "trajectory_schema_version": _trajectory_schema_version(data),
+        "stage1_buffer_schema_version": _stage1_buffer_schema_version(data),
+        "trajectory_actor_capacity": _trajectory_int(
+            data,
+            "trajectory_actor_capacity",
+            int(cfg.prediction.get("wcdt_v3_max_agents", cfg.prediction.max_pred_num)),
+        ),
+        "trajectory_max_agent_count": _trajectory_int(
+            data,
+            "trajectory_max_agent_count",
+            int(cfg.prediction.get("wcdt_v3_max_agents", cfg.prediction.max_pred_num)) + 1,
+        ),
         "safety_metric_version": _safety_metric_version(data),
         "actor_selection_version": _trajectory_string(data, "actor_selection_version"),
         "actor_selection_config_hash": _trajectory_string(data, "actor_selection_config_hash"),
@@ -2700,6 +2729,8 @@ def run(cfg) -> Path:
             data,
             "vehicle_state_ordering_version",
         ),
+        "trajectory_actor_capacity": _trajectory_int(data, "trajectory_actor_capacity", 0),
+        "trajectory_max_agent_count": _trajectory_int(data, "trajectory_max_agent_count", 0),
         "episode_seed_schedule": _trajectory_string(data, "episode_seed_schedule"),
         "actor_selector_overflow_rate": (
             float(np.mean(np.asarray(data["actor_selector_overflow"], dtype=np.float32)))

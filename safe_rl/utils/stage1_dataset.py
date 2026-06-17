@@ -13,7 +13,7 @@ import numpy as np
 
 
 STAGE1_FORMAT_VERSION = "manifest_npy_v1"
-STAGE1_BUFFER_SCHEMA_VERSION = 7
+STAGE1_BUFFER_SCHEMA_VERSION = 8
 
 
 def sha256_file(path: str | Path, *, chunk_size: int = 1024 * 1024) -> str:

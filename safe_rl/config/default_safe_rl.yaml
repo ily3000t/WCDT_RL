@@ -127,7 +127,7 @@ prediction:
   wcdt_v3_num_heads: 4
   wcdt_v3_dropout: 0.1
   wcdt_v3_horizon_steps: 30
-  wcdt_v3_max_agents: 5
+  wcdt_v3_max_agents: 6
   wcdt_v3_early_stopping:
     enabled: true
     patience: 10

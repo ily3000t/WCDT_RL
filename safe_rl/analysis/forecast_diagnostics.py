@@ -2198,6 +2198,18 @@ def run_forecast_diagnostics(
         "safety_metric_version": metric_version,
         "actor_selection_version": actor_selection_version,
         "actor_selection_config_hash": actor_selection_config_hash,
+        "trajectory_actor_capacity": (
+            int(np.asarray(data["trajectory_actor_capacity"]).reshape(-1)[0])
+            if "trajectory_actor_capacity" in data
+            else 0
+        ),
+        "trajectory_max_agent_count": (
+            int(np.asarray(data["trajectory_max_agent_count"]).reshape(-1)[0])
+            if "trajectory_max_agent_count" in data
+            else 0
+        ),
+        "wcdt_v2_max_agents": int(cfg.prediction.get("wcdt_v2_max_agents", 0)),
+        "wcdt_v3_max_agents": int(cfg.prediction.get("wcdt_v3_max_agents", 0)),
         "actor_selector_overflow_rate": (
             float(np.mean(np.asarray(data["actor_selector_overflow"], dtype=np.float32)))
             if "actor_selector_overflow" in data and np.asarray(data["actor_selector_overflow"]).size

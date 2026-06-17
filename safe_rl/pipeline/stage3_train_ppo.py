@@ -157,6 +157,8 @@ def run(cfg):
     )
     report["forecast_rollout_bundle_version"] = FORECAST_ROLLOUT_BUNDLE_VERSION
     report["forecast_rollout_bundle_config_hash"] = actor_selection_config_hash(cfg)
+    report["wcdt_v2_max_agents"] = int(cfg.prediction.get("wcdt_v2_max_agents", 0))
+    report["wcdt_v3_max_agents"] = int(cfg.prediction.get("wcdt_v3_max_agents", 0))
     report["trajectory_postprocess_version"] = TRAJECTORY_POSTPROCESS_VERSION
     report["episode_seed_schedule"] = str(
         cfg.get("run", {}).get("episode_seed_schedule", "fixed_legacy")

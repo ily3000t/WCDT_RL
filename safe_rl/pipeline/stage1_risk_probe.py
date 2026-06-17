@@ -21,6 +21,7 @@ from safe_rl.risk.merge_local import candidate_action_risk_samples, candidate_sa
 from safe_rl.risk.risk_aggregator import aggregate_episode_reports
 from safe_rl.risk.stage1_sampling import configured_sampling_probs, sampling_summary, select_stage1_action
 from safe_rl.sim.metrics import SAFETY_METRIC_VERSION
+from safe_rl.sim.sumo_highway_merge_env import configured_trajectory_actor_capacity
 from safe_rl.utils.config import clone_with_overrides, prepare_run_dir
 from safe_rl.utils.progress import TensorboardLogger, progress_iter, stage_log
 from safe_rl.utils.replay import write_replay_file
@@ -138,8 +139,13 @@ def _should_write_replay(cfg, episode_report: dict) -> bool:
 
 
 def _stage1_dataset_metadata(cfg) -> dict:
+    trajectory_actor_capacity = configured_trajectory_actor_capacity(cfg)
     return {
         "trajectory_schema_version": 4,
+        "trajectory_actor_capacity": trajectory_actor_capacity,
+        "trajectory_max_agent_count": trajectory_actor_capacity + 1,
+        "wcdt_v2_max_agents": int(cfg.prediction.get("wcdt_v2_max_agents", 0)),
+        "wcdt_v3_max_agents": int(cfg.prediction.get("wcdt_v3_max_agents", 0)),
         "episode_seed_schedule": str(
             cfg.get("run", {}).get("episode_seed_schedule", "fixed_legacy")
         ),
@@ -832,6 +838,22 @@ def _run_serial(
             dtype=np.int64,
         ),
         "trajectory_schema_version": np.asarray(4, dtype=np.int64),
+        "trajectory_actor_capacity": np.asarray(
+            configured_trajectory_actor_capacity(cfg),
+            dtype=np.int64,
+        ),
+        "trajectory_max_agent_count": np.asarray(
+            configured_trajectory_actor_capacity(cfg) + 1,
+            dtype=np.int64,
+        ),
+        "wcdt_v2_max_agents": np.asarray(
+            int(cfg.prediction.get("wcdt_v2_max_agents", 0)),
+            dtype=np.int64,
+        ),
+        "wcdt_v3_max_agents": np.asarray(
+            int(cfg.prediction.get("wcdt_v3_max_agents", 0)),
+            dtype=np.int64,
+        ),
         "safety_metric_version": np.asarray(SAFETY_METRIC_VERSION),
         "actor_selection_version": np.asarray(ACTOR_SELECTION_VERSION),
         "actor_selection_config_hash": np.asarray(actor_selection_config_hash(cfg)),
@@ -1000,6 +1022,10 @@ def _run_serial(
         "candidate_risk_sample_count": len(transitions["actions"]),
         "trajectory_sample_count": int(sum(item.shape[0] for item in history_samples)),
         "stage1_buffer_schema_version": STAGE1_BUFFER_SCHEMA_VERSION,
+        "trajectory_actor_capacity": configured_trajectory_actor_capacity(cfg),
+        "trajectory_max_agent_count": configured_trajectory_actor_capacity(cfg) + 1,
+        "wcdt_v2_max_agents": int(cfg.prediction.get("wcdt_v2_max_agents", 0)),
+        "wcdt_v3_max_agents": int(cfg.prediction.get("wcdt_v3_max_agents", 0)),
         "episode_seed_schedule": str(
             cfg.get("run", {}).get("episode_seed_schedule", "fixed_legacy")
         ),

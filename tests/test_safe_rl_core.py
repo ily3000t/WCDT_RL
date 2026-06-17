@@ -1512,6 +1512,21 @@ def test_trajectory_window_future_missing_state_is_zero_and_masked():
     ]
 
 
+def test_wcdt_v3_capacity_does_not_change_observation_shape():
+    cfg = load_config()
+    cfg.scenario["top_k_neighbors"] = 5
+    cfg.prediction["wcdt_v3_max_agents"] = 6
+    cfg.prediction["wcdt_v3_train_enabled"] = True
+    env = SumoHighwayMergeEnv(cfg, seed=1)
+    try:
+        assert env.observation_space.shape == (52,)
+        assert env.top_k == 5
+        assert env.trajectory_actor_capacity == 6
+        assert env.history.max_agents == 7
+    finally:
+        env.close()
+
+
 def test_wcdt_v2_actor_selection_prioritizes_merge_local_agents():
     cfg = load_config()
     history = np.zeros((6, cfg.scenario.history_steps, 5), dtype=np.float32)
@@ -2942,6 +2957,19 @@ def test_full_pipeline_forecast_ppo_overrides_are_forecast_only(tmp_path):
     assert "reward_profile" not in main["rl"]
     assert forecast_cv["rl"]["total_timesteps"] == 100000
     assert forecast_cv["rl"]["reward_profile"] == "safety_forecast"
+
+
+def test_full_pipeline_cli_stage1_episodes_overrides_performance_profile(tmp_path):
+    configs = build_generated_configs(
+        "safe_rl_test_run",
+        tmp_path,
+        pipeline_profile="performance",
+        stage1_episodes=100,
+        forecast_sources=["wcdt_v3"],
+    )
+    main = yaml.safe_load(configs["main"].read_text(encoding="utf-8"))
+    assert main["stage1"]["episodes"] == 100
+    assert main["training"]["ppo_num_envs"] == 4
 
 
 def test_full_pipeline_shield_guided_profile_binds_base_risk_module_for_forecast_only(tmp_path):

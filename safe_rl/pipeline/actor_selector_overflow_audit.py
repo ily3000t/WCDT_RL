@@ -290,6 +290,15 @@ def build_actor_selector_overflow_audit(cfg: Any, *, max_examples: int = 20) -> 
             "trajectory_count": int(critical_count.shape[0]),
             "selector_version": str(dataset["actor_selection_version"].item()) if "actor_selection_version" in dataset else None,
             "actor_selection_config_hash": str(dataset["actor_selection_config_hash"].item()) if "actor_selection_config_hash" in dataset else None,
+            "trajectory_actor_capacity": int(np.asarray(dataset["trajectory_actor_capacity"]).reshape(-1)[0])
+            if "trajectory_actor_capacity" in dataset
+            else 0,
+            "trajectory_max_agent_count": int(np.asarray(dataset["trajectory_max_agent_count"]).reshape(-1)[0])
+            if "trajectory_max_agent_count" in dataset
+            else 0,
+            "wcdt_v3_max_agents": int(np.asarray(dataset["wcdt_v3_max_agents"]).reshape(-1)[0])
+            if "wcdt_v3_max_agents" in dataset
+            else 0,
             "critical_actor_overflow_count": int(np.sum(overflow)),
             "critical_actor_overflow_rate": _rate(overflow),
             "critical_actor_count": _summary(critical_count),
