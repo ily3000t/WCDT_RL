@@ -78,13 +78,27 @@ def _prediction_loss_summary_from_checkpoint(checkpoint: str) -> dict | None:
         }
     if not history:
         return None
-    return {
+    summary = {
         "epochs": len(history),
         "first": float(history[0]),
         "last": float(history[-1]),
         "min": float(min(history)),
         "source": "checkpoint",
     }
+    for key in (
+        "architecture_version",
+        "loss_version",
+        "trajectory_schema_version",
+        "stage1_buffer_schema_version",
+        "actor_selection_version",
+        "actor_selection_config_hash",
+        "max_actor_count",
+        "safety_metric_version",
+        "trajectory_postprocess_version",
+    ):
+        if key in payload:
+            summary[key] = payload.get(key)
+    return summary
 
 
 def run(cfg):

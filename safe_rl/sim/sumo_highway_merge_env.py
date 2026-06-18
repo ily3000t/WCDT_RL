@@ -62,6 +62,8 @@ def configured_trajectory_actor_capacity(config: Any) -> int:
     prediction_cfg = config.get("prediction", {}) or {}
     capacities = [scenario_top_k]
     train_enabled = bool(prediction_cfg.get("train_enabled", True))
+    if train_enabled and bool(prediction_cfg.get("wcdt_v1_train_enabled", False)):
+        capacities.append(int(prediction_cfg.get("max_pred_num", scenario_top_k)))
     if train_enabled and bool(prediction_cfg.get("wcdt_v2_train_enabled", False)):
         capacities.append(int(prediction_cfg.get("wcdt_v2_max_agents", scenario_top_k)))
     if train_enabled and bool(prediction_cfg.get("wcdt_v3_train_enabled", False)):
@@ -73,6 +75,8 @@ def configured_trajectory_actor_capacity(config: Any) -> int:
             capacities.append(int(prediction_cfg.get("wcdt_v2_max_agents", scenario_top_k)))
         elif source == "wcdt_v3":
             capacities.append(int(prediction_cfg.get("wcdt_v3_max_agents", scenario_top_k)))
+        elif source == "wcdt":
+            capacities.append(int(prediction_cfg.get("max_pred_num", scenario_top_k)))
     return max(1, max(int(value) for value in capacities))
 
 

@@ -3,7 +3,9 @@ from __future__ import annotations
 import argparse
 from collections import Counter
 import json
+import os
 from pathlib import Path
+import tempfile
 from typing import Any
 
 import numpy as np
@@ -345,20 +347,43 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
+def _write_report_atomic(output: Path, report: dict[str, Any]) -> tuple[Path, str | None]:
+    output.parent.mkdir(parents=True, exist_ok=True)
+    candidates = [
+        output,
+        output.with_name(f"{output.stem}_{os.getpid()}{output.suffix}"),
+    ]
+    if len(output.parents) >= 3:
+        candidates.append(output.parents[2] / f"{output.stem}_{os.getpid()}{output.suffix}")
+    candidates.append(Path.cwd() / f"{output.stem}_{os.getpid()}{output.suffix}")
+    candidates.append(Path(tempfile.gettempdir()) / f"{output.stem}_{os.getpid()}{output.suffix}")
+    errors: list[str] = []
+    for candidate in candidates:
+        temp = candidate.with_name(f"{candidate.name}.{os.getpid()}.tmp")
+        try:
+            with temp.open("w", encoding="utf-8") as file:
+                json.dump(report, file, indent=2, ensure_ascii=False, sort_keys=True)
+                file.write("\n")
+            temp.replace(candidate)
+            return candidate, None
+        except OSError as exc:
+            errors.append(f"{candidate}: {exc}")
+            try:
+                temp.unlink()
+            except OSError:
+                pass
+    return output, "; ".join(errors)
+
+
 def main() -> None:
     args = parse_args()
     cfg = load_stage_config(args)
     report = build_actor_selector_overflow_audit(cfg, max_examples=int(args.max_examples))
     output = Path(args.output) if args.output else run_root(cfg) / "stage5" / "diagnostics" / "actor_selector_overflow_audit.json"
-    try:
-        output.parent.mkdir(parents=True, exist_ok=True)
-        with output.open("w", encoding="utf-8") as file:
-            json.dump(report, file, indent=2, ensure_ascii=False, sort_keys=True)
-            file.write("\n")
-        report["output"] = str(output)
-    except OSError as exc:
-        report["output"] = str(output)
-        report["output_error"] = str(exc)
+    written, error = _write_report_atomic(output, report)
+    report["output"] = str(written)
+    if error:
+        report["output_error"] = error
     print(json.dumps(report, indent=2, ensure_ascii=False, sort_keys=True))
 
 

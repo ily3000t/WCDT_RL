@@ -7,6 +7,7 @@ from typing import Any
 
 import numpy as np
 
+from safe_rl.prediction.actor_selector import select_merge_relevant_actors
 from safe_rl.sim.scenario_semantics import (
     auxiliary_lane_index,
     distance_to_taper,
@@ -35,32 +36,53 @@ class SumoWcDTAdapter:
 
     def to_wcdt_input(self, history: HistoryBuffer, ego_id: str) -> dict[str, Any]:
         torch = _require_torch()
-        agent_history, agent_mask = history.to_tensor_arrays(ego_id)
         latest = history.latest()
-        ordered_ids = self._ordered_agent_ids(history, ego_id)
-        predicted_ids = [vehicle_id for vehicle_id in ordered_ids if vehicle_id != ego_id]
-        predicted_ids = predicted_ids[: self.max_pred_num]
+        selected_ids = self._selected_prediction_ids(history, ego_id)
+        all_ids = [vehicle_id for vehicle_id in history.all_agent_ids(ego_id) if vehicle_id != ego_id]
+        remaining_ids = [
+            vehicle_id for vehicle_id in all_ids if vehicle_id not in set(selected_ids)
+        ]
+        tensors = history.build_tensor_for_ids(
+            ego_id,
+            [*selected_ids, *remaining_ids],
+            self.config,
+        )
+        agent_history = tensors["history"]
+        agent_mask = tensors["mask"]
+        runtime_agent_ids = [str(vehicle_id) for vehicle_id in tensors["agent_ids"].tolist()]
+        id_to_index = {vehicle_id: idx for idx, vehicle_id in enumerate(runtime_agent_ids)}
+
+        predicted_ids = [
+            vehicle_id for vehicle_id in selected_ids[: self.max_pred_num] if vehicle_id in id_to_index
+        ]
         other_ids = [ego_id] + [
-            vehicle_id for vehicle_id in ordered_ids if vehicle_id not in predicted_ids and vehicle_id != ego_id
+            vehicle_id
+            for vehicle_id in runtime_agent_ids
+            if vehicle_id not in predicted_ids and vehicle_id != ego_id
         ]
         other_ids = other_ids[: self.max_other_num]
 
-        id_to_index = {vehicle_id: idx for idx, vehicle_id in enumerate(history.agent_ids(ego_id))}
         predicted = np.zeros((self.max_pred_num, self.his_step, 5), dtype=np.float32)
         predicted_feature = np.zeros((self.max_pred_num, 7), dtype=np.float32)
         predicted_mask = np.zeros((self.max_pred_num,), dtype=np.float32)
         for row, vehicle_id in enumerate(predicted_ids):
-            predicted[row] = agent_history[id_to_index[vehicle_id]]
+            idx = id_to_index.get(vehicle_id)
+            if idx is None:
+                continue
+            predicted[row] = agent_history[idx]
             predicted_feature[row] = self._vehicle_feature(latest.get(vehicle_id))
-            predicted_mask[row] = 1.0
+            predicted_mask[row] = float(agent_mask[idx])
 
         other = np.zeros((self.max_other_num, self.his_step, 5), dtype=np.float32)
         other_feature = np.zeros((self.max_other_num, 7), dtype=np.float32)
         other_mask = np.zeros((self.max_other_num,), dtype=np.float32)
         for row, vehicle_id in enumerate(other_ids):
-            other[row] = agent_history[id_to_index[vehicle_id]]
+            idx = id_to_index.get(vehicle_id)
+            if idx is None:
+                continue
+            other[row] = agent_history[idx]
             other_feature[row] = self._vehicle_feature(latest.get(vehicle_id))
-            other_mask[row] = 1.0
+            other_mask[row] = float(agent_mask[idx])
 
         predicted_future = np.zeros((self.max_pred_num, 80, 5), dtype=np.float32)
         predicted_his_traj_delt = predicted[:, 1:] - predicted[:, :-1]
@@ -82,13 +104,30 @@ class SumoWcDTAdapter:
             "traffic_mask": torch.zeros((1, self.max_traffic_light), dtype=torch.float32),
             "lane_list": torch.tensor(self.lane_list).unsqueeze(0),
             "predicted_ids": predicted_ids,
+            "selected_vehicle_ids": predicted_ids,
         }
         return data
+
+    def _selected_prediction_ids(self, history: HistoryBuffer, ego_id: str) -> list[str]:
+        latest = history.latest()
+        ego = latest.get(ego_id)
+        if ego is not None:
+            selection = select_merge_relevant_actors(
+                self.config,
+                ego,
+                [latest[vehicle_id] for vehicle_id in sorted(latest)],
+                self.max_pred_num,
+            )
+            if selection.selected_actor_ids:
+                return list(selection.selected_actor_ids)
+        return [vehicle_id for vehicle_id in self._ordered_agent_ids(history, ego_id) if vehicle_id != ego_id][
+            : self.max_pred_num
+        ]
 
     def _ordered_agent_ids(self, history: HistoryBuffer, ego_id: str) -> list[str]:
         latest = history.latest()
         ego = latest.get(ego_id)
-        ids = [vehicle_id for vehicle_id in history.agent_ids(ego_id) if vehicle_id != ego_id]
+        ids = [vehicle_id for vehicle_id in history.all_agent_ids(ego_id) if vehicle_id != ego_id]
         if ego is None:
             return ids
         def _priority(vehicle_id: str) -> tuple[float, float, float, str]:

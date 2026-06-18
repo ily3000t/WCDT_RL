@@ -144,6 +144,7 @@ def _stage1_dataset_metadata(cfg) -> dict:
         "trajectory_schema_version": 4,
         "trajectory_actor_capacity": trajectory_actor_capacity,
         "trajectory_max_agent_count": trajectory_actor_capacity + 1,
+        "wcdt_v1_max_agents": int(cfg.prediction.get("max_pred_num", 0)),
         "wcdt_v2_max_agents": int(cfg.prediction.get("wcdt_v2_max_agents", 0)),
         "wcdt_v3_max_agents": int(cfg.prediction.get("wcdt_v3_max_agents", 0)),
         "episode_seed_schedule": str(
@@ -406,6 +407,7 @@ def _run_parallel(cfg, workers: int) -> Path:
         transition_count=transition_count,
     )
     performance["merge_io_time"] = float(merge_io_time)
+    trajectory_actor_capacity = configured_trajectory_actor_capacity(cfg)
     report = {
         "stage": "stage1",
         "run_id": cfg.run.run_id,
@@ -430,6 +432,11 @@ def _run_parallel(cfg, workers: int) -> Path:
         "performance": performance,
         "worker_performance": worker_results,
         "stage1_buffer_schema_version": STAGE1_BUFFER_SCHEMA_VERSION,
+        "trajectory_actor_capacity": trajectory_actor_capacity,
+        "trajectory_max_agent_count": trajectory_actor_capacity + 1,
+        "wcdt_v1_max_agents": int(cfg.prediction.get("max_pred_num", 0)),
+        "wcdt_v2_max_agents": int(cfg.prediction.get("wcdt_v2_max_agents", 0)),
+        "wcdt_v3_max_agents": int(cfg.prediction.get("wcdt_v3_max_agents", 0)),
         "episode_seed_schedule": str(
             cfg.get("run", {}).get("episode_seed_schedule", "fixed_legacy")
         ),
@@ -1024,6 +1031,7 @@ def _run_serial(
         "stage1_buffer_schema_version": STAGE1_BUFFER_SCHEMA_VERSION,
         "trajectory_actor_capacity": configured_trajectory_actor_capacity(cfg),
         "trajectory_max_agent_count": configured_trajectory_actor_capacity(cfg) + 1,
+        "wcdt_v1_max_agents": int(cfg.prediction.get("max_pred_num", 0)),
         "wcdt_v2_max_agents": int(cfg.prediction.get("wcdt_v2_max_agents", 0)),
         "wcdt_v3_max_agents": int(cfg.prediction.get("wcdt_v3_max_agents", 0)),
         "episode_seed_schedule": str(

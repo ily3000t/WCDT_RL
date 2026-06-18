@@ -1527,6 +1527,42 @@ def test_wcdt_v3_capacity_does_not_change_observation_shape():
         env.close()
 
 
+def test_legacy_wcdt_adapter_uses_merge_relevant_selector_for_predicted_ids():
+    pytest.importorskip("torch")
+    cfg = load_config()
+    cfg.prediction["max_pred_num"] = 1
+    cfg.prediction["max_other_num"] = 3
+    history = HistoryBuffer(history_steps=int(cfg.scenario.history_steps), max_agents=4)
+
+    def state(vehicle_id: str, lane: int, lane_pos: float, speed: float = 20.0) -> VehicleState:
+        return VehicleState(
+            vehicle_id=vehicle_id,
+            x=float(lane_pos),
+            y=float(lane_center(cfg, lane, "main_aux", lane_pos)),
+            heading=0.0,
+            speed=float(speed),
+            lane_index=int(lane),
+            lane_id=f"main_aux_{lane}",
+            lane_pos=float(lane_pos),
+            edge_id="main_aux",
+        )
+
+    frames = [
+        state("ego", 0, 100.0, 20.0),
+        state("aaa_far_context", 3, 180.0, 20.0),
+        state("target_front", 1, 112.0, 16.0),
+        state("zzz_context", 2, 170.0, 20.0),
+    ]
+    for _ in range(int(cfg.scenario.history_steps)):
+        history.append(frames)
+
+    data = SumoWcDTAdapter(cfg).to_wcdt_input(history, "ego")
+
+    assert data["selected_vehicle_ids"] == ["target_front"]
+    assert data["predicted_ids"] == ["target_front"]
+    assert tuple(data["predicted_his_traj"].shape[1:3]) == (1, int(cfg.scenario.history_steps))
+
+
 def test_wcdt_v2_actor_selection_prioritizes_merge_local_agents():
     cfg = load_config()
     history = np.zeros((6, cfg.scenario.history_steps, 5), dtype=np.float32)

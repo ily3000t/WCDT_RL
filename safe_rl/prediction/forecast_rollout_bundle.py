@@ -191,6 +191,10 @@ def _selected_prediction_rollouts(
     if trajectories is None:
         return [], [], 0.0
     uncertainty = float(prediction.get("uncertainty", 0.0))
+    actor_uncertainty = prediction.get("actor_uncertainty", [])
+    if hasattr(actor_uncertainty, "detach"):
+        actor_uncertainty = actor_uncertainty.detach().cpu().numpy()
+    actor_uncertainty = np.asarray(actor_uncertainty, dtype=np.float32).reshape(-1)
     actors: list[ForecastActorRollout] = []
     used_ids: list[str] = []
     for row, trajectory in enumerate(trajectories):
@@ -212,7 +216,7 @@ def _selected_prediction_rollouts(
                 vehicle_id=vehicle_id,
                 source=str(prediction.get("forecast_source", "wcdt")),
                 trajectory=states,
-                uncertainty=uncertainty,
+                uncertainty=float(actor_uncertainty[row]) if row < actor_uncertainty.size else uncertainty,
                 current_state=reference,
             )
         )
@@ -231,8 +235,12 @@ def build_forecast_rollout_bundle(
     vehicles = list(context.get("vehicles") or [])
     vehicles_by_id = {str(vehicle.vehicle_id): vehicle for vehicle in vehicles}
     forecast_source = str(cfg.forecast_features.get("source", "constant_velocity")).lower()
-    max_actor_key = "wcdt_v2_max_agents" if forecast_source == "wcdt_v2" else "wcdt_v3_max_agents"
-    max_actors = int(cfg.prediction.get(max_actor_key, cfg.prediction.max_pred_num))
+    if forecast_source == "wcdt_v2":
+        max_actors = int(cfg.prediction.get("wcdt_v2_max_agents", cfg.prediction.max_pred_num))
+    elif forecast_source == "wcdt_v3":
+        max_actors = int(cfg.prediction.get("wcdt_v3_max_agents", cfg.prediction.max_pred_num))
+    else:
+        max_actors = int(cfg.prediction.max_pred_num)
     selection = select_merge_relevant_actors(cfg, ego, vehicles, max_actors)
     horizon = int(
         cfg.forecast_features.get(

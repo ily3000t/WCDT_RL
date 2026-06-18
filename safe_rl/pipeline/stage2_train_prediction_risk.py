@@ -983,10 +983,12 @@ def _build_wcdt_batch(
     sample_indices = np.asarray(indices if indices is not None else np.arange(history.shape[0]), dtype=np.int64)
     if sample_indices.size == 0:
         return None
+    _require_trajectory_schema_v3(data, "WcDT v1", cfg)
     max_pred = int(cfg.prediction.max_pred_num)
     max_other = int(cfg.prediction.max_other_num)
     hist_steps = int(cfg.scenario.history_steps)
     horizon = future.shape[2]
+    future_valid_mask = data["agent_future_valid_mask"] if "agent_future_valid_mask" in data else None
     padded_future = np.zeros((sample_indices.shape[0], max_pred, 80, 5), dtype=np.float32)
     ego_future = np.zeros((sample_indices.shape[0], horizon, 5), dtype=np.float32)
     predicted_his = np.zeros((sample_indices.shape[0], max_pred, hist_steps, 5), dtype=np.float32)
@@ -995,13 +997,11 @@ def _build_wcdt_batch(
     other_mask = np.zeros((sample_indices.shape[0], max_other), dtype=np.float32)
 
     for output_idx, sample_idx in enumerate(sample_indices):
-        ordered_agents = _ordered_prediction_indices(
-            cfg,
-            history[sample_idx],
-            mask[sample_idx],
-            None if "agent_lane_index" not in data else data["agent_lane_index"][sample_idx],
-            None if "agent_edge_role" not in data else data["agent_edge_role"][sample_idx],
-        )
+        ordered_agents = [
+            agent_idx
+            for agent_idx in range(1, history.shape[1])
+            if float(mask[sample_idx, agent_idx]) > 0.0
+        ]
         pred_agents = ordered_agents[:max_pred]
         leftover = [agent_idx for agent_idx in ordered_agents if agent_idx not in set(pred_agents)]
         leftover.sort(
@@ -1018,7 +1018,12 @@ def _build_wcdt_batch(
             padded_future[output_idx, row, :horizon] = future[sample_idx, agent_idx]
             if horizon < 80:
                 padded_future[output_idx, row, horizon:] = future[sample_idx, agent_idx, -1]
-            predicted_mask[output_idx, row] = mask[sample_idx, agent_idx]
+            full_future_valid = True
+            if future_valid_mask is not None:
+                full_future_valid = bool(
+                    np.all(np.asarray(future_valid_mask[sample_idx, agent_idx, :horizon]) > 0.5)
+                )
+            predicted_mask[output_idx, row] = float(mask[sample_idx, agent_idx]) if full_future_valid else 0.0
         for row, agent_idx in enumerate(other_agents[:max_other]):
             other_his[output_idx, row] = history[sample_idx, agent_idx]
             other_mask[output_idx, row] = mask[sample_idx, agent_idx]
@@ -1053,6 +1058,50 @@ def _build_wcdt_batch(
 
 def _wcdt_v1_batch_size(cfg: Any) -> int:
     return int(cfg.prediction.get("wcdt_v1_batch_size", cfg.prediction.batch_size))
+
+
+def _wcdt_v1_checkpoint_metadata(
+    cfg: Any,
+    data: Any,
+    *,
+    train_sample_count: int,
+    validation_sample_count: int,
+) -> dict[str, Any]:
+    from safe_rl.prediction.actor_selector import actor_selection_config_hash
+
+    return {
+        "architecture_version": "wcdt_v1_legacy_diffusion_route_selector_v1",
+        "loss_version": "legacy_multimodal_diffusion_v1",
+        "trajectory_schema_version": _trajectory_schema_version(data),
+        "stage1_buffer_schema_version": _stage1_buffer_schema_version(data),
+        "stage1_storage_format": _trajectory_string(data, "stage1_storage_format"),
+        "trajectory_actor_capacity": _trajectory_int(
+            data,
+            "trajectory_actor_capacity",
+            int(cfg.prediction.max_pred_num),
+        ),
+        "trajectory_max_agent_count": _trajectory_int(
+            data,
+            "trajectory_max_agent_count",
+            int(cfg.prediction.max_pred_num) + 1,
+        ),
+        "safety_metric_version": _safety_metric_version(data),
+        "actor_selection_version": _trajectory_string(data, "actor_selection_version"),
+        "actor_selection_config_hash": _trajectory_string(data, "actor_selection_config_hash")
+        or actor_selection_config_hash(cfg),
+        "trajectory_postprocess_version": _trajectory_string(data, "trajectory_postprocess_version")
+        or TRAJECTORY_POSTPROCESS_VERSION,
+        "forecast_rollout_bundle_version": _trajectory_string(data, "forecast_rollout_bundle_version"),
+        "route_projection_config": dict(cfg.prediction.get("route_projection", {}) or {}),
+        "vehicle_state_ordering_version": _trajectory_string(data, "vehicle_state_ordering_version"),
+        "episode_seed_schedule": _trajectory_string(data, "episode_seed_schedule"),
+        "max_actor_count": int(cfg.prediction.max_pred_num),
+        "history_steps": int(cfg.scenario.history_steps),
+        "horizon_steps": int(cfg.prediction.horizon_steps),
+        "wcdt_v1_batch_size": _wcdt_v1_batch_size(cfg),
+        "train_sample_count": int(train_sample_count),
+        "validation_sample_count": int(validation_sample_count),
+    }
 
 
 def _wcdt_v2_batch_size(cfg: Any) -> int:
@@ -1438,6 +1487,12 @@ def _train_wcdt_predictor(
     best_payload: dict[str, Any] | None = None
     best_score: float | None = None
     best_epoch = 0
+    checkpoint_metadata = _wcdt_v1_checkpoint_metadata(
+        cfg,
+        data,
+        train_sample_count=int(train_indices.shape[0]),
+        validation_sample_count=int(val_indices.shape[0]),
+    )
     pin_memory = bool(getattr(loader, "pin_memory", False))
     stage_log(
         "stage2",
@@ -1502,6 +1557,7 @@ def _train_wcdt_predictor(
                 "best_metric": "val_score" if val_loader is not None else "train_loss",
                 "train_sample_count": int(train_indices.shape[0]),
                 "validation_sample_count": int(val_indices.shape[0]),
+                **checkpoint_metadata,
             }
         if validation_metrics is not None:
             stage_log(
@@ -1526,6 +1582,7 @@ def _train_wcdt_predictor(
             "best_metric": "train_loss",
             "train_sample_count": int(train_indices.shape[0]),
             "validation_sample_count": int(val_indices.shape[0]),
+            **checkpoint_metadata,
         }
     torch.save(best_payload, best_checkpoint)
     torch.save(best_payload, checkpoint)
@@ -1537,6 +1594,15 @@ def _train_wcdt_predictor(
         "prediction_validation_history": validation_history,
         "prediction_best_epoch": int(best_payload["best_epoch"]),
         "prediction_best_val_score": float(best_payload["best_val_score"]),
+        "prediction_architecture_version": checkpoint_metadata["architecture_version"],
+        "prediction_loss_version": checkpoint_metadata["loss_version"],
+        "prediction_safety_metric_version": checkpoint_metadata["safety_metric_version"],
+        "prediction_actor_selection_version": checkpoint_metadata["actor_selection_version"],
+        "prediction_actor_selection_config_hash": checkpoint_metadata["actor_selection_config_hash"],
+        "prediction_trajectory_schema_version": checkpoint_metadata["trajectory_schema_version"],
+        "prediction_stage1_buffer_schema_version": checkpoint_metadata["stage1_buffer_schema_version"],
+        "prediction_max_actor_count": checkpoint_metadata["max_actor_count"],
+        "prediction_trajectory_actor_capacity": checkpoint_metadata["trajectory_actor_capacity"],
     }
 
 
@@ -2742,6 +2808,7 @@ def run(cfg) -> Path:
         "wcdt_v1_train_enabled": bool(cfg.prediction.get("wcdt_v1_train_enabled", False)),
         "wcdt_v2_train_enabled": bool(cfg.prediction.get("wcdt_v2_train_enabled", True)),
         "wcdt_v3_train_enabled": bool(cfg.prediction.get("wcdt_v3_train_enabled", False)),
+        "wcdt_v1_max_agents": int(cfg.prediction.max_pred_num),
         "wcdt_v1_batch_size": _wcdt_v1_batch_size(cfg),
         "wcdt_v2_batch_size": _wcdt_v2_batch_size(cfg),
         "wcdt_v3_batch_size": _wcdt_v3_batch_size(cfg),
