@@ -84,7 +84,11 @@ def test_performance_profile_enables_parallelism_without_changing_defaults(tmp_p
     assert main["training"]["ppo_num_envs"] == 4
     assert main["rl"]["n_steps"] == 256
     assert forecast["shield"]["forecast_task_shadow_enabled"] is False
-    assert stage5["shield"]["forecast_task_shadow_enabled"] is True
+    assert stage5["shield"]["forecast_task_shadow_enabled"] is False
+    groups = {item["name"]: item for item in stage5["stage5"]["groups"]}
+    assert groups["wcdt_v3_prediction_shield_shadow"]["shield_overrides"][
+        "forecast_aware_candidate_ranking_mode"
+    ] == "shadow"
 
 
 def test_candidate_rollout_reuses_surrounding_vehicle_rollouts(monkeypatch):

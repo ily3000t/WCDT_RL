@@ -128,6 +128,10 @@ def _paired_delta(a_report: dict | None, b_report: dict | None) -> dict | None:
                 "task_replacement_delta": int(
                     item.get("task_replacement_count", 0) - left.get("task_replacement_count", 0)
                 ),
+                "forecast_ranking_replacement_delta": int(
+                    item.get("forecast_ranking_replacement_count", 0)
+                    - left.get("forecast_ranking_replacement_count", 0)
+                ),
                 "fallback_delta": int(item["fallback_count"] - left["fallback_count"]),
                 "emergency_fallback_delta": int(
                     item.get("emergency_fallback_count", 0) - left.get("emergency_fallback_count", 0)
@@ -176,6 +180,12 @@ def _paired_delta(a_report: dict | None, b_report: dict | None) -> dict | None:
         "mean_actual_replacement_delta": sum(row["actual_replacement_delta"] for row in rows) / len(rows),
         "mean_task_replacement_delta": sum(row["task_replacement_delta"] for row in rows) / len(rows),
         "task_replacement_count_delta": sum(row["task_replacement_delta"] for row in rows),
+        "mean_forecast_ranking_replacement_delta": (
+            sum(row["forecast_ranking_replacement_delta"] for row in rows) / len(rows)
+        ),
+        "forecast_ranking_replacement_count_delta": sum(
+            row["forecast_ranking_replacement_delta"] for row in rows
+        ),
         "mean_fallback_delta": sum(row["fallback_delta"] for row in rows) / len(rows),
         "mean_emergency_fallback_delta": sum(row["emergency_fallback_delta"] for row in rows) / len(rows),
         "emergency_fallback_count_delta": sum(row["emergency_fallback_delta"] for row in rows),
@@ -397,11 +407,12 @@ def run(cfg) -> Path:
         else:
             group_reports[group.name]["forecast_source"] = None
             group_reports[group.name]["forecast_checkpoint"] = ""
+        group_reports[group.name]["shield_enabled"] = bool(group.shield)
         group_reports[group.name]["shield_overrides"] = dict(group.get("shield_overrides", {}) or {})
         group_reports[group.name]["risk_module_overrides"] = dict(group.get("risk_module_overrides", {}) or {})
 
-    shield_off = {name: report for name, report in group_reports.items() if not name.endswith("shield")}
-    shield_on = {name: report for name, report in group_reports.items() if name.endswith("shield") or name == "full_prediction_shield"}
+    shield_off = {name: report for name, report in group_reports.items() if not bool(report.get("shield_enabled", False))}
+    shield_on = {name: report for name, report in group_reports.items() if bool(report.get("shield_enabled", False))}
     forecast_baseline = _forecast_baseline_group(group_reports)
     paired_delta = _build_paired_delta(group_reports)
     acceptance = _build_acceptance(group_reports)

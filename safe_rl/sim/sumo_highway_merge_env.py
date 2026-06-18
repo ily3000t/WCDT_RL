@@ -203,6 +203,7 @@ class SumoHighwayMergeEnv(gym.Env):
         self._task_missed_consecutive_count = 0
         self._task_backstop_consecutive_count = 0
         self._task_replacements: list[dict[str, Any]] = []
+        self._forecast_ranking_replacements: list[dict[str, Any]] = []
         self.performance = PerformanceTracker()
         self._decision_context_cache: dict[str, Any] | None = None
         self._lane_count_cache: dict[str, int] = {}
@@ -322,6 +323,7 @@ class SumoHighwayMergeEnv(gym.Env):
         self._task_missed_consecutive_count = 0
         self._task_backstop_consecutive_count = 0
         self._task_replacements.clear()
+        self._forecast_ranking_replacements.clear()
         if self.shield is not None and hasattr(self.shield, "reset_episode_state"):
             self.shield.reset_episode_state()
 
@@ -354,10 +356,22 @@ class SumoHighwayMergeEnv(gym.Env):
             intervention["step"] = int(self._episode_step)
             intervention["decision_index"] = decision_index
             self._interventions.append(intervention)
-        task_replacement = self._maybe_task_backstop(raw_action, final_action, context, intervention)
-        if task_replacement is not None:
-            final_action = decode_action(int(task_replacement["final_action"]))
-            self._task_replacements.append(task_replacement)
+        forecast_replacement = self._maybe_forecast_aware_replacement(
+            raw_action,
+            final_action,
+            context,
+            intervention,
+        )
+        task_replacement = None
+        forecast_ranking_replacement = None
+        if forecast_replacement is not None:
+            final_action = decode_action(int(forecast_replacement["final_action"]))
+            if str(forecast_replacement.get("replacement_type", "")) == "task_backstop":
+                task_replacement = forecast_replacement
+                self._task_replacements.append(forecast_replacement)
+            else:
+                forecast_ranking_replacement = forecast_replacement
+                self._forecast_ranking_replacements.append(forecast_replacement)
 
         raw_action_lane_oob = self._action_lane_oob(raw_action)
         final_action_lane_oob = self._action_lane_oob(final_action)
@@ -404,8 +418,8 @@ class SumoHighwayMergeEnv(gym.Env):
                     "closest_vehicle_id": str(metrics.closest_vehicle_id),
                 }
             )
-        if task_replacement is not None:
-            task_replacement.update(
+        if forecast_replacement is not None:
+            forecast_replacement.update(
                 {
                     "min_distance": float(metrics.min_distance),
                     "min_ttc": float(metrics.min_ttc),
@@ -428,6 +442,7 @@ class SumoHighwayMergeEnv(gym.Env):
             done_reason=done_reason,
             intervention=intervention,
             task_replacement=task_replacement,
+            forecast_ranking_replacement=forecast_ranking_replacement,
         )
         info["raw_action"] = int(raw_action.index)
         info["final_action"] = int(final_action.index)
@@ -1034,6 +1049,25 @@ class SumoHighwayMergeEnv(gym.Env):
         }
         return total_penalty, debug
 
+    def _forecast_aware_candidate_ranking_mode(self) -> str:
+        raw_mode = self.config.shield.get("forecast_aware_candidate_ranking_mode", None)
+        if raw_mode is None:
+            if bool(self.config.shield.get("task_backstop_enabled", False)):
+                return "task_backstop"
+            if bool(self.config.shield.get("forecast_task_shadow_enabled", False)):
+                return "shadow"
+            return "off"
+        mode = str(raw_mode).strip().lower()
+        if mode not in {"off", "shadow", "task_backstop", "full_ranking"}:
+            raise ValueError(
+                "shield.forecast_aware_candidate_ranking_mode must be one of "
+                "off, shadow, task_backstop, full_ranking"
+            )
+        return mode
+
+    def _forecast_aware_scoring_enabled(self) -> bool:
+        return self._forecast_aware_candidate_ranking_mode() != "off"
+
     def _task_merge_shadow(
         self,
         context: dict[str, Any] | None,
@@ -1041,8 +1075,10 @@ class SumoHighwayMergeEnv(gym.Env):
         *,
         update_counters: bool = True,
     ) -> dict[str, Any]:
+        ranking_mode = self._forecast_aware_candidate_ranking_mode()
         debug: dict[str, Any] = {
             "available": False,
+            "forecast_aware_candidate_ranking_mode": ranking_mode,
             "task_merge_opportunity": False,
             "task_would_merge": False,
             "task_missed_merge": False,
@@ -1061,6 +1097,9 @@ class SumoHighwayMergeEnv(gym.Env):
             "forecast_aware_raw_task_cost": None,
             "forecast_aware_best_task_cost": None,
             "forecast_aware_task_improvement": None,
+            "forecast_aware_raw_score": None,
+            "forecast_aware_best_score": None,
+            "forecast_aware_score_improvement": None,
             "forecast_aware_raw_task_risk": None,
             "forecast_aware_best_task_risk": None,
             "forecast_aware_best_action": None,
@@ -1077,6 +1116,13 @@ class SumoHighwayMergeEnv(gym.Env):
             "task_backstop_risk_module_uncertainty": None,
             "task_backstop_risk_module_pass": False,
             "task_backstop_veto_reason": "",
+            "forecast_ranking_eligible": False,
+            "forecast_ranking_veto_reason": "",
+            "forecast_ranking_risk_module_score": None,
+            "forecast_ranking_risk_module_uncertainty": None,
+            "forecast_ranking_risk_module_pass": False,
+            "forecast_ranking_replacement": False,
+            "forecast_ranking_replacement_reason": "",
         }
         if context is None or raw_action is None:
             return debug
@@ -1141,7 +1187,7 @@ class SumoHighwayMergeEnv(gym.Env):
                 "decision_ego_lane": int(ego.lane_index),
             }
         )
-        if bool(self.config.shield.get("forecast_task_shadow_enabled", True)):
+        if self._forecast_aware_scoring_enabled():
             debug.update(
                 self.forecast_task_scorer.score(
                     context,
@@ -1152,6 +1198,147 @@ class SumoHighwayMergeEnv(gym.Env):
                 )
             )
         return debug
+
+    def _maybe_forecast_aware_replacement(
+        self,
+        raw_action: Any,
+        final_action: Any,
+        context: dict[str, Any],
+        intervention: dict[str, Any] | None,
+    ) -> dict[str, Any] | None:
+        mode = self._forecast_aware_candidate_ranking_mode()
+        if mode in {"off", "shadow"}:
+            self._task_backstop_consecutive_count = 0
+            return None
+        if mode == "task_backstop":
+            return self._maybe_task_backstop(raw_action, final_action, context, intervention)
+        if mode == "full_ranking":
+            self._task_backstop_consecutive_count = 0
+            return self._maybe_forecast_full_ranking(raw_action, final_action, context, intervention)
+        return None
+
+    def _mark_forecast_ranking_veto(
+        self,
+        reason: str,
+        risk_check: dict[str, Any] | None = None,
+        *,
+        eligible: bool = False,
+    ) -> None:
+        if self._last_task_merge_record is None:
+            self._last_task_merge_record = {}
+        check = risk_check or {}
+        self._last_task_merge_record.update(
+            {
+                "forecast_ranking_eligible": bool(eligible),
+                "forecast_ranking_veto_reason": str(reason),
+                "forecast_ranking_risk_module_score": check.get("risk_score"),
+                "forecast_ranking_risk_module_uncertainty": check.get("risk_uncertainty"),
+                "forecast_ranking_risk_module_pass": bool(check.get("safety_pass", False)),
+                "forecast_ranking_replacement": False,
+                "forecast_ranking_replacement_reason": "",
+            }
+        )
+
+    def _maybe_forecast_full_ranking(
+        self,
+        raw_action: Any,
+        final_action: Any,
+        context: dict[str, Any],
+        intervention: dict[str, Any] | None,
+    ) -> dict[str, Any] | None:
+        if self.shield is None or not self.shield.enabled:
+            self._mark_forecast_ranking_veto("shield_disabled")
+            return None
+        if int(final_action.index) != int(raw_action.index):
+            self._mark_forecast_ranking_veto("safety_shield_replaced")
+            return None
+        if intervention is not None and int(intervention.get("final_action", raw_action.index)) != int(
+            intervention.get("raw_action", raw_action.index)
+        ):
+            self._mark_forecast_ranking_veto("safety_shield_replaced")
+            return None
+
+        record = self._last_task_merge_record or {}
+        best_action_index = record.get("forecast_aware_best_action")
+        best_action = decode_action(int(best_action_index)) if best_action_index is not None else None
+        if best_action is None:
+            self._mark_forecast_ranking_veto("candidate_unavailable")
+            return None
+        risk_check = self.shield.evaluate_candidate(best_action, context)
+
+        def record_float(key: str, default: float) -> float:
+            value = record.get(key)
+            return float(default) if value is None else float(value)
+
+        margin = float(self.config.shield.get("forecast_aware_ranking_improvement_margin", 0.05))
+        uncertainty_threshold = float(self.config.shield.get("task_backstop_uncertainty_threshold", 0.40))
+        improvement = record_float("forecast_aware_score_improvement", -INF_TTC)
+        veto_reason = ""
+        if not bool(record.get("forecast_aware_available", False)):
+            veto_reason = "forecast_unavailable"
+        elif int(best_action.index) == int(raw_action.index):
+            veto_reason = "best_action_is_raw"
+        elif not is_candidate_legal(best_action, context):
+            veto_reason = "candidate_illegal"
+        elif bool(record.get("actor_selector_overflow", False)):
+            veto_reason = "actor_selector_overflow"
+        elif bool(record.get("critical_actor_overflow", False)):
+            veto_reason = "critical_actor_overflow"
+        elif bool(record.get("cv_fallback_overflow", False)):
+            veto_reason = "cv_fallback_overflow"
+        elif not bool(record.get("forecast_safety_actor_coverage_complete", False)):
+            veto_reason = "forecast_safety_actor_coverage"
+        elif not bool(record.get("combined_critical_coverage_complete", False)):
+            veto_reason = "combined_critical_coverage"
+        elif bool(record.get("forecast_gap_consistency_checkable", False)) and not bool(
+            record.get("forecast_gap_consistency_pass", False)
+        ):
+            veto_reason = "forecast_gap_consistency"
+        elif not bool(record.get("forecast_gap_physical_consistency_pass", False)):
+            veto_reason = "forecast_physical_consistency"
+        elif record_float("forecast_aware_uncertainty", INF_TTC) > uncertainty_threshold:
+            veto_reason = "forecast_uncertainty"
+        elif improvement < margin:
+            veto_reason = "forecast_score_margin"
+        elif not bool(risk_check.get("safety_pass", False)):
+            veto_reason = f"risk_module_{risk_check.get('veto_reason', 'veto')}"
+
+        if veto_reason:
+            self._mark_forecast_ranking_veto(veto_reason, risk_check)
+            return None
+
+        self._last_task_merge_record.update(
+            {
+                "forecast_ranking_eligible": True,
+                "forecast_ranking_veto_reason": "",
+                "forecast_ranking_risk_module_score": risk_check.get("risk_score"),
+                "forecast_ranking_risk_module_uncertainty": risk_check.get("risk_uncertainty"),
+                "forecast_ranking_risk_module_pass": bool(risk_check.get("safety_pass", False)),
+                "forecast_ranking_replacement": True,
+                "forecast_ranking_replacement_reason": "forecast_aware_full_ranking",
+            }
+        )
+        return {
+            "step": int(self._episode_step),
+            "replacement_type": "forecast_ranking",
+            "replacement_reason": "forecast_aware_full_ranking",
+            "forecast_ranking_replacement_reason": "forecast_aware_full_ranking",
+            "raw_action": int(raw_action.index),
+            "final_action": int(best_action.index),
+            "raw_action_name": str(raw_action.name),
+            "final_action_name": str(best_action.name),
+            "forecast_aware_candidate_ranking_mode": "full_ranking",
+            "forecast_aware_raw_score": record.get("forecast_aware_raw_score"),
+            "forecast_aware_best_score": record.get("forecast_aware_best_score"),
+            "forecast_aware_score_improvement": float(improvement),
+            "forecast_aware_raw_task_risk": record.get("forecast_aware_raw_task_risk"),
+            "forecast_aware_best_task_risk": record.get("forecast_aware_best_task_risk"),
+            "forecast_aware_safety_risk": record.get("forecast_aware_safety_risk"),
+            "forecast_aware_uncertainty": record.get("forecast_aware_uncertainty"),
+            "forecast_ranking_risk_module_score": risk_check.get("risk_score"),
+            "forecast_ranking_risk_module_uncertainty": risk_check.get("risk_uncertainty"),
+            "forecast_ranking_risk_module_pass": bool(risk_check.get("safety_pass", False)),
+        }
 
     def _maybe_task_backstop(
         self,
@@ -1301,14 +1488,19 @@ class SumoHighwayMergeEnv(gym.Env):
             return None
         replacement = {
             "step": int(self._episode_step),
+            "replacement_type": "task_backstop",
             "replacement_reason": "task_backstop",
             "raw_action": int(raw_action.index),
             "final_action": int(best_action.index),
             "raw_action_name": str(raw_action.name),
             "final_action_name": str(best_action.name),
+            "forecast_aware_candidate_ranking_mode": "task_backstop",
             "task_deadline_urgency": urgency,
             "distance_to_taper": decision_distance,
             "decision_distance_to_taper": decision_distance,
+            "forecast_aware_raw_score": record.get("forecast_aware_raw_score"),
+            "forecast_aware_best_score": record.get("forecast_aware_best_score"),
+            "forecast_aware_score_improvement": record.get("forecast_aware_score_improvement"),
             "forecast_aware_task_improvement": task_improvement,
             "forecast_aware_best_task_risk": record_float("forecast_aware_best_task_risk", 0.0),
             "forecast_aware_safety_risk": record_float("forecast_aware_safety_risk", 0.0),
@@ -1423,6 +1615,7 @@ class SumoHighwayMergeEnv(gym.Env):
         done_reason: str = "",
         intervention: dict[str, Any] | None = None,
         task_replacement: dict[str, Any] | None = None,
+        forecast_ranking_replacement: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         info: dict[str, Any] = {
             "seed": self.seed_value,
@@ -1508,6 +1701,17 @@ class SumoHighwayMergeEnv(gym.Env):
                     "decision_ego_edge": str(self._last_task_merge_record.get("decision_ego_edge", "")),
                     "decision_ego_lane": int(self._last_task_merge_record.get("decision_ego_lane", -1)),
                     "task_safe_merge_action": str(self._last_task_merge_record.get("task_safe_merge_action", "")),
+                    "forecast_aware_candidate_ranking_mode": str(
+                        self._last_task_merge_record.get(
+                            "forecast_aware_candidate_ranking_mode",
+                            self._forecast_aware_candidate_ranking_mode(),
+                        )
+                    ),
+                    "forecast_aware_raw_score": self._last_task_merge_record.get("forecast_aware_raw_score"),
+                    "forecast_aware_best_score": self._last_task_merge_record.get("forecast_aware_best_score"),
+                    "forecast_aware_score_improvement": self._last_task_merge_record.get(
+                        "forecast_aware_score_improvement"
+                    ),
                     "forecast_aware_raw_task_cost": self._last_task_merge_record.get(
                         "forecast_aware_raw_task_cost"
                     ),
@@ -1735,6 +1939,27 @@ class SumoHighwayMergeEnv(gym.Env):
                     "task_backstop_veto_reason": str(
                         self._last_task_merge_record.get("task_backstop_veto_reason", "")
                     ),
+                    "forecast_ranking_eligible": bool(
+                        self._last_task_merge_record.get("forecast_ranking_eligible", False)
+                    ),
+                    "forecast_ranking_veto_reason": str(
+                        self._last_task_merge_record.get("forecast_ranking_veto_reason", "")
+                    ),
+                    "forecast_ranking_risk_module_score": self._last_task_merge_record.get(
+                        "forecast_ranking_risk_module_score"
+                    ),
+                    "forecast_ranking_risk_module_uncertainty": self._last_task_merge_record.get(
+                        "forecast_ranking_risk_module_uncertainty"
+                    ),
+                    "forecast_ranking_risk_module_pass": bool(
+                        self._last_task_merge_record.get("forecast_ranking_risk_module_pass", False)
+                    ),
+                    "forecast_ranking_replacement": bool(forecast_ranking_replacement is not None),
+                    "forecast_ranking_replacement_reason": str(
+                        forecast_ranking_replacement.get("forecast_ranking_replacement_reason", "")
+                    )
+                    if forecast_ranking_replacement is not None
+                    else "",
                     "task_replacement": bool(task_replacement is not None),
                     "task_replacement_reason": str(task_replacement.get("replacement_reason", ""))
                     if task_replacement is not None
@@ -1933,6 +2158,17 @@ class SumoHighwayMergeEnv(gym.Env):
             self._first_merge_request_step is None and self._last_done_reason == "taper_miss"
         )
         task_replacement_count = len(self._task_replacements)
+        forecast_ranking_replacement_count = len(self._forecast_ranking_replacements)
+        task_replacement_reason_counts = Counter(
+            str(item.get("replacement_reason", ""))
+            for item in self._task_replacements
+            if str(item.get("replacement_reason", ""))
+        )
+        forecast_ranking_replacement_reason_counts = Counter(
+            str(item.get("forecast_ranking_replacement_reason", item.get("replacement_reason", "")))
+            for item in self._forecast_ranking_replacements
+            if str(item.get("forecast_ranking_replacement_reason", item.get("replacement_reason", "")))
+        )
         task_replacement_records = [
             {
                 "replacement_reason": str(item.get("replacement_reason", "")),
@@ -1962,6 +2198,38 @@ class SumoHighwayMergeEnv(gym.Env):
                 "closest_vehicle_id": str(item.get("closest_vehicle_id", "")),
             }
             for item in self._task_replacements
+        ]
+        forecast_ranking_replacement_records = [
+            {
+                "replacement_reason": str(item.get("replacement_reason", "")),
+                "forecast_ranking_replacement_reason": str(
+                    item.get("forecast_ranking_replacement_reason", "")
+                ),
+                "raw_action": int(item.get("raw_action", -1)),
+                "final_action": int(item.get("final_action", -1)),
+                "raw_action_name": str(item.get("raw_action_name", "")),
+                "final_action_name": str(item.get("final_action_name", "")),
+                "step": int(item.get("step", -1)),
+                "forecast_aware_raw_score": item.get("forecast_aware_raw_score"),
+                "forecast_aware_best_score": item.get("forecast_aware_best_score"),
+                "forecast_aware_score_improvement": item.get("forecast_aware_score_improvement"),
+                "forecast_aware_best_task_risk": item.get("forecast_aware_best_task_risk"),
+                "forecast_aware_safety_risk": item.get("forecast_aware_safety_risk"),
+                "forecast_aware_uncertainty": item.get("forecast_aware_uncertainty"),
+                "forecast_ranking_risk_module_score": item.get("forecast_ranking_risk_module_score"),
+                "forecast_ranking_risk_module_uncertainty": item.get(
+                    "forecast_ranking_risk_module_uncertainty"
+                ),
+                "forecast_ranking_risk_module_pass": bool(
+                    item.get("forecast_ranking_risk_module_pass", False)
+                ),
+                "min_distance": float(item.get("min_distance", INF_TTC)),
+                "min_ttc": float(item.get("min_ttc", INF_TTC)),
+                "max_drac": float(item.get("max_drac", 0.0)),
+                "geometric_overlap": bool(item.get("geometric_overlap", False)),
+                "closest_vehicle_id": str(item.get("closest_vehicle_id", "")),
+            }
+            for item in self._forecast_ranking_replacements
         ]
         score_records = [
             {
@@ -2063,6 +2331,17 @@ class SumoHighwayMergeEnv(gym.Env):
             "task_replacement_rate": float(task_replacement_count / max(self._decision_index, 1)),
             "mean_task_replacements": float(task_replacement_count),
             "task_replacement_records": task_replacement_records,
+            "task_replacement_reason_counts": dict(task_replacement_reason_counts),
+            "forecast_aware_candidate_ranking_mode": self._forecast_aware_candidate_ranking_mode(),
+            "forecast_ranking_replacement_count": int(forecast_ranking_replacement_count),
+            "forecast_ranking_replacement_rate": float(
+                forecast_ranking_replacement_count / max(self._decision_index, 1)
+            ),
+            "mean_forecast_ranking_replacements": float(forecast_ranking_replacement_count),
+            "forecast_ranking_replacement_records": forecast_ranking_replacement_records,
+            "forecast_ranking_replacement_reason_counts": dict(
+                forecast_ranking_replacement_reason_counts
+            ),
             "forecast_actor_coverage_complete_count": int(forecast_coverage_complete_count),
             "forecast_record_count": int(len(forecast_records)),
             "forecast_actor_coverage_complete_rate": (

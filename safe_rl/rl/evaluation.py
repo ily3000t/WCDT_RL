@@ -107,6 +107,12 @@ def _step_safety_record(
         "task_missed_merge": bool(info.get("task_missed_merge", False)),
         "task_deadline_urgency": _safe_float(info.get("task_deadline_urgency"), 0.0),
         "task_safe_merge_action": str(info.get("task_safe_merge_action", "")),
+        "forecast_aware_candidate_ranking_mode": str(
+            info.get("forecast_aware_candidate_ranking_mode", "")
+        ),
+        "forecast_aware_raw_score": info.get("forecast_aware_raw_score"),
+        "forecast_aware_best_score": info.get("forecast_aware_best_score"),
+        "forecast_aware_score_improvement": info.get("forecast_aware_score_improvement"),
         "forecast_aware_raw_task_risk": info.get("forecast_aware_raw_task_risk"),
         "forecast_aware_best_task_risk": info.get("forecast_aware_best_task_risk"),
         "forecast_aware_raw_task_cost": info.get("forecast_aware_raw_task_cost"),
@@ -180,6 +186,19 @@ def _step_safety_record(
         "task_backstop_veto_reason": str(info.get("task_backstop_veto_reason", "")),
         "task_replacement": bool(info.get("task_replacement", False)),
         "task_replacement_reason": str(info.get("task_replacement_reason", "")),
+        "forecast_ranking_eligible": bool(info.get("forecast_ranking_eligible", False)),
+        "forecast_ranking_veto_reason": str(info.get("forecast_ranking_veto_reason", "")),
+        "forecast_ranking_risk_module_score": info.get("forecast_ranking_risk_module_score"),
+        "forecast_ranking_risk_module_uncertainty": info.get(
+            "forecast_ranking_risk_module_uncertainty"
+        ),
+        "forecast_ranking_risk_module_pass": bool(
+            info.get("forecast_ranking_risk_module_pass", False)
+        ),
+        "forecast_ranking_replacement": bool(info.get("forecast_ranking_replacement", False)),
+        "forecast_ranking_replacement_reason": str(
+            info.get("forecast_ranking_replacement_reason", "")
+        ),
         "safety_metric_version": str(info.get("safety_metric_version", "")),
     }
 

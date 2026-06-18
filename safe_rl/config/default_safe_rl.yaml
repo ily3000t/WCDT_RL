@@ -283,6 +283,11 @@ shield:
   emergency_saturated_consecutive_enabled: false
   emergency_saturated_consecutive_steps: 2
   emergency_actions: ["keep_decelerate", "keep_hold"]
+  forecast_aware_candidate_ranking_mode: "off"
+  forecast_aware_ranking_safety_weight: 1.0
+  forecast_aware_ranking_task_weight: 1.0
+  forecast_aware_ranking_uncertainty_weight: 0.5
+  forecast_aware_ranking_improvement_margin: 0.05
   forecast_task_shadow_enabled: true
   task_backstop_enabled: false
   task_backstop_deadline_distance: 120.0

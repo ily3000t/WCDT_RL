@@ -77,6 +77,10 @@ def aggregate_episode_reports(reports: list[dict]) -> dict:
         [float(report.get("task_replacement_count", 0)) for report in reports],
         dtype=np.float32,
     )
+    forecast_ranking_replacements = np.asarray(
+        [float(report.get("forecast_ranking_replacement_count", 0)) for report in reports],
+        dtype=np.float32,
+    )
     fallbacks = np.asarray([float(report.get("fallback_count", 0)) for report in reports], dtype=np.float32)
     emergency_fallbacks = np.asarray(
         [float(report.get("emergency_fallback_count", 0)) for report in reports],
@@ -189,8 +193,14 @@ def aggregate_episode_reports(reports: list[dict]) -> dict:
         sum(int(report.get("task_backstop_eligible_count", 0)) for report in reports)
     )
     task_backstop_veto_reason_counts: Counter[str] = Counter()
+    task_replacement_reason_counts: Counter[str] = Counter()
+    forecast_ranking_replacement_reason_counts: Counter[str] = Counter()
     for report in reports:
         task_backstop_veto_reason_counts.update(report.get("task_backstop_veto_reason_counts", {}) or {})
+        task_replacement_reason_counts.update(report.get("task_replacement_reason_counts", {}) or {})
+        forecast_ranking_replacement_reason_counts.update(
+            report.get("forecast_ranking_replacement_reason_counts", {}) or {}
+        )
     return {
         "episodes": len(reports),
         "collision_rate": float(np.mean(collisions)),
@@ -230,6 +240,9 @@ def aggregate_episode_reports(reports: list[dict]) -> dict:
         "task_replacement_rate": float(np.mean(task_replacements > 0)),
         "mean_task_replacements": float(np.mean(task_replacements)),
         "task_replacement_count": int(np.sum(task_replacements)),
+        "forecast_ranking_replacement_rate": float(np.mean(forecast_ranking_replacements > 0)),
+        "mean_forecast_ranking_replacements": float(np.mean(forecast_ranking_replacements)),
+        "forecast_ranking_replacement_count": int(np.sum(forecast_ranking_replacements)),
         "fallback_rate": float(np.mean(fallbacks > 0)),
         "emergency_fallback_rate": float(np.mean(emergency_fallbacks > 0)),
         "mean_emergency_fallbacks": float(np.mean(emergency_fallbacks)),
@@ -350,4 +363,8 @@ def aggregate_episode_reports(reports: list[dict]) -> dict:
         "task_backstop_watch_count": task_backstop_watch_count,
         "task_backstop_eligible_count": task_backstop_eligible_count,
         "task_backstop_veto_reason_counts": dict(task_backstop_veto_reason_counts),
+        "task_replacement_reason_counts": dict(task_replacement_reason_counts),
+        "forecast_ranking_replacement_reason_counts": dict(
+            forecast_ranking_replacement_reason_counts
+        ),
     }

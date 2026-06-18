@@ -104,6 +104,7 @@ def _prediction_loss_summary_from_checkpoint(checkpoint: str) -> dict | None:
 def run(cfg):
     cfg.shield["forecast_task_shadow_enabled"] = False
     cfg.shield["task_backstop_enabled"] = False
+    cfg.shield["forecast_aware_candidate_ranking_mode"] = "off"
     stage_dir = prepare_run_dir(cfg, "stage3")
     stage_log("stage3", f"run_id={cfg.run.run_id}")
     stage_log("stage3", f"SUMO config={cfg.scenario.sumocfg}")

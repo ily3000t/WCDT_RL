@@ -474,6 +474,7 @@ def run(cfg) -> Path:
         )
     cfg.shield["forecast_task_shadow_enabled"] = False
     cfg.shield["task_backstop_enabled"] = False
+    cfg.shield["forecast_aware_candidate_ranking_mode"] = "off"
     workers = max(1, int(cfg.stage1.get("workers", 1)))
     if not bool(cfg.stage1.get("_worker_mode", False)):
         return _run_parallel(cfg, workers)

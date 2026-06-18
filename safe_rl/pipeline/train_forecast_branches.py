@@ -61,6 +61,11 @@ def _forecast_training_payload(
             "allow_heuristic_fallback": False,
         },
         "rl": {"use_wcdt_forecast_features": True},
+        "shield": {
+            "forecast_aware_candidate_ranking_mode": "off",
+            "forecast_task_shadow_enabled": False,
+            "task_backstop_enabled": False,
+        },
     }
     if profile == "safety":
         payload["rl"]["reward_profile"] = "safety_forecast"
@@ -87,6 +92,12 @@ def _forecast_group(base_run_id: str, source: str, *, shield: bool) -> dict[str,
     checkpoint = _forecast_checkpoint(base_run_id, source)
     if checkpoint:
         group["forecast_checkpoint"] = checkpoint
+    if shield:
+        group["shield_overrides"] = {
+            "forecast_aware_candidate_ranking_mode": "off",
+            "forecast_task_shadow_enabled": False,
+            "task_backstop_enabled": False,
+        }
     return group
 
 
@@ -106,7 +117,50 @@ def _merge_timing_group(base_run_id: str, source: str, suffix: str, *, shield: b
     checkpoint = _forecast_checkpoint(base_run_id, source)
     if checkpoint:
         group["forecast_checkpoint"] = checkpoint
+    if shield:
+        group["shield_overrides"] = {
+            "forecast_aware_candidate_ranking_mode": "off",
+            "forecast_task_shadow_enabled": False,
+            "task_backstop_enabled": False,
+        }
     return group
+
+
+def _merge_timing_forecast_aware_groups(base_run_id: str, source: str, suffix: str) -> list[dict[str, Any]]:
+    if source != "wcdt_v3":
+        return []
+    groups: list[dict[str, Any]] = []
+    for mode_name, overrides in (
+        (
+            "shadow",
+            {
+                "forecast_aware_candidate_ranking_mode": "shadow",
+                "forecast_task_shadow_enabled": True,
+                "task_backstop_enabled": False,
+            },
+        ),
+        (
+            "task_backstop",
+            {
+                "forecast_aware_candidate_ranking_mode": "task_backstop",
+                "forecast_task_shadow_enabled": True,
+                "task_backstop_enabled": True,
+            },
+        ),
+        (
+            "full_ranking",
+            {
+                "forecast_aware_candidate_ranking_mode": "full_ranking",
+                "forecast_task_shadow_enabled": True,
+                "task_backstop_enabled": False,
+            },
+        ),
+    ):
+        group = _merge_timing_group(base_run_id, source, suffix, shield=True)
+        group["name"] = f"wcdt_v3_merge_timing_prediction_shield_{mode_name}"
+        group["shield_overrides"] = overrides
+        groups.append(group)
+    return groups
 
 
 def _stage5_payload(base_run_id: str, sources: list[str], suffix: str) -> dict[str, Any]:
@@ -129,7 +183,16 @@ def _stage5_payload(base_run_id: str, sources: list[str], suffix: str) -> dict[s
         groups.append(_forecast_group(base_run_id, source, shield=True))
         groups.append(_merge_timing_group(base_run_id, source, suffix, shield=False))
         groups.append(_merge_timing_group(base_run_id, source, suffix, shield=True))
-    return {"run": {"run_id": base_run_id}, "stage5": {"groups": groups}}
+        groups.extend(_merge_timing_forecast_aware_groups(base_run_id, source, suffix))
+    return {
+        "run": {"run_id": base_run_id},
+        "shield": {
+            "forecast_aware_candidate_ranking_mode": "off",
+            "forecast_task_shadow_enabled": False,
+            "task_backstop_enabled": False,
+        },
+        "stage5": {"groups": groups},
+    }
 
 
 def _assert_base_artifacts(base_run_id: str, sources: list[str]) -> None:

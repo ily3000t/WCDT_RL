@@ -941,6 +941,7 @@ def test_forecast_aware_task_scorer_blocks_merge_when_gap_is_unsafe():
 def test_task_backstop_requires_consecutive_shadow_and_counts_separately():
     cfg = load_config()
     cfg.shield["enabled"] = True
+    cfg.shield["forecast_aware_candidate_ranking_mode"] = "task_backstop"
     cfg.shield["task_backstop_enabled"] = True
     cfg.shield["task_backstop_consecutive_steps"] = 2
     env = SumoHighwayMergeEnv(
@@ -968,6 +969,7 @@ def test_task_backstop_requires_consecutive_shadow_and_counts_separately():
 def test_task_backstop_risk_module_veto_blocks_merge():
     cfg = load_config()
     cfg.shield["enabled"] = True
+    cfg.shield["forecast_aware_candidate_ranking_mode"] = "task_backstop"
     cfg.shield["task_backstop_enabled"] = True
     cfg.shield["task_backstop_consecutive_steps"] = 1
     env = SumoHighwayMergeEnv(
@@ -992,6 +994,7 @@ def test_task_backstop_risk_module_veto_blocks_merge():
 def test_task_backstop_does_not_require_legacy_current_gap_task_would_merge():
     cfg = load_config()
     cfg.shield["enabled"] = True
+    cfg.shield["forecast_aware_candidate_ranking_mode"] = "task_backstop"
     cfg.shield["task_backstop_enabled"] = True
     cfg.shield["task_backstop_consecutive_steps"] = 1
     env = SumoHighwayMergeEnv(
@@ -2413,6 +2416,18 @@ def test_full_pipeline_generated_configs_use_forecast_model_and_checkpoint(tmp_p
     assert groups["wcdt_v3_prediction_shield"]["forecast_checkpoint"] == (
         "safe_rl_output/runs/safe_rl_test_run/stage2/wcdt_v3_predictor.pt"
     )
+    assert groups["wcdt_v3_prediction_shield"]["shield_overrides"][
+        "forecast_aware_candidate_ranking_mode"
+    ] == "off"
+    assert groups["wcdt_v3_prediction_shield_shadow"]["shield_overrides"][
+        "forecast_aware_candidate_ranking_mode"
+    ] == "shadow"
+    assert groups["wcdt_v3_prediction_shield_task_backstop"]["shield_overrides"][
+        "forecast_aware_candidate_ranking_mode"
+    ] == "task_backstop"
+    assert groups["wcdt_v3_prediction_shield_full_ranking"]["shield_overrides"][
+        "forecast_aware_candidate_ranking_mode"
+    ] == "full_ranking"
     main = yaml.safe_load(configs["main"].read_text(encoding="utf-8"))
     assert main["prediction"] == {
         "train_enabled": True,
@@ -2539,10 +2554,13 @@ def test_full_pipeline_generated_configs_enable_explicit_v3_ablation(tmp_path):
     assert "forecast_wcdt_v3_ppo" in configs
     stage5 = yaml.safe_load(configs["stage5_multi_groups"].read_text(encoding="utf-8"))
     groups = {item["name"]: item for item in stage5["stage5"]["groups"]}
-    assert len(groups) == 8
+    assert len(groups) == 11
     assert groups["ppo_wcdt_v3_features"]["model_path"].endswith("_forecast_wcdt_v3/stage3/ppo_model.zip")
     assert groups["ppo_wcdt_v3_features"]["forecast_checkpoint"].endswith("/stage2/wcdt_v3_predictor.pt")
     assert groups["wcdt_v3_prediction_shield"]["forecast_source"] == "wcdt_v3"
+    assert "wcdt_v3_prediction_shield_shadow" in groups
+    assert "wcdt_v3_prediction_shield_task_backstop" in groups
+    assert "wcdt_v3_prediction_shield_full_ranking" in groups
 
 
 def test_wcdt_predictors_use_independent_batch_sizes():
@@ -3069,6 +3087,9 @@ def test_forecast_branch_runner_builds_merge_timing_stage5_groups():
     assert "wcdt_v3_prediction_shield" in groups
     assert "ppo_wcdt_v3_merge_timing_features" in groups
     assert "wcdt_v3_merge_timing_prediction_shield" in groups
+    assert "wcdt_v3_merge_timing_prediction_shield_shadow" in groups
+    assert "wcdt_v3_merge_timing_prediction_shield_task_backstop" in groups
+    assert "wcdt_v3_merge_timing_prediction_shield_full_ranking" in groups
     assert groups["ppo_wcdt_v3_merge_timing_features"]["model_path"].endswith(
         "safe_rl_base_forecast_wcdt_v3_merge_timing/stage3/ppo_model.zip"
     )
@@ -3371,10 +3392,19 @@ def test_confirmatory_payload_generates_fifty_seed_cv_wcdt_v3_config():
         "cv_prediction_shield",
         "ppo_wcdt_v3_features",
         "wcdt_v3_prediction_shield",
+        "wcdt_v3_prediction_shield_shadow",
+        "wcdt_v3_prediction_shield_task_backstop",
+        "wcdt_v3_prediction_shield_full_ranking",
     }
     assert groups["ppo_wcdt_v3_features"]["forecast_checkpoint"] == (
         "safe_rl_output/runs/safe_rl_test_run/stage2/wcdt_v3_predictor.pt"
     )
+    assert groups["wcdt_v3_prediction_shield"]["shield_overrides"][
+        "forecast_aware_candidate_ranking_mode"
+    ] == "off"
+    assert groups["wcdt_v3_prediction_shield_shadow"]["shield_overrides"][
+        "forecast_aware_candidate_ranking_mode"
+    ] == "shadow"
 
 
 def test_confirmatory_payload_supports_optional_v3_ablation_groups():
@@ -3384,11 +3414,14 @@ def test_confirmatory_payload_supports_optional_v3_ablation_groups():
         forecast_sources=["constant_velocity", "wcdt_v2", "wcdt_v3"],
     )
     groups = {item["name"]: item for item in payload["stage5"]["groups"]}
-    assert len(groups) == 8
+    assert len(groups) == 11
     assert groups["ppo_wcdt_v3_features"]["forecast_checkpoint"] == (
         "safe_rl_output/runs/safe_rl_test_run/stage2/wcdt_v3_predictor.pt"
     )
     assert groups["wcdt_v3_prediction_shield"]["forecast_source"] == "wcdt_v3"
+    assert "wcdt_v3_prediction_shield_shadow" in groups
+    assert "wcdt_v3_prediction_shield_task_backstop" in groups
+    assert "wcdt_v3_prediction_shield_full_ranking" in groups
 
 
 def test_confirmatory_input_validation_reports_missing_checkpoints():

@@ -86,7 +86,7 @@ class ForecastAwareTaskScorer:
                 deadline_distance=float(deadline_distance),
                 dt=dt,
             )
-        best = min(scores, key=lambda item: float(item["task_cost"]))
+        best = min(scores, key=lambda item: float(item["forecast_aware_score"]))
         best_action = decode_action(int(best["action"]))
         safety_threshold = float(self.config.shield.get("task_backstop_safety_risk_threshold", 0.35))
         uncertainty_threshold = float(self.config.shield.get("task_backstop_uncertainty_threshold", 0.40))
@@ -233,9 +233,13 @@ class ForecastAwareTaskScorer:
         )
         raw_score = raw_score or best
         task_improvement = float(raw_score["task_cost"] - best["task_cost"])
+        score_improvement = float(raw_score["forecast_aware_score"] - best["forecast_aware_score"])
         return {
             "forecast_aware_available": True,
             "forecast_aware_source": source,
+            "forecast_aware_raw_score": float(raw_score["forecast_aware_score"]),
+            "forecast_aware_best_score": float(best["forecast_aware_score"]),
+            "forecast_aware_score_improvement": score_improvement,
             "forecast_aware_raw_task_cost": float(raw_score["task_cost"]),
             "forecast_aware_best_task_cost": float(best["task_cost"]),
             "forecast_aware_task_improvement": task_improvement,
@@ -300,6 +304,9 @@ class ForecastAwareTaskScorer:
             "forecast_rear_gap_vehicle_id": str(best["rear_gap_vehicle_id"]),
             "forecast_aware_taper_miss_risk": float(best["taper_miss_risk"]),
             "forecast_aware_merge_progress_bonus": float(best["merge_progress_bonus"]),
+            "forecast_aware_best_uncertainty_risk": float(best["uncertainty_risk"]),
+            "forecast_aware_best_taper_miss_risk": float(best["taper_miss_risk"]),
+            "forecast_aware_best_unsafe_gap_risk": float(best["unsafe_gap_risk"]),
             **bundle.trace_fields(),
         }
 
@@ -307,6 +314,9 @@ class ForecastAwareTaskScorer:
         return {
             "forecast_aware_available": False,
             "forecast_aware_source": source,
+            "forecast_aware_raw_score": None,
+            "forecast_aware_best_score": None,
+            "forecast_aware_score_improvement": None,
             "forecast_aware_raw_task_cost": None,
             "forecast_aware_best_task_cost": None,
             "forecast_aware_task_improvement": None,
@@ -375,6 +385,9 @@ class ForecastAwareTaskScorer:
             "forecast_rear_gap_vehicle_id": "",
             "forecast_aware_taper_miss_risk": None,
             "forecast_aware_merge_progress_bonus": None,
+            "forecast_aware_best_uncertainty_risk": None,
+            "forecast_aware_best_taper_miss_risk": None,
+            "forecast_aware_best_unsafe_gap_risk": None,
         }
 
     def _first_step_route_consistency(
@@ -563,12 +576,22 @@ class ForecastAwareTaskScorer:
             + 0.15 * uncertainty_risk
             - merge_progress_bonus
         )
+        task_component = float(0.55 * taper_miss_risk + 0.45 * unsafe_gap_risk)
+        forecast_aware_score = float(
+            float(self.config.shield.get("forecast_aware_ranking_safety_weight", 1.0)) * safety_risk
+            + float(self.config.shield.get("forecast_aware_ranking_task_weight", 1.0)) * task_component
+            + float(self.config.shield.get("forecast_aware_ranking_uncertainty_weight", 0.5)) * uncertainty_risk
+            - merge_progress_bonus
+        )
         task_risk = float(np.clip(task_cost, 0.0, 1.0))
         return {
             "action": int(action.index),
+            "forecast_aware_score": forecast_aware_score,
             "task_cost": task_cost,
             "task_risk": task_risk,
             "safety_risk": float(safety_risk),
+            "uncertainty_risk": float(uncertainty_risk),
+            "unsafe_gap_risk": float(unsafe_gap_risk),
             "future_min_distance": float(min_distance),
             "future_min_ttc": float(min_ttc),
             "future_max_drac": float(max_drac),

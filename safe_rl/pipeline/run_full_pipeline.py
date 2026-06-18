@@ -720,6 +720,7 @@ def _forecast_payload(
         },
         "rl": {"use_wcdt_forecast_features": True},
         "shield": {
+            "forecast_aware_candidate_ranking_mode": "off",
             "forecast_task_shadow_enabled": False,
             "task_backstop_enabled": False,
         },
@@ -756,13 +757,57 @@ def _forecast_stage5_groups(run_id: str, source: str) -> list[dict[str, Any]]:
         "shield": True,
         "model_path": _relative_run_path(forecast_run_id, "stage3", "ppo_model.zip"),
         "forecast_source": source,
+        "shield_overrides": {
+            "forecast_aware_candidate_ranking_mode": "off",
+            "forecast_task_shadow_enabled": False,
+            "task_backstop_enabled": False,
+        },
     }
     checkpoint_name = _forecast_checkpoint_name(source)
     if checkpoint_name:
         checkpoint = _relative_run_path(run_id, "stage2", checkpoint_name)
         base["forecast_checkpoint"] = checkpoint
         shield["forecast_checkpoint"] = checkpoint
-    return [base, shield]
+    groups = [base, shield]
+    if source == "wcdt_v3":
+        for mode_name, overrides in (
+            (
+                "shadow",
+                {
+                    "forecast_aware_candidate_ranking_mode": "shadow",
+                    "forecast_task_shadow_enabled": True,
+                    "task_backstop_enabled": False,
+                },
+            ),
+            (
+                "task_backstop",
+                {
+                    "forecast_aware_candidate_ranking_mode": "task_backstop",
+                    "forecast_task_shadow_enabled": True,
+                    "task_backstop_enabled": True,
+                },
+            ),
+            (
+                "full_ranking",
+                {
+                    "forecast_aware_candidate_ranking_mode": "full_ranking",
+                    "forecast_task_shadow_enabled": True,
+                    "task_backstop_enabled": False,
+                },
+            ),
+        ):
+            branch = {
+                "name": f"wcdt_v3_prediction_shield_{mode_name}",
+                "forecast_features": True,
+                "shield": True,
+                "model_path": _relative_run_path(forecast_run_id, "stage3", "ppo_model.zip"),
+                "forecast_source": source,
+                "shield_overrides": overrides,
+            }
+            if checkpoint_name:
+                branch["forecast_checkpoint"] = _relative_run_path(run_id, "stage2", checkpoint_name)
+            groups.append(branch)
+    return groups
 
 
 def build_generated_configs(
@@ -807,6 +852,7 @@ def build_generated_configs(
         "run": {"run_id": run_id},
         "prediction": _predictor_training_flags(sources),
         "shield": {
+            "forecast_aware_candidate_ranking_mode": "off",
             "forecast_task_shadow_enabled": False,
             "task_backstop_enabled": False,
         },
@@ -850,7 +896,11 @@ def build_generated_configs(
     )
     stage5_payload: dict[str, Any] = _deep_merge(profile_payload, {
         "run": {"run_id": run_id},
-        "shield": {"forecast_task_shadow_enabled": True},
+        "shield": {
+            "forecast_aware_candidate_ranking_mode": "off",
+            "forecast_task_shadow_enabled": False,
+            "task_backstop_enabled": False,
+        },
         "stage5": {
             "episodes_per_group": requested_stage5_episodes,
             "seeds": list(range(1, requested_stage5_episodes + 1)),
