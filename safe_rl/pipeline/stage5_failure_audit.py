@@ -358,7 +358,7 @@ def _episode_summary(
     first_step = _first_failure_step(step_trace, collision_threshold)
     task_step = _task_failure_step(step_trace, episode)
     trace_focus_step = first_step if first_step is not None else task_step
-    records = episode.get("shield_score_records", []) or []
+    records = episode.get("safety_shield_score_records", episode.get("shield_score_records", [])) or []
     records = [item for item in records if isinstance(item, dict)]
     replay_command = (
         f"& {_powershell_quote(sys.executable)} -m safe_rl.tools.replay_episode "
@@ -437,6 +437,10 @@ def _episode_summary(
         "replacement_reason_counts": episode.get("replacement_reason_counts", {}) or {},
         "raw_action_histogram": episode.get("raw_action_histogram", {}) or {},
         "final_action_histogram": episode.get("final_action_histogram", {}) or {},
+        "safety_shield_record_count": len(records),
+        "safety_shield_records_near_failure": _records_near_failure(records, first_step),
+        "action_execution_records_near_failure": step_trace_near_failure,
+        # Legacy aliases for audits written before forecast-ranking execution traces.
         "shield_record_count": len(records),
         "shield_records_near_failure": _records_near_failure(records, first_step),
         "step_trace_near_failure": step_trace_near_failure,

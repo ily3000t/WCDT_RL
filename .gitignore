@@ -3,4 +3,5 @@ safe_rl_output/
 __pycache__/
 *.py[cod]
 .pytest_cache/
+/.pytest_tmp/
 /_tmp_pytest*/

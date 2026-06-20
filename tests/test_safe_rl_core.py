@@ -2175,6 +2175,49 @@ def test_episode_report_defaults_efficiency_metrics_without_ego_samples():
     assert report["emergency_fallback_count"] == 0
 
 
+def test_episode_report_separates_safety_shield_and_executed_actions():
+    cfg = load_config()
+    env = SumoHighwayMergeEnv(cfg, seed=1)
+    env._interventions = [
+        {
+            "decision_index": 0,
+            "raw_action": 8,
+            "final_action": 8,
+            "raw_action_name": "left_accelerate",
+            "final_action_name": "left_accelerate",
+            "replacement_reason": "raw_safe",
+            "risk_before": 0.2,
+            "risk_after": 0.2,
+            "best_candidate_risk": 0.2,
+        }
+    ]
+    env._action_execution_records = [
+        {
+            "decision_index": 0,
+            "raw_action": 8,
+            "safety_shield_action": 8,
+            "final_action": 5,
+            "final_action_name": "keep_accelerate",
+            "execution_path": "forecast_ranking",
+            "forecast_ranking_replacement": True,
+            "task_replacement": False,
+        }
+    ]
+
+    report = env.episode_report()
+
+    assert report["raw_action_histogram"] == {"8": 1}
+    assert report["safety_shield_action_histogram"] == {"8": 1}
+    assert report["executed_action_histogram"] == {"5": 1}
+    assert report["final_action_histogram"] == {"5": 1}
+    assert report["shield_score_records_semantics"] == "safety_shield_pre_forecast_ranking"
+    record = report["safety_shield_score_records"][0]
+    assert record["safety_shield_final_action"] == 8
+    assert record["executed_action"] == 5
+    assert record["execution_path"] == "forecast_ranking"
+    assert report["shield_score_records"] == report["safety_shield_score_records"]
+
+
 def test_env_reset_resets_shield_episode_state(monkeypatch):
     class DummyShield:
         def __init__(self):
@@ -3183,6 +3226,31 @@ def test_wcdt_v3_promotion_gate_rejects_smoke_episode_count_and_slow_policy():
     assert not candidate["checks"]["shield_replacements_not_worse_than_v2"]
 
 
+def test_wcdt_v3_promotion_gate_uses_shadow_trace_for_semantic_checks():
+    reports = {
+        "ppo_cv_features": _fake_group([(seed, 100.0) for seed in range(1, 51)], 100.0),
+        "cv_prediction_shield": _fake_group([(seed, 100.0) for seed in range(1, 51)], 100.0),
+        "ppo_wcdt_v3_features": _fake_group([(seed, 101.0) for seed in range(1, 51)], 101.0),
+        "wcdt_v3_prediction_shield": _fake_group([(seed, 101.0) for seed in range(1, 51)], 101.0),
+        "wcdt_v3_prediction_shield_shadow": _fake_group(
+            [(seed, 101.0) for seed in range(1, 51)], 101.0
+        ),
+    }
+    for name, report in reports.items():
+        report["metrics"]["episodes"] = 50
+        if name == "ppo_wcdt_v3_features":
+            report["metrics"]["forecast_gap_consistency_checkable_rate"] = 0.0
+            report["metrics"]["forecast_gap_consistency_pass_rate"] = 0.0
+            report["metrics"]["critical_actor_overflow_rate"] = 1.0
+
+    candidate = _wcdt_v3_candidate_summary(reports)
+
+    assert candidate["forecast_semantics_group"] == "wcdt_v3_prediction_shield_shadow"
+    assert candidate["checks"]["gap_consistency_checkable"]
+    assert candidate["checks"]["gap_consistency_pass"]
+    assert candidate["checks"]["critical_actor_overflow_acceptable"]
+
+
 def test_stage5_dynamic_paired_delta_and_acceptance_for_optional_forecast_groups():
     reports = {
         "ppo": _fake_group([(1, 100.0)], 100.0),
@@ -3455,6 +3523,50 @@ def test_confirmatory_summary_uses_wcdt_v3_as_main_prediction_branch():
     assert summary["reporting_recommendation"][0]["comparison"] == "ppo_vs_ppo_shield"
     assert summary["forecast_policy_utilization_summary"]["available"] is False
     assert summary["overall_pass"]
+
+
+def test_confirmatory_promotion_uses_diagnostics_quality_and_formal_stage5_evidence():
+    reports = {
+        "ppo": _fake_group([(seed, 100.0) for seed in range(1, 51)], 100.0, min_distance=2.0),
+        "ppo_shield": _fake_group(
+            [(seed, 101.0) for seed in range(1, 51)], 101.0, min_distance=2.1, replacements=0.1
+        ),
+        "ppo_cv_features": _fake_group([(seed, 105.0) for seed in range(1, 51)], 105.0, min_distance=3.0),
+        "cv_prediction_shield": _fake_group(
+            [(seed, 105.0) for seed in range(1, 51)], 105.0, min_distance=3.0, replacements=0.1
+        ),
+        "ppo_wcdt_v3_features": _fake_group(
+            [(seed, 110.0) for seed in range(1, 51)], 110.0, min_distance=5.0
+        ),
+        "wcdt_v3_prediction_shield": _fake_group(
+            [(seed, 110.0) for seed in range(1, 51)], 110.0, min_distance=5.0, replacements=0.1
+        ),
+        "wcdt_v3_prediction_shield_shadow": _fake_group(
+            [(seed, 110.0) for seed in range(1, 51)], 110.0, min_distance=5.0
+        ),
+    }
+    for report in reports.values():
+        report["metrics"]["episodes"] = 50
+    paired = _build_paired_delta(reports)
+    acceptance = _build_acceptance(reports)
+    diagnostics = {
+        "forecast_conclusion": {
+            "wcdt_v3_prediction_quality_pass": True,
+            "wcdt_v3_uncertainty_quality_pass": True,
+            # Selective-risk support gates Task Backstop use, not whether the
+            # predictor has passed formal policy confirmation.
+            "wcdt_v3_uncertainty_safety_gate_supported": False,
+            "wcdt_v3_candidate_for_promotion": False,
+        }
+    }
+
+    summary = build_confirmatory_summary(reports, paired, acceptance, diagnostics)
+
+    candidate = summary["wcdt_v3_candidate"]
+    assert candidate["stage5_candidate_pass"]
+    assert candidate["prediction_candidate_for_promotion"]
+    assert candidate["candidate_for_promotion"]
+    assert not candidate["uncertainty_safety_gate_supported"]
 
 
 def test_confirmatory_summary_marks_wcdt_v2_shield_low_frequency_backstop():

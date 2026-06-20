@@ -323,6 +323,15 @@ def _wcdt_v3_candidate_summary(group_reports: dict[str, dict]) -> dict[str, Any]
     v3 = group_reports.get("ppo_wcdt_v3_features")
     v2_shield = group_reports.get("wcdt_v2_prediction_shield")
     v3_shield = group_reports.get("wcdt_v3_prediction_shield")
+    # Trace-only shadow evaluates the same policy without changing its action.
+    # Prefer it for forecast semantic gates because the ordinary policy group
+    # intentionally runs forecast-aware ranking mode "off".
+    v3_semantics = group_reports.get("wcdt_v3_prediction_shield_shadow") or v3
+    semantics_group = (
+        "wcdt_v3_prediction_shield_shadow"
+        if group_reports.get("wcdt_v3_prediction_shield_shadow")
+        else "ppo_wcdt_v3_features"
+    )
     reference = v2 or cv
     reference_shield = v2_shield or cv_shield
     reference_branch = "wcdt_v2" if v2 else "constant_velocity"
@@ -338,9 +347,10 @@ def _wcdt_v3_candidate_summary(group_reports: dict[str, dict]) -> dict[str, Any]
         "merge_success_not_worse_than_reference": _metric(v3, "merge_success_rate")
         >= _metric(reference, "merge_success_rate"),
         "completion_time_not_degraded_vs_reference": _metric(v3, "completion_time_mean") <= completion_limit,
-        "gap_consistency_checkable": _metric(v3, "forecast_gap_consistency_checkable_rate") >= 0.95,
-        "gap_consistency_pass": _metric(v3, "forecast_gap_consistency_pass_rate") >= 0.99,
-        "critical_actor_overflow_acceptable": _metric(v3, "critical_actor_overflow_rate", 1.0) <= 0.01,
+        "gap_consistency_checkable": _metric(v3_semantics, "forecast_gap_consistency_checkable_rate") >= 0.95,
+        "gap_consistency_pass": _metric(v3_semantics, "forecast_gap_consistency_pass_rate") >= 0.99,
+        "critical_actor_overflow_acceptable": _metric(v3_semantics, "critical_actor_overflow_rate", 1.0)
+        <= 0.01,
         "shield_fallback_rate_zero": _metric(v3_shield, "fallback_rate", 1.0) == 0.0,
         "shield_emergency_fallback_not_worse_than_reference": _metric(v3_shield, "emergency_fallback_rate", 1.0)
         <= _metric(reference_shield, "emergency_fallback_rate", 0.0),
@@ -363,6 +373,7 @@ def _wcdt_v3_candidate_summary(group_reports: dict[str, dict]) -> dict[str, Any]
     return {
         "available": bool(reference and v3 and v3_shield),
         "reference_branch": reference_branch,
+        "forecast_semantics_group": semantics_group,
         "checks": checks,
         "completion_time_limit": float(completion_limit),
         "stage5_candidate_pass": bool(reference and v3 and v3_shield and all(checks.values())),
@@ -415,7 +426,7 @@ def _forecast_policy_utilization_summary(
         "predictor_uncertainty_pass": predictor_uncertainty_pass,
         "recommended_for_stage5": bool(conclusion.get(f"{branch}_recommended_for_stage5", False))
         if branch == "wcdt_v2"
-        else bool(conclusion.get("wcdt_v3_candidate_for_promotion", False)),
+        else bool(predictor_quality_pass and predictor_uncertainty_pass),
         "ppo_better_than_cv": bool(forecast_summary.get("pass", False)),
         "feature_sensitivity_available": bool(sensitivity.get("available", False)),
         "action_sensitive_to_forecast_features": action_sensitive,
@@ -453,8 +464,22 @@ def build_confirmatory_summary(
     wcdt_v3 = _wcdt_v3_candidate_summary(group_reports)
     wcdt_v3_shield = _wcdt_v3_shield_summary(group_reports)
     forecast_conclusion = (diagnostics or {}).get("forecast_conclusion", {})
+    # Diagnostics establishes predictor quality. Formal episode count and
+    # policy safety belong to this confirmatory report, not the typically
+    # smaller Stage5 sample embedded in forecast diagnostics.
+    wcdt_v3["prediction_quality_pass"] = bool(
+        forecast_conclusion.get("wcdt_v3_prediction_quality_pass", False)
+    )
+    wcdt_v3["uncertainty_quality_pass"] = bool(
+        forecast_conclusion.get("wcdt_v3_uncertainty_quality_pass", False)
+    )
+    wcdt_v3["uncertainty_safety_gate_supported"] = bool(
+        forecast_conclusion.get("wcdt_v3_uncertainty_safety_gate_supported", False)
+    )
     wcdt_v3["prediction_candidate_for_promotion"] = bool(
-        forecast_conclusion.get("wcdt_v3_candidate_for_promotion", False)
+        diagnostics
+        and wcdt_v3["prediction_quality_pass"]
+        and wcdt_v3["uncertainty_quality_pass"]
     )
     wcdt_v3["candidate_for_promotion"] = bool(
         wcdt_v3.get("stage5_candidate_pass") and wcdt_v3.get("prediction_candidate_for_promotion")
@@ -558,15 +583,58 @@ def run(cfg, episodes: int = 50) -> Path:
     return stage_dir
 
 
+def rebuild_summary(cfg) -> Path:
+    """Rebuild summary files from completed paired-evaluation results."""
+    stage_dir = run_root(cfg) / "stage5_confirmatory"
+    report_path = stage_dir / "formal_paired_eval_report.json"
+    if not report_path.exists():
+        raise FileNotFoundError(f"Confirmatory paired report not found: {report_path}")
+    with report_path.open("r", encoding="utf-8") as file:
+        report = json.load(file)
+    summary = build_confirmatory_summary(
+        dict(report.get("groups", {})),
+        dict(report.get("paired_delta", {})),
+        dict(report.get("acceptance", {})),
+        _load_forecast_diagnostics(cfg),
+    )
+    report["confirmatory_summary"] = summary
+    summary_path = stage_dir / "confirmatory_summary.json"
+    try:
+        write_report(summary_path, summary)
+    except PermissionError:
+        summary_path = stage_dir / "confirmatory_summary_rebuilt.json"
+        write_report(summary_path, summary)
+        stage_log("stage5_confirmatory", f"warning=summary_locked summary_written={summary_path}")
+    try:
+        write_report(report_path, report)
+    except PermissionError:
+        # A user may have the large raw paired report open on Windows. The
+        # standalone summary is authoritative for summary-only regeneration.
+        stage_log(
+            "stage5_confirmatory",
+            f"warning=report_locked summary_written={summary_path}",
+        )
+    stage_log("stage5_confirmatory", f"summary_rebuilt={summary_path}")
+    return stage_dir
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="Stage5 confirmatory paired evaluation for final SAFE_RL results")
     parser.add_argument("--config", default=None, help="Optional YAML config overlay.")
     parser.add_argument("--run-id", required=True, help="Existing base run id to evaluate.")
     parser.add_argument("--episodes", type=int, default=50, help="Number of paired seeds to evaluate. Default: 50.")
+    parser.add_argument(
+        "--summary-only",
+        action="store_true",
+        help="Rebuild confirmatory summary from the existing paired report without re-evaluating episodes.",
+    )
     args = parser.parse_args()
     cfg = load_config(args.config)
     cfg.run["run_id"] = args.run_id
-    run(cfg, episodes=int(args.episodes))
+    if args.summary_only:
+        rebuild_summary(cfg)
+    else:
+        run(cfg, episodes=int(args.episodes))
 
 
 if __name__ == "__main__":

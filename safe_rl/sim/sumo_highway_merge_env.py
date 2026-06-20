@@ -180,6 +180,7 @@ class SumoHighwayMergeEnv(gym.Env):
         self._episode_metrics: list[StepMetrics] = []
         self._ego_speeds: list[float] = []
         self._interventions: list[dict[str, Any]] = []
+        self._action_execution_records: list[dict[str, Any]] = []
         self._reward_debug_records: list[dict[str, Any]] = []
         self._last_reward_debug: dict[str, Any] = {}
         self._reward_component_records: list[dict[str, float]] = []
@@ -300,6 +301,7 @@ class SumoHighwayMergeEnv(gym.Env):
         self._episode_metrics.clear()
         self._ego_speeds.clear()
         self._interventions.clear()
+        self._action_execution_records.clear()
         self._reward_debug_records.clear()
         self._last_reward_debug = {}
         self._reward_component_records.clear()
@@ -356,6 +358,7 @@ class SumoHighwayMergeEnv(gym.Env):
             intervention["step"] = int(self._episode_step)
             intervention["decision_index"] = decision_index
             self._interventions.append(intervention)
+        safety_shield_action = final_action
         forecast_replacement = self._maybe_forecast_aware_replacement(
             raw_action,
             final_action,
@@ -372,6 +375,36 @@ class SumoHighwayMergeEnv(gym.Env):
             else:
                 forecast_ranking_replacement = forecast_replacement
                 self._forecast_ranking_replacements.append(forecast_replacement)
+
+        safety_shield_replaced = bool(
+            intervention is not None
+            and int(intervention.get("final_action", raw_action.index)) != int(raw_action.index)
+        )
+        execution_path = "policy"
+        if safety_shield_replaced:
+            execution_path = "safety_shield"
+        elif task_replacement is not None:
+            execution_path = "task_backstop"
+        elif forecast_ranking_replacement is not None:
+            execution_path = "forecast_ranking"
+        execution_record = {
+            "step": int(self._episode_step),
+            "decision_index": decision_index,
+            "raw_action": int(raw_action.index),
+            "raw_action_name": str(raw_action.name),
+            "safety_shield_action": int(safety_shield_action.index),
+            "safety_shield_action_name": str(safety_shield_action.name),
+            "safety_shield_replaced": safety_shield_replaced,
+            "safety_shield_replacement_reason": str(
+                intervention.get("replacement_reason", "") if intervention is not None else ""
+            ),
+            "final_action": int(final_action.index),
+            "final_action_name": str(final_action.name),
+            "execution_path": execution_path,
+            "task_replacement": bool(task_replacement is not None),
+            "forecast_ranking_replacement": bool(forecast_ranking_replacement is not None),
+        }
+        self._action_execution_records.append(execution_record)
 
         raw_action_lane_oob = self._action_lane_oob(raw_action)
         final_action_lane_oob = self._action_lane_oob(final_action)
@@ -428,6 +461,15 @@ class SumoHighwayMergeEnv(gym.Env):
                     "closest_vehicle_id": str(metrics.closest_vehicle_id),
                 }
             )
+        execution_record.update(
+            {
+                "min_distance": float(metrics.min_distance),
+                "min_ttc": float(metrics.min_ttc),
+                "max_drac": float(metrics.max_drac),
+                "geometric_overlap": bool(metrics.geometric_overlap),
+                "closest_vehicle_id": str(metrics.closest_vehicle_id),
+            }
+        )
         if ego is not None:
             self._ego_speeds.append(float(ego.speed))
             self._record_target_lane_entry(ego)
@@ -448,6 +490,10 @@ class SumoHighwayMergeEnv(gym.Env):
         info["final_action"] = int(final_action.index)
         info["raw_action_name"] = str(raw_action.name)
         info["final_action_name"] = str(final_action.name)
+        info["safety_shield_action"] = int(safety_shield_action.index)
+        info["safety_shield_action_name"] = str(safety_shield_action.name)
+        info["safety_shield_replaced"] = safety_shield_replaced
+        info["action_execution_path"] = execution_path
         info["raw_action_lane_oob"] = bool(raw_action_lane_oob)
         info["final_action_lane_oob"] = bool(final_action_lane_oob)
         info["prevented_lane_oob"] = bool(raw_action_lane_oob and not final_action_lane_oob)
@@ -2054,8 +2100,25 @@ class SumoHighwayMergeEnv(gym.Env):
             if int(item.get("final_action", item.get("raw_action", -1))) != int(item.get("raw_action", -1))
         )
         reason_counts = Counter(str(item.get("replacement_reason", "")) for item in self._interventions)
-        raw_actions = Counter(str(item.get("raw_action", "")) for item in self._interventions)
-        final_actions = Counter(str(item.get("final_action", "")) for item in self._interventions)
+        if self._action_execution_records:
+            raw_actions = Counter(
+                str(item.get("raw_action", "")) for item in self._action_execution_records
+            )
+            safety_shield_actions = Counter(
+                str(item.get("safety_shield_action", item.get("raw_action", "")))
+                for item in self._action_execution_records
+            )
+            executed_actions = Counter(
+                str(item.get("final_action", "")) for item in self._action_execution_records
+            )
+        else:
+            # Backward-compatible fallback for synthetic reports and legacy callers.
+            raw_actions = Counter(str(item.get("raw_action", "")) for item in self._interventions)
+            safety_shield_actions = Counter(
+                str(item.get("final_action", item.get("raw_action", "")))
+                for item in self._interventions
+            )
+            executed_actions = Counter(safety_shield_actions)
         emergency_fallback_count = sum(1 for item in self._interventions if item.get("emergency_fallback"))
         task_available_records = [record for record in self._task_merge_records if record.get("available")]
         task_merge_count = sum(1 for record in task_available_records if record.get("task_merge_opportunity"))
@@ -2231,8 +2294,19 @@ class SumoHighwayMergeEnv(gym.Env):
             }
             for item in self._forecast_ranking_replacements
         ]
-        score_records = [
-            {
+        execution_by_decision = {
+            int(item.get("decision_index", -1)): item
+            for item in self._action_execution_records
+            if int(item.get("decision_index", -1)) >= 0
+        }
+        score_records = []
+        for item in self._interventions:
+            execution = execution_by_decision.get(int(item.get("decision_index", -1)), {})
+            safety_final_action = int(item.get("final_action", item.get("raw_action", -1)))
+            executed_action = int(execution.get("final_action", safety_final_action))
+            score_records.append(
+                {
+                "score_record_stage": "safety_shield_pre_forecast_ranking",
                 "replacement_reason": str(item.get("replacement_reason", "")),
                 "raw_risk_score": float(item.get("risk_before", 0.0)),
                 "final_risk_score": float(item.get("risk_after", 0.0)),
@@ -2247,9 +2321,20 @@ class SumoHighwayMergeEnv(gym.Env):
                 "emergency_saturated_count": int(item.get("emergency_saturated_count", 0)),
                 "emergency_saturated_required": int(item.get("emergency_saturated_required", 0)),
                 "raw_action": int(item.get("raw_action", -1)),
-                "final_action": int(item.get("final_action", -1)),
+                "final_action": safety_final_action,
                 "raw_action_name": str(item.get("raw_action_name", "")),
                 "final_action_name": str(item.get("final_action_name", "")),
+                "safety_shield_final_action": safety_final_action,
+                "safety_shield_final_action_name": str(item.get("final_action_name", "")),
+                "executed_action": executed_action,
+                "executed_action_name": str(
+                    execution.get("final_action_name", item.get("final_action_name", ""))
+                ),
+                "execution_path": str(execution.get("execution_path", "safety_shield")),
+                "forecast_ranking_replaced": bool(
+                    execution.get("forecast_ranking_replacement", False)
+                ),
+                "task_backstop_replaced": bool(execution.get("task_replacement", False)),
                 "best_candidate_action": int(item.get("best_candidate_action", -1)),
                 "best_candidate_action_name": str(item.get("best_candidate_action_name", "")),
                 "step": int(item.get("step", -1)),
@@ -2259,8 +2344,7 @@ class SumoHighwayMergeEnv(gym.Env):
                 "geometric_overlap": bool(item.get("geometric_overlap", False)),
                 "closest_vehicle_id": str(item.get("closest_vehicle_id", "")),
             }
-            for item in self._interventions
-        ]
+            )
         reward_component_totals = {
             name: float(sum(record.get(name, 0.0) for record in self._reward_component_records))
             for name in (
@@ -2427,7 +2511,14 @@ class SumoHighwayMergeEnv(gym.Env):
             ),
             "replacement_reason_counts": dict(reason_counts),
             "raw_action_histogram": dict(raw_actions),
-            "final_action_histogram": dict(final_actions),
+            "safety_shield_action_histogram": dict(safety_shield_actions),
+            "executed_action_histogram": dict(executed_actions),
+            "final_action_histogram": dict(executed_actions),
+            "action_execution_records": list(self._action_execution_records),
+            "safety_shield_score_records": score_records,
+            "shield_score_records_semantics": "safety_shield_pre_forecast_ranking",
+            # Legacy alias. Consumers needing executed actions must use
+            # action_execution_records or executed_action_histogram.
             "shield_score_records": score_records,
             "shield_guided_reward_summary": self._shield_guided_reward_summary(),
             "first_merge_request_step": self._first_merge_request_step,

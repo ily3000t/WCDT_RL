@@ -1288,13 +1288,23 @@ def _forecast_conclusion(report: dict[str, Any]) -> dict[str, Any]:
     stage5_evaluation = report.get("stage5_evaluation", {})
     stage5_episodes = int(stage5_evaluation.get("episodes", 0))
     v3_stage5 = stage5_evaluation.get("ppo_wcdt_v3_features", {})
+    # The raw v3 policy deliberately has forecast-aware ranking disabled.
+    # Its trace counters are therefore zero. When available, the shadow group
+    # supplies semantic coverage and consistency evidence without changing
+    # policy actions.
+    v3_semantics_stage5 = stage5_evaluation.get("wcdt_v3_prediction_shield_shadow") or v3_stage5
+    v3_semantics_group = (
+        "wcdt_v3_prediction_shield_shadow"
+        if stage5_evaluation.get("wcdt_v3_prediction_shield_shadow")
+        else "ppo_wcdt_v3_features"
+    )
     cv_stage5 = stage5_evaluation.get("ppo_cv_features", {})
     gap_consistency_pass = bool(
-        float(v3_stage5.get("forecast_gap_consistency_checkable_rate", 0.0)) >= 0.95
-        and float(v3_stage5.get("forecast_gap_consistency_pass_rate", 0.0)) >= 0.99
+        float(v3_semantics_stage5.get("forecast_gap_consistency_checkable_rate", 0.0)) >= 0.95
+        and float(v3_semantics_stage5.get("forecast_gap_consistency_pass_rate", 0.0)) >= 0.99
     )
     critical_overflow_pass = bool(
-        float(v3_stage5.get("critical_actor_overflow_rate", 1.0)) <= 0.01
+        float(v3_semantics_stage5.get("critical_actor_overflow_rate", 1.0)) <= 0.01
     )
     stage5_policy_pass = bool(
         stage5_episodes >= 50
@@ -1330,6 +1340,7 @@ def _forecast_conclusion(report: dict[str, Any]) -> dict[str, Any]:
         "wcdt_v3_uncertainty_quality_pass": wcdt_v3_uncertainty_pass,
         "wcdt_v3_uncertainty_safety_gate_supported": uncertainty_safety_gate_supported,
         "wcdt_v3_prediction_reference": reference_name,
+        "wcdt_v3_forecast_semantics_group": v3_semantics_group,
         "wcdt_v3_candidate_for_promotion": candidate_for_promotion,
         "candidate_for_promotion": candidate_for_promotion,
         "promotion_reason": (
