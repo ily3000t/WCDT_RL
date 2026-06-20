@@ -27,7 +27,9 @@ class SumoWcDTAdapter:
     def __init__(self, config: Any):
         self.config = config
         self.his_step = int(config.scenario.history_steps)
-        self.max_pred_num = int(config.prediction.max_pred_num)
+        self.max_pred_num = int(
+            config.prediction.get("wcdt_v1_max_agents", config.prediction.max_pred_num)
+        )
         self.max_other_num = int(config.prediction.max_other_num)
         self.max_traffic_light = int(config.prediction.max_traffic_light)
         self.max_lane_num = int(config.prediction.max_lane_num)

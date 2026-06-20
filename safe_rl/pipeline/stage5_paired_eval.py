@@ -1,19 +1,26 @@
 from __future__ import annotations
 
+import re
 from pathlib import Path
 
 from safe_rl.pipeline.common import latest_stage_file, load_stage_config, parse_config_arg, write_report
-from safe_rl.rl.evaluation import evaluate_ppo
+from safe_rl.rl.evaluation import evaluate_policy
 from safe_rl.sim.metrics import SAFETY_METRIC_VERSION
 from safe_rl.utils.config import clone_with_overrides, prepare_run_dir
 from safe_rl.utils.progress import TensorboardLogger, stage_log
 
 
 def _default_model_path(cfg) -> Path:
+    configured = cfg.stage5.get("default_model_path")
+    if configured:
+        return Path(configured)
     return latest_stage_file(cfg, "stage3", str(cfg.stage3.model_name))
 
 
 def _risk_path(cfg) -> Path:
+    configured = cfg.stage5.get("risk_checkpoint")
+    if configured:
+        return Path(configured)
     return latest_stage_file(cfg, "stage2", "risk_module.pt")
 
 
@@ -49,7 +56,9 @@ def _group_overrides(group) -> dict:
     return overrides
 
 
-def _group_model_path(group, default_model: Path) -> Path:
+def _group_model_path(group, default_model: Path) -> Path | None:
+    if str(group.get("policy_type", "sb3_ppo")) == "rule_gap_acceptance":
+        return None
     model_path = group.get("model_path")
     if bool(group.forecast_features) and not model_path:
         raise ValueError(
@@ -368,6 +377,60 @@ def _build_acceptance(group_reports: dict) -> dict:
     return acceptance
 
 
+def _comparison_tables(group_reports: dict) -> dict[str, dict]:
+    policy: dict[str, dict] = {}
+    shield: dict[str, dict] = {}
+    high_impact: dict[str, dict] = {}
+    for name, report in group_reports.items():
+        lowered = str(name).lower()
+        metrics = dict(report.get("metrics", {}) or {})
+        if "task_backstop" in lowered or "full_ranking" in lowered:
+            high_impact[name] = metrics
+        elif bool(report.get("shield_enabled", False)):
+            shield[name] = metrics
+        else:
+            policy[name] = metrics
+    return {
+        "policy_comparison": policy,
+        "shield_ablation": shield,
+        "high_impact_controller_ablation": high_impact,
+    }
+
+
+def _training_seed_summary(group_reports: dict) -> dict[str, dict]:
+    grouped: dict[str, list[dict]] = {}
+    for name, report in group_reports.items():
+        base = re.sub(r"_seed_\d+$", "", str(name))
+        grouped.setdefault(base, []).append(dict(report.get("metrics", {}) or {}))
+    result: dict[str, dict] = {}
+    for name, metrics_rows in grouped.items():
+        numeric_keys = {
+            key
+            for row in metrics_rows
+            for key, value in row.items()
+            if isinstance(value, (int, float)) and not isinstance(value, bool)
+        }
+        result[name] = {
+            "training_seed_count": len(metrics_rows),
+            "mean": {
+                key: sum(float(row.get(key, 0.0)) for row in metrics_rows) / len(metrics_rows)
+                for key in sorted(numeric_keys)
+            },
+            "std": {
+                key: (
+                    sum(
+                        (float(row.get(key, 0.0))
+                        - sum(float(item.get(key, 0.0)) for item in metrics_rows) / len(metrics_rows)) ** 2
+                        for row in metrics_rows
+                    )
+                    / len(metrics_rows)
+                ) ** 0.5
+                for key in sorted(numeric_keys)
+            },
+        }
+    return result
+
+
 def run(cfg) -> Path:
     stage_dir = prepare_run_dir(cfg, "stage5")
     seeds = _select_eval_seeds(cfg)
@@ -383,12 +446,20 @@ def run(cfg) -> Path:
     group_reports = {}
     for group_idx, group in enumerate(cfg.stage5.groups):
         group_cfg = clone_with_overrides(cfg, _group_overrides(group))
+        policy_type = str(group.get("policy_type", "sb3_ppo"))
+        if policy_type == "rule_gap_acceptance" and (
+            bool(group.shield) or bool(group.forecast_features)
+        ):
+            raise ValueError(
+                "rule_gap_acceptance is an unshielded current-state baseline; "
+                "do not enable Shield or forecast features in this comparison group."
+            )
         model_path = _group_model_path(group, default_model)
         stage_log(
             "stage5",
-            f"group={group.name} forecast={bool(group.forecast_features)} shield={bool(group.shield)} model={model_path}",
+            f"group={group.name} policy_type={policy_type} forecast={bool(group.forecast_features)} shield={bool(group.shield)} model={model_path}",
         )
-        group_reports[group.name] = evaluate_ppo(
+        group_reports[group.name] = evaluate_policy(
             group_cfg,
             model_path,
             seeds=seeds,
@@ -398,6 +469,7 @@ def run(cfg) -> Path:
             group_name=str(group.name),
             tensorboard=tb,
             tensorboard_step_offset=group_idx * max(1, len(seeds)),
+            policy_type=policy_type,
         )
         if bool(group.forecast_features):
             group_reports[group.name]["forecast_source"] = str(
@@ -410,6 +482,7 @@ def run(cfg) -> Path:
         group_reports[group.name]["shield_enabled"] = bool(group.shield)
         group_reports[group.name]["shield_overrides"] = dict(group.get("shield_overrides", {}) or {})
         group_reports[group.name]["risk_module_overrides"] = dict(group.get("risk_module_overrides", {}) or {})
+        group_reports[group.name]["policy_type"] = policy_type
 
     shield_off = {name: report for name, report in group_reports.items() if not bool(report.get("shield_enabled", False))}
     shield_on = {name: report for name, report in group_reports.items() if bool(report.get("shield_enabled", False))}
@@ -429,6 +502,8 @@ def run(cfg) -> Path:
         "forecast_baseline_group": forecast_baseline,
         "paired_delta": paired_delta,
         "acceptance": acceptance,
+        "comparison_tables": _comparison_tables(group_reports),
+        "training_seed_summary": _training_seed_summary(group_reports),
     }
     write_report(stage_dir / "formal_paired_eval_report.json", report)
     tb.close()

@@ -47,6 +47,11 @@ class WcDTPredictor:
         self.adapter = SumoWcDTAdapter(config)
         betas = MathUtil.generate_linear_schedule(50, 1e-4, 0.008)
         self.model = BackBone(betas).to(self.device)
+        if int(self.model.traj_decoder.multimodal) != 10:
+            raise ValueError(
+                "WcDT v1 adapted baseline requires the upstream 10-mode TrajDecoder; "
+                f"found {self.model.traj_decoder.multimodal}."
+            )
         payload = torch.load(self.checkpoint_path, map_location=self.device)
         self.payload = payload if isinstance(payload, dict) else {}
         self.legacy_checkpoint_metadata = not self._has_formal_metadata(self.payload)
@@ -65,6 +70,9 @@ class WcDTPredictor:
             "trajectory_schema_version",
             "stage1_buffer_schema_version",
             "max_actor_count",
+            "actor_row_alignment",
+            "trajectory_selector_order_version",
+            "num_modes",
         }
         return bool(payload) and required.issubset(payload)
 
@@ -82,8 +90,22 @@ class WcDTPredictor:
             ),
             "max_actor_count": (
                 int(payload.get("max_actor_count", -1)),
-                int(self.config.prediction.max_pred_num),
+                int(
+                    self.config.prediction.get(
+                        "wcdt_v1_max_agents",
+                        self.config.prediction.max_pred_num,
+                    )
+                ),
             ),
+            "actor_row_alignment": (
+                payload.get("actor_row_alignment"),
+                "selector_v2_vehicle_id_verified",
+            ),
+            "trajectory_selector_order_version": (
+                payload.get("trajectory_selector_order_version"),
+                "selector_v2_vehicle_id_order_v1",
+            ),
+            "num_modes": (int(payload.get("num_modes", -1)), 10),
         }
         mismatches = {
             key: {"found": found, "expected": expected}
@@ -128,6 +150,32 @@ class WcDTPredictor:
         prediction["forecast_source"] = "wcdt"
         prediction["checkpoint"] = self.checkpoint_path
         prediction["legacy_checkpoint_metadata"] = bool(self.legacy_checkpoint_metadata)
+        prediction["num_modes"] = int(self.model.traj_decoder.multimodal)
+        mode_confidence = prediction.get("mode_confidence")
+        if mode_confidence is not None:
+            confidence = self._to_numpy(mode_confidence).astype(np.float32)
+            if confidence.ndim == 3:
+                confidence = confidence[0]
+            if confidence.ndim == 2 and confidence.shape[1] > 0:
+                mode_probabilities = np.mean(confidence[: len(selected_ids)], axis=0)
+                mode_probabilities = mode_probabilities / max(float(np.sum(mode_probabilities)), 1.0e-8)
+                prediction["mode_probabilities"] = mode_probabilities.tolist()
+                entropy = -float(np.sum(mode_probabilities * np.log(np.maximum(mode_probabilities, 1.0e-8))))
+                entropy /= max(float(np.log(max(2, mode_probabilities.size))), 1.0)
+                trajectories = self._to_numpy(prediction["future_trajectories"]).astype(np.float32)
+                if trajectories.ndim == 5:
+                    trajectories = trajectories[0]
+                dispersion = 0.0
+                if trajectories.ndim == 4 and trajectories.shape[1] > 1:
+                    centered = trajectories[: len(selected_ids)] - np.mean(
+                        trajectories[: len(selected_ids)], axis=1, keepdims=True
+                    )
+                    dispersion = float(np.mean(np.linalg.norm(centered[..., :2], axis=-1)))
+                prediction["mode_entropy"] = float(entropy)
+                prediction["mode_trajectory_dispersion"] = float(dispersion)
+                prediction["uncertainty"] = float(
+                    np.clip(0.5 * entropy + 0.5 * (dispersion / 5.0), 0.0, 1.0)
+                )
         uncertainty = prediction.get("uncertainty")
         if uncertainty is not None:
             values = self._to_numpy(uncertainty).astype(np.float32)

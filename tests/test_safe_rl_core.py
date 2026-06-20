@@ -1534,6 +1534,7 @@ def test_legacy_wcdt_adapter_uses_merge_relevant_selector_for_predicted_ids():
     pytest.importorskip("torch")
     cfg = load_config()
     cfg.prediction["max_pred_num"] = 1
+    cfg.prediction["wcdt_v1_max_agents"] = 1
     cfg.prediction["max_other_num"] = 3
     history = HistoryBuffer(history_steps=int(cfg.scenario.history_steps), max_agents=4)
 

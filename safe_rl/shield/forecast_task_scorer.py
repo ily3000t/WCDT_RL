@@ -54,23 +54,40 @@ class ForecastAwareTaskScorer:
             self.predictor,
         )
         other_rollouts = bundle.rollout_lists()
+        mode_rollout_sets = bundle.mode_rollout_lists()
         uncertainty = float(bundle.combined_uncertainty)
         source = "hybrid" if self.predictor is not None else "constant_velocity"
         selected_vehicle_ids = [actor.vehicle_id for actor in bundle.actors]
-        scores = [
-            self._candidate_score(
-                action,
-                context,
-                other_rollouts,
-                uncertainty,
-                merge_cmd=int(merge_cmd),
-                urgency=float(urgency),
-                deadline_distance=float(deadline_distance),
-                dt=dt,
-            )
-            for action in ACTIONS
-            if is_candidate_legal(action, context)
-        ]
+        legal_actions = [action for action in ACTIONS if is_candidate_legal(action, context)]
+        if mode_rollout_sets:
+            weights = np.asarray(bundle.mode_probabilities, dtype=np.float32)
+            if weights.size != len(mode_rollout_sets) or float(np.sum(weights)) <= 0.0:
+                weights = np.full((len(mode_rollout_sets),), 1.0 / len(mode_rollout_sets))
+            else:
+                weights = weights / float(np.sum(weights))
+            scores = [
+                self._aggregate_mode_scores(
+                    [
+                        self._candidate_score(
+                            action, context, rollouts, uncertainty,
+                            merge_cmd=int(merge_cmd), urgency=float(urgency),
+                            deadline_distance=float(deadline_distance), dt=dt,
+                        )
+                        for rollouts in mode_rollout_sets
+                    ],
+                    weights,
+                )
+                for action in legal_actions
+            ]
+        else:
+            scores = [
+                self._candidate_score(
+                    action, context, other_rollouts, uncertainty,
+                    merge_cmd=int(merge_cmd), urgency=float(urgency),
+                    deadline_distance=float(deadline_distance), dt=dt,
+                )
+                for action in legal_actions
+            ]
         scores = [item for item in scores if item is not None]
         if not scores:
             return self._empty(source=source, uncertainty=uncertainty)
@@ -309,6 +326,32 @@ class ForecastAwareTaskScorer:
             "forecast_aware_best_unsafe_gap_risk": float(best["unsafe_gap_risk"]),
             **bundle.trace_fields(),
         }
+
+    @staticmethod
+    def _aggregate_mode_scores(
+        mode_scores: list[dict[str, Any] | None],
+        weights: np.ndarray,
+    ) -> dict[str, Any] | None:
+        valid = [item for item in mode_scores if item is not None]
+        if not valid:
+            return None
+        active_weights = np.asarray(weights[: len(mode_scores)], dtype=np.float32)
+        active_weights = active_weights[[item is not None for item in mode_scores]]
+        active_weights = active_weights / max(float(np.sum(active_weights)), 1.0e-8)
+        top = valid[int(np.argmax(active_weights))]
+        merged = dict(top)
+        numeric = {
+            "forecast_aware_score", "task_cost", "task_risk", "safety_risk",
+            "uncertainty_risk", "unsafe_gap_risk", "future_min_distance",
+            "future_min_ttc", "future_max_drac", "target_front_gap",
+            "target_rear_gap", "first_step_target_front_gap",
+            "first_step_target_rear_gap", "taper_miss_risk", "merge_progress_bonus",
+        }
+        for key in numeric:
+            values = np.asarray([float(item[key]) for item in valid], dtype=np.float32)
+            merged[key] = float(np.dot(active_weights, values))
+        merged["mode_wise_aggregation"] = True
+        return merged
 
     def _empty(self, *, source: str = "unavailable", uncertainty: float = 0.0) -> dict[str, Any]:
         return {

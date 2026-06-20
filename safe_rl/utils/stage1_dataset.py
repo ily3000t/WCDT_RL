@@ -13,7 +13,7 @@ import numpy as np
 
 
 STAGE1_FORMAT_VERSION = "manifest_npy_v1"
-STAGE1_BUFFER_SCHEMA_VERSION = 8
+STAGE1_BUFFER_SCHEMA_VERSION = 9
 
 
 def sha256_file(path: str | Path, *, chunk_size: int = 1024 * 1024) -> str:
@@ -255,13 +255,40 @@ def merge_stage1_shards(
     entries: dict[str, Any] = {}
     try:
         all_keys = sorted(set().union(*(set(dataset.files) for dataset in datasets)))
+        # Worker-local ID tables cannot be concatenated directly. Build one stable
+        # table and remap trajectory row IDs while copying the shards.
+        id_table_key = "trajectory_vehicle_id_table"
+        id_index_key = "trajectory_agent_vehicle_id_index"
+        global_vehicle_ids: list[str] = []
+        local_id_maps: dict[int, np.ndarray] = {}
+        if id_table_key in all_keys:
+            global_vehicle_ids = sorted(
+                {
+                    str(value)
+                    for dataset in datasets
+                    if id_table_key in dataset
+                    for value in np.asarray(dataset[id_table_key]).reshape(-1)
+                    if str(value)
+                }
+            )
+            global_lookup = {vehicle_id: index for index, vehicle_id in enumerate(global_vehicle_ids)}
+            for dataset_index, dataset in enumerate(datasets):
+                if id_table_key not in dataset:
+                    continue
+                local_values = np.asarray(dataset[id_table_key]).reshape(-1)
+                local_id_maps[dataset_index] = np.asarray(
+                    [global_lookup.get(str(value), -1) for value in local_values],
+                    dtype=np.int32,
+                )
         group_specs = (
             ("transition_episode_id", transition_keys, ("transition_episode_step",)),
             ("episode_id", candidate_keys, ("candidate_episode_step", "actions")),
             ("trajectory_episode_id", trajectory_keys, ("trajectory_window_end_step",)),
         )
         grouped_keys = set().union(*(keys for _, keys, _ in group_specs))
-        scalar_keys = [key for key in all_keys if key not in grouped_keys]
+        scalar_keys = [
+            key for key in all_keys if key not in grouped_keys and key != id_table_key
+        ]
 
         for episode_key, keys, _sort_keys in group_specs:
             available = [dataset for dataset in datasets if episode_key in dataset]
@@ -300,8 +327,8 @@ def merge_stage1_shards(
         )
         for episode_id in episode_ids:
             for episode_key, keys, sort_keys in group_specs:
-                rows: list[tuple[Stage1Dataset, np.ndarray]] = []
-                for dataset in datasets:
+                rows: list[tuple[int, Stage1Dataset, np.ndarray]] = []
+                for dataset_index, dataset in enumerate(datasets):
                     if episode_key not in dataset:
                         continue
                     episode_values = dataset[episode_key]
@@ -317,13 +344,25 @@ def merge_stage1_shards(
                     ]
                     if local_sort_values:
                         order = np.lexsort(tuple(reversed(local_sort_values)))
-                    rows.append((dataset, np.arange(source_slice.start, source_slice.stop)[order]))
-                for dataset, indices in rows:
+                    rows.append((dataset_index, dataset, np.arange(source_slice.start, source_slice.stop)[order]))
+                for dataset_index, dataset, indices in rows:
                     destination_start = offsets[episode_key]
                     destination_stop = destination_start + int(indices.shape[0])
                     for key in keys:
                         if key in memmaps and key in dataset:
-                            memmaps[key][destination_start:destination_stop] = dataset[key][indices]
+                            values = dataset[key][indices]
+                            if key == id_index_key:
+                                local_map = local_id_maps.get(dataset_index)
+                                if local_map is None:
+                                    raise ValueError(
+                                        "Trajectory ID indices require a worker-local vehicle ID table."
+                                    )
+                                remapped = np.full_like(values, -1, dtype=np.int32)
+                                valid = np.asarray(values) >= 0
+                                if np.any(valid):
+                                    remapped[valid] = local_map[np.asarray(values)[valid]]
+                                values = remapped
+                            memmaps[key][destination_start:destination_stop] = values
                     if episode_key == "transition_episode_id":
                         steps = np.asarray(dataset["transition_episode_step"][indices], dtype=np.int64)
                         for local_index, step in enumerate(steps):
@@ -343,6 +382,14 @@ def merge_stage1_shards(
                 continue
             array_path = arrays_dir / f"{key}.npy"
             np.save(array_path, np.asarray(source), allow_pickle=False)
+
+        if global_vehicle_ids:
+            max_length = max(1, max(len(item) for item in global_vehicle_ids))
+            np.save(
+                arrays_dir / f"{id_table_key}.npy",
+                np.asarray(global_vehicle_ids, dtype=f"<U{max_length}"),
+                allow_pickle=False,
+            )
 
         for memmap in memmaps.values():
             memmap.flush()

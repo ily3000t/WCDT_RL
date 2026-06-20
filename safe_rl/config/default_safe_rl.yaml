@@ -88,6 +88,7 @@ prediction:
   num_modes: 10
   train_enabled: true
   wcdt_v1_train_enabled: false
+  wcdt_v1_max_agents: 6
   epochs: 50
   batch_size: 16
   wcdt_v1_batch_size: 16
@@ -175,6 +176,18 @@ forecast_features:
   normalize: true
   normalize_features: true
   detach_gradient: true
+
+rule_gap_acceptance:
+  desired_speed_source: "lane_speed_limit"
+  idm_min_gap: 2.0
+  idm_time_headway: 1.5
+  idm_max_acceleration: 1.5
+  idm_comfortable_deceleration: 2.0
+  merge_min_front_gap: 8.0
+  merge_min_rear_gap: 8.0
+  merge_front_ttc_min: 3.0
+  merge_rear_ttc_min: 3.0
+  deadline_distance: 120.0
 
 risk_module:
   enabled: true

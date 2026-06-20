@@ -63,7 +63,7 @@ def configured_trajectory_actor_capacity(config: Any) -> int:
     capacities = [scenario_top_k]
     train_enabled = bool(prediction_cfg.get("train_enabled", True))
     if train_enabled and bool(prediction_cfg.get("wcdt_v1_train_enabled", False)):
-        capacities.append(int(prediction_cfg.get("max_pred_num", scenario_top_k)))
+        capacities.append(int(prediction_cfg.get("wcdt_v1_max_agents", scenario_top_k)))
     if train_enabled and bool(prediction_cfg.get("wcdt_v2_train_enabled", False)):
         capacities.append(int(prediction_cfg.get("wcdt_v2_max_agents", scenario_top_k)))
     if train_enabled and bool(prediction_cfg.get("wcdt_v3_train_enabled", False)):
@@ -76,7 +76,7 @@ def configured_trajectory_actor_capacity(config: Any) -> int:
         elif source == "wcdt_v3":
             capacities.append(int(prediction_cfg.get("wcdt_v3_max_agents", scenario_top_k)))
         elif source == "wcdt":
-            capacities.append(int(prediction_cfg.get("max_pred_num", scenario_top_k)))
+            capacities.append(int(prediction_cfg.get("wcdt_v1_max_agents", scenario_top_k)))
     return max(1, max(int(value) for value in capacities))
 
 
@@ -2055,6 +2055,31 @@ class SumoHighwayMergeEnv(gym.Env):
         self._decision_context_cache = context
         return context
 
+    def get_rule_control_context(self) -> dict[str, Any]:
+        """Expose current-state-only inputs for deterministic rule baselines."""
+
+        latest = self.history.latest()
+        ego = latest.get(self.ego_id)
+        vehicles = list(latest.values())
+        local = merge_local_stats(ego, vehicles, self.config)
+        by_id = {str(vehicle.vehicle_id): vehicle for vehicle in vehicles}
+        lane_speed_limit = None
+        if ego is not None:
+            try:
+                lane_speed_limit = float(self.traci.lane.getMaxSpeed(str(ego.lane_id)))
+            except Exception:
+                lane_speed_limit = None
+        return {
+            "ego": ego,
+            "vehicles": vehicles,
+            "merge_local": local,
+            "target_front": by_id.get(str(local.target_front_vehicle_id)),
+            "target_rear": by_id.get(str(local.target_rear_vehicle_id)),
+            "lane_speed_limit": lane_speed_limit,
+            "lane_count": self._lane_count(ego.edge_id) if ego is not None else 1,
+            "config": self.config,
+        }
+
     def _invalidate_decision_cache(self) -> None:
         self._decision_context_cache = None
 
@@ -2609,6 +2634,8 @@ class SumoHighwayMergeEnv(gym.Env):
             "contextual_actor_truncated_count": np.zeros((0,), dtype=np.int64),
             "critical_actor_metadata_json": np.zeros((0,), dtype="<U2"),
             "dropped_critical_actor_metadata_json": np.zeros((0,), dtype="<U2"),
+            "trajectory_agent_vehicle_ids": np.zeros((0, max_agents), dtype="<U1"),
+            "trajectory_selector_selected_count": np.zeros((0,), dtype=np.int64),
         }
         if len(frames) < hist + horizon:
             result = (
@@ -2661,6 +2688,8 @@ class SumoHighwayMergeEnv(gym.Env):
         contextual_actor_truncated_counts: list[int] = []
         critical_actor_metadata_json: list[str] = []
         dropped_critical_actor_metadata_json: list[str] = []
+        trajectory_agent_vehicle_ids: list[np.ndarray] = []
+        selector_selected_counts: list[int] = []
         for end_idx in range(hist, len(frames) - horizon + 1):
             latest = frames[end_idx - 1]
             if self.ego_id not in latest:
@@ -2689,8 +2718,10 @@ class SumoHighwayMergeEnv(gym.Env):
             sample_agent_widths = np.full((max_agents,), 1.8, dtype=np.float32)
             sample_relevance_mask = np.zeros((max_agents,), dtype=np.float32)
             sample_relevance_score = np.zeros((max_agents,), dtype=np.float32)
+            sample_vehicle_ids = np.full((max_agents,), "", dtype="<U96")
             for agent_idx, vehicle_id in enumerate(agent_ids[:max_agents]):
                 mask[agent_idx] = 1.0
+                sample_vehicle_ids[agent_idx] = str(vehicle_id)
                 latest_state = latest.get(vehicle_id)
                 if latest_state is not None:
                     sample_lane_indices[agent_idx] = int(latest_state.lane_index)
@@ -2761,6 +2792,8 @@ class SumoHighwayMergeEnv(gym.Env):
             dropped_critical_actor_metadata_json.append(
                 _actor_metadata_json(selection, selection.dropped_critical_ids)
             )
+            trajectory_agent_vehicle_ids.append(sample_vehicle_ids)
+            selector_selected_counts.append(int(len(selection.selected_actor_ids)))
             metadata = frame_metadata[end_idx - 1] if end_idx - 1 < len(frame_metadata) else {}
             window_end_steps.append(int(metadata.get("simulation_step", -1)))
             window_decision_indices.append(int(metadata.get("decision_index", -1)))
@@ -2824,6 +2857,11 @@ class SumoHighwayMergeEnv(gym.Env):
             ),
             "dropped_critical_actor_metadata_json": np.asarray(
                 dropped_critical_actor_metadata_json,
+            ),
+            "trajectory_agent_vehicle_ids": np.stack(trajectory_agent_vehicle_ids, axis=0),
+            "trajectory_selector_selected_count": np.asarray(
+                selector_selected_counts,
+                dtype=np.int64,
             ),
         }
         if include_dimensions:

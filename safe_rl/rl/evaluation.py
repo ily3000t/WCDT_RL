@@ -207,9 +207,9 @@ def _step_safety_record(
     }
 
 
-def evaluate_ppo(
+def evaluate_policy(
     cfg: Any,
-    model_path: str | Path,
+    model_path: str | Path | None,
     seeds: list[int],
     shield_enabled: bool,
     risk_checkpoint: str | None = None,
@@ -217,12 +217,22 @@ def evaluate_ppo(
     group_name: str | None = None,
     tensorboard: TensorboardLogger | None = None,
     tensorboard_step_offset: int = 0,
+    policy_type: str = "sb3_ppo",
 ) -> dict:
-    model = load_ppo(model_path, device=_training_device(cfg))
+    policy_type = str(policy_type).strip().lower()
+    if policy_type not in {"sb3_ppo", "rule_gap_acceptance"}:
+        raise ValueError(f"Unsupported policy_type={policy_type!r}")
+    model = load_ppo(model_path, device=_training_device(cfg)) if policy_type == "sb3_ppo" else None
+    controller = None
+    if policy_type == "rule_gap_acceptance":
+        from safe_rl.baselines import RuleGapAcceptancePolicy
+
+        controller = RuleGapAcceptancePolicy(cfg)
     shape_env = make_env(cfg, seed=int(seeds[0]) if seeds else int(cfg.run.seed), shield_enabled=shield_enabled, risk_checkpoint=risk_checkpoint)
     try:
-        validate_model_env_observation_shape(model, shape_env, model_path)
-        model_observation_shape = tuple(model.observation_space.shape)
+        if model is not None:
+            validate_model_env_observation_shape(model, shape_env, model_path or "")
+        model_observation_shape = tuple(model.observation_space.shape) if model is not None else []
         env_observation_shape = tuple(shape_env.observation_space.shape)
     finally:
         shape_env.close()
@@ -239,7 +249,11 @@ def evaluate_ppo(
             obs, _info = env.reset(seed=seed)
             terminated = truncated = False
             while not (terminated or truncated):
-                action, _state = model.predict(obs, deterministic=True)
+                if model is not None:
+                    action, _state = model.predict(obs, deterministic=True)
+                else:
+                    decision = controller.act(env.get_rule_control_context())
+                    action = int(decision.action)
                 actions.append(int(action))
                 obs, reward, terminated, truncated, _info = env.step(int(action))
                 final_action = int(_info.get("final_action", action))
@@ -283,7 +297,7 @@ def evaluate_ppo(
                     executed_actions=executed_actions,
                     shield_enabled=shield_enabled,
                     risk_checkpoint=risk_checkpoint if shield_enabled else None,
-                    model_path=str(model_path),
+                    model_path=str(model_path or ""),
                     group_name=group_name,
                     safety_metric_version=str(cfg.risk_module.get("safety_metric_version", "")),
                     trace_schema_version=2,
@@ -300,4 +314,32 @@ def evaluate_ppo(
         "metrics": metrics,
         "model_observation_shape": list(model_observation_shape),
         "env_observation_shape": list(env_observation_shape),
+        "policy_type": policy_type,
     }
+
+
+def evaluate_ppo(
+    cfg: Any,
+    model_path: str | Path,
+    seeds: list[int],
+    shield_enabled: bool,
+    risk_checkpoint: str | None = None,
+    replay_dir: str | Path | None = None,
+    group_name: str | None = None,
+    tensorboard: TensorboardLogger | None = None,
+    tensorboard_step_offset: int = 0,
+) -> dict:
+    """Backward-compatible PPO-only entrypoint."""
+
+    return evaluate_policy(
+        cfg,
+        model_path,
+        seeds,
+        shield_enabled,
+        risk_checkpoint=risk_checkpoint,
+        replay_dir=replay_dir,
+        group_name=group_name,
+        tensorboard=tensorboard,
+        tensorboard_step_offset=tensorboard_step_offset,
+        policy_type="sb3_ppo",
+    )

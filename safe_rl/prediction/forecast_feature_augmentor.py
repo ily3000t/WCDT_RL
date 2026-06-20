@@ -67,9 +67,33 @@ class ForecastFeatureAugmentor:
         return features.astype(np.float32)
 
     def _from_bundle(self, ego: Any, bundle: ForecastRolloutBundle) -> np.ndarray:
-        if not bundle.actors:
+        if bundle.mode_actor_sets:
+            weights = np.asarray(bundle.mode_probabilities, dtype=np.float32)
+            if weights.size != len(bundle.mode_actor_sets) or float(np.sum(weights)) <= 0.0:
+                weights = np.full((len(bundle.mode_actor_sets),), 1.0 / len(bundle.mode_actor_sets))
+            else:
+                weights = weights / float(np.sum(weights))
+            mode_features = np.stack(
+                [
+                    self._from_actor_rollouts(ego, actors, bundle.combined_uncertainty)
+                    for actors in bundle.mode_actor_sets
+                ],
+                axis=0,
+            )
+            # Each mode is evaluated as a physically valid scene. Only scalar
+            # features are probability-aggregated; trajectories are never averaged.
+            return np.average(mode_features, axis=0, weights=weights).astype(np.float32)
+        return self._from_actor_rollouts(ego, bundle.actors, bundle.combined_uncertainty)
+
+    def _from_actor_rollouts(
+        self,
+        ego: Any,
+        actors: list[Any],
+        combined_uncertainty: float,
+    ) -> np.ndarray:
+        if not actors:
             return np.asarray(
-                [50.0, INF_TTC, 0.0, 0.0, bundle.combined_uncertainty, 50.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+                [50.0, INF_TTC, 0.0, 0.0, combined_uncertainty, 50.0, 0.0, 0.0, 0.0, 0.0, 0.0],
                 dtype=np.float32,
             )
         horizon = int(
@@ -87,7 +111,7 @@ class ForecastFeatureAugmentor:
         nearest_dy = 0.0
         target_lane_gap = 50.0
         top_risks: list[float] = []
-        for actor in bundle.actors:
+        for actor in actors:
             actor_min = 50.0
             for step_idx, other_future in enumerate(actor.trajectory[: len(ego_rollout)]):
                 ego_future = ego_rollout[step_idx]
@@ -103,7 +127,7 @@ class ForecastFeatureAugmentor:
         for step_idx, ego_future in enumerate(ego_rollout):
             step_vehicles = [
                 actor.trajectory[step_idx]
-                for actor in bundle.actors
+                for actor in actors
                 if step_idx < len(actor.trajectory)
             ]
             if step_vehicles:
@@ -122,7 +146,7 @@ class ForecastFeatureAugmentor:
                 min_ttc,
                 max_drac,
                 collision_probability,
-                float(bundle.combined_uncertainty),
+                float(combined_uncertainty),
                 target_lane_gap,
                 nearest_dx,
                 nearest_dy,

@@ -337,6 +337,63 @@ def _require_trajectory_schema_v3(data: Any, consumer: str, cfg: Any | None = No
         )
 
 
+def _wcdt_v1_max_agents(cfg: Any) -> int:
+    legacy = int(cfg.prediction.get("max_pred_num", 0))
+    configured = cfg.prediction.get("wcdt_v1_max_agents")
+    if configured is None:
+        return legacy
+    value = int(configured)
+    if value <= 0:
+        raise ValueError("prediction.wcdt_v1_max_agents must be positive.")
+    return value
+
+
+def _require_wcdt_v1_row_alignment(data: Any, cfg: Any) -> None:
+    """Reject legacy buffers that cannot prove selector-row/vehicle-ID alignment."""
+
+    _require_trajectory_schema_v3(data, "WcDT v1", cfg)
+    required = {
+        "trajectory_vehicle_id_table",
+        "trajectory_agent_vehicle_id_index",
+        "trajectory_selector_selected_count",
+        "trajectory_actor_row_alignment",
+        "trajectory_selector_order_version",
+    }
+    missing = sorted(key for key in required if not _has_key(data, key))
+    alignment = _trajectory_string(data, "trajectory_actor_row_alignment")
+    order_version = _trajectory_string(data, "trajectory_selector_order_version")
+    history = np.asarray(data["agent_history"])
+    masks = np.asarray(data["agent_mask"])
+    indices = (
+        np.asarray(data["trajectory_agent_vehicle_id_index"], dtype=np.int64)
+        if not missing
+        else np.zeros((0, 0), dtype=np.int64)
+    )
+    selected_counts = (
+        np.asarray(data["trajectory_selector_selected_count"], dtype=np.int64).reshape(-1)
+        if not missing
+        else np.zeros((0,), dtype=np.int64)
+    )
+    invalid = bool(
+        indices.shape != masks.shape
+        or selected_counts.shape[0] != history.shape[0]
+        or np.any(indices[masks > 0.5] < 0)
+        or np.any(selected_counts < 0)
+        or np.any(selected_counts > _wcdt_v1_max_agents(cfg))
+    )
+    if (
+        missing
+        or alignment != "selector_v2_vehicle_id_verified"
+        or order_version != "selector_v2_vehicle_id_order_v1"
+        or invalid
+    ):
+        raise ValueError(
+            "WcDT v1 formal comparison requires schema9 selector vehicle-ID row alignment; "
+            f"missing={missing}, alignment={alignment!r}, order={order_version!r}, invalid={invalid}. "
+            "Re-run Stage1 with a new comparison base run."
+        )
+
+
 def _require_trajectory_schema_v2(data: Any, consumer: str) -> None:
     """Compatibility alias; current formal training requires schema v4."""
 
@@ -983,8 +1040,8 @@ def _build_wcdt_batch(
     sample_indices = np.asarray(indices if indices is not None else np.arange(history.shape[0]), dtype=np.int64)
     if sample_indices.size == 0:
         return None
-    _require_trajectory_schema_v3(data, "WcDT v1", cfg)
-    max_pred = int(cfg.prediction.max_pred_num)
+    _require_wcdt_v1_row_alignment(data, cfg)
+    max_pred = _wcdt_v1_max_agents(cfg)
     max_other = int(cfg.prediction.max_other_num)
     hist_steps = int(cfg.scenario.history_steps)
     horizon = future.shape[2]
@@ -996,13 +1053,16 @@ def _build_wcdt_batch(
     predicted_mask = np.zeros((sample_indices.shape[0], max_pred), dtype=np.float32)
     other_mask = np.zeros((sample_indices.shape[0], max_other), dtype=np.float32)
 
+    selected_counts = np.asarray(data["trajectory_selector_selected_count"], dtype=np.int64)
+    row_ids = np.asarray(data["trajectory_agent_vehicle_id_index"], dtype=np.int64)
     for output_idx, sample_idx in enumerate(sample_indices):
-        ordered_agents = [
-            agent_idx
-            for agent_idx in range(1, history.shape[1])
-            if float(mask[sample_idx, agent_idx]) > 0.0
+        selected_count = min(max_pred, int(selected_counts[sample_idx]))
+        ordered_agents = list(range(1, min(history.shape[1], selected_count + 1)))
+        pred_agents = [
+            agent_idx for agent_idx in ordered_agents if float(mask[sample_idx, agent_idx]) > 0.0
         ]
-        pred_agents = ordered_agents[:max_pred]
+        if any(int(row_ids[sample_idx, agent_idx]) < 0 for agent_idx in pred_agents):
+            raise ValueError("WcDT v1 trajectory row is missing its selector vehicle ID.")
         leftover = [agent_idx for agent_idx in ordered_agents if agent_idx not in set(pred_agents)]
         leftover.sort(
             key=lambda agent_idx: (
@@ -1070,7 +1130,7 @@ def _wcdt_v1_checkpoint_metadata(
     from safe_rl.prediction.actor_selector import actor_selection_config_hash
 
     return {
-        "architecture_version": "wcdt_v1_legacy_diffusion_route_selector_v1",
+        "architecture_version": "wcdt_v1_adapted_multimodal_selector_v2",
         "loss_version": "legacy_multimodal_diffusion_v1",
         "trajectory_schema_version": _trajectory_schema_version(data),
         "stage1_buffer_schema_version": _stage1_buffer_schema_version(data),
@@ -1078,12 +1138,12 @@ def _wcdt_v1_checkpoint_metadata(
         "trajectory_actor_capacity": _trajectory_int(
             data,
             "trajectory_actor_capacity",
-            int(cfg.prediction.max_pred_num),
+            _wcdt_v1_max_agents(cfg),
         ),
         "trajectory_max_agent_count": _trajectory_int(
             data,
             "trajectory_max_agent_count",
-            int(cfg.prediction.max_pred_num) + 1,
+            _wcdt_v1_max_agents(cfg) + 1,
         ),
         "safety_metric_version": _safety_metric_version(data),
         "actor_selection_version": _trajectory_string(data, "actor_selection_version"),
@@ -1095,7 +1155,10 @@ def _wcdt_v1_checkpoint_metadata(
         "route_projection_config": dict(cfg.prediction.get("route_projection", {}) or {}),
         "vehicle_state_ordering_version": _trajectory_string(data, "vehicle_state_ordering_version"),
         "episode_seed_schedule": _trajectory_string(data, "episode_seed_schedule"),
-        "max_actor_count": int(cfg.prediction.max_pred_num),
+        "max_actor_count": _wcdt_v1_max_agents(cfg),
+        "actor_row_alignment": "selector_v2_vehicle_id_verified",
+        "trajectory_selector_order_version": "selector_v2_vehicle_id_order_v1",
+        "num_modes": 10,
         "history_steps": int(cfg.scenario.history_steps),
         "horizon_steps": int(cfg.prediction.horizon_steps),
         "wcdt_v1_batch_size": _wcdt_v1_batch_size(cfg),
@@ -2808,12 +2871,16 @@ def run(cfg) -> Path:
         "wcdt_v1_train_enabled": bool(cfg.prediction.get("wcdt_v1_train_enabled", False)),
         "wcdt_v2_train_enabled": bool(cfg.prediction.get("wcdt_v2_train_enabled", True)),
         "wcdt_v3_train_enabled": bool(cfg.prediction.get("wcdt_v3_train_enabled", False)),
-        "wcdt_v1_max_agents": int(cfg.prediction.max_pred_num),
+        "wcdt_v1_max_agents": _wcdt_v1_max_agents(cfg),
         "wcdt_v1_batch_size": _wcdt_v1_batch_size(cfg),
         "wcdt_v2_batch_size": _wcdt_v2_batch_size(cfg),
         "wcdt_v3_batch_size": _wcdt_v3_batch_size(cfg),
     }
-    report.update(_train_risk_module(cfg, risk_data, stage_dir, tb, device))
+    if bool(cfg.stage2.get("train_risk_module", True)):
+        report.update(_train_risk_module(cfg, risk_data, stage_dir, tb, device))
+    else:
+        report["risk_training_skipped"] = True
+        report["risk_checkpoint_reference"] = str(cfg.stage2.get("risk_checkpoint_reference", ""))
     if bool(cfg.prediction.get("train_enabled", True)):
         if bool(cfg.prediction.get("wcdt_v1_train_enabled", False)):
             report.update(_train_wcdt_predictor(cfg, data, stage_dir, tb, device))

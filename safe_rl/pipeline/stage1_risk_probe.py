@@ -100,6 +100,8 @@ TRAJECTORY_KEYS = {
     "contextual_actor_truncated_count",
     "critical_actor_metadata_json",
     "dropped_critical_actor_metadata_json",
+    "trajectory_agent_vehicle_id_index",
+    "trajectory_selector_selected_count",
     "trajectory_episode_id",
     "trajectory_window_end_step",
     "trajectory_decision_index",
@@ -144,7 +146,7 @@ def _stage1_dataset_metadata(cfg) -> dict:
         "trajectory_schema_version": 4,
         "trajectory_actor_capacity": trajectory_actor_capacity,
         "trajectory_max_agent_count": trajectory_actor_capacity + 1,
-        "wcdt_v1_max_agents": int(cfg.prediction.get("max_pred_num", 0)),
+        "wcdt_v1_max_agents": int(cfg.prediction.get("wcdt_v1_max_agents", 0)),
         "wcdt_v2_max_agents": int(cfg.prediction.get("wcdt_v2_max_agents", 0)),
         "wcdt_v3_max_agents": int(cfg.prediction.get("wcdt_v3_max_agents", 0)),
         "episode_seed_schedule": str(
@@ -161,11 +163,29 @@ def _stage1_dataset_metadata(cfg) -> dict:
         "actor_selection_config_hash": actor_selection_config_hash(cfg),
         "trajectory_postprocess_version": TRAJECTORY_POSTPROCESS_VERSION,
         "forecast_rollout_bundle_version": FORECAST_ROLLOUT_BUNDLE_VERSION,
+        "trajectory_actor_row_alignment": "selector_v2_vehicle_id_verified",
+        "trajectory_selector_order_version": "selector_v2_vehicle_id_order_v1",
         "route_projection_config": dict(cfg.prediction.get("route_projection", {}) or {}),
         "sumo_installation_fingerprint": dict(
             cfg.get("scenario", {}).get("sumo_installation_fingerprint", {}) or {}
         ),
     }
+
+
+def _encode_trajectory_vehicle_ids(rows: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    """Encode fixed-width row IDs as a compact, shard-mergeable ID table."""
+
+    values = np.asarray(rows, dtype=str)
+    non_empty = sorted({str(value) for value in values.reshape(-1) if str(value)})
+    width = max(1, max((len(value) for value in non_empty), default=1))
+    table = np.asarray(non_empty, dtype=f"<U{width}")
+    lookup = {value: index for index, value in enumerate(non_empty)}
+    indices = np.full(values.shape, -1, dtype=np.int32)
+    for index in np.ndindex(values.shape):
+        vehicle_id = str(values[index])
+        if vehicle_id:
+            indices[index] = int(lookup[vehicle_id])
+    return table, indices
 
 
 def _stage1_worker_entry(
@@ -434,7 +454,7 @@ def _run_parallel(cfg, workers: int) -> Path:
         "stage1_buffer_schema_version": STAGE1_BUFFER_SCHEMA_VERSION,
         "trajectory_actor_capacity": trajectory_actor_capacity,
         "trajectory_max_agent_count": trajectory_actor_capacity + 1,
-        "wcdt_v1_max_agents": int(cfg.prediction.get("max_pred_num", 0)),
+        "wcdt_v1_max_agents": int(cfg.prediction.get("wcdt_v1_max_agents", 0)),
         "wcdt_v2_max_agents": int(cfg.prediction.get("wcdt_v2_max_agents", 0)),
         "wcdt_v3_max_agents": int(cfg.prediction.get("wcdt_v3_max_agents", 0)),
         "episode_seed_schedule": str(
@@ -556,6 +576,8 @@ def _run_serial(
     contextual_actor_truncated_counts: list[np.ndarray] = []
     critical_actor_metadata_json: list[np.ndarray] = []
     dropped_critical_actor_metadata_json: list[np.ndarray] = []
+    trajectory_agent_vehicle_ids: list[np.ndarray] = []
+    trajectory_selector_selected_counts: list[np.ndarray] = []
     trajectory_episode_ids: list[np.ndarray] = []
     trajectory_window_end_steps: list[np.ndarray] = []
     trajectory_decision_indices: list[np.ndarray] = []
@@ -788,6 +810,15 @@ def _run_serial(
                         trajectory_metadata.get("dropped_critical_actor_metadata_json"),
                     )
                 )
+                trajectory_agent_vehicle_ids.append(
+                    np.asarray(trajectory_metadata.get("trajectory_agent_vehicle_ids"), dtype=str)
+                )
+                trajectory_selector_selected_counts.append(
+                    np.asarray(
+                        trajectory_metadata.get("trajectory_selector_selected_count"),
+                        dtype=np.int64,
+                    )
+                )
                 sample_count = int(hist.shape[0])
                 trajectory_episode_ids.append(np.full((sample_count,), episode, dtype=np.int64))
                 trajectory_window_end_steps.append(
@@ -814,6 +845,14 @@ def _run_serial(
             env.close()
 
     output = stage_dir / str(cfg.stage1.output_name)
+    raw_trajectory_agent_vehicle_ids = (
+        np.concatenate(trajectory_agent_vehicle_ids, axis=0)
+        if trajectory_agent_vehicle_ids
+        else np.zeros((0, configured_trajectory_actor_capacity(cfg) + 1), dtype="<U1")
+    )
+    trajectory_vehicle_id_table, trajectory_agent_vehicle_id_index = _encode_trajectory_vehicle_ids(
+        raw_trajectory_agent_vehicle_ids
+    )
     output_arrays = {
         **{key: np.asarray(value) for key, value in transitions.items()},
         "agent_history": (
@@ -854,6 +893,10 @@ def _run_serial(
             configured_trajectory_actor_capacity(cfg) + 1,
             dtype=np.int64,
         ),
+        "wcdt_v1_max_agents": np.asarray(
+            int(cfg.prediction.get("wcdt_v1_max_agents", 0)),
+            dtype=np.int64,
+        ),
         "wcdt_v2_max_agents": np.asarray(
             int(cfg.prediction.get("wcdt_v2_max_agents", 0)),
             dtype=np.int64,
@@ -867,6 +910,15 @@ def _run_serial(
         "actor_selection_config_hash": np.asarray(actor_selection_config_hash(cfg)),
         "trajectory_postprocess_version": np.asarray(TRAJECTORY_POSTPROCESS_VERSION),
         "forecast_rollout_bundle_version": np.asarray(FORECAST_ROLLOUT_BUNDLE_VERSION),
+        "trajectory_actor_row_alignment": np.asarray("selector_v2_vehicle_id_verified"),
+        "trajectory_selector_order_version": np.asarray("selector_v2_vehicle_id_order_v1"),
+        "trajectory_vehicle_id_table": trajectory_vehicle_id_table,
+        "trajectory_agent_vehicle_id_index": trajectory_agent_vehicle_id_index,
+        "trajectory_selector_selected_count": (
+            np.concatenate(trajectory_selector_selected_counts, axis=0)
+            if trajectory_selector_selected_counts
+            else np.zeros((0,), dtype=np.int64)
+        ),
         "episode_seed_schedule": np.asarray(
             str(cfg.get("run", {}).get("episode_seed_schedule", "fixed_legacy"))
         ),
@@ -1032,7 +1084,7 @@ def _run_serial(
         "stage1_buffer_schema_version": STAGE1_BUFFER_SCHEMA_VERSION,
         "trajectory_actor_capacity": configured_trajectory_actor_capacity(cfg),
         "trajectory_max_agent_count": configured_trajectory_actor_capacity(cfg) + 1,
-        "wcdt_v1_max_agents": int(cfg.prediction.get("max_pred_num", 0)),
+        "wcdt_v1_max_agents": int(cfg.prediction.get("wcdt_v1_max_agents", 0)),
         "wcdt_v2_max_agents": int(cfg.prediction.get("wcdt_v2_max_agents", 0)),
         "wcdt_v3_max_agents": int(cfg.prediction.get("wcdt_v3_max_agents", 0)),
         "episode_seed_schedule": str(

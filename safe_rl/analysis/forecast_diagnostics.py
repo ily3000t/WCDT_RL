@@ -669,6 +669,10 @@ def _wcdt_diagnostics(
     uncertainty_values: list[float] = []
     confidence_values: list[float] = []
     confidence_fde_values: list[float] = []
+    weighted_ade: list[float] = []
+    weighted_fde: list[float] = []
+    minade_at_10: list[float] = []
+    minfde_at_10: list[float] = []
 
     with torch.no_grad():
         for start in range(0, indices.shape[0], batch_size):
@@ -694,6 +698,23 @@ def _wcdt_diagnostics(
                 row_fde = float(np.mean(per_step[:, -1]))
                 ade.append(row_ade)
                 fde.append(row_fde)
+                if confidence_np is not None and traj.ndim == 5:
+                    mode_errors = np.linalg.norm(
+                        traj[row, valid_agents, :, :, :2]
+                        - actual_future[row, valid_agents, None, :, :2],
+                        axis=-1,
+                    )
+                    mode_ade = np.mean(mode_errors, axis=-1)
+                    mode_fde = mode_errors[..., -1]
+                    probabilities = confidence_np[row, valid_agents]
+                    probabilities = probabilities / np.maximum(
+                        np.sum(probabilities, axis=-1, keepdims=True), 1.0e-8
+                    )
+                    weighted_ade.append(float(np.mean(np.sum(probabilities * mode_ade, axis=-1))))
+                    weighted_fde.append(float(np.mean(np.sum(probabilities * mode_fde, axis=-1))))
+                    # Oracle-only multi-modal coverage diagnostics. Never used by runtime.
+                    minade_at_10.append(float(np.mean(np.min(mode_ade, axis=-1))))
+                    minfde_at_10.append(float(np.mean(np.min(mode_fde, axis=-1))))
                 pred_min_distance = _future_min_distance(ego_future[row], selected[row], pred_mask[row])
                 actual_min_distance = _future_min_distance(ego_future[row], actual_future[row], pred_mask[row])
                 min_distance_errors.append(float(pred_min_distance - actual_min_distance))
@@ -748,6 +769,16 @@ def _wcdt_diagnostics(
         "sample_count": int(len(feature_rows)),
         "ade": _summary(ade),
         "fde": _summary(fde),
+        "top1_deployment_metrics": {"ade": _summary(ade), "fde": _summary(fde)},
+        "confidence_weighted_deployment_metrics": {
+            "ade": _summary(weighted_ade),
+            "fde": _summary(weighted_fde),
+        },
+        "oracle_multimodal_coverage": {
+            "minADE_at_10": _summary(minade_at_10),
+            "minFDE_at_10": _summary(minfde_at_10),
+            "uses_future_ground_truth": True,
+        },
         "future_min_distance_error": _summary(min_distance_errors),
         "future_min_distance_abs_error": _summary(min_distance_abs_errors),
         "target_lane_gap_error": _summary(target_gap_errors),
