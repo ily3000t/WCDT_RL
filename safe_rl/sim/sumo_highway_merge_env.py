@@ -2051,12 +2051,16 @@ class SumoHighwayMergeEnv(gym.Env):
             "merge_local": local,
             "curriculum_profile": self._curriculum_profile,
             "performance_tracker": self.performance,
+            "episode_seed": int(self.seed_value),
+            "decision_index": int(self._decision_index),
         }
         self._decision_context_cache = context
         return context
 
-    def get_rule_control_context(self) -> dict[str, Any]:
+    def get_rule_control_context(self):
         """Expose current-state-only inputs for deterministic rule baselines."""
+
+        from safe_rl.baselines.api import RuleControlContext
 
         latest = self.history.latest()
         ego = latest.get(self.ego_id)
@@ -2069,16 +2073,67 @@ class SumoHighwayMergeEnv(gym.Env):
                 lane_speed_limit = float(self.traci.lane.getMaxSpeed(str(ego.lane_id)))
             except Exception:
                 lane_speed_limit = None
-        return {
-            "ego": ego,
-            "vehicles": vehicles,
-            "merge_local": local,
-            "target_front": by_id.get(str(local.target_front_vehicle_id)),
-            "target_rear": by_id.get(str(local.target_rear_vehicle_id)),
-            "lane_speed_limit": lane_speed_limit,
-            "lane_count": self._lane_count(ego.edge_id) if ego is not None else 1,
-            "config": self.config,
-        }
+        target_front = by_id.get(str(local.target_front_vehicle_id))
+        target_rear = by_id.get(str(local.target_rear_vehicle_id))
+        current_front = None
+        current_front_gap = INF_TTC
+        if ego is not None:
+            candidates = [
+                vehicle
+                for vehicle in vehicles
+                if vehicle.vehicle_id != ego.vehicle_id
+                and vehicle.edge_id == ego.edge_id
+                and int(vehicle.lane_index) == int(ego.lane_index)
+                and float(vehicle.lane_pos) > float(ego.lane_pos)
+            ]
+            if candidates:
+                current_front = min(candidates, key=lambda vehicle: float(vehicle.lane_pos))
+                current_front_gap = max(
+                    0.0,
+                    float(current_front.lane_pos - ego.lane_pos)
+                    - 0.5 * (float(current_front.length) + float(ego.length)),
+                )
+        target_front_closing = max(0.0, float(ego.speed - target_front.speed)) if ego and target_front else 0.0
+        target_rear_closing = max(0.0, float(target_rear.speed - ego.speed)) if ego and target_rear else 0.0
+        front_ttc = (
+            float(local.target_front_gap) / target_front_closing
+            if target_front_closing > 1.0e-6
+            else INF_TTC
+        )
+        rear_ttc = (
+            float(local.target_rear_gap) / target_rear_closing
+            if target_rear_closing > 1.0e-6
+            else INF_TTC
+        )
+        context = self.get_risk_context()
+        legal_actions = frozenset(
+            int(action.index)
+            for action in ACTIONS
+            if is_candidate_legal(action, context)
+        )
+        merge_cmd = (
+            int(target_lane_index(self.config, ego.edge_id) - ego.lane_index)
+            if ego is not None
+            else 0
+        )
+        return RuleControlContext(
+            ego=ego,
+            current_lane_front=current_front,
+            target_front=target_front,
+            target_rear=target_rear,
+            current_lane_front_gap=float(current_front_gap),
+            target_front_gap=float(local.target_front_gap),
+            target_rear_gap=float(local.target_rear_gap),
+            target_front_closing_speed=float(target_front_closing),
+            target_rear_closing_speed=float(target_rear_closing),
+            target_front_ttc=float(front_ttc),
+            target_rear_ttc=float(rear_ttc),
+            lane_speed_limit=lane_speed_limit,
+            distance_to_taper=float(local.merge_distance),
+            ego_on_auxiliary=bool(local.ego_on_auxiliary),
+            merge_lateral_cmd=merge_cmd,
+            legal_action_indices=legal_actions,
+        )
 
     def _invalidate_decision_cache(self) -> None:
         self._decision_context_cache = None

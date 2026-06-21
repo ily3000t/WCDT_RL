@@ -101,10 +101,18 @@ def run(
     training_seeds: list[int] | None = None,
     ppo_timesteps: int = 20_000,
     stage5_episodes: int = 20,
+    upstream_root: str | Path | None = None,
+    upstream_commit: str = "6baa2330fc3f620863d358b5d7f36323b4bfccae",
+    allowed_differences: list[str] | None = None,
+    formal: bool = False,
 ) -> Path:
     seeds = training_seeds or [101]
     if int(stage5_episodes) <= 0:
         raise ValueError("stage5_episodes must be positive.")
+    if formal and (sorted(seeds) != [101, 202, 303] or int(stage5_episodes) != 50):
+        raise ValueError("Formal comparative runs require training seeds 101,202,303 and 50 scenario seeds.")
+    if formal and upstream_root is None:
+        raise ValueError("Formal comparative runs require --upstream-root to generate a source diff manifest.")
     base = _run_dir(base_run_id)
     stage1 = base / "stage1" / "risk_probe_buffer"
     risk = base / "stage2" / "risk_module.pt"
@@ -119,6 +127,22 @@ def run(
     manifests = experiment_root / "manifests"
     manifests.mkdir(parents=True, exist_ok=False)
     provenance = _provenance(base, stage1=stage1, risk=risk, v3=v3)
+    if upstream_root is not None:
+        from safe_rl.tools.audit_wcdt_upstream import run as audit_upstream
+
+        source_diff = manifests / "source_diff_manifest.json"
+        audit = audit_upstream(
+            upstream_root=Path(upstream_root),
+            output=source_diff,
+            upstream_commit=upstream_commit,
+            allowed_differences=set(allowed_differences or []) or None,
+        )
+        provenance["source_diff_manifest"] = str(source_diff)
+        provenance["source_fidelity"] = str(audit["source_fidelity"])
+    else:
+        provenance["source_fidelity"] = "unverified"
+    if formal and provenance["source_fidelity"] != "verified":
+        raise ValueError("Formal comparative runs require a verified source_diff_manifest.json.")
     (manifests / "input_provenance.json").write_text(
         json.dumps(provenance, indent=2, sort_keys=True) + "\n", encoding="utf-8"
     )
@@ -167,7 +191,17 @@ def run(
             model_paths[source][seed] = path
 
     groups: list[dict[str, Any]] = [
-        {"name": "rule_gap_acceptance", "policy_type": "rule_gap_acceptance", "forecast_features": False, "shield": False}
+        {
+            "name": "rule_gap_acceptance",
+            "policy_type": "rule_gap_acceptance",
+            "forecast_features": False,
+            "shield": False,
+            "comparative": {
+                "method": "rule_gap_acceptance",
+                "training_seed": None,
+                "evaluation_variant": "policy",
+            },
+        }
     ]
     source_names = {"ppo": "ppo", "constant_velocity": "cv", "wcdt": "wcdt_v1_adapted", "wcdt_v3": "wcdt_v3"}
     for source, display in source_names.items():
@@ -178,6 +212,11 @@ def run(
                 "forecast_features": source != "ppo",
                 "shield": False,
                 "model_path": str(model_paths[source][seed]),
+                "comparative": {
+                    "method": display,
+                    "training_seed": int(seed),
+                    "evaluation_variant": "policy",
+                },
             }
             if source != "ppo":
                 group["forecast_source"] = source
@@ -186,11 +225,15 @@ def run(
                 elif source == "wcdt_v3":
                     group["forecast_checkpoint"] = str(v3)
             groups.append(group)
-            if source != "ppo" or source == "ppo":
-                shielded = dict(group)
-                shielded["name"] = f"{display}_shield_seed_{seed}"
-                shielded["shield"] = True
-                groups.append(shielded)
+            shielded = dict(group)
+            shielded["name"] = f"{display}_shield_seed_{seed}"
+            shielded["shield"] = True
+            shielded["comparative"] = {
+                "method": display,
+                "training_seed": int(seed),
+                "evaluation_variant": "shield",
+            }
+            groups.append(shielded)
     payload = {
         "run": {"output_root": str(comparative_root), "run_id": experiment_id},
         "stage5": {
@@ -212,6 +255,10 @@ def main() -> None:
     parser.add_argument("--training-seeds", default="101")
     parser.add_argument("--ppo-timesteps", type=int, default=20_000)
     parser.add_argument("--stage5-episodes", type=int, default=20)
+    parser.add_argument("--upstream-root")
+    parser.add_argument("--upstream-commit", default="6baa2330fc3f620863d358b5d7f36323b4bfccae")
+    parser.add_argument("--allowed-difference", action="append", default=[])
+    parser.add_argument("--formal", action="store_true")
     args = parser.parse_args()
     run(
         base_run_id=str(args.base_run_id),
@@ -219,6 +266,10 @@ def main() -> None:
         training_seeds=[int(value) for value in str(args.training_seeds).split(",") if value.strip()],
         ppo_timesteps=int(args.ppo_timesteps),
         stage5_episodes=int(args.stage5_episodes),
+        upstream_root=args.upstream_root,
+        upstream_commit=str(args.upstream_commit),
+        allowed_differences=list(args.allowed_difference),
+        formal=bool(args.formal),
     )
 
 

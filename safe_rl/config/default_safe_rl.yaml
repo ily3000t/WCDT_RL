@@ -89,6 +89,9 @@ prediction:
   train_enabled: true
   wcdt_v1_train_enabled: false
   wcdt_v1_max_agents: 6
+  wcdt_v1_mode_aggregation:
+    version: "per_actor_joint_world_v1"
+    joint_world_count: 32
   epochs: 50
   batch_size: 16
   wcdt_v1_batch_size: 16
@@ -334,7 +337,6 @@ stage1:
   random_action_probability: 1.0
   output_name: "risk_probe_buffer"
   output_format: "manifest_npy_v1"
-  buffer_schema_version: 5
   cleanup_worker_shards: true
   audit_enabled: true
   audit_gate:

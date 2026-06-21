@@ -67,23 +67,19 @@ class ForecastFeatureAugmentor:
         return features.astype(np.float32)
 
     def _from_bundle(self, ego: Any, bundle: ForecastRolloutBundle) -> np.ndarray:
-        if bundle.mode_actor_sets:
-            weights = np.asarray(bundle.mode_probabilities, dtype=np.float32)
-            if weights.size != len(bundle.mode_actor_sets) or float(np.sum(weights)) <= 0.0:
-                weights = np.full((len(bundle.mode_actor_sets),), 1.0 / len(bundle.mode_actor_sets))
-            else:
-                weights = weights / float(np.sum(weights))
-            mode_features = np.stack(
-                [
-                    self._from_actor_rollouts(ego, actors, bundle.combined_uncertainty)
-                    for actors in bundle.mode_actor_sets
-                ],
-                axis=0,
-            )
-            # Each mode is evaluated as a physically valid scene. Only scalar
-            # features are probability-aggregated; trajectories are never averaged.
-            return np.average(mode_features, axis=0, weights=weights).astype(np.float32)
-        return self._from_actor_rollouts(ego, bundle.actors, bundle.combined_uncertainty)
+        worlds = bundle.joint_world_actor_sets()
+        if len(worlds) == 1:
+            return self._from_actor_rollouts(ego, worlds[0], bundle.combined_uncertainty)
+        # Every world has one physically valid trajectory for every actor. Aggregate
+        # scalar features only; do not average coordinates across multimodal paths.
+        features = np.stack(
+            [
+                self._from_actor_rollouts(ego, actors, bundle.combined_uncertainty)
+                for actors in worlds
+            ],
+            axis=0,
+        )
+        return np.mean(features, axis=0, dtype=np.float64).astype(np.float32)
 
     def _from_actor_rollouts(
         self,

@@ -483,6 +483,9 @@ def run(cfg) -> Path:
         group_reports[group.name]["shield_overrides"] = dict(group.get("shield_overrides", {}) or {})
         group_reports[group.name]["risk_module_overrides"] = dict(group.get("risk_module_overrides", {}) or {})
         group_reports[group.name]["policy_type"] = policy_type
+        comparative_metadata = dict(group.get("comparative", {}) or {})
+        if comparative_metadata:
+            group_reports[group.name]["comparative"] = comparative_metadata
 
     shield_off = {name: report for name, report in group_reports.items() if not bool(report.get("shield_enabled", False))}
     shield_on = {name: report for name, report in group_reports.items() if bool(report.get("shield_enabled", False))}

@@ -53,29 +53,23 @@ class ForecastAwareTaskScorer:
             context,
             self.predictor,
         )
-        other_rollouts = bundle.rollout_lists()
-        mode_rollout_sets = bundle.mode_rollout_lists()
+        world_actor_sets = bundle.joint_world_actor_sets()
+        other_rollouts = [actor.trajectory for actor in world_actor_sets[0]] if world_actor_sets else []
         uncertainty = float(bundle.combined_uncertainty)
         source = "hybrid" if self.predictor is not None else "constant_velocity"
         selected_vehicle_ids = [actor.vehicle_id for actor in bundle.actors]
         legal_actions = [action for action in ACTIONS if is_candidate_legal(action, context)]
-        if mode_rollout_sets:
-            weights = np.asarray(bundle.mode_probabilities, dtype=np.float32)
-            if weights.size != len(mode_rollout_sets) or float(np.sum(weights)) <= 0.0:
-                weights = np.full((len(mode_rollout_sets),), 1.0 / len(mode_rollout_sets))
-            else:
-                weights = weights / float(np.sum(weights))
+        if len(world_actor_sets) > 1:
             scores = [
-                self._aggregate_mode_scores(
+                self._aggregate_world_scores(
                     [
                         self._candidate_score(
-                            action, context, rollouts, uncertainty,
+                            action, context, [actor.trajectory for actor in actors], uncertainty,
                             merge_cmd=int(merge_cmd), urgency=float(urgency),
                             deadline_distance=float(deadline_distance), dt=dt,
                         )
-                        for rollouts in mode_rollout_sets
-                    ],
-                    weights,
+                        for actors in world_actor_sets
+                    ]
                 )
                 for action in legal_actions
             ]
@@ -93,16 +87,20 @@ class ForecastAwareTaskScorer:
             return self._empty(source=source, uncertainty=uncertainty)
         raw_score = next((item for item in scores if int(item["action"]) == int(raw.index)), None)
         if raw_score is None:
-            raw_score = self._candidate_score(
-                raw,
-                context,
-                other_rollouts,
-                uncertainty,
-                merge_cmd=int(merge_cmd),
-                urgency=float(urgency),
-                deadline_distance=float(deadline_distance),
-                dt=dt,
-            )
+            raw_world_scores = [
+                self._candidate_score(
+                    raw,
+                    context,
+                    [actor.trajectory for actor in actors],
+                    uncertainty,
+                    merge_cmd=int(merge_cmd),
+                    urgency=float(urgency),
+                    deadline_distance=float(deadline_distance),
+                    dt=dt,
+                )
+                for actors in world_actor_sets
+            ]
+            raw_score = self._aggregate_world_scores(raw_world_scores)
         best = min(scores, key=lambda item: float(item["forecast_aware_score"]))
         best_action = decode_action(int(best["action"]))
         safety_threshold = float(self.config.shield.get("task_backstop_safety_risk_threshold", 0.35))
@@ -328,16 +326,13 @@ class ForecastAwareTaskScorer:
         }
 
     @staticmethod
-    def _aggregate_mode_scores(
+    def _aggregate_world_scores(
         mode_scores: list[dict[str, Any] | None],
-        weights: np.ndarray,
     ) -> dict[str, Any] | None:
         valid = [item for item in mode_scores if item is not None]
         if not valid:
             return None
-        active_weights = np.asarray(weights[: len(mode_scores)], dtype=np.float32)
-        active_weights = active_weights[[item is not None for item in mode_scores]]
-        active_weights = active_weights / max(float(np.sum(active_weights)), 1.0e-8)
+        active_weights = np.full((len(valid),), 1.0 / len(valid), dtype=np.float32)
         top = valid[int(np.argmax(active_weights))]
         merged = dict(top)
         numeric = {
@@ -350,7 +345,7 @@ class ForecastAwareTaskScorer:
         for key in numeric:
             values = np.asarray([float(item[key]) for item in valid], dtype=np.float32)
             merged[key] = float(np.dot(active_weights, values))
-        merged["mode_wise_aggregation"] = True
+        merged["joint_world_aggregation"] = True
         return merged
 
     def _empty(self, *, source: str = "unavailable", uncertainty: float = 0.0) -> dict[str, Any]:

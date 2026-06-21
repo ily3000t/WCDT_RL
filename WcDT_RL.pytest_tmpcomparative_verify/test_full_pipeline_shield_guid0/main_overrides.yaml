@@ -1,0 +1,13 @@
+run:
+  run_id: safe_rl_test_run
+prediction:
+  train_enabled: true
+  wcdt_v1_train_enabled: false
+  wcdt_v2_train_enabled: true
+  wcdt_v3_train_enabled: false
+shield:
+  forecast_aware_candidate_ranking_mode: 'off'
+  forecast_task_shadow_enabled: false
+  task_backstop_enabled: false
+rl:
+  total_timesteps: 20000

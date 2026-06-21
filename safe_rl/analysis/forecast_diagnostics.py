@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 from pathlib import Path
 from typing import Any
@@ -671,6 +672,10 @@ def _wcdt_diagnostics(
     confidence_fde_values: list[float] = []
     weighted_ade: list[float] = []
     weighted_fde: list[float] = []
+    joint_ade: list[float] = []
+    joint_fde: list[float] = []
+    joint_min_distance_abs_errors: list[float] = []
+    joint_target_gap_abs_errors: list[float] = []
     minade_at_10: list[float] = []
     minfde_at_10: list[float] = []
 
@@ -692,6 +697,7 @@ def _wcdt_diagnostics(
                 valid_agents = pred_mask[row] > 0.0
                 if not np.any(valid_agents):
                     continue
+                joint_feature_worlds: list[np.ndarray] = []
                 diff = selected[row, valid_agents, :, :2] - actual_future[row, valid_agents, :, :2]
                 per_step = np.linalg.norm(diff, axis=-1)
                 row_ade = float(np.mean(per_step))
@@ -715,6 +721,44 @@ def _wcdt_diagnostics(
                     # Oracle-only multi-modal coverage diagnostics. Never used by runtime.
                     minade_at_10.append(float(np.mean(np.min(mode_ade, axis=-1))))
                     minfde_at_10.append(float(np.mean(np.min(mode_fde, axis=-1))))
+                    # Actor modes are not a single global scene mode. Sample
+                    # deterministic joint worlds instead of averaging coordinates.
+                    world_ade: list[float] = []
+                    world_fde: list[float] = []
+                    world_min_error: list[float] = []
+                    world_gap_error: list[float] = []
+                    actual_min_for_world = _future_min_distance(
+                        ego_future[row], actual_future[row], pred_mask[row]
+                    )
+                    actual_gap_for_world = _target_lane_gap(
+                        ego_future[row], actual_future[row], pred_mask[row], cfg
+                    )
+                    for world_index in range(int(cfg.prediction.get("wcdt_v1_mode_aggregation", {}).get("joint_world_count", 32))):
+                        world = np.zeros_like(selected[row])
+                        for actor_index in np.flatnonzero(valid_agents):
+                            digest = hashlib.sha256(
+                                f"diagnostics:{int(batch_indices[row])}:{int(actor_index)}:{world_index}".encode("utf-8")
+                            ).digest()
+                            draw = int.from_bytes(digest[:8], "little") / float(2**64)
+                            mode_index = int(np.searchsorted(np.cumsum(probabilities[list(np.flatnonzero(valid_agents)).index(actor_index)]), draw, side="right"))
+                            mode_index = min(max(mode_index, 0), traj.shape[2] - 1)
+                            world[actor_index] = traj[row, actor_index, mode_index]
+                        world_diff = np.linalg.norm(
+                            world[valid_agents, :, :2] - actual_future[row, valid_agents, :, :2], axis=-1
+                        )
+                        world_ade.append(float(np.mean(world_diff)))
+                        world_fde.append(float(np.mean(world_diff[:, -1])))
+                        joint_feature_worlds.append(world)
+                        predicted_world_min = _future_min_distance(ego_future[row], world, pred_mask[row])
+                        world_min_error.append(abs(float(predicted_world_min - actual_min_for_world)))
+                        predicted_world_gap = _target_lane_gap(ego_future[row], world, pred_mask[row], cfg)
+                        if predicted_world_gap < INF_TTC and actual_gap_for_world < INF_TTC:
+                            world_gap_error.append(abs(float(predicted_world_gap - actual_gap_for_world)))
+                    joint_ade.append(float(np.mean(world_ade)))
+                    joint_fde.append(float(np.mean(world_fde)))
+                    joint_min_distance_abs_errors.append(float(np.mean(world_min_error)))
+                    if world_gap_error:
+                        joint_target_gap_abs_errors.append(float(np.mean(world_gap_error)))
                 pred_min_distance = _future_min_distance(ego_future[row], selected[row], pred_mask[row])
                 actual_min_distance = _future_min_distance(ego_future[row], actual_future[row], pred_mask[row])
                 min_distance_errors.append(float(pred_min_distance - actual_min_distance))
@@ -740,13 +784,26 @@ def _wcdt_diagnostics(
                         confidence_values.append(float(np.mean(np.max(confidence_np[row][valid_agents], axis=-1))))
                         confidence_fde_values.append(row_fde)
                     references = [state for state in states if state.vehicle_id != "ego"]
-                    features = _forecast_features_from_prediction(
-                        ego,
-                        selected[row, valid_agents],
-                        sample_uncertainty,
-                        cfg,
-                        references,
-                    )
+                    if joint_feature_worlds:
+                        world_features = [
+                            _forecast_features_from_prediction(
+                                ego,
+                                world[valid_agents],
+                                sample_uncertainty,
+                                cfg,
+                                references,
+                            )
+                            for world in joint_feature_worlds
+                        ]
+                        features = np.mean(world_features, axis=0, dtype=np.float64).astype(np.float32)
+                    else:
+                        features = _forecast_features_from_prediction(
+                            ego,
+                            selected[row, valid_agents],
+                            sample_uncertainty,
+                            cfg,
+                            references,
+                        )
                     if bool(cfg.forecast_features.normalize):
                         features = augmentor._normalize(features)
                     feature_rows.append(features)
@@ -770,10 +827,14 @@ def _wcdt_diagnostics(
         "ade": _summary(ade),
         "fde": _summary(fde),
         "top1_deployment_metrics": {"ade": _summary(ade), "fde": _summary(fde)},
-        "confidence_weighted_deployment_metrics": {
-            "ade": _summary(weighted_ade),
-            "fde": _summary(weighted_fde),
+        "joint_world_deployment_metrics": {
+            "ade": _summary(joint_ade),
+            "fde": _summary(joint_fde),
+            "future_min_distance_abs_error": _summary(joint_min_distance_abs_errors),
+            "target_lane_gap_abs_error": _summary(joint_target_gap_abs_errors),
+            "joint_world_count": int(cfg.prediction.get("wcdt_v1_mode_aggregation", {}).get("joint_world_count", 32)),
         },
+        "actor_marginal_confidence_metrics": {"ade": _summary(weighted_ade), "fde": _summary(weighted_fde)},
         "oracle_multimodal_coverage": {
             "minADE_at_10": _summary(minade_at_10),
             "minFDE_at_10": _summary(minfde_at_10),

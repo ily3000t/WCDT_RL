@@ -73,6 +73,8 @@ class WcDTPredictor:
             "actor_row_alignment",
             "trajectory_selector_order_version",
             "num_modes",
+            "mode_aggregation_version",
+            "joint_world_count",
         }
         return bool(payload) and required.issubset(payload)
 
@@ -106,6 +108,22 @@ class WcDTPredictor:
                 "selector_v2_vehicle_id_order_v1",
             ),
             "num_modes": (int(payload.get("num_modes", -1)), 10),
+            "mode_aggregation_version": (
+                payload.get("mode_aggregation_version"),
+                str(
+                    self.config.prediction.get("wcdt_v1_mode_aggregation", {}).get(
+                        "version", "per_actor_joint_world_v1"
+                    )
+                ),
+            ),
+            "joint_world_count": (
+                int(payload.get("joint_world_count", -1)),
+                int(
+                    self.config.prediction.get("wcdt_v1_mode_aggregation", {}).get(
+                        "joint_world_count", 32
+                    )
+                ),
+            ),
         }
         mismatches = {
             key: {"found": found, "expected": expected}
@@ -157,28 +175,38 @@ class WcDTPredictor:
             if confidence.ndim == 3:
                 confidence = confidence[0]
             if confidence.ndim == 2 and confidence.shape[1] > 0:
-                mode_probabilities = np.mean(confidence[: len(selected_ids)], axis=0)
-                mode_probabilities = mode_probabilities / max(float(np.sum(mode_probabilities)), 1.0e-8)
-                prediction["mode_probabilities"] = mode_probabilities.tolist()
-                entropy = -float(np.sum(mode_probabilities * np.log(np.maximum(mode_probabilities, 1.0e-8))))
-                entropy /= max(float(np.log(max(2, mode_probabilities.size))), 1.0)
+                actor_probabilities = np.clip(confidence[: len(selected_ids)], 0.0, None)
+                normalizer = np.sum(actor_probabilities, axis=1, keepdims=True)
+                invalid = normalizer[:, 0] <= 1.0e-8
+                if np.any(invalid):
+                    actor_probabilities[invalid] = 1.0
+                    normalizer = np.sum(actor_probabilities, axis=1, keepdims=True)
+                actor_probabilities = actor_probabilities / np.maximum(normalizer, 1.0e-8)
                 trajectories = self._to_numpy(prediction["future_trajectories"]).astype(np.float32)
                 if trajectories.ndim == 5:
                     trajectories = trajectories[0]
-                dispersion = 0.0
+                dispersion = np.zeros((actor_probabilities.shape[0],), dtype=np.float32)
                 if trajectories.ndim == 4 and trajectories.shape[1] > 1:
-                    centered = trajectories[: len(selected_ids)] - np.mean(
-                        trajectories[: len(selected_ids)], axis=1, keepdims=True
+                    trajectories = trajectories[: len(selected_ids), : actor_probabilities.shape[1]]
+                    mean_trajectory = np.sum(
+                        trajectories * actor_probabilities[:, :, None, None], axis=1, keepdims=True
                     )
-                    dispersion = float(np.mean(np.linalg.norm(centered[..., :2], axis=-1)))
-                prediction["mode_entropy"] = float(entropy)
-                prediction["mode_trajectory_dispersion"] = float(dispersion)
-                prediction["uncertainty"] = float(
-                    np.clip(0.5 * entropy + 0.5 * (dispersion / 5.0), 0.0, 1.0)
-                )
-        uncertainty = prediction.get("uncertainty")
-        if uncertainty is not None:
-            values = self._to_numpy(uncertainty).astype(np.float32)
+                    displacement = np.linalg.norm(trajectories[..., :2] - mean_trajectory[..., :2], axis=-1)
+                    dispersion = np.sum(
+                        np.mean(displacement, axis=-1) * actor_probabilities,
+                        axis=1,
+                    ).astype(np.float32)
+                entropy = -np.sum(
+                    actor_probabilities * np.log(np.maximum(actor_probabilities, 1.0e-8)), axis=1
+                ) / max(float(np.log(max(2, actor_probabilities.shape[1]))), 1.0)
+                actor_uncertainty = np.clip(0.5 * entropy + 0.5 * (dispersion / 5.0), 0.0, 1.0)
+                prediction["actor_mode_probabilities"] = actor_probabilities.tolist()
+                prediction["actor_mode_entropy"] = entropy.astype(np.float32).tolist()
+                prediction["actor_mode_trajectory_dispersion"] = dispersion.tolist()
+                prediction["actor_uncertainty"] = actor_uncertainty.astype(np.float32).tolist()
+                prediction["uncertainty"] = float(np.max(actor_uncertainty)) if actor_uncertainty.size else 0.0
+        elif prediction.get("uncertainty") is not None:
+            values = self._to_numpy(prediction["uncertainty"]).astype(np.float32)
             if values.ndim >= 2:
                 values = values[0]
             values = values.reshape(-1)

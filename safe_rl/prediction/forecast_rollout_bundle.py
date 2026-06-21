@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import time
+import hashlib
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -69,6 +70,16 @@ class ForecastActorRollout:
 
 
 @dataclass
+class ActorModeForecast:
+    vehicle_id: str
+    source: str
+    trajectories: list[list[VehicleState]]
+    probabilities: np.ndarray
+    uncertainty: float
+    current_state: VehicleState | None = None
+
+
+@dataclass
 class ForecastRolloutBundle:
     actors: list[ForecastActorRollout]
     selection_result: ActorSelectionResult
@@ -87,8 +98,11 @@ class ForecastRolloutBundle:
     cv_fallback_dropped_vehicle_ids: list[str]
     version: str = FORECAST_ROLLOUT_BUNDLE_VERSION
     actor_sources: dict[str, str] = field(default_factory=dict)
-    mode_actor_sets: list[list[ForecastActorRollout]] = field(default_factory=list)
-    mode_probabilities: list[float] = field(default_factory=list)
+    actor_mode_forecasts: list[ActorModeForecast] = field(default_factory=list)
+    cv_fallback_actors: list[ForecastActorRollout] = field(default_factory=list)
+    joint_world_count: int = 0
+    joint_world_seed: tuple[int, int, int] = (0, 0, 0)
+    _joint_world_cache: list[list[ForecastActorRollout]] | None = field(default=None, init=False, repr=False)
 
     def rollout_lists(self) -> list[list[VehicleState]]:
         return [actor.trajectory for actor in self.actors if actor.trajectory]
@@ -96,11 +110,39 @@ class ForecastRolloutBundle:
     def actor_by_id(self, vehicle_id: str) -> ForecastActorRollout | None:
         return next((actor for actor in self.actors if actor.vehicle_id == vehicle_id), None)
 
-    def mode_rollout_lists(self) -> list[list[list[VehicleState]]]:
-        return [
-            [actor.trajectory for actor in actors if actor.trajectory]
-            for actors in self.mode_actor_sets
-        ]
+    def joint_world_actor_sets(self) -> list[list[ForecastActorRollout]]:
+        """Return deterministic independent-mode world samples for safety metrics."""
+
+        if self._joint_world_cache is not None:
+            return self._joint_world_cache
+        if not self.actor_mode_forecasts:
+            self._joint_world_cache = [list(self.actors)]
+            return self._joint_world_cache
+        worlds: list[list[ForecastActorRollout]] = []
+        world_count = max(1, int(self.joint_world_count))
+        run_seed, episode_seed, decision_index = self.joint_world_seed
+        for world_index in range(world_count):
+            actors = list(self.cv_fallback_actors)
+            for forecast in self.actor_mode_forecasts:
+                digest = hashlib.sha256(
+                    f"{run_seed}:{episode_seed}:{decision_index}:{forecast.vehicle_id}:{world_index}".encode("utf-8")
+                ).digest()
+                random_value = int.from_bytes(digest[:8], "little") / float(2**64)
+                cumulative = np.cumsum(forecast.probabilities)
+                mode_index = int(np.searchsorted(cumulative, random_value, side="right"))
+                mode_index = min(max(mode_index, 0), len(forecast.trajectories) - 1)
+                actors.append(
+                    ForecastActorRollout(
+                        vehicle_id=forecast.vehicle_id,
+                        source=forecast.source,
+                        trajectory=forecast.trajectories[mode_index],
+                        uncertainty=forecast.uncertainty,
+                        current_state=forecast.current_state,
+                    )
+                )
+            worlds.append(actors)
+        self._joint_world_cache = worlds
+        return worlds
 
     def trace_fields(self) -> dict[str, Any]:
         return {
@@ -146,8 +188,8 @@ class ForecastRolloutBundle:
                 vehicle_id: metadata.to_dict()
                 for vehicle_id, metadata in self.selection_result.actor_metadata.items()
             },
-            "forecast_mode_count": int(len(self.mode_actor_sets)),
-            "forecast_mode_probabilities": list(self.mode_probabilities),
+            "forecast_mode_aggregation": "per_actor_joint_world_v1",
+            "forecast_joint_world_count": int(self.joint_world_count),
         }
 
 
@@ -213,55 +255,71 @@ def _selected_prediction_rollouts(
     prediction: dict[str, Any],
     horizon: int,
     dt: float,
-) -> tuple[list[ForecastActorRollout], list[str], float, list[list[ForecastActorRollout]], list[float]]:
+) -> tuple[list[ForecastActorRollout], list[str], float, list[ActorModeForecast]]:
     trajectories = _prediction_array(prediction)
     modes = _prediction_modes(prediction)
     selected_ids = [str(value or "") for value in prediction.get("selected_vehicle_ids", [])]
     if trajectories is None:
-        return [], [], 0.0, [], []
+        return [], [], 0.0, []
     uncertainty = float(prediction.get("uncertainty", 0.0))
     actor_uncertainty = prediction.get("actor_uncertainty", [])
     if hasattr(actor_uncertainty, "detach"):
         actor_uncertainty = actor_uncertainty.detach().cpu().numpy()
     actor_uncertainty = np.asarray(actor_uncertainty, dtype=np.float32).reshape(-1)
-    mode_probabilities = np.asarray(prediction.get("mode_probabilities", []), dtype=np.float32).reshape(-1)
-    if modes is not None and modes.shape[0] > 1:
-        if mode_probabilities.size != modes.shape[0]:
-            mode_probabilities = np.full((modes.shape[0],), 1.0 / modes.shape[0], dtype=np.float32)
-        else:
-            mode_probabilities = mode_probabilities / max(float(np.sum(mode_probabilities)), 1.0e-8)
-    else:
-        mode_probabilities = np.asarray([1.0], dtype=np.float32)
-    mode_actor_sets: list[list[ForecastActorRollout]] = []
-    if modes is not None:
-        for mode_trajectories in modes:
-            mode_actors: list[ForecastActorRollout] = []
-            for row, trajectory in enumerate(mode_trajectories):
-                vehicle_id = selected_ids[row] if row < len(selected_ids) else ""
-                reference = vehicles_by_id.get(vehicle_id)
-                if reference is None:
-                    continue
-                states = trajectory_to_states(
-                    trajectory[:horizon], reference=reference, dt=dt, vehicle_id=vehicle_id, config=cfg
-                )
-                if states:
-                    mode_actors.append(
-                        ForecastActorRollout(
-                            vehicle_id=vehicle_id,
-                            source=str(prediction.get("forecast_source", "wcdt")),
-                            trajectory=states,
-                            uncertainty=float(actor_uncertainty[row]) if row < actor_uncertainty.size else uncertainty,
-                            current_state=reference,
-                        )
-                    )
-            mode_actor_sets.append(mode_actors)
+    actor_mode_probabilities = prediction.get("actor_mode_probabilities")
+    if hasattr(actor_mode_probabilities, "detach"):
+        actor_mode_probabilities = actor_mode_probabilities.detach().cpu().numpy()
+    actor_mode_probabilities = np.asarray(actor_mode_probabilities, dtype=np.float32)
+    if actor_mode_probabilities.ndim == 3:
+        actor_mode_probabilities = actor_mode_probabilities[0]
+    actor_mode_forecasts: list[ActorModeForecast] = []
     actors: list[ForecastActorRollout] = []
     used_ids: list[str] = []
-    top_mode = int(np.argmax(mode_probabilities)) if mode_actor_sets else 0
-    if mode_actor_sets:
-        actors = list(mode_actor_sets[top_mode])
-        used_ids = [actor.vehicle_id for actor in actors]
-        return actors, used_ids, uncertainty, mode_actor_sets, mode_probabilities.tolist()
+    if modes is not None and modes.shape[0] > 1:
+        for row, vehicle_id in enumerate(selected_ids[: modes.shape[1]]):
+            reference = vehicles_by_id.get(vehicle_id)
+            if reference is None:
+                continue
+            trajectories_for_actor: list[list[VehicleState]] = []
+            for mode_index in range(modes.shape[0]):
+                states = trajectory_to_states(
+                    modes[mode_index, row, :horizon],
+                    reference=reference,
+                    dt=dt,
+                    vehicle_id=vehicle_id,
+                    config=cfg,
+                )
+                if states:
+                    trajectories_for_actor.append(states)
+            if not trajectories_for_actor:
+                continue
+            probabilities = (
+                actor_mode_probabilities[row, : len(trajectories_for_actor)]
+                if actor_mode_probabilities.ndim == 2 and row < actor_mode_probabilities.shape[0]
+                else np.full((len(trajectories_for_actor),), 1.0 / len(trajectories_for_actor), dtype=np.float32)
+            )
+            probabilities = probabilities / max(float(np.sum(probabilities)), 1.0e-8)
+            actor_forecast = ActorModeForecast(
+                vehicle_id=vehicle_id,
+                source=str(prediction.get("forecast_source", "wcdt")),
+                trajectories=trajectories_for_actor,
+                probabilities=probabilities.astype(np.float32),
+                uncertainty=float(actor_uncertainty[row]) if row < actor_uncertainty.size else uncertainty,
+                current_state=reference,
+            )
+            actor_mode_forecasts.append(actor_forecast)
+            top_mode = int(np.argmax(probabilities))
+            actors.append(
+                ForecastActorRollout(
+                    vehicle_id=vehicle_id,
+                    source=actor_forecast.source,
+                    trajectory=actor_forecast.trajectories[top_mode],
+                    uncertainty=actor_forecast.uncertainty,
+                    current_state=reference,
+                )
+            )
+            used_ids.append(vehicle_id)
+        return actors, used_ids, uncertainty, actor_mode_forecasts
     for row, trajectory in enumerate(trajectories):
         vehicle_id = selected_ids[row] if row < len(selected_ids) else ""
         reference = vehicles_by_id.get(vehicle_id)
@@ -286,7 +344,7 @@ def _selected_prediction_rollouts(
             )
         )
         used_ids.append(vehicle_id)
-    return actors, used_ids, uncertainty, mode_actor_sets, mode_probabilities.tolist()
+    return actors, used_ids, uncertainty, actor_mode_forecasts
 
 
 def build_forecast_rollout_bundle(
@@ -319,11 +377,10 @@ def build_forecast_rollout_bundle(
     predicted_actors: list[ForecastActorRollout] = []
     selected_ids: list[str] = []
     wcdt_uncertainty = 0.0
-    mode_actor_sets: list[list[ForecastActorRollout]] = []
-    mode_probabilities: list[float] = []
+    actor_mode_forecasts: list[ActorModeForecast] = []
     if predictor is not None:
         prediction = predictor.predict(context)
-        predicted_actors, selected_ids, wcdt_uncertainty, mode_actor_sets, mode_probabilities = _selected_prediction_rollouts(
+        predicted_actors, selected_ids, wcdt_uncertainty, actor_mode_forecasts = _selected_prediction_rollouts(
             cfg,
             vehicles_by_id,
             prediction,
@@ -439,8 +496,16 @@ def build_forecast_rollout_bundle(
         cv_fallback_overflow=bool(cv_fallback_overflow),
         cv_fallback_dropped_vehicle_ids=list(dropped_fallback),
         actor_sources={actor.vehicle_id: actor.source for actor in actors},
-        mode_actor_sets=mode_actor_sets,
-        mode_probabilities=mode_probabilities,
+        actor_mode_forecasts=actor_mode_forecasts,
+        cv_fallback_actors=fallback_actors,
+        joint_world_count=int(
+            cfg.prediction.get("wcdt_v1_mode_aggregation", {}).get("joint_world_count", 32)
+        ) if actor_mode_forecasts else 0,
+        joint_world_seed=(
+            int(cfg.run.get("seed", 0)),
+            int(context.get("episode_seed", cfg.run.get("seed", 0))),
+            int(context.get("decision_index", 0)),
+        ),
     )
 
 

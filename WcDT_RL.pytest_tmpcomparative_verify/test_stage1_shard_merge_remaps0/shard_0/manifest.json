@@ -1,0 +1,51 @@
+{
+  "arrays": {
+    "trajectory_agent_vehicle_id_index": {
+      "dtype": "int32",
+      "path": "arrays/trajectory_agent_vehicle_id_index.npy",
+      "sha256": "d2ec6d305ffee75ec5d24fdc762d58b3d3b38e280520c0a3592664637c3dbac1",
+      "shape": [
+        1,
+        2
+      ]
+    },
+    "trajectory_episode_id": {
+      "dtype": "int64",
+      "path": "arrays/trajectory_episode_id.npy",
+      "sha256": "f6df0000bed676f0a4b777e2a1d915b6608dab452e11737f82c685cebf0e8ba7",
+      "shape": [
+        1
+      ]
+    },
+    "trajectory_selector_selected_count": {
+      "dtype": "int64",
+      "path": "arrays/trajectory_selector_selected_count.npy",
+      "sha256": "fc44e6cab97678b988677b1e24dc073c80b029ccf6566c7bc1bd9ec1061a6106",
+      "shape": [
+        1
+      ]
+    },
+    "trajectory_vehicle_id_table": {
+      "dtype": "<U5",
+      "path": "arrays/trajectory_vehicle_id_table.npy",
+      "sha256": "cb70aa2cab966fb9cbfa45dcb8bf8d0bdd5f2502c43ff19f39260dd896d6f1ff",
+      "shape": [
+        2
+      ]
+    },
+    "trajectory_window_end_step": {
+      "dtype": "int64",
+      "path": "arrays/trajectory_window_end_step.npy",
+      "sha256": "f6df0000bed676f0a4b777e2a1d915b6608dab452e11737f82c685cebf0e8ba7",
+      "shape": [
+        1
+      ]
+    }
+  },
+  "candidate_count": 0,
+  "format_version": "manifest_npy_v1",
+  "stage1_buffer_schema_version": 9,
+  "trajectory_count": 1,
+  "trajectory_schema_version": 4,
+  "transition_count": 0
+}

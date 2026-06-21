@@ -363,7 +363,12 @@ def _require_wcdt_v1_row_alignment(data: Any, cfg: Any) -> None:
     alignment = _trajectory_string(data, "trajectory_actor_row_alignment")
     order_version = _trajectory_string(data, "trajectory_selector_order_version")
     history = np.asarray(data["agent_history"])
-    masks = np.asarray(data["agent_mask"])
+    masks = np.asarray(data["agent_mask"], dtype=np.float32)
+    vehicle_id_table = (
+        np.asarray(data["trajectory_vehicle_id_table"]).reshape(-1)
+        if not missing
+        else np.asarray([], dtype=str)
+    )
     indices = (
         np.asarray(data["trajectory_agent_vehicle_id_index"], dtype=np.int64)
         if not missing
@@ -374,13 +379,33 @@ def _require_wcdt_v1_row_alignment(data: Any, cfg: Any) -> None:
         if not missing
         else np.zeros((0,), dtype=np.int64)
     )
+    active = masks > 0.5
+    ego_id = str(cfg.scenario.get("ego_id", "ego"))
     invalid = bool(
         indices.shape != masks.shape
         or selected_counts.shape[0] != history.shape[0]
-        or np.any(indices[masks > 0.5] < 0)
+        or vehicle_id_table.size == 0
+        or np.any(indices[active] < 0)
+        or np.any(indices[~active] != -1)
+        or np.any(indices[active] >= vehicle_id_table.size)
         or np.any(selected_counts < 0)
         or np.any(selected_counts > _wcdt_v1_max_agents(cfg))
     )
+    if not invalid and indices.shape[0]:
+        resolved_ids = vehicle_id_table[indices]
+        if np.any(resolved_ids[:, 0] != ego_id):
+            invalid = True
+        expected_actor_counts = np.sum(active[:, 1:], axis=1, dtype=np.int64)
+        if np.any(expected_actor_counts != selected_counts):
+            invalid = True
+        for row, actor_count in enumerate(expected_actor_counts):
+            actor_ids = resolved_ids[row, 1 : 1 + int(actor_count)]
+            if (
+                np.any(actor_ids == ego_id)
+                or len(set(str(value) for value in actor_ids)) != int(actor_count)
+            ):
+                invalid = True
+                break
     if (
         missing
         or alignment != "selector_v2_vehicle_id_verified"
@@ -1159,6 +1184,14 @@ def _wcdt_v1_checkpoint_metadata(
         "actor_row_alignment": "selector_v2_vehicle_id_verified",
         "trajectory_selector_order_version": "selector_v2_vehicle_id_order_v1",
         "num_modes": 10,
+        "mode_aggregation_version": str(
+            cfg.prediction.get("wcdt_v1_mode_aggregation", {}).get(
+                "version", "per_actor_joint_world_v1"
+            )
+        ),
+        "joint_world_count": int(
+            cfg.prediction.get("wcdt_v1_mode_aggregation", {}).get("joint_world_count", 32)
+        ),
         "history_steps": int(cfg.scenario.history_steps),
         "horizon_steps": int(cfg.prediction.horizon_steps),
         "wcdt_v1_batch_size": _wcdt_v1_batch_size(cfg),
@@ -1421,8 +1454,10 @@ def _wcdt_validation_metrics(cfg: Any, model: Any, loader: Any, device: Any, pin
     torch, _DataLoader, _TensorDataset = _require_torch()
     ade: list[float] = []
     fde: list[float] = []
-    critical_actor_ade: list[float] = []
-    critical_actor_fde: list[float] = []
+    weighted_ade: list[float] = []
+    weighted_fde: list[float] = []
+    minade_at_10: list[float] = []
+    minfde_at_10: list[float] = []
     future_min_distance_errors: list[float] = []
     future_min_distance_abs_errors: list[float] = []
     target_gap_errors: list[float] = []
@@ -1477,17 +1512,23 @@ def _wcdt_validation_metrics(cfg: Any, model: Any, loader: Any, device: Any, pin
                 row_fde = float(np.mean(per_step[:, -1]))
                 ade.append(row_ade)
                 fde.append(row_fde)
-                critical_mask = mask_np[row] * np.isin(role_ids_np[row], [0, 1]).astype(np.float32)
-                critical_errors = _masked_trajectory_errors(
-                    pred_np[row],
-                    target_np[row],
-                    critical_mask,
-                    future_valid_np[row],
-                    ego_future_valid_np[row],
-                )
-                if critical_errors is not None:
-                    critical_actor_ade.append(float(critical_errors[0]))
-                    critical_actor_fde.append(float(critical_errors[1]))
+                if confidence_np is not None and traj.ndim == 5:
+                    mode_errors = np.linalg.norm(
+                        traj[row, valid, :, :, :2]
+                        - actual_future[row, valid, None, :, :2],
+                        axis=-1,
+                    )
+                    mode_ade = np.mean(mode_errors, axis=-1)
+                    mode_fde = mode_errors[..., -1]
+                    probabilities = confidence_np[row, valid]
+                    probabilities = probabilities / np.maximum(
+                        np.sum(probabilities, axis=-1, keepdims=True), 1.0e-8
+                    )
+                    weighted_ade.append(float(np.mean(np.sum(probabilities * mode_ade, axis=-1))))
+                    weighted_fde.append(float(np.mean(np.sum(probabilities * mode_fde, axis=-1))))
+                    # Oracle coverage only: these values never reach runtime features.
+                    minade_at_10.append(float(np.mean(np.min(mode_ade, axis=-1))))
+                    minfde_at_10.append(float(np.mean(np.min(mode_fde, axis=-1))))
                 confidence_values.append(float(np.mean(max_confidence_np[row][valid])))
                 confidence_fde_values.append(row_fde)
                 uncertainty_values.append(float(np.mean(uncertainty_np[row][valid])))
@@ -1505,8 +1546,17 @@ def _wcdt_validation_metrics(cfg: Any, model: Any, loader: Any, device: Any, pin
         "loss": float(np.mean(val_losses)) if val_losses else 0.0,
         "ade": _summary(ade),
         "fde": _summary(fde),
-        "critical_actor_ade": _summary(critical_actor_ade),
-        "critical_actor_fde": _summary(critical_actor_fde),
+        "critical_actor_metrics": {"available": False, "reason": "v1_batch_has_no_role_labels"},
+        "top1_visualization_metrics": {"ade": _summary(ade), "fde": _summary(fde)},
+        "confidence_weighted_deployment_metrics": {
+            "ade": _summary(weighted_ade),
+            "fde": _summary(weighted_fde),
+        },
+        "oracle_multimodal_coverage": {
+            "minADE_at_10": _summary(minade_at_10),
+            "minFDE_at_10": _summary(minfde_at_10),
+            "uses_future_ground_truth": True,
+        },
         "future_min_distance_error": _summary(future_min_distance_errors),
         "future_min_distance_abs_error": _summary(future_min_distance_abs_errors),
         "target_lane_gap_error": _summary(target_gap_errors),
