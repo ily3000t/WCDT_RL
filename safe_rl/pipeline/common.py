@@ -165,11 +165,17 @@ def make_env(
         if bool(reward_cfg.get("use_calibrated_risk", False)):
             reward_risk_model.apply_temperature = True
     forecast_augmentor = make_forecast_augmentor(cfg)
+    accvp_controller = None
+    if bool(cfg.accvp.get("enabled", False)) and str(cfg.accvp.get("mode", "off")) != "off":
+        from safe_rl.accvp.runtime import build_accvp_controller
+
+        accvp_controller = build_accvp_controller(cfg)
     return SumoHighwayMergeEnv(
         cfg,
         seed=seed,
         forecast_augmentor=forecast_augmentor,
         shield=shield,
+        accvp_controller=accvp_controller,
         reward_risk_model=reward_risk_model,
         record_trajectory_samples=record_trajectory_samples,
         sumo_step_delay_ms=sumo_step_delay_ms,

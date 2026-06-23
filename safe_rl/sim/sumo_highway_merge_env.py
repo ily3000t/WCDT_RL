@@ -68,6 +68,11 @@ def configured_trajectory_actor_capacity(config: Any) -> int:
         capacities.append(int(prediction_cfg.get("wcdt_v2_max_agents", scenario_top_k)))
     if train_enabled and bool(prediction_cfg.get("wcdt_v3_train_enabled", False)):
         capacities.append(int(prediction_cfg.get("wcdt_v3_max_agents", scenario_top_k)))
+    # Counterfactual collection needs the ACCVP actor layout even when legacy
+    # WcDT-v3 training/runtime features are disabled in the base experiment.
+    accvp_cfg = config.get("accvp", {}) or {}
+    if bool(accvp_cfg.get("_counterfactual_collection_enabled", False)):
+        capacities.append(int(accvp_cfg.get("actor_count", scenario_top_k)))
     forecast_cfg = config.get("forecast_features", {}) or {}
     if bool(forecast_cfg.get("enabled", False)):
         source = str(forecast_cfg.get("source", "")).lower()
@@ -122,6 +127,7 @@ class SumoHighwayMergeEnv(gym.Env):
         seed: int | None = None,
         forecast_augmentor: ForecastFeatureAugmentor | None = None,
         shield: SafetyShield | None = None,
+        accvp_controller: Any | None = None,
         reward_risk_model: Any | None = None,
         record_trajectory_samples: bool = False,
         sumo_step_delay_ms: float = 0.0,
@@ -148,6 +154,14 @@ class SumoHighwayMergeEnv(gym.Env):
         self.forecast_enabled = bool(config.forecast_features.enabled or config.rl.use_wcdt_forecast_features)
         self.forecast_augmentor = forecast_augmentor
         self.shield = shield
+        self.accvp_controller = accvp_controller
+        if self.accvp_controller is not None and self.shield is None:
+            raise ValueError("ACCVP requires an existing SafetyShield instance")
+        if self.accvp_controller is not None and (
+            bool(config.shield.get("task_backstop_enabled", False))
+            or str(config.shield.get("forecast_aware_candidate_ranking_mode", "off")) in {"task_backstop", "full_ranking"}
+        ):
+            raise ValueError("ACCVP cannot be combined with Task Backstop or Full Ranking")
         self.reward_risk_model = reward_risk_model
         self.reward_ranker = CandidateRiskRanker(config, reward_risk_model) if reward_risk_model is not None else None
         task_predictor = getattr(forecast_augmentor, "predictor", None) if forecast_augmentor is not None else None
@@ -205,6 +219,7 @@ class SumoHighwayMergeEnv(gym.Env):
         self._task_backstop_consecutive_count = 0
         self._task_replacements: list[dict[str, Any]] = []
         self._forecast_ranking_replacements: list[dict[str, Any]] = []
+        self._accvp_records: list[dict[str, Any]] = []
         self.performance = PerformanceTracker()
         self._decision_context_cache: dict[str, Any] | None = None
         self._lane_count_cache: dict[str, int] = {}
@@ -326,8 +341,11 @@ class SumoHighwayMergeEnv(gym.Env):
         self._task_backstop_consecutive_count = 0
         self._task_replacements.clear()
         self._forecast_ranking_replacements.clear()
+        self._accvp_records.clear()
         if self.shield is not None and hasattr(self.shield, "reset_episode_state"):
             self.shield.reset_episode_state()
+        if self.accvp_controller is not None:
+            self.accvp_controller.reset_episode_state()
 
         for _ in range(max(1, self.history_steps)):
             self._simulation_step()
@@ -359,6 +377,21 @@ class SumoHighwayMergeEnv(gym.Env):
             intervention["decision_index"] = decision_index
             self._interventions.append(intervention)
         safety_shield_action = final_action
+        safety_shield_replaced = bool(
+            intervention is not None
+            and int(intervention.get("final_action", raw_action.index)) != int(raw_action.index)
+        )
+        accvp_debug: dict[str, Any] = {}
+        if self.accvp_controller is not None:
+            final_action, accvp_debug = self.accvp_controller.decide(
+                context=context,
+                raw_action=raw_action,
+                safety_shield_action=safety_shield_action,
+                safety_shield_replaced=safety_shield_replaced,
+                shield=self.shield,
+            )
+            accvp_debug.update({"step": int(self._episode_step), "decision_index": decision_index})
+            self._accvp_records.append(dict(accvp_debug))
         forecast_replacement = self._maybe_forecast_aware_replacement(
             raw_action,
             final_action,
@@ -376,13 +409,11 @@ class SumoHighwayMergeEnv(gym.Env):
                 forecast_ranking_replacement = forecast_replacement
                 self._forecast_ranking_replacements.append(forecast_replacement)
 
-        safety_shield_replaced = bool(
-            intervention is not None
-            and int(intervention.get("final_action", raw_action.index)) != int(raw_action.index)
-        )
         execution_path = "policy"
         if safety_shield_replaced:
             execution_path = "safety_shield"
+        elif bool(accvp_debug.get("accvp_replacement", False)):
+            execution_path = "accvp"
         elif task_replacement is not None:
             execution_path = "task_backstop"
         elif forecast_ranking_replacement is not None:
@@ -401,6 +432,11 @@ class SumoHighwayMergeEnv(gym.Env):
             "final_action": int(final_action.index),
             "final_action_name": str(final_action.name),
             "execution_path": execution_path,
+            "accvp_replacement": bool(accvp_debug.get("accvp_replacement", False)),
+            "accvp_replacement_reason": str(accvp_debug.get("accvp_replacement_reason", "")),
+            "accvp_bypass_reason": str(accvp_debug.get("accvp_bypass_reason", "")),
+            "accvp_commitment_cancelled": bool(accvp_debug.get("accvp_commitment_cancelled", False)),
+            "accvp_decision_latency_s": float(accvp_debug.get("decision_latency_s", 0.0)),
             "task_replacement": bool(task_replacement is not None),
             "forecast_ranking_replacement": bool(forecast_ranking_replacement is not None),
         }
@@ -411,7 +447,11 @@ class SumoHighwayMergeEnv(gym.Env):
         self._raw_action_lane_oob_count += int(raw_action_lane_oob)
         self._final_action_lane_oob_count += int(final_action_lane_oob)
         self._prevented_lane_oob_count += int(raw_action_lane_oob and not final_action_lane_oob)
-        lane_oob = self._apply_action(final_action)
+        accvp_lane_duration = accvp_debug.get("accvp_lane_change_duration_s")
+        lane_oob = self._apply_action(
+            final_action,
+            lane_change_duration=float(accvp_lane_duration) if accvp_lane_duration is not None else None,
+        )
         prev_ego = self._get_ego()
         prev_x = prev_ego.x if prev_ego else self._last_ego_x
 
@@ -494,6 +534,7 @@ class SumoHighwayMergeEnv(gym.Env):
         info["safety_shield_action_name"] = str(safety_shield_action.name)
         info["safety_shield_replaced"] = safety_shield_replaced
         info["action_execution_path"] = execution_path
+        info.update(accvp_debug)
         info["raw_action_lane_oob"] = bool(raw_action_lane_oob)
         info["final_action_lane_oob"] = bool(final_action_lane_oob)
         info["prevented_lane_oob"] = bool(raw_action_lane_oob and not final_action_lane_oob)
@@ -779,7 +820,8 @@ class SumoHighwayMergeEnv(gym.Env):
         except Exception:
             return False
 
-    def _apply_action(self, action) -> bool:
+    def _apply_action(self, action, lane_change_duration: float | None = None) -> bool:
+        """Apply the legacy action by default; ACCVP may pass an explicit commitment duration."""
         ego = self._get_ego()
         if ego is None:
             return True
@@ -797,7 +839,12 @@ class SumoHighwayMergeEnv(gym.Env):
                 self._traci.vehicle.changeLane(
                     self.ego_id,
                     target_lane,
-                    max(self.step_length, self.control_interval_steps * self.step_length),
+                    max(
+                        self.step_length,
+                        self.control_interval_steps * self.step_length
+                        if lane_change_duration is None
+                        else float(lane_change_duration),
+                    ),
                 )
         return lane_oob
 
@@ -2496,6 +2543,26 @@ class SumoHighwayMergeEnv(gym.Env):
             "mean_task_replacements": float(task_replacement_count),
             "task_replacement_records": task_replacement_records,
             "task_replacement_reason_counts": dict(task_replacement_reason_counts),
+            "accvp_mode": str(self.config.accvp.get("mode", "off")),
+            "accvp_record_count": int(len(self._accvp_records)),
+            "accvp_replacement_count": int(
+                sum(1 for item in self._accvp_records if bool(item.get("accvp_replacement", False)))
+            ),
+            "accvp_replacement_rate": float(
+                sum(1 for item in self._accvp_records if bool(item.get("accvp_replacement", False)))
+                / max(1, len(self._accvp_records))
+            ),
+            "accvp_bypass_count": int(
+                sum(1 for item in self._accvp_records if str(item.get("accvp_bypass_reason", "")))
+            ),
+            "accvp_bypass_rate": float(
+                sum(1 for item in self._accvp_records if str(item.get("accvp_bypass_reason", "")))
+                / max(1, len(self._accvp_records))
+            ),
+            "accvp_commitment_cancellation_count": int(
+                sum(1 for item in self._accvp_records if bool(item.get("accvp_commitment_cancelled", False)))
+            ),
+            "accvp_records": list(self._accvp_records),
             "forecast_aware_candidate_ranking_mode": self._forecast_aware_candidate_ranking_mode(),
             "forecast_ranking_replacement_count": int(forecast_ranking_replacement_count),
             "forecast_ranking_replacement_rate": float(

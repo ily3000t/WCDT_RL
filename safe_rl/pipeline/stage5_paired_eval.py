@@ -50,6 +50,9 @@ def _group_overrides(group) -> dict:
         "rl": {"use_wcdt_forecast_features": bool(group.forecast_features)},
         "shield": shield_overrides,
     }
+    requested_accvp = group.get("accvp")
+    if requested_accvp:
+        overrides["accvp"] = dict(requested_accvp)
     requested_risk_overrides = group.get("risk_module_overrides")
     if requested_risk_overrides:
         overrides["risk_module"] = dict(requested_risk_overrides)
@@ -454,6 +457,8 @@ def run(cfg) -> Path:
                 "rule_gap_acceptance is an unshielded current-state baseline; "
                 "do not enable Shield or forecast features in this comparison group."
             )
+        if bool(group_cfg.accvp.get("enabled", False)) and not bool(group.shield):
+            raise ValueError(f"stage5 group '{group.name}' enables ACCVP but disables Safety Shield")
         model_path = _group_model_path(group, default_model)
         stage_log(
             "stage5",
@@ -483,6 +488,11 @@ def run(cfg) -> Path:
         group_reports[group.name]["shield_overrides"] = dict(group.get("shield_overrides", {}) or {})
         group_reports[group.name]["risk_module_overrides"] = dict(group.get("risk_module_overrides", {}) or {})
         group_reports[group.name]["policy_type"] = policy_type
+        group_reports[group.name]["raw_policy"] = str(group.get("raw_policy", group.name))
+        group_reports[group.name]["counterfactual_predictor"] = str(
+            group.get("counterfactual_predictor", "")
+        )
+        group_reports[group.name]["controller"] = str(group.get("controller", ""))
         comparative_metadata = dict(group.get("comparative", {}) or {})
         if comparative_metadata:
             group_reports[group.name]["comparative"] = comparative_metadata

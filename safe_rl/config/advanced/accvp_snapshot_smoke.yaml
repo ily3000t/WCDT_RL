@@ -1,0 +1,19 @@
+# Bounded mechanics smoke only. It validates isolated saveState/loadState workers;
+# it is not the formal 5,000-root dataset or the frozen-PPO seed-2/5 Go/No-Go run.
+run:
+  run_id: "accvp_snapshot_smoke"
+  output_root: "safe_rl_output"
+  tensorboard: false
+  seed: 2
+stage1:
+  episodes: 4
+  action_sampling: "mixed"
+accvp:
+  enabled: false
+  mode: "off"
+  counterfactual:
+    root_budget: 2
+    roots_per_episode_limit: 1
+    workers: 1
+    shard_roots: 1
+    output_name: "accvp_counterfactual_smoke"

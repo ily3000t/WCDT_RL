@@ -40,6 +40,9 @@ scenario:
   episode_seconds: 80.0
   control_interval_steps: 5
   lane_change_duration: 1.0
+  # Legacy action semantics. ACCVP never changes this profile.
+  action_execution_profile: "current_v1"
+  accvp_candidate_plan_profile: "accvp_commitment_v1"
   top_k_neighbors: 5
   history_steps: 11
   forecast_horizon_steps: 30
@@ -322,6 +325,63 @@ shield:
     uncertainty: 0.2
     action_distance: 0.1
     progress: -0.05
+
+# ACCVP is an independent, deployment-time branch. Keeping it off preserves
+# all existing PPO, Risk Module, WcDT and Shield experiment semantics.
+accvp:
+  enabled: false
+  mode: "off"                 # off | shadow | viability_branch
+  dataset_dir: null
+  checkpoint: null
+  calibration_bundle: null
+  operating_point: null
+  schema_version: 1
+  candidate_plan_profile: "accvp_commitment_v1"
+  response_horizon_s: 3.0
+  viability_horizon_s: 8.0
+  response_horizon_steps: 30
+  candidate_plan_horizon_steps: 80
+  actor_count: 6
+  ensemble_size: 3
+  deadline_distance: 120.0
+  proxy_collision_upper_bound: 0.10
+  safety_violation_upper_bound: 0.15
+  merge_viability_lower_bound: 0.50
+  max_decision_latency_s: 0.5
+  lateral_commitment_s: 1.0
+  warm_start:
+    enabled: true
+    checkpoint: null
+    freeze_encoder_epochs: 5
+    encoder_lr_multiplier: 0.1
+  training:
+    epochs: 20
+    batch_size: 32
+    learning_rate: 0.0003
+    weight_decay: 0.00001
+    ensemble_seed_offset: 1000
+    loss_weights:
+      trajectory: 1.0
+      events: 1.0
+      geometry: 0.25
+      ordering: 0.10
+      smoothness: 0.01
+  tuning:
+    required_availability: 0.95
+    proxy_collision_upper_bounds: [0.05, 0.10, 0.15, 0.20]
+    safety_violation_upper_bounds: [0.05, 0.10, 0.15, 0.20]
+    merge_viability_lower_bounds: [0.40, 0.50, 0.60, 0.70]
+  counterfactual:
+    root_budget: 5000
+    roots_per_episode_limit: 3
+    workers: 2
+    shard_roots: 50
+    root_strata: ["mixed", "ppo", "merge_timing", "rule", "deadline_hard"]
+    policy_checkpoints:
+      ppo: null
+      merge_timing: null
+    output_name: "accvp_counterfactual_v1"
+    deadline_window_only_for_viability: true
 
 stage1:
   episodes: 500
