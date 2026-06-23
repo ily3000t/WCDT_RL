@@ -11,9 +11,13 @@ from safe_rl.accvp.schema import canonical_json, validate_branch_row
 class CounterfactualSnapshotStore:
     """Durable root/branch store with snapshot deletion only after complete roots."""
 
-    def __init__(self, output_dir: str | Path):
+    def __init__(self, output_dir: str | Path, *, cache_dir: str | Path | None = None):
         self.output_dir = Path(output_dir)
-        self.snapshots_dir = self.output_dir / "snapshots"
+        # SUMO state files are temporary worker cache, not dataset artifacts.
+        # Keep them out of the buffer directory so completed datasets remain
+        # immutable and cache cleanup never risks deleting branch records.
+        self.cache_dir = Path(cache_dir) if cache_dir is not None else self.output_dir / ".cache"
+        self.snapshots_dir = self.cache_dir / "snapshots"
         self.roots_dir = self.output_dir / "roots"
         self.branches_dir = self.output_dir / "branches"
         self.manifest_dir = self.output_dir / "manifests"

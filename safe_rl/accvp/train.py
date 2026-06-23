@@ -131,17 +131,26 @@ def train_accvp(config: Any, dataset_dir: str | Path) -> Path:
     dataset_dir = Path(dataset_dir)
     split_path = dataset_dir / "manifests" / "split_manifest.jsonl"
     if not split_path.exists():
-        build_split_manifest(dataset_dir, seed=int(config.run.seed))
+        build_split_manifest(dataset_dir, seed=int(config.run.seed), require_all_splits=True)
+    training = config.accvp.training
     train_set = ACCVPBranchDataset(dataset_dir, "train")
     validation_set = ACCVPBranchDataset(dataset_dir, "validation")
     calibration_set = ACCVPBranchDataset(dataset_dir, "calibration")
     operating_set = ACCVPBranchDataset(dataset_dir, "operating_point")
-    if not len(train_set):
-        raise ValueError("ACCVP train split is empty")
+    test_set = ACCVPBranchDataset(dataset_dir, "test")
+    required_splits = {
+        "train": train_set,
+        "validation": validation_set,
+        "calibration": calibration_set,
+        "operating_point": operating_set,
+        "test": test_set,
+    }
+    empty = [name for name, split in required_splits.items() if not len(split)]
+    if empty:
+        raise ValueError(f"ACCVP formal training requires non-empty grouped splits; empty={empty}")
     loss_weights = dict(training.loss_weights)
     loss_weights["event_positive_weights"] = _event_positive_weights(train_set)
     output_dir = prepare_run_dir(config, "accvp")
-    training = config.accvp.training
     warm = config.accvp.warm_start
     warm_source = Path(str(warm.checkpoint)) if warm.get("checkpoint") else None
     source_payload = None
@@ -184,7 +193,7 @@ def train_accvp(config: Any, dataset_dir: str | Path) -> Path:
                 loss, _parts = accvp_loss(_model_output(model, batch), batch, loss_weights)
                 loss.backward()
                 optimizer.step()
-            validation_loss = _evaluate_loss(model, validation_set if len(validation_set) else train_set, torch, loss_weights)
+            validation_loss = _evaluate_loss(model, validation_set, torch, loss_weights)
             if validation_loss < best_loss:
                 best_loss = validation_loss
                 best_state = {key: value.detach().cpu().clone() for key, value in model.state_dict().items()}
@@ -195,11 +204,11 @@ def train_accvp(config: Any, dataset_dir: str | Path) -> Path:
         warm_record["freeze_encoder_epochs"] = int(warm.freeze_encoder_epochs)
         warm_records.append(warm_record)
     calibration = _calibrate(models, calibration_set, torch)
-    operating_point = None
-    if len(operating_set):
-        from safe_rl.accvp.tuning import tune_operating_point
+    from safe_rl.accvp.tuning import tune_operating_point
+    from safe_rl.accvp.diagnostics import final_test_diagnostics
 
-        operating_point = tune_operating_point(models, operating_set, calibration, torch, config.accvp.tuning)
+    operating_point = tune_operating_point(models, operating_set, calibration, torch, config.accvp.tuning)
+    final_test = final_test_diagnostics(models, test_set, calibration, operating_point, torch)
     metadata = checkpoint_metadata(
         config,
         warm_start={"members": warm_records, "config_hash": stable_hash(dict(config))},
@@ -216,16 +225,19 @@ def train_accvp(config: Any, dataset_dir: str | Path) -> Path:
     with calibration_path.open("w", encoding="utf-8") as handle:
         json.dump(calibration.to_dict(), handle, indent=2, sort_keys=True)
     operating_point_path = output_dir / "accvp_v1_operating_point.json"
-    if operating_point is not None:
-        with operating_point_path.open("w", encoding="utf-8") as handle:
-            json.dump(operating_point, handle, indent=2, sort_keys=True)
+    with operating_point_path.open("w", encoding="utf-8") as handle:
+        json.dump(operating_point, handle, indent=2, sort_keys=True)
+    final_test_path = output_dir / "accvp_v1_final_test_diagnostics.json"
+    with final_test_path.open("w", encoding="utf-8") as handle:
+        json.dump(final_test, handle, indent=2, sort_keys=True)
     with (output_dir / "training_manifest.json").open("w", encoding="utf-8") as handle:
         json.dump(
             {
                 "dataset_dir": str(dataset_dir.resolve()),
                 "checkpoint": str(checkpoint.resolve()),
                 "calibration": str(calibration_path.resolve()),
-                "operating_point": str(operating_point_path.resolve()) if operating_point is not None else None,
+                "operating_point": str(operating_point_path.resolve()),
+                "final_test_diagnostics": str(final_test_path.resolve()),
                 "best_validation_losses": best_losses,
                 "event_positive_weights": loss_weights["event_positive_weights"],
                 "checkpoint_metadata": metadata,

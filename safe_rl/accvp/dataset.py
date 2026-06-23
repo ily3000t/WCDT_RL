@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
-from collections import defaultdict
+from collections import Counter, defaultdict
 from pathlib import Path
 from typing import Any, Iterable
 
@@ -29,63 +29,111 @@ def _jsonl(path: Path) -> list[dict[str, Any]]:
         return [json.loads(line) for line in handle if line.strip()]
 
 
-def build_split_manifest(dataset_dir: str | Path, *, seed: int = 0) -> list[dict[str, Any]]:
-    """Split by episode seed, never by action branch or individual root row."""
+def _root_group_id(row: dict[str, Any]) -> str:
+    return str(row.get("root_episode_id") or f"{row.get('root_policy', row.get('root_source', 'unknown'))}:{row['episode_seed']}")
+
+
+def _split_quotas(group_count: int, require_all_splits: bool) -> dict[str, int]:
+    names = list(SPLIT_RATIOS)
+    if require_all_splits and group_count < len(names):
+        raise ValueError(
+            f"ACCVP requires at least {len(names)} grouped root episodes for train/validation/calibration/"
+            f"operating-point/test separation; found {group_count}"
+        )
+    raw = {name: float(ratio) * group_count for name, ratio in SPLIT_RATIOS.items()}
+    quotas = {name: int(np.floor(value)) for name, value in raw.items()}
+    if require_all_splits:
+        for name in names:
+            quotas[name] = max(1, quotas[name])
+    while sum(quotas.values()) > group_count:
+        removable = [name for name in names if quotas[name] > (1 if require_all_splits else 0)]
+        name = min(removable, key=lambda item: (raw[item] - quotas[item], SPLIT_RATIOS[item]))
+        quotas[name] -= 1
+    while sum(quotas.values()) < group_count:
+        name = max(names, key=lambda item: (raw[item] - quotas[item], SPLIT_RATIOS[item]))
+        quotas[name] += 1
+    return quotas
+
+
+def build_split_manifest(
+    dataset_dir: str | Path,
+    *,
+    seed: int = 0,
+    require_all_splits: bool = True,
+) -> list[dict[str, Any]]:
+    """Grouped, quota-constrained split with marginal rather than combinatorial strata."""
 
     dataset = Path(dataset_dir)
     roots = [row for row in _jsonl(dataset / "manifests" / "roots.jsonl") if bool(row.get("complete", False))]
-    groups: dict[int, list[dict[str, Any]]] = defaultdict(list)
+    grouped: dict[str, list[dict[str, Any]]] = defaultdict(list)
     for row in roots:
-        groups[int(row["episode_seed"])].append(row)
-    strata: dict[str, list[int]] = defaultdict(list)
-    for episode_seed, grouped_roots in groups.items():
-        signature = "|".join(
-            sorted(
-                f"{row.get('root_source', '')}:{row.get('traffic_profile', '')}:{row.get('deadline_bin', '')}"
-                for row in grouped_roots
-            )
+        grouped[_root_group_id(row)].append(row)
+    quotas = _split_quotas(len(grouped), require_all_splits)
+    group_items = []
+    for group_id, members in grouped.items():
+        # Avoid the old full root-combination signature. Balance the meaningful
+        # primary strata and report source/traffic/deadline marginals separately.
+        policy = str(members[0].get("root_policy", members[0].get("root_source", "unknown")))
+        deadline = str(members[0].get("deadline_bin", "unknown"))
+        primary = f"{policy}:{deadline}"
+        digest = hashlib.sha256(f"{seed}:{group_id}".encode("utf-8")).hexdigest()
+        group_items.append((primary, digest, group_id, members))
+    primary_sizes = Counter(item[0] for item in group_items)
+    group_items.sort(key=lambda item: (primary_sizes[item[0]], item[1]))
+    assigned: Counter[str] = Counter()
+    primary_counts: dict[str, Counter[str]] = {name: Counter() for name in SPLIT_RATIOS}
+    assignments: dict[str, str] = {}
+    for primary, _digest, group_id, _members in group_items:
+        available = [name for name in SPLIT_RATIOS if assigned[name] < quotas[name]]
+        split = min(
+            available,
+            key=lambda name: (
+                primary_counts[name][primary],
+                assigned[name] / max(1, quotas[name]),
+                hashlib.sha256(f"{seed}:{group_id}:{name}".encode("utf-8")).hexdigest(),
+            ),
         )
-        strata[signature].append(episode_seed)
+        assignments[group_id] = split
+        assigned[split] += 1
+        primary_counts[split][primary] += 1
+    if require_all_splits and any(assigned[name] == 0 for name in SPLIT_RATIOS):
+        raise RuntimeError(f"ACCVP split assignment left an empty split: {dict(assigned)}")
     rows: list[dict[str, Any]] = []
-    for signature, group_seeds in sorted(strata.items()):
-        rng_seed = int.from_bytes(hashlib.sha256(f"{seed}:{signature}".encode("utf-8")).digest()[:8], "little")
-        rng = np.random.default_rng(rng_seed)
-        group_seeds = list(sorted(group_seeds))
-        rng.shuffle(group_seeds)
-        boundaries: dict[str, int] = {}
-        start = 0
-        for name, ratio in list(SPLIT_RATIOS.items())[:-1]:
-            start += int(round(len(group_seeds) * ratio))
-            boundaries[name] = min(start, len(group_seeds))
-        for index, episode_seed in enumerate(group_seeds):
-            if index < boundaries["train"]:
-                split = "train"
-            elif index < boundaries["validation"]:
-                split = "validation"
-            elif index < boundaries["calibration"]:
-                split = "calibration"
-            elif index < boundaries["operating_point"]:
-                split = "operating_point"
-            else:
-                split = "test"
-            for root in groups[episode_seed]:
-                rows.append(
-                    {
-                        "root_id": root["root_id"],
-                        "episode_seed": episode_seed,
-                        "stratum": signature,
-                        "split": split,
-                    }
-                )
-    seen: dict[str, str] = {}
-    for row in rows:
-        previous = seen.setdefault(str(row["root_id"]), str(row["split"]))
-        if previous != row["split"]:
-            raise RuntimeError("ACCVP split leakage: root assigned to multiple splits")
-    output = dataset / "manifests" / "split_manifest.jsonl"
+    for group_id, members in grouped.items():
+        for root in members:
+            rows.append(
+                {
+                    "root_id": root["root_id"],
+                    "root_episode_id": group_id,
+                    "episode_seed": int(root["episode_seed"]),
+                    "primary_stratum": f"{root.get('root_policy', root.get('root_source', 'unknown'))}:{root.get('deadline_bin', 'unknown')}",
+                    "split": assignments[group_id],
+                }
+            )
+    provenance = {
+        "split_ratios": SPLIT_RATIOS,
+        "group_quotas": quotas,
+        "group_counts": dict(assigned),
+        "source_counts": {
+            name: dict(Counter(str(root.get("root_policy", root.get("root_source", "unknown"))) for root in roots if assignments[_root_group_id(root)] == name))
+            for name in SPLIT_RATIOS
+        },
+        "traffic_profile_counts": {
+            name: dict(Counter(str(root.get("traffic_profile", "unknown")) for root in roots if assignments[_root_group_id(root)] == name))
+            for name in SPLIT_RATIOS
+        },
+        "deadline_bin_counts": {
+            name: dict(Counter(str(root.get("deadline_bin", "unknown")) for root in roots if assignments[_root_group_id(root)] == name))
+            for name in SPLIT_RATIOS
+        },
+    }
+    manifest_dir = dataset / "manifests"
+    output = manifest_dir / "split_manifest.jsonl"
     with output.open("w", encoding="utf-8") as handle:
         for row in rows:
             handle.write(json.dumps(row, sort_keys=True) + "\n")
+    with (manifest_dir / "split_provenance.json").open("w", encoding="utf-8") as handle:
+        json.dump(provenance, handle, indent=2, sort_keys=True)
     return rows
 
 

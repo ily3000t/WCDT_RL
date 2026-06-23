@@ -1,5 +1,6 @@
 run:
   output_root: "safe_rl_output/runs"
+  cache_root: ".cache/safe_rl"
   run_id: null
   seed: 1
   episode_seed_schedule: "incrementing_v1"
@@ -377,6 +378,13 @@ accvp:
     workers: 2
     shard_roots: 50
     root_strata: ["mixed", "ppo", "merge_timing", "rule", "deadline_hard"]
+    # Root policy, root-state filter and seed selection are independent. This
+    # permits the formal query: merge_timing PPO + deadline + seeds [2, 5].
+    root_policy: "mixed"
+    root_filter: "all"         # all | deadline
+    episode_seeds: null
+    min_deadline_roots_per_seed: 1
+    cache_root: null            # inherits run.cache_root when null
     policy_checkpoints:
       ppo: null
       merge_timing: null

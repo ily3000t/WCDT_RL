@@ -12,9 +12,17 @@
    checksum validation.
 
 2. Build the formal root pool with frozen checkpoints supplied under
-   `accvp.counterfactual.policy_checkpoints`. Run separate, bounded collections
-   for `mixed`, `ppo`, `merge_timing`, `rule`, and `deadline_hard`; preserve
-   `root_source`, traffic profile and deadline bins in every manifest.
+   `accvp.counterfactual.policy_checkpoints`. Policy, state filter and seeds
+   are independent. The required failure query is therefore explicit:
+
+   ```powershell
+   python -m safe_rl.pipeline.stage1_counterfactual --config <formal.yaml> --root-policy merge_timing --root-filter deadline --episode-seeds 2 5
+   ```
+
+   Run bounded pools for `mixed`, `ppo`, `merge_timing` and `rule`; preserve
+   root policy, filter, raw action, traffic profile and deadline bin in every
+   manifest. Temporary SUMO states are written below `run.cache_root`, not the
+   counterfactual dataset directory.
 
 3. Before training, run the seed-2/5 oracle on a dataset containing their
    deadline roots:
@@ -23,9 +31,10 @@
    python -m safe_rl.pipeline.accvp_oracle_smoke --dataset <counterfactual-dataset> --seeds 2 5
    ```
 
-   `go_for_training=false` means no observed safe viable action exists for at
-   least one required failure seed. In that case do not increase predictor
-   capacity; investigate policy merge timing or scenario feasibility first.
+   Oracle state is one of `insufficient_coverage`,
+   `no_safe_viable_alternative` or `go`. Only `go` proves that a raw frozen PPO
+   action is infeasible while another legal candidate is safety-safe and
+   observed to merge before taper. Do not train on either non-go state.
 
 4. Set `accvp.dataset_dir` and `accvp.warm_start.checkpoint` to the frozen
    WcDT-v3 ensemble, then train:

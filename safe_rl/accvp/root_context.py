@@ -10,6 +10,7 @@ import numpy as np
 
 from safe_rl.accvp.schema import COUNTERFACTUAL_SCHEMA_VERSION, canonical_json, file_sha256, stable_hash
 from safe_rl.prediction.wcdt_v3_predictor import build_v3_runtime_batch
+from safe_rl.sim.action_space import decode_action
 from safe_rl.sim.history_buffer import HistoryBuffer
 from safe_rl.sim.types import VehicleState
 
@@ -77,7 +78,10 @@ def capture_root_context(
     env: Any,
     *,
     root_id: str | None = None,
-    root_source: str,
+    root_policy: str,
+    root_filter: str,
+    raw_action_id: int,
+    raw_action_legal: bool,
     traffic_profile: str,
     deadline_bin: str,
     snapshot_path: str | Path,
@@ -103,11 +107,18 @@ def capture_root_context(
     metadata = {
         "counterfactual_schema_version": COUNTERFACTUAL_SCHEMA_VERSION,
         "root_id": root_id,
-        "root_episode_id": f"{root_source}:{int(env.seed_value)}",
+        "root_episode_id": f"{root_policy}:{int(env.seed_value)}",
         "episode_seed": int(env.seed_value),
         "decision_index": int(env._decision_index),
         "sim_step": int(env._episode_step),
-        "root_source": str(root_source),
+        # root_source is retained for schema-v1 consumers; it is exactly the
+        # root policy, never a mixed policy/filter encoding.
+        "root_source": str(root_policy),
+        "root_policy": str(root_policy),
+        "root_filter": str(root_filter),
+        "raw_action_id": int(raw_action_id),
+        "raw_action_name": str(decode_action(raw_action_id).name),
+        "raw_action_legal": bool(raw_action_legal),
         "traffic_profile": str(traffic_profile),
         "deadline_bin": str(deadline_bin),
         "snapshot_path": str(snapshot.resolve()),

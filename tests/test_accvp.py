@@ -12,6 +12,7 @@ from safe_rl.accvp.dataset import build_split_manifest
 from safe_rl.accvp.oracle import counterfactual_oracle_report
 from safe_rl.accvp.root_context import RootContext
 from safe_rl.accvp.snapshot_store import CounterfactualSnapshotStore
+from safe_rl.stage1_counterfactual.collector import _root_filter_matches, _seed_schedule
 from safe_rl.sim.action_space import decode_action
 from safe_rl.sim.types import VehicleState
 from safe_rl.utils.config import clone_with_overrides, load_config
@@ -139,7 +140,8 @@ def test_snapshot_is_deleted_only_after_all_expected_branches_complete(tmp_path:
         metadata={"root_id": "root", "snapshot_path": str(snapshot), "root_ego": {}, "history_frames": []},
         tensors={"history_features": np.zeros((1, 1, 1, 10), dtype=np.float32)},
     )
-    store = CounterfactualSnapshotStore(tmp_path / "data")
+    store = CounterfactualSnapshotStore(tmp_path / "data", cache_dir=tmp_path / ".cache" / "accvp")
+    assert store.snapshots_dir == tmp_path / ".cache" / "accvp" / "snapshots"
     store.write_root(root, [0, 1])
     base = {
         "counterfactual_schema_version": 1,
@@ -193,25 +195,52 @@ def test_split_keeps_all_roots_of_same_episode_seed_together(tmp_path: Path):
         {"root_id": "c", "episode_seed": 2, "root_source": "rule", "traffic_profile": "hard", "deadline_bin": "pre_deadline", "complete": True},
     ]
     (manifests / "roots.jsonl").write_text("".join(__import__("json").dumps(row) + "\n" for row in roots), encoding="utf-8")
-    rows = build_split_manifest(tmp_path, seed=7)
+    rows = build_split_manifest(tmp_path, seed=7, require_all_splits=False)
     assignments = {row["root_id"]: row["split"] for row in rows}
     assert assignments["a"] == assignments["b"]
+    with __import__("pytest").raises(ValueError, match="at least 5"):
+        build_split_manifest(tmp_path, seed=7)
 
 
 def test_oracle_requires_safe_viable_counterfactual_for_each_failure_seed(tmp_path: Path):
     manifests = tmp_path / "manifests"
     manifests.mkdir()
     roots = [
-        {"root_id": "seed2", "episode_seed": 2, "deadline_bin": "deadline", "complete": True},
-        {"root_id": "seed5", "episode_seed": 5, "deadline_bin": "deadline", "complete": True},
+        {"root_id": "seed2", "root_episode_id": "ppo:2", "episode_seed": 2, "root_policy": "ppo", "deadline_bin": "deadline", "raw_action_id": 4, "raw_action_legal": True, "complete": True},
+        {"root_id": "seed5", "root_episode_id": "ppo:5", "episode_seed": 5, "root_policy": "ppo", "deadline_bin": "deadline", "raw_action_id": 4, "raw_action_legal": True, "complete": True},
     ]
     branches = [
-        {"root_id": "seed2", "branch_status": "completed", "action_id": 7, "proxy_collision_within_horizon": False, "safety_violation_within_horizon": False, "merge_before_taper_observed": True},
-        {"root_id": "seed5", "branch_status": "completed", "action_id": 4, "proxy_collision_within_horizon": True, "safety_violation_within_horizon": True, "merge_before_taper_observed": False},
+        {"root_id": "seed2", "branch_status": "completed", "action_id": 4, "proxy_collision_within_horizon": True, "safety_violation_within_horizon": True, "merge_before_taper_observed": False, "viability_observation_status": "observed_failure"},
+        {"root_id": "seed2", "branch_status": "completed", "action_id": 7, "proxy_collision_within_horizon": False, "safety_violation_within_horizon": False, "merge_before_taper_observed": True, "viability_observation_status": "observed_success"},
+        {"root_id": "seed5", "branch_status": "completed", "action_id": 4, "proxy_collision_within_horizon": True, "safety_violation_within_horizon": True, "merge_before_taper_observed": False, "viability_observation_status": "observed_failure"},
     ]
     (manifests / "roots.jsonl").write_text("".join(__import__("json").dumps(row) + "\n" for row in roots), encoding="utf-8")
     (manifests / "branches.jsonl").write_text("".join(__import__("json").dumps(row) + "\n" for row in branches), encoding="utf-8")
     report = counterfactual_oracle_report(tmp_path, required_seeds=[2, 5])
-    assert report["required_failure_seed_results"]["2"]["go"] is True
-    assert report["required_failure_seed_results"]["5"]["go"] is False
+    assert report["required_failure_seed_results"]["2"]["state"] == "go"
+    assert report["required_failure_seed_results"]["5"]["state"] == "no_safe_viable_alternative"
+    assert report["oracle_state"] == "no_safe_viable_alternative"
     assert report["go_for_training"] is False
+
+
+def test_oracle_distinguishes_missing_deadline_coverage(tmp_path: Path):
+    manifests = tmp_path / "manifests"
+    manifests.mkdir()
+    (manifests / "roots.jsonl").write_text(
+        __import__("json").dumps(
+            {"root_id": "early", "episode_seed": 2, "deadline_bin": "pre_deadline", "raw_action_id": 4, "raw_action_legal": True, "complete": True}
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    (manifests / "branches.jsonl").write_text("", encoding="utf-8")
+    report = counterfactual_oracle_report(tmp_path, required_seeds=[2])
+    assert report["oracle_state"] == "insufficient_coverage"
+    assert report["go_for_training"] is False
+
+
+def test_root_policy_filter_and_exact_seed_schedule_are_independent():
+    cfg = load_config()
+    assert _root_filter_matches("deadline", "deadline") is True
+    assert _root_filter_matches("deadline", "pre_deadline") is False
+    assert _seed_schedule(cfg, [2, 5], None) == [2, 5]

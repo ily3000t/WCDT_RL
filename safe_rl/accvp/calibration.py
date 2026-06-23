@@ -127,12 +127,19 @@ def selected_action_metrics(records: Iterable[dict[str, Any]]) -> dict[str, floa
     proxy_y = np.asarray([float(row["proxy_collision"]) for row in rows])
     viability = np.asarray([float(row["p_merge_before_taper"]) for row in rows])
     viability_y = np.asarray([float(row["merge_before_taper"]) for row in rows])
+    proxy_upper = np.asarray([float(row.get("pU_proxy_collision", row["p_proxy_collision"])) for row in rows])
+    viability_lower = np.asarray([float(row.get("pL_merge_before_taper", row["p_merge_before_taper"])) for row in rows])
+    viability_observed = np.asarray([bool(row.get("merge_observed", True)) for row in rows])
     decisions = {str(row.get("root_id", index)) for index, row in enumerate(rows)}
     available = {str(row.get("root_id", index)) for index, row in enumerate(rows) if bool(row.get("candidate_set_available", False))}
     return {
         "selected_count": float(len(rows)),
-        "selected_action_safety_coverage": float(np.mean(proxy_y <= proxy)) if len(rows) else float("nan"),
-        "selected_action_viability_coverage": float(np.mean(viability_y >= viability)) if len(rows) else float("nan"),
+        "selected_action_safety_coverage": float(np.mean(proxy_y <= proxy_upper)) if len(rows) else float("nan"),
+        "selected_action_viability_coverage": (
+            float(np.mean(viability_y[viability_observed] >= viability_lower[viability_observed]))
+            if np.any(viability_observed)
+            else float("nan")
+        ),
         "candidate_set_availability": float(len(available) / max(1, len(decisions))),
         "post_selection_safety_brier": brier_score(proxy, proxy_y),
         "post_selection_safety_ece": expected_calibration_error(proxy, proxy_y),
