@@ -9,6 +9,7 @@ from safe_rl.pipeline.stage2_train_prediction_risk import (
     _referenced_risk_checkpoint,
 )
 from safe_rl.pipeline.train_comparative_suite import (
+    _forecast_settings,
     _validate_existing_wcdt_v1_checkpoint,
     _validate_input_provenance,
 )
@@ -58,3 +59,13 @@ def test_existing_wcdt_v1_checkpoint_validation_uses_top_level_payload(tmp_path:
     )
     summary = _validate_existing_wcdt_v1_checkpoint(checkpoint, cfg)
     assert summary == {"best_epoch": 7, "best_val_score": 1.5}
+
+
+def test_forecast_settings_uses_the_source_specific_checkpoint(tmp_path: Path):
+    v1 = tmp_path / "wcdt_predictor.pt"
+    v3 = tmp_path / "wcdt_v3_predictor.pt"
+
+    assert _forecast_settings("ppo", v1, v3)["forecast_features"]["enabled"] is False
+    assert _forecast_settings("constant_velocity", v1, v3)["forecast_features"]["source"] == "constant_velocity"
+    assert _forecast_settings("wcdt", v1, v3)["forecast_features"]["checkpoint"] == str(v1)
+    assert _forecast_settings("wcdt_v3", v1, v3)["forecast_features"]["checkpoint"] == str(v3)

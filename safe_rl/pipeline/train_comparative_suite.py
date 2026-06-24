@@ -205,8 +205,8 @@ def run(
     base = _run_dir(base_run_id)
     stage1 = base / "stage1" / "risk_probe_buffer"
     risk = base / "stage2" / "risk_module.pt"
-    v3 = base / "stage2" / "wcdt_v3_predictor.pt"
-    for path in (stage1, risk, v3):
+    v3_checkpoint = base / "stage2" / "wcdt_v3_predictor.pt"
+    for path in (stage1, risk, v3_checkpoint):
         if not path.exists():
             raise FileNotFoundError(f"Comparative base artifact is missing: {path}")
     _require_schema9(stage1)
@@ -214,7 +214,7 @@ def run(
     comparative_root = base / "comparative_eval"
     experiment_root = comparative_root / experiment_id
     manifests = experiment_root / "manifests"
-    provenance = _provenance(base, stage1=stage1, risk=risk, v3=v3)
+    provenance = _provenance(base, stage1=stage1, risk=risk, v3=v3_checkpoint)
     input_provenance_path = manifests / "input_provenance.json"
     state_path = manifests / "comparative_state.json"
     if experiment_root.exists():
@@ -290,8 +290,8 @@ def run(
             "wcdt_v1_checkpoint_sha256": sha256_file(v1_checkpoint),
             "risk_checkpoint": str(risk),
             "risk_checkpoint_sha256": sha256_file(risk),
-            "wcdt_v3_checkpoint": str(v3),
-            "wcdt_v3_checkpoint_sha256": sha256_file(v3),
+            "wcdt_v3_checkpoint": str(v3_checkpoint),
+            "wcdt_v3_checkpoint_sha256": sha256_file(v3_checkpoint),
         },
     )
 
@@ -365,7 +365,7 @@ def run(
                 if source == "wcdt":
                     group["forecast_checkpoint"] = str(v1_checkpoint)
                 elif source == "wcdt_v3":
-                    group["forecast_checkpoint"] = str(v3)
+                    group["forecast_checkpoint"] = str(v3_checkpoint)
             groups.append(group)
             shielded = dict(group)
             shielded["name"] = f"{display}_shield_seed_{seed}"
