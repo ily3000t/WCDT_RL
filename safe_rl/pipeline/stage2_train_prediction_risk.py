@@ -1048,6 +1048,35 @@ def _train_risk_module(
     }
 
 
+def _referenced_risk_checkpoint(cfg) -> Path:
+    """Return the immutable Risk Module used by predictor-only Stage2 runs."""
+
+    configured = cfg.stage2.get("risk_checkpoint_reference")
+    if not configured:
+        raise ValueError(
+            "stage2.train_risk_module=false requires stage2.risk_checkpoint_reference"
+        )
+    checkpoint = Path(str(configured)).expanduser().resolve()
+    if not checkpoint.is_file():
+        raise FileNotFoundError(
+            f"Referenced Risk Module checkpoint does not exist: {checkpoint}"
+        )
+    return checkpoint
+
+
+def _reference_risk_report(checkpoint: Path) -> dict[str, Any]:
+    """Stage2 report fields for a frozen, externally owned Risk Module."""
+
+    return {
+        # Keep the established report contract for downstream code, but make
+        # provenance explicit: this is not a comparative artifact.
+        "risk_checkpoint": str(checkpoint),
+        "risk_checkpoint_reference": str(checkpoint),
+        "risk_checkpoint_source": "reference",
+        "risk_training_skipped": True,
+    }
+
+
 def _build_wcdt_batch(
     cfg: Any,
     data: np.lib.npyio.NpzFile,
@@ -2883,6 +2912,12 @@ def run(cfg) -> Path:
         stage_log("stage2", f"risk_transition_count={int(risk_data['actions'].shape[0])}")
     if "agent_history" in data:
         stage_log("stage2", f"trajectory_samples={int(data['agent_history'].shape[0])}")
+    train_risk_module = bool(cfg.stage2.get("train_risk_module", True))
+    referenced_risk_checkpoint = None
+    # Fail before expensive predictor training when a predictor-only caller has
+    # not bound the run to a frozen common-base Risk Module.
+    if not train_risk_module:
+        referenced_risk_checkpoint = _referenced_risk_checkpoint(cfg)
     report = {
         "stage": "stage2",
         "run_id": cfg.run.run_id,
@@ -2926,11 +2961,10 @@ def run(cfg) -> Path:
         "wcdt_v2_batch_size": _wcdt_v2_batch_size(cfg),
         "wcdt_v3_batch_size": _wcdt_v3_batch_size(cfg),
     }
-    if bool(cfg.stage2.get("train_risk_module", True)):
+    if train_risk_module:
         report.update(_train_risk_module(cfg, risk_data, stage_dir, tb, device))
     else:
-        report["risk_training_skipped"] = True
-        report["risk_checkpoint_reference"] = str(cfg.stage2.get("risk_checkpoint_reference", ""))
+        report.update(_reference_risk_report(referenced_risk_checkpoint))
     if bool(cfg.prediction.get("train_enabled", True)):
         if bool(cfg.prediction.get("wcdt_v1_train_enabled", False)):
             report.update(_train_wcdt_predictor(cfg, data, stage_dir, tb, device))
@@ -2984,9 +3018,16 @@ def run(cfg) -> Path:
         report["initial_prediction_report"] = str(initial_prediction_report_path)
     if stage4_data is None:
         risk_checkpoint = Path(str(report["risk_checkpoint"]))
-        initial_risk_checkpoint = stage_dir / "risk_module_initial.pt"
-        shutil.copy2(risk_checkpoint, initial_risk_checkpoint)
-        report["risk_initial_checkpoint"] = str(initial_risk_checkpoint)
+        if train_risk_module:
+            initial_risk_checkpoint = stage_dir / "risk_module_initial.pt"
+            shutil.copy2(risk_checkpoint, initial_risk_checkpoint)
+            report["risk_initial_checkpoint"] = str(initial_risk_checkpoint)
+            report["risk_initial_checkpoint_source"] = "trained_copy"
+        else:
+            # Predictor-only comparisons must keep the common Risk Module
+            # external. Creating a local copy would imply a new risk artifact.
+            report["risk_initial_checkpoint"] = str(risk_checkpoint)
+            report["risk_initial_checkpoint_source"] = "reference"
         initial_training_report_path = stage_dir / "stage2_initial_training_report.json"
         write_report(initial_training_report_path, report)
         report["initial_training_report"] = str(initial_training_report_path)
