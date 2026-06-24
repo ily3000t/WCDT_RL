@@ -71,31 +71,33 @@ def build_split_manifest(
     quotas = _split_quotas(len(grouped), require_all_splits)
     group_items = []
     for group_id, members in grouped.items():
-        # Avoid the old full root-combination signature. Balance the meaningful
-        # primary strata and report source/traffic/deadline marginals separately.
+        # Balance the three meaningful marginals without creating the sparse
+        # combinatorial signature that previously produced singleton strata.
         policy = str(members[0].get("root_policy", members[0].get("root_source", "unknown")))
+        traffic = str(members[0].get("traffic_profile", "unknown"))
         deadline = str(members[0].get("deadline_bin", "unknown"))
-        primary = f"{policy}:{deadline}"
+        marginals = (f"policy:{policy}", f"traffic:{traffic}", f"deadline:{deadline}")
         digest = hashlib.sha256(f"{seed}:{group_id}".encode("utf-8")).hexdigest()
-        group_items.append((primary, digest, group_id, members))
-    primary_sizes = Counter(item[0] for item in group_items)
-    group_items.sort(key=lambda item: (primary_sizes[item[0]], item[1]))
+        group_items.append((marginals, digest, group_id, members))
+    marginal_sizes = Counter(marginal for item in group_items for marginal in item[0])
+    group_items.sort(key=lambda item: (min(marginal_sizes[value] for value in item[0]), item[1]))
     assigned: Counter[str] = Counter()
-    primary_counts: dict[str, Counter[str]] = {name: Counter() for name in SPLIT_RATIOS}
+    marginal_counts: dict[str, Counter[str]] = {name: Counter() for name in SPLIT_RATIOS}
     assignments: dict[str, str] = {}
-    for primary, _digest, group_id, _members in group_items:
+    for marginals, _digest, group_id, _members in group_items:
         available = [name for name in SPLIT_RATIOS if assigned[name] < quotas[name]]
         split = min(
             available,
             key=lambda name: (
-                primary_counts[name][primary],
+                sum(marginal_counts[name][value] for value in marginals),
                 assigned[name] / max(1, quotas[name]),
                 hashlib.sha256(f"{seed}:{group_id}:{name}".encode("utf-8")).hexdigest(),
             ),
         )
         assignments[group_id] = split
         assigned[split] += 1
-        primary_counts[split][primary] += 1
+        for marginal in marginals:
+            marginal_counts[split][marginal] += 1
     if require_all_splits and any(assigned[name] == 0 for name in SPLIT_RATIOS):
         raise RuntimeError(f"ACCVP split assignment left an empty split: {dict(assigned)}")
     rows: list[dict[str, Any]] = []
@@ -125,6 +127,11 @@ def build_split_manifest(
         "deadline_bin_counts": {
             name: dict(Counter(str(root.get("deadline_bin", "unknown")) for root in roots if assignments[_root_group_id(root)] == name))
             for name in SPLIT_RATIOS
+        },
+        "unsupported_marginals": {
+            marginal: count
+            for marginal, count in sorted(marginal_sizes.items())
+            if count < len(SPLIT_RATIOS)
         },
     }
     manifest_dir = dataset / "manifests"
@@ -177,6 +184,10 @@ class ACCVPBranchDataset:
             horizon_steps=int(metadata.get("candidate_plan_horizon_steps", 80)),
         ).states
         observed = float(bool(row["event_observed"]))
+        viability_eligible = float(
+            bool(row["event_observed"])
+            and str(root_row.get("deadline_bin", row.get("deadline_bin", ""))) == "deadline"
+        )
         target_entry = row.get("target_lane_entry_time_s")
         entry_target = float(target_entry) if target_entry is not None else float(row["censor_time"])
         return {
@@ -201,7 +212,7 @@ class ACCVPBranchDataset:
                 ],
                 dtype=np.float32,
             ),
-            "event_mask": np.asarray([1.0, 1.0, 1.0, observed], dtype=np.float32),
+            "event_mask": np.asarray([1.0, 1.0, 1.0, viability_eligible], dtype=np.float32),
             "geometry_targets": np.asarray(
                 [
                     float(row["min_obb_distance"]),
@@ -212,7 +223,8 @@ class ACCVPBranchDataset:
                 ],
                 dtype=np.float32,
             ),
-            "geometry_mask": np.asarray([1.0, 1.0, 1.0, 1.0, observed], dtype=np.float32),
+            "geometry_mask": np.asarray([1.0, 1.0, 1.0, 1.0, viability_eligible], dtype=np.float32),
+            "viability_eligible": np.asarray(viability_eligible, dtype=np.float32),
         }
 
 

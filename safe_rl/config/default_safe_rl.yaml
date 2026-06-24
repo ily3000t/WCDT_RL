@@ -1,6 +1,8 @@
 run:
   output_root: "safe_rl_output/runs"
-  cache_root: ".cache/safe_rl"
+  # Null keeps temporary artifacts in <output_root parent>/.cache. Set an
+  # absolute path only when a separate cache volume is required.
+  cache_root: null
   run_id: null
   seed: 1
   episode_seed_schedule: "incrementing_v1"
@@ -267,6 +269,7 @@ rl:
     merge_zone_margin: 30.0
   shield_guided_reward:
     risk_checkpoint: null
+    require_frozen_risk_model: true
     raw_risk_threshold: 0.85
     raw_risk_penalty_weight: -3.0
     risk_margin_threshold: 0.15
@@ -333,9 +336,12 @@ accvp:
   enabled: false
   mode: "off"                 # off | shadow | viability_branch
   dataset_dir: null
+  oracle_report: null
   checkpoint: null
   calibration_bundle: null
   operating_point: null
+  artifact_manifest: null
+  risk_checkpoint: null
   schema_version: 1
   candidate_plan_profile: "accvp_commitment_v1"
   response_horizon_s: 3.0
@@ -355,6 +361,13 @@ accvp:
     checkpoint: null
     freeze_encoder_epochs: 5
     encoder_lr_multiplier: 0.1
+  calibration:
+    nominal_alpha: 0.05
+    bins: 20
+    bonferroni_signal_count: 3
+  inference_worker:
+    enabled: true
+    restart_on_timeout: true
   training:
     epochs: 20
     batch_size: 32
@@ -377,7 +390,16 @@ accvp:
     roots_per_episode_limit: 3
     workers: 2
     shard_roots: 50
-    root_strata: ["mixed", "ppo", "merge_timing", "rule", "deadline_hard"]
+    # Immutable jobs are collected separately and merged into one formal
+    # dataset; this list is executable metadata rather than a descriptive tag.
+    collection_id: null
+    collection_jobs:
+      - {name: "mixed", root_policy: "mixed", root_filter: "all"}
+      - {name: "ppo", root_policy: "ppo", root_filter: "all"}
+      - {name: "merge_timing", root_policy: "merge_timing", root_filter: "all"}
+      - {name: "rule", root_policy: "rule", root_filter: "all"}
+      - {name: "deadline_hard", root_policy: "mixed", root_filter: "deadline"}
+      - {name: "merge_timing_oracle_seed2_5", root_policy: "merge_timing", root_filter: "deadline", episode_seeds: [2, 5]}
     # Root policy, root-state filter and seed selection are independent. This
     # permits the formal query: merge_timing PPO + deadline + seeds [2, 5].
     root_policy: "mixed"
@@ -388,8 +410,8 @@ accvp:
     policy_checkpoints:
       ppo: null
       merge_timing: null
+    risk_checkpoint: null
     output_name: "accvp_counterfactual_v1"
-    deadline_window_only_for_viability: true
 
 stage1:
   episodes: 500

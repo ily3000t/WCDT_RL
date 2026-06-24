@@ -7,6 +7,7 @@ import numpy as np
 
 from safe_rl.accvp.calibration import CalibrationBundle, brier_score, expected_calibration_error, selected_action_metrics
 from safe_rl.accvp.dataset import ACCVPBranchDataset, collate_numpy
+from safe_rl.accvp.selection import select_viability_action
 
 
 def _tensor_batch(batch: dict[str, np.ndarray], torch: Any) -> dict[str, Any]:
@@ -36,6 +37,8 @@ def _candidate_records(models: list[Any], dataset: ACCVPBranchDataset, calibrati
     with torch.no_grad():
         for index, row in enumerate(dataset.rows):
             batch_np = collate_numpy([dataset[index]])
+            if not bool(batch_np["viability_eligible"][0]):
+                continue
             batch = _tensor_batch(batch_np, torch)
             outputs = [_model_output(model, batch) for model in models]
             events = np.stack([torch.sigmoid(output["event_logits"]).cpu().numpy()[0] for output in outputs], axis=0)
@@ -64,6 +67,10 @@ def _candidate_records(models: list[Any], dataset: ACCVPBranchDataset, calibrati
                     "safety_violation": float(batch_np["event_targets"][0, 1]),
                     "merge_before_taper": float(batch_np["event_targets"][0, 3]),
                     "merge_observed": bool(batch_np["event_mask"][0, 3]),
+                    "candidate_legal": bool(dict(row.get("secondary_risk", {})).get("candidate_legal", True)),
+                    "secondary_safety_pass": bool(
+                        row.get("secondary_safety_pass", dict(row.get("secondary_risk", {})).get("secondary_safety_pass", False))
+                    ),
                 }
             )
     return records
@@ -82,36 +89,26 @@ def final_test_diagnostics(
         raise ValueError("ACCVP final test split is empty")
     thresholds = dict(operating_point["selected"])
     records = _candidate_records(models, dataset, calibration, torch)
+    if not records:
+        raise ValueError("ACCVP final test split has no observed deadline viability rows")
     by_root: dict[str, list[dict[str, Any]]] = defaultdict(list)
     for record in records:
         by_root[record["root_id"]].append(record)
     selected: list[dict[str, Any]] = []
     availability = 0
     for root_id, candidates in by_root.items():
-        accepted = [
-            row
-            for row in candidates
-            if row["pU_proxy_collision"] <= float(thresholds["proxy_collision_upper_bound"])
-            and row["pU_safety_violation"] <= float(thresholds["safety_violation_upper_bound"])
-            and row["pL_merge_before_taper"] >= float(thresholds["merge_viability_lower_bound"])
-        ]
-        if not accepted:
+        decision = select_viability_action(
+            candidates,
+            raw_action_id=int(candidates[0]["raw_action_id"]),
+            thresholds=thresholds,
+        )
+        chosen = decision["selected"]
+        if chosen is None:
             continue
         availability += 1
-        raw_id = candidates[0].get("raw_action_id")
-        raw = next((row for row in accepted if raw_id is not None and int(row["action_id"]) == int(raw_id)), None)
-        chosen = raw or min(
-            accepted,
-            key=lambda row: (
-                -row["pL_merge_before_taper"],
-                row["pU_safety_violation"],
-                row["target_lane_entry_time_s"],
-                row["action_id"],
-            ),
-        )
         chosen = dict(chosen)
         chosen["selected"] = True
-        chosen["candidate_set_available"] = True
+        chosen["candidate_set_available"] = bool(decision["candidate_set_available"])
         selected.append(chosen)
     candidate_proxy = np.asarray([row["p_proxy_collision"] for row in records])
     candidate_proxy_y = np.asarray([row["proxy_collision"] for row in records])
@@ -132,6 +129,6 @@ def final_test_diagnostics(
             "viability_brier": brier_score(candidate_viability, candidate_viability_y),
             "viability_ece": expected_calibration_error(candidate_viability, candidate_viability_y),
         },
-        "post_selection": selected_action_metrics(selected),
+        "post_selection": selected_action_metrics(selected, total_decision_count=len(by_root)),
         "operating_point": thresholds,
     }

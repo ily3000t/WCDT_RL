@@ -49,6 +49,8 @@ stage5:
         mode: "shadow"
         checkpoint: "safe_rl_output/runs/<accvp_run>/accvp/accvp_v1_predictor.pt"
         calibration_bundle: "safe_rl_output/runs/<accvp_run>/accvp/accvp_v1_calibration.json"
+        artifact_manifest: "safe_rl_output/runs/<accvp_run>/accvp/accvp_v1_artifact_manifest.json"
+        risk_checkpoint: "safe_rl_output/runs/<risk_run>/stage2/risk_module.pt"
     - name: "wcdt_v3_prediction_shield_accvp_viability"
       forecast_features: true
       forecast_source: "wcdt_v3"
@@ -67,3 +69,5 @@ stage5:
         checkpoint: "safe_rl_output/runs/<accvp_run>/accvp/accvp_v1_predictor.pt"
         calibration_bundle: "safe_rl_output/runs/<accvp_run>/accvp/accvp_v1_calibration.json"
         operating_point: "safe_rl_output/runs/<accvp_run>/accvp/accvp_v1_operating_point.json"
+        artifact_manifest: "safe_rl_output/runs/<accvp_run>/accvp/accvp_v1_artifact_manifest.json"
+        risk_checkpoint: "safe_rl_output/runs/<risk_run>/stage2/risk_module.pt"

@@ -8,6 +8,8 @@ from typing import Any, Mapping
 
 
 COUNTERFACTUAL_SCHEMA_VERSION = 1
+COUNTERFACTUAL_SHARD_MANIFEST_VERSION = 1
+COUNTERFACTUAL_DATASET_MANIFEST_VERSION = 1
 VIABILITY_STATUSES = frozenset({"observed_success", "observed_failure", "censored"})
 BRANCH_REQUIRED_FIELDS = frozenset(
     {
@@ -17,6 +19,8 @@ BRANCH_REQUIRED_FIELDS = frozenset(
         "action_id",
         "snapshot_sha256",
         "candidate_plan_profile",
+        "risk_model_fingerprint",
+        "secondary_safety_pass",
         "event_observed",
         "censor_time",
         "censor_reason",
@@ -71,6 +75,35 @@ def file_sha256(path: str | Path) -> str:
         for chunk in iter(lambda: handle.read(1024 * 1024), b""):
             digest.update(chunk)
     return digest.hexdigest()
+
+
+def jsonl_sha256(path: str | Path) -> str:
+    """Return the byte hash of a manifest file with a clear missing-file error."""
+
+    value = Path(path)
+    if not value.exists():
+        raise FileNotFoundError(f"required manifest does not exist: {value}")
+    return file_sha256(value)
+
+
+def read_json(path: str | Path) -> dict[str, Any]:
+    with Path(path).open("r", encoding="utf-8") as handle:
+        value = json.load(handle)
+    if not isinstance(value, dict):
+        raise ValueError(f"expected JSON object in {path}")
+    return value
+
+
+def write_json_atomic(path: str | Path, value: Mapping[str, Any] | dict[str, Any]) -> Path:
+    """Write a canonical JSON artifact without exposing partial files."""
+
+    output = Path(path)
+    output.parent.mkdir(parents=True, exist_ok=True)
+    temporary = output.with_suffix(output.suffix + ".tmp")
+    with temporary.open("w", encoding="utf-8") as handle:
+        handle.write(canonical_json(value))
+    temporary.replace(output)
+    return output
 
 
 def validate_branch_row(row: Mapping[str, Any]) -> None:

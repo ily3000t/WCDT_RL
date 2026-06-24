@@ -13,6 +13,7 @@ def main() -> None:
     parser.add_argument("--root-policy", choices=["mixed", "ppo", "merge_timing", "rule"], default=None)
     parser.add_argument("--root-filter", choices=["all", "deadline"], default=None)
     parser.add_argument("--episode-seeds", nargs="*", type=int, default=None)
+    parser.add_argument("--collection-id", default=None, help="Immutable shard identifier; existing identifiers are rejected")
     parser.add_argument("--root-source", default=None, choices=["mixed", "ppo", "merge_timing", "rule", "deadline_hard"], help="Deprecated compatibility alias for --root-policy.")
     args = parser.parse_args()
     cfg = load_config(args.config)
@@ -24,6 +25,7 @@ def main() -> None:
         root_filter=args.root_filter,
         episode_seeds=args.episode_seeds,
         root_source=args.root_source,
+        collection_id=args.collection_id,
     )
 
 

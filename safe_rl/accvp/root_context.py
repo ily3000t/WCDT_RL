@@ -104,6 +104,7 @@ def capture_root_context(
     snapshot = Path(snapshot_path)
     root_id = root_id or f"seed{int(env.seed_value)}_decision{int(env._decision_index)}_{uuid.uuid4().hex[:12]}"
     scenario_hash = stable_hash(dict(env.config.scenario))
+    config_hash = stable_hash(dict(env.config))
     metadata = {
         "counterfactual_schema_version": COUNTERFACTUAL_SCHEMA_VERSION,
         "root_id": root_id,
@@ -124,6 +125,7 @@ def capture_root_context(
         "snapshot_path": str(snapshot.resolve()),
         "snapshot_sha256": file_sha256(snapshot),
         "scenario_config_hash": scenario_hash,
+        "config_hash": config_hash,
         "sumo_version": str(env.config.scenario.get("sumo_version", "unknown")),
         "action_execution_profile": str(env.config.scenario.get("action_execution_profile", "current_v1")),
         "candidate_plan_profile": str(env.config.accvp.candidate_plan_profile),

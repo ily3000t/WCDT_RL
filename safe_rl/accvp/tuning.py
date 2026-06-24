@@ -8,6 +8,7 @@ import numpy as np
 
 from safe_rl.accvp.calibration import CalibrationBundle
 from safe_rl.accvp.dataset import ACCVPBranchDataset, collate_numpy
+from safe_rl.accvp.selection import select_viability_action
 from safe_rl.accvp.train import _model_output, _tensor_batch
 
 
@@ -22,6 +23,8 @@ def tune_operating_point(models: list[Any], dataset: ACCVPBranchDataset, calibra
     with torch.no_grad():
         for index in range(len(dataset)):
             batch_np = collate_numpy([dataset[index]])
+            if not bool(batch_np["viability_eligible"][0]):
+                continue
             batch = _tensor_batch(batch_np, torch)
             event_members = [torch.sigmoid(_model_output(model, batch)["event_logits"]).cpu().numpy()[0] for model in models]
             events = np.stack(event_members, axis=0)
@@ -32,6 +35,8 @@ def tune_operating_point(models: list[Any], dataset: ACCVPBranchDataset, calibra
             }
             bounds = calibration.score(raw)
             manifest = dataset.rows[index]
+            root = dataset.roots[str(manifest["root_id"])]
+            secondary = dict(manifest.get("secondary_risk", {}))
             rows.append(
                 {
                     "root_id": str(manifest["root_id"]),
@@ -42,8 +47,14 @@ def tune_operating_point(models: list[Any], dataset: ACCVPBranchDataset, calibra
                     "safety_violation": float(batch_np["event_targets"][0, 1]),
                     "merge_before_taper": float(batch_np["event_targets"][0, 3]),
                     "merge_observed": bool(batch_np["event_mask"][0, 3]),
+                    "action_id": int(manifest["action_id"]),
+                    "raw_action_id": int(root["raw_action_id"]),
+                    "candidate_legal": bool(secondary.get("candidate_legal", True)),
+                    "secondary_safety_pass": bool(manifest.get("secondary_safety_pass", secondary.get("secondary_safety_pass", False))),
                 }
             )
+    if not rows:
+        raise ValueError("operating-point split has no observed deadline viability rows")
     required = float(tuning.required_availability)
     candidates: list[dict[str, Any]] = []
     for collision_bound, safety_bound, viability_bound in product(
@@ -51,26 +62,22 @@ def tune_operating_point(models: list[Any], dataset: ACCVPBranchDataset, calibra
         tuning.safety_violation_upper_bounds,
         tuning.merge_viability_lower_bounds,
     ):
-        accepted = [
-            row
-            for row in rows
-            if row["pU_proxy_collision"] <= float(collision_bound)
-            and row["pU_safety_violation"] <= float(safety_bound)
-            and row["pL_merge_before_taper"] >= float(viability_bound)
-        ]
         by_root: dict[str, list[dict[str, Any]]] = defaultdict(list)
-        for row in accepted:
+        for row in rows:
             by_root[row["root_id"]].append(row)
-        availability = float(len(by_root) / max(1, len({row["root_id"] for row in rows})))
+        thresholds = {
+            "proxy_collision_upper_bound": float(collision_bound),
+            "safety_violation_upper_bound": float(safety_bound),
+            "merge_viability_lower_bound": float(viability_bound),
+        }
+        decisions = [
+            select_viability_action(candidates, raw_action_id=int(candidates[0]["raw_action_id"]), thresholds=thresholds)
+            for candidates in by_root.values()
+        ]
+        selected = [decision["selected"] for decision in decisions if decision["selected"] is not None]
+        availability = float(len(selected) / max(1, len(by_root)))
         if availability < required:
             continue
-        selected = [
-            min(
-                choices,
-                key=lambda row: (-row["pL_merge_before_taper"], row["pU_safety_violation"]),
-            )
-            for choices in by_root.values()
-        ]
         observed = [row for row in selected if row["merge_observed"]]
         candidates.append(
             {

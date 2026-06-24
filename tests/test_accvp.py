@@ -11,8 +11,10 @@ from safe_rl.accvp.controller import ACCVPController
 from safe_rl.accvp.dataset import build_split_manifest
 from safe_rl.accvp.oracle import counterfactual_oracle_report
 from safe_rl.accvp.root_context import RootContext
+from safe_rl.accvp.selection import select_viability_action
+from safe_rl.accvp.shards import merge_counterfactual_shards
 from safe_rl.accvp.snapshot_store import CounterfactualSnapshotStore
-from safe_rl.stage1_counterfactual.collector import _root_filter_matches, _seed_schedule
+from safe_rl.stage1_counterfactual.collector import _cache_dir, _root_filter_matches, _seed_schedule
 from safe_rl.sim.action_space import decode_action
 from safe_rl.sim.types import VehicleState
 from safe_rl.utils.config import clone_with_overrides, load_config
@@ -94,7 +96,7 @@ def test_only_raw_infeasible_allows_accvp_replacement_and_commitment():
     assert debug["accvp_replacement"] is True
     assert debug["accvp_commitment_started"] is True
     continued, continued_debug = controller.decide(
-        context=_context(1), raw_action=raw, safety_shield_action=raw, safety_shield_replaced=False, shield=_Shield()
+        context=_context(1), raw_action=raw, safety_shield_action=merge, safety_shield_replaced=False, shield=_Shield(), shield_input_action=merge
     )
     assert continued == merge
     assert continued_debug["accvp_commitment_active"] is True
@@ -106,11 +108,12 @@ def test_shield_veto_cancels_active_commitment():
     controller = ACCVPController(_cfg("viability_branch"), _Predictor([_score(4, risk=0.9), _score(7)]))
     controller.decide(context=_context(), raw_action=raw, safety_shield_action=raw, safety_shield_replaced=False, shield=_Shield())
     action, debug = controller.decide(
-        context=_context(1), raw_action=raw, safety_shield_action=raw, safety_shield_replaced=False, shield=_Shield(False)
+        context=_context(1), raw_action=raw, safety_shield_action=raw, safety_shield_replaced=True, shield=_Shield(False), shield_input_action=merge
     )
     assert action == raw
     assert debug["accvp_commitment_cancelled"] is True
-    assert debug["accvp_bypass_reason"] == "commitment_shield_veto"
+    assert debug["accvp_bypass_reason"] == ""
+    assert debug["accvp_skip_reason"] == "commitment_shield_veto"
     assert merge != action
 
 
@@ -148,6 +151,8 @@ def test_snapshot_is_deleted_only_after_all_expected_branches_complete(tmp_path:
         "root_id": "root",
         "snapshot_sha256": "hash",
         "candidate_plan_profile": ACCVP_COMMITMENT_PROFILE,
+        "risk_model_fingerprint": "risk_checkpoint:test",
+        "secondary_safety_pass": True,
         "event_observed": False,
         "censor_time": 8.0,
         "censor_reason": "horizon_elapsed",
@@ -177,6 +182,8 @@ def test_calibration_and_selected_action_metrics_are_decision_level():
                 "candidate_set_available": True,
                 "p_proxy_collision": 0.2,
                 "proxy_collision": 0.0,
+                "p_safety_violation": 0.2,
+                "safety_violation": 0.0,
                 "p_merge_before_taper": 0.8,
                 "merge_before_taper": 1.0,
             }
@@ -184,6 +191,29 @@ def test_calibration_and_selected_action_metrics_are_decision_level():
     )
     assert metrics["selected_count"] == 1.0
     assert metrics["candidate_set_availability"] == 1.0
+    assert "proxy_collision" in metrics
+    assert "safety_violation" in metrics
+
+
+def test_empty_calibration_bin_is_conservative_and_selector_retains_raw():
+    calibrator = OneSidedBinnedCalibrator.fit([0.1], [0.0], bins=2)
+    assert calibrator.transform_upper([0.9])[0] == 1.0
+    assert calibrator.transform_lower([0.9])[0] == 0.0
+    thresholds = {
+        "proxy_collision_upper_bound": 0.2,
+        "safety_violation_upper_bound": 0.2,
+        "merge_viability_lower_bound": 0.5,
+    }
+    decision = select_viability_action(
+        [
+            {"action_id": 4, "pU_proxy_collision": 0.1, "pU_safety_violation": 0.1, "pL_merge_before_taper": 0.6, "secondary_safety_pass": True},
+            {"action_id": 7, "pU_proxy_collision": 0.1, "pU_safety_violation": 0.1, "pL_merge_before_taper": 0.9, "secondary_safety_pass": True},
+        ],
+        raw_action_id=4,
+        thresholds=thresholds,
+    )
+    assert decision["selected"]["action_id"] == 4
+    assert decision["raw_feasible"] is True
 
 
 def test_split_keeps_all_roots_of_same_episode_seed_together(tmp_path: Path):
@@ -244,3 +274,51 @@ def test_root_policy_filter_and_exact_seed_schedule_are_independent():
     assert _root_filter_matches("deadline", "deadline") is True
     assert _root_filter_matches("deadline", "pre_deadline") is False
     assert _seed_schedule(cfg, [2, 5], None) == [2, 5]
+
+
+def test_default_counterfactual_cache_is_under_output_tree_not_repository_root(tmp_path: Path):
+    cfg = clone_with_overrides(
+        load_config(),
+        {"run": {"output_root": str(tmp_path / "safe_rl_output" / "runs"), "run_id": "cache_test", "cache_root": None}},
+    )
+    cache = _cache_dir(cfg, "counterfactual", cfg.accvp.counterfactual)
+    assert cache == tmp_path / "safe_rl_output" / ".cache" / "cache_test" / "stage1_counterfactual" / "counterfactual"
+
+
+def test_immutable_shards_merge_without_overwriting_sources(tmp_path: Path):
+    shards = []
+    for index in range(2):
+        shard = tmp_path / f"shard_{index}"
+        manifests = shard / "manifests"
+        manifests.mkdir(parents=True)
+        root_id = f"root_{index}"
+        (manifests / "roots.jsonl").write_text(
+            __import__("json").dumps({"root_id": root_id, "complete": True, "root_policy": "merge_timing", "traffic_profile": "hard", "deadline_bin": "deadline"}) + "\n",
+            encoding="utf-8",
+        )
+        (manifests / "branches.jsonl").write_text(
+            __import__("json").dumps({"root_id": root_id, "action_id": 4, "branch_status": "completed", "secondary_safety_pass": True, "risk_model_fingerprint": "risk_checkpoint:fixture"}) + "\n",
+            encoding="utf-8",
+        )
+        (manifests / "dataset_manifest.json").write_text(
+            __import__("json").dumps(
+                {
+                    "artifact_kind": "counterfactual_shard_v1",
+                    "counterfactual_schema_version": 1,
+                    "collection_id": f"job_{index}",
+                    "scenario_config_hash": "scenario",
+                    "action_execution_profile": "current_v1",
+                    "candidate_plan_profile": ACCVP_COMMITMENT_PROFILE,
+                    "risk_model_fingerprint": "risk_checkpoint:fixture",
+                    "config_hash": "config",
+                }
+            ),
+            encoding="utf-8",
+        )
+        shards.append(shard)
+    output = merge_counterfactual_shards(shards, tmp_path / "formal")
+    manifest = __import__("json").loads((output / "manifests" / "dataset_manifest.json").read_text(encoding="utf-8"))
+    assert manifest["root_count"] == 2
+    assert (shards[0] / "manifests" / "roots.jsonl").exists()
+    with __import__("pytest").raises(FileExistsError):
+        merge_counterfactual_shards(shards, output)

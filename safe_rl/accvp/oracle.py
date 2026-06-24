@@ -5,6 +5,8 @@ from collections import defaultdict
 from pathlib import Path
 from typing import Any, Iterable
 
+from safe_rl.accvp.schema import file_sha256, read_json, write_json_atomic
+
 
 ORACLE_STATES = frozenset({"insufficient_coverage", "no_safe_viable_alternative", "go"})
 
@@ -12,6 +14,27 @@ ORACLE_STATES = frozenset({"insufficient_coverage", "no_safe_viable_alternative"
 def _jsonl(path: Path) -> list[dict[str, Any]]:
     with path.open("r", encoding="utf-8") as handle:
         return [json.loads(line) for line in handle if line.strip()]
+
+
+def _dataset_provenance(dataset: Path) -> dict[str, Any]:
+    """Capture immutable dataset inputs so a report cannot be reused elsewhere."""
+
+    manifests = dataset / "manifests"
+    dataset_manifest_path = manifests / "dataset_manifest.json"
+    roots_path = manifests / "roots.jsonl"
+    branches_path = manifests / "branches.jsonl"
+    if not dataset_manifest_path.exists():
+        return {"formal_dataset": False}
+    manifest = read_json(dataset_manifest_path)
+    return {
+        "formal_dataset": str(manifest.get("artifact_kind", "")) == "counterfactual_dataset_v1",
+        "dataset_manifest_sha256": file_sha256(dataset_manifest_path),
+        "roots_manifest_sha256": file_sha256(roots_path),
+        "branches_manifest_sha256": file_sha256(branches_path),
+        "dataset_fingerprint": str(manifest.get("dataset_fingerprint", "")),
+        "config_hash": str(manifest.get("config_hash", "")),
+        "risk_model_fingerprint": str(manifest.get("risk_model_fingerprint", "")),
+    }
 
 
 def _safe_viable(candidate: dict[str, Any]) -> bool:
@@ -57,6 +80,7 @@ def counterfactual_oracle_report(
     named states in :data:`ORACLE_STATES`.
     """
 
+    seed_list = [int(value) for value in required_seeds]
     dataset = Path(dataset_dir)
     roots = {
         str(row["root_id"]): row
@@ -100,7 +124,7 @@ def counterfactual_oracle_report(
             }
         )
     per_seed: dict[str, dict[str, Any]] = {}
-    for seed in [int(value) for value in required_seeds]:
+    for seed in seed_list:
         deadline_roots = [
             row
             for row in root_rows
@@ -133,8 +157,10 @@ def counterfactual_oracle_report(
         "dataset_dir": str(dataset.resolve()),
         "oracle_state": state,
         "go_for_training": state == "go",
+        "required_seeds": seed_list,
         "required_min_deadline_roots_per_seed": int(min_deadline_roots_per_seed),
         "root_policy": root_policy,
+        "dataset_provenance": _dataset_provenance(dataset),
         "root_count": len(root_rows),
         "required_failure_seed_results": per_seed,
         "roots": root_rows,
@@ -155,6 +181,39 @@ def write_oracle_report(
         min_deadline_roots_per_seed=min_deadline_roots_per_seed,
         root_policy=root_policy,
     )
-    with Path(output_path).open("w", encoding="utf-8") as handle:
-        json.dump(report, handle, indent=2, sort_keys=True)
+    write_json_atomic(output_path, report)
+    return report
+
+
+def validate_oracle_for_training(config: Any, dataset_dir: str | Path) -> dict[str, Any]:
+    """Enforce the non-bypassable ACCVP-v1 repairability gate."""
+
+    report_path = config.accvp.get("oracle_report")
+    if not report_path:
+        raise FileNotFoundError("formal ACCVP training requires accvp.oracle_report with oracle_state='go'")
+    report = read_json(report_path)
+    if str(report.get("oracle_state", "")) != "go" or not bool(report.get("go_for_training", False)):
+        raise ValueError(f"ACCVP training blocked by oracle_state={report.get('oracle_state')!r}")
+    if str(report.get("root_policy", "")) != "merge_timing":
+        raise ValueError("ACCVP training requires a merge_timing-PPO oracle report")
+    if [int(value) for value in report.get("required_seeds", [])] != [2, 5]:
+        raise ValueError("ACCVP training requires the pre-registered oracle seeds [2, 5]")
+    dataset = Path(dataset_dir).resolve()
+    if Path(str(report.get("dataset_dir", ""))).resolve() != dataset:
+        raise ValueError("ACCVP oracle report belongs to a different dataset directory")
+    current = _dataset_provenance(dataset)
+    expected = dict(report.get("dataset_provenance", {}))
+    if not bool(current.get("formal_dataset", False)):
+        raise ValueError("ACCVP training requires a merged formal counterfactual dataset")
+    for key in ("dataset_manifest_sha256", "roots_manifest_sha256", "branches_manifest_sha256", "dataset_fingerprint"):
+        if not expected.get(key) or expected.get(key) != current.get(key):
+            raise ValueError(f"ACCVP oracle report provenance mismatch for {key}")
+    risk_fingerprint = str(current.get("risk_model_fingerprint", ""))
+    if risk_fingerprint.startswith("heuristic:") or not risk_fingerprint:
+        raise ValueError("ACCVP formal dataset is not bound to a frozen Risk Module checkpoint")
+    configured_risk = config.accvp.get("risk_checkpoint")
+    if configured_risk:
+        expected_fingerprint = f"risk_checkpoint:{file_sha256(configured_risk)}"
+        if expected_fingerprint != risk_fingerprint:
+            raise ValueError("ACCVP Risk Module checkpoint does not match the counterfactual dataset")
     return report

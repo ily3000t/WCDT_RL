@@ -10,9 +10,12 @@ import numpy as np
 
 from safe_rl.accvp.branch_worker import run_branch_job
 from safe_rl.accvp.root_context import capture_root_context, synchronise_root_state
-from safe_rl.accvp.schema import canonical_json, stable_hash
+from safe_rl.accvp.schema import canonical_json, file_sha256, stable_hash, write_json_atomic
+from safe_rl.accvp.shards import assert_new_shard, immutable_shard_dir
 from safe_rl.accvp.snapshot_store import CounterfactualSnapshotStore
 from safe_rl.risk.merge_local import is_candidate_legal
+from safe_rl.risk.risk_module import RiskModuleWrapper
+from safe_rl.shield.safety_shield import SafetyShield
 from safe_rl.sim.action_space import ACTIONS
 from safe_rl.utils.config import REPO_ROOT, prepare_run_dir
 from safe_rl.utils.progress import stage_log
@@ -75,10 +78,20 @@ def _root_filter_matches(root_filter: str, deadline_bin: str) -> bool:
 
 
 def _cache_dir(cfg: Any, output_name: str, counterfactual: Any) -> Path:
-    configured = counterfactual.get("cache_root") or cfg.run.get("cache_root", ".cache/safe_rl")
-    root = Path(str(configured))
-    if not root.is_absolute():
-        root = REPO_ROOT / root
+    configured = counterfactual.get("cache_root") or cfg.run.get("cache_root")
+    if configured:
+        root = Path(str(configured))
+        if not root.is_absolute():
+            root = REPO_ROOT / root
+    else:
+        # Keep transient SUMO snapshots in the output tree, never beside source
+        # files or inside the durable counterfactual dataset.  The normal
+        # output root is ``safe_rl_output/runs``; use its parent so cache
+        # cleanup remains separate from individual run artifacts.
+        output_root = Path(str(cfg.run.output_root))
+        if not output_root.is_absolute():
+            output_root = REPO_ROOT / output_root
+        root = (output_root.parent if output_root.name.lower() == "runs" else output_root) / ".cache"
     return root / str(cfg.run.run_id) / "stage1_counterfactual" / str(output_name)
 
 
@@ -113,6 +126,56 @@ def _seed_schedule(cfg: Any, episode_seeds: Iterable[int] | None, episodes: int 
     return [int(cfg.run.seed) + index for index in range(count)]
 
 
+class _SecondaryRiskEvaluator:
+    """Frozen Risk Module snapshot used by offline ACCVP selection diagnostics."""
+
+    def __init__(self, cfg: Any):
+        configured = cfg.accvp.counterfactual.get("risk_checkpoint")
+        self.checkpoint = Path(str(configured)).resolve() if configured else None
+        if self.checkpoint is not None and not self.checkpoint.exists():
+            raise FileNotFoundError(f"counterfactual Risk Module checkpoint does not exist: {self.checkpoint}")
+        self.fingerprint = (
+            f"risk_checkpoint:{file_sha256(self.checkpoint)}" if self.checkpoint is not None else "heuristic:risk_module_v1"
+        )
+        self.shield = SafetyShield(cfg, RiskModuleWrapper(cfg, checkpoint=str(self.checkpoint) if self.checkpoint else None))
+        self.shield.enabled = True
+
+    def score(self, context: dict[str, Any], legal_ids: list[int]) -> dict[str, dict[str, Any]]:
+        by_index = {action.index: action for action in ACTIONS}
+        result: dict[str, dict[str, Any]] = {}
+        for action_id in legal_ids:
+            check = self.shield.evaluate_candidate(by_index[int(action_id)], context)
+            result[str(action_id)] = {
+                "candidate_legal": bool(check["candidate_legal"]),
+                "risk_score": float(check["risk_score"]),
+                "risk_uncertainty": float(check["risk_uncertainty"]),
+                "secondary_safety_pass": bool(check["safety_pass"]),
+                "veto_reason": str(check.get("veto_reason", "")),
+            }
+        return result
+
+
+def _collection_id(
+    counterfactual: Any,
+    policy_name: str,
+    filter_name: str,
+    seed_schedule: list[int],
+    explicit: str | None,
+) -> str:
+    configured = explicit or counterfactual.get("collection_id")
+    if configured:
+        return str(configured)
+    digest = stable_hash(
+        {
+            "root_policy": policy_name,
+            "root_filter": filter_name,
+            "episode_seeds": seed_schedule,
+            "root_budget": int(counterfactual.root_budget),
+        }
+    )[:12]
+    return f"{policy_name}_{filter_name}_{digest}"
+
+
 def collect(
     cfg: Any,
     *,
@@ -121,6 +184,7 @@ def collect(
     episode_seeds: Iterable[int] | None = None,
     episodes: int | None = None,
     root_source: str | None = None,
+    collection_id: str | None = None,
 ) -> Path:
     """Collect bounded roots without ever loading state on the root connection.
 
@@ -141,20 +205,23 @@ def collect(
     workers = max(1, int(counterfactual.workers))
     output_name = str(counterfactual.output_name)
     stage_dir = prepare_run_dir(cfg, "stage1_counterfactual")
+    seed_schedule = _seed_schedule(cfg, episode_seeds, episodes)
+    shard_id = _collection_id(counterfactual, policy_name, filter_name, seed_schedule, collection_id)
+    shard_dir = assert_new_shard(immutable_shard_dir(stage_dir, output_name, shard_id))
     store = CounterfactualSnapshotStore(
-        stage_dir / output_name,
-        cache_dir=_cache_dir(cfg, output_name, counterfactual),
+        shard_dir,
+        cache_dir=_cache_dir(cfg, output_name, counterfactual) / shard_id,
     )
     branch_tensor_dir = store.branches_dir / "tensors"
     branch_tensor_dir.mkdir(parents=True, exist_ok=True)
-    seed_schedule = _seed_schedule(cfg, episode_seeds, episodes)
     stage_log(
         "stage1_counterfactual",
-        f"root_policy={policy_name} root_filter={filter_name} root_budget={root_budget} workers={workers} seeds={len(seed_schedule)}",
+        f"collection_id={shard_id} root_policy={policy_name} root_filter={filter_name} root_budget={root_budget} workers={workers} seeds={len(seed_schedule)}",
     )
     cfg.accvp["_counterfactual_collection_enabled"] = True
     env = make_env(cfg, seed=int(seed_schedule[0] if seed_schedule else cfg.run.seed), shield_enabled=False)
     policy = _RootPolicy(cfg, policy_name)
+    secondary_risk = _SecondaryRiskEvaluator(cfg)
     root_rows: list[dict[str, Any]] = []
     branch_rows: list[dict[str, Any]] = []
     pending: dict[Any, tuple[str, int]] = {}
@@ -187,6 +254,11 @@ def collect(
                         context = env.get_risk_context()
                         legal_ids = [int(action.index) for action in ACTIONS if is_candidate_legal(action, context)]
                         if legal_ids:
+                            # The raw action may have been chosen from a stale
+                            # subscription view. Oracle semantics must use the
+                            # same synchronised state as the snapshot.
+                            raw_action_legal = int(raw_action) in set(legal_ids)
+                            secondary_scores = secondary_risk.score(context, legal_ids)
                             root_id = f"seed{int(env.seed_value)}_decision{int(env._decision_index)}_{uuid.uuid4().hex[:12]}"
                             snapshot_path = store.save_snapshot_from_root(env, root_id)
                             root = capture_root_context(
@@ -200,6 +272,9 @@ def collect(
                                 deadline_bin=deadline_bin,
                                 snapshot_path=snapshot_path,
                             )
+                            root.metadata["secondary_risk"] = secondary_scores
+                            root.metadata["risk_model_fingerprint"] = secondary_risk.fingerprint
+                            root.metadata["collection_id"] = shard_id
                             metadata_path, tensor_path = store.write_root(root, legal_ids)
                             root_rows.append(
                                 {
@@ -213,6 +288,12 @@ def collect(
                                     "raw_action_legal": bool(raw_action_legal),
                                     "traffic_profile": str(context.get("curriculum_profile", "unknown")),
                                     "deadline_bin": deadline_bin,
+                                    "scenario_config_hash": str(root.metadata["scenario_config_hash"]),
+                                    "config_hash": str(root.metadata["config_hash"]),
+                                    "action_execution_profile": str(root.metadata["action_execution_profile"]),
+                                    "candidate_plan_profile": str(root.metadata["candidate_plan_profile"]),
+                                    "risk_model_fingerprint": secondary_risk.fingerprint,
+                                    "collection_id": shard_id,
                                     "metadata_path": str(metadata_path),
                                     "tensor_path": str(tensor_path),
                                     "expected_action_ids": legal_ids,
@@ -245,8 +326,11 @@ def collect(
     with (manifests / "branches.jsonl").open("w", encoding="utf-8") as handle:
         for row in branch_rows:
             handle.write(canonical_json(row) + "\n")
+    scenario_config_hash = stable_hash(dict(cfg.scenario))
     dataset_manifest = {
+        "artifact_kind": "counterfactual_shard_v1",
         "counterfactual_schema_version": 1,
+        "collection_id": shard_id,
         "root_policy": policy_name,
         "root_filter": filter_name,
         "episode_seeds": seed_schedule,
@@ -254,12 +338,15 @@ def collect(
         "collected_roots": collected,
         "complete_roots": sum(1 for row in root_rows if row.get("complete")),
         "failed_branches": sum(1 for row in branch_rows if row.get("branch_status") != "completed"),
-        "root_strata": list(counterfactual.root_strata),
+        "collection_jobs": list(counterfactual.get("collection_jobs", [])),
         "cache_dir": str(store.cache_dir),
         "config_hash": stable_hash(dict(cfg)),
+        "scenario_config_hash": scenario_config_hash,
+        "action_execution_profile": str(cfg.scenario.get("action_execution_profile", "current_v1")),
+        "candidate_plan_profile": str(cfg.accvp.candidate_plan_profile),
+        "risk_model_fingerprint": secondary_risk.fingerprint,
         "branch_status_counts": dict(Counter(str(row.get("branch_status", "failed")) for row in branch_rows)),
     }
-    with (manifests / "dataset_manifest.json").open("w", encoding="utf-8") as handle:
-        handle.write(canonical_json(dataset_manifest))
+    write_json_atomic(manifests / "dataset_manifest.json", dataset_manifest)
     stage_log("stage1_counterfactual", f"dataset={store.output_dir} complete_roots={dataset_manifest['complete_roots']}")
     return store.output_dir

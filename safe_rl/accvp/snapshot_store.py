@@ -16,7 +16,13 @@ class CounterfactualSnapshotStore:
         # SUMO state files are temporary worker cache, not dataset artifacts.
         # Keep them out of the buffer directory so completed datasets remain
         # immutable and cache cleanup never risks deleting branch records.
-        self.cache_dir = Path(cache_dir) if cache_dir is not None else self.output_dir / ".cache"
+        # Direct callers get the same separation guarantee as the collector:
+        # cache files are siblings of, never children of, durable datasets.
+        self.cache_dir = (
+            Path(cache_dir)
+            if cache_dir is not None
+            else self.output_dir.parent / ".cache" / self.output_dir.name
+        )
         self.snapshots_dir = self.cache_dir / "snapshots"
         self.roots_dir = self.output_dir / "roots"
         self.branches_dir = self.output_dir / "branches"

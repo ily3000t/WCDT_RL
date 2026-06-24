@@ -9,6 +9,7 @@ import pytest
 torch = pytest.importorskip("torch")
 
 from safe_rl.accvp.dataset import build_split_manifest
+from safe_rl.accvp.schema import file_sha256
 from safe_rl.accvp.train import train_accvp
 from safe_rl.sim.types import VehicleState
 from safe_rl.utils.config import clone_with_overrides, load_config
@@ -53,18 +54,12 @@ def _write_minimal_formal_dataset(dataset: Path, cfg) -> None:
             ),
             encoding="utf-8",
         )
-        branch_npz = branches_dir / f"{root_id}_action4.npz"
-        np.savez_compressed(
-            branch_npz,
-            actor_response=np.zeros((actors, response, 5), dtype=np.float32),
-            actor_valid_mask=np.ones((actors, response), dtype=np.float32),
-        )
         roots.append(
             {
                 "root_id": root_id,
                 "root_episode_id": f"ppo:{seed}",
                 "episode_seed": seed,
-                "root_policy": "ppo",
+                "root_policy": "merge_timing",
                 "traffic_profile": "hard" if seed % 2 else "safe",
                 "deadline_bin": "deadline",
                 "raw_action_id": 4,
@@ -74,30 +69,63 @@ def _write_minimal_formal_dataset(dataset: Path, cfg) -> None:
                 "complete": True,
             }
         )
-        branches.append(
-            {
-                "root_id": root_id,
-                "branch_id": f"{root_id}_action4",
-                "branch_status": "completed",
-                "action_id": 4,
-                "event_observed": True,
-                "censor_time": 1.0,
-                "censor_reason": "",
-                "proxy_collision_within_horizon": False,
-                "safety_violation_within_horizon": False,
-                "taper_miss_observed": False,
-                "merge_before_taper_observed": True,
-                "viability_observation_status": "observed_success",
-                "min_obb_distance": 5.0,
-                "max_drac": 0.1,
-                "target_front_gap": 10.0,
-                "target_rear_gap": 10.0,
-                "target_lane_entry_time_s": 1.0,
-                "tensor_path": str(branch_npz),
-            }
-        )
+        for action_id in (4, 7):
+            branch_npz = branches_dir / f"{root_id}_action{action_id}.npz"
+            np.savez_compressed(
+                branch_npz,
+                actor_response=np.zeros((actors, response, 5), dtype=np.float32),
+                actor_valid_mask=np.ones((actors, response), dtype=np.float32),
+            )
+            raw_failure = seed in {2, 5} and action_id == 4
+            branches.append(
+                {
+                    "root_id": root_id,
+                    "branch_id": f"{root_id}_action{action_id}",
+                    "branch_status": "completed",
+                    "action_id": action_id,
+                    "event_observed": True,
+                    "censor_time": 1.0,
+                    "censor_reason": "",
+                    "proxy_collision_within_horizon": raw_failure,
+                    "safety_violation_within_horizon": raw_failure,
+                    "taper_miss_observed": raw_failure,
+                    "merge_before_taper_observed": not raw_failure,
+                    "viability_observation_status": "observed_failure" if raw_failure else "observed_success",
+                    "min_obb_distance": 5.0,
+                    "max_drac": 0.1,
+                    "target_front_gap": 10.0,
+                    "target_rear_gap": 10.0,
+                    "target_lane_entry_time_s": 1.0,
+                    "secondary_risk": {"candidate_legal": True, "secondary_safety_pass": True},
+                    "secondary_safety_pass": True,
+                    "tensor_path": str(branch_npz),
+                }
+            )
     (manifests / "roots.jsonl").write_text("".join(json.dumps(row) + "\n" for row in roots), encoding="utf-8")
     (manifests / "branches.jsonl").write_text("".join(json.dumps(row) + "\n" for row in branches), encoding="utf-8")
+    manifest = {
+        "artifact_kind": "counterfactual_dataset_v1",
+        "dataset_fingerprint": "fixture-dataset",
+        "risk_model_fingerprint": "risk_checkpoint:fixture",
+    }
+    (manifests / "dataset_manifest.json").write_text(json.dumps(manifest), encoding="utf-8")
+    oracle = {
+        "dataset_dir": str(dataset.resolve()),
+        "oracle_state": "go",
+        "go_for_training": True,
+        "root_policy": "merge_timing",
+        "required_seeds": [2, 5],
+        "dataset_provenance": {
+            "formal_dataset": True,
+            "dataset_manifest_sha256": file_sha256(manifests / "dataset_manifest.json"),
+            "roots_manifest_sha256": file_sha256(manifests / "roots.jsonl"),
+            "branches_manifest_sha256": file_sha256(manifests / "branches.jsonl"),
+            "dataset_fingerprint": manifest["dataset_fingerprint"],
+        },
+    }
+    oracle_path = manifests / "oracle_report.json"
+    oracle_path.write_text(json.dumps(oracle), encoding="utf-8")
+    cfg.accvp["oracle_report"] = str(oracle_path)
 
 
 def test_formal_training_initializes_training_before_loss_weights_and_writes_final_test(tmp_path: Path):
@@ -131,3 +159,10 @@ def test_formal_training_initializes_training_before_loss_weights_and_writes_fin
     assert diagnostics["split"] == "test"
     assert "post_selection" in diagnostics
     assert (output / "accvp_v1_operating_point.json").exists()
+    assert (output / "accvp_v1_artifact_manifest.json").exists()
+
+
+def test_formal_training_requires_strict_oracle_report(tmp_path: Path):
+    cfg = clone_with_overrides(load_config(), {"accvp": {"oracle_report": None}})
+    with pytest.raises(FileNotFoundError, match="oracle_report"):
+        train_accvp(cfg, tmp_path / "dataset")

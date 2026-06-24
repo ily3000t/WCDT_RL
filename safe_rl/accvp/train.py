@@ -16,7 +16,8 @@ from safe_rl.accvp.model import (
     set_scene_encoder_trainable,
     warm_start_scene_encoder,
 )
-from safe_rl.accvp.schema import file_sha256, stable_hash
+from safe_rl.accvp.schema import file_sha256, read_json, stable_hash, write_json_atomic
+from safe_rl.accvp.oracle import validate_oracle_for_training
 from safe_rl.utils.config import prepare_run_dir
 
 
@@ -92,7 +93,7 @@ def _event_positive_weights(dataset: ACCVPBranchDataset) -> list[float]:
     return np.clip(negatives / np.maximum(positives, 1.0), 1.0, 50.0).tolist()
 
 
-def _calibrate(models: list[Any], dataset: ACCVPBranchDataset, torch: Any) -> CalibrationBundle:
+def _calibrate(models: list[Any], dataset: ACCVPBranchDataset, torch: Any, calibration_config: Any) -> CalibrationBundle:
     if not len(dataset):
         raise ValueError("ACCVP calibration split is empty")
     proxy_scores: list[float] = []
@@ -118,17 +119,30 @@ def _calibrate(models: list[Any], dataset: ACCVPBranchDataset, torch: Any) -> Ca
             observed = batch_np["event_mask"][:, 3] > 0.0
             viability_labels.extend(batch_np["event_targets"][observed, 3].tolist())
             viability_scores.extend(viability_prediction[observed].tolist())
+    fit_kwargs = {
+        "bins": int(calibration_config.get("bins", 20)),
+        "nominal_alpha": float(calibration_config.get("nominal_alpha", 0.05)),
+        "bonferroni_family_size": int(calibration_config.get("bonferroni_signal_count", 3)),
+    }
     return CalibrationBundle(
-        proxy_collision=OneSidedBinnedCalibrator.fit(proxy_scores, proxy_labels),
-        safety_violation=OneSidedBinnedCalibrator.fit(safety_scores, safety_labels),
-        merge_viability=OneSidedBinnedCalibrator.fit(viability_scores, viability_labels),
-        provenance={"split": "calibration", "candidate_level_only": True},
+        proxy_collision=OneSidedBinnedCalibrator.fit(proxy_scores, proxy_labels, **fit_kwargs),
+        safety_violation=OneSidedBinnedCalibrator.fit(safety_scores, safety_labels, **fit_kwargs),
+        merge_viability=OneSidedBinnedCalibrator.fit(viability_scores, viability_labels, **fit_kwargs),
+        provenance={
+            "split": "calibration",
+            "candidate_level_only": True,
+            "proxy_count": len(proxy_labels),
+            "safety_count": len(safety_labels),
+            "eligible_viability_count": len(viability_labels),
+            **fit_kwargs,
+        },
     )
 
 
 def train_accvp(config: Any, dataset_dir: str | Path) -> Path:
     torch = _torch()
     dataset_dir = Path(dataset_dir)
+    oracle_report = validate_oracle_for_training(config, dataset_dir)
     split_path = dataset_dir / "manifests" / "split_manifest.jsonl"
     if not split_path.exists():
         build_split_manifest(dataset_dir, seed=int(config.run.seed), require_all_splits=True)
@@ -203,7 +217,7 @@ def train_accvp(config: Any, dataset_dir: str | Path) -> Path:
         best_losses.append(best_loss)
         warm_record["freeze_encoder_epochs"] = int(warm.freeze_encoder_epochs)
         warm_records.append(warm_record)
-    calibration = _calibrate(models, calibration_set, torch)
+    calibration = _calibrate(models, calibration_set, torch, config.accvp.calibration)
     from safe_rl.accvp.tuning import tune_operating_point
     from safe_rl.accvp.diagnostics import final_test_diagnostics
 
@@ -230,14 +244,35 @@ def train_accvp(config: Any, dataset_dir: str | Path) -> Path:
     final_test_path = output_dir / "accvp_v1_final_test_diagnostics.json"
     with final_test_path.open("w", encoding="utf-8") as handle:
         json.dump(final_test, handle, indent=2, sort_keys=True)
+    dataset_manifest_path = dataset_dir / "manifests" / "dataset_manifest.json"
+    split_manifest_path = dataset_dir / "manifests" / "split_manifest.jsonl"
+    dataset_manifest = read_json(dataset_manifest_path)
+    artifact_manifest = {
+        "artifact_kind": "accvp_v1_artifact_bundle",
+        "architecture_version": metadata["architecture_version"],
+        "counterfactual_schema_version": int(metadata["counterfactual_schema_version"]),
+        "predictor_sha256": file_sha256(checkpoint),
+        "calibration_sha256": file_sha256(calibration_path),
+        "operating_point_sha256": file_sha256(operating_point_path),
+        "dataset_manifest_sha256": file_sha256(dataset_manifest_path),
+        "split_manifest_sha256": file_sha256(split_manifest_path),
+        "dataset_fingerprint": str(dataset_manifest.get("dataset_fingerprint", "")),
+        "risk_model_fingerprint": str(dataset_manifest.get("risk_model_fingerprint", "")),
+        "config_hash": stable_hash(dict(config)),
+        "oracle_report": oracle_report,
+    }
+    artifact_manifest["artifact_fingerprint"] = stable_hash(artifact_manifest)
+    artifact_manifest_path = write_json_atomic(output_dir / "accvp_v1_artifact_manifest.json", artifact_manifest)
     with (output_dir / "training_manifest.json").open("w", encoding="utf-8") as handle:
         json.dump(
             {
                 "dataset_dir": str(dataset_dir.resolve()),
+                "oracle_report": oracle_report,
                 "checkpoint": str(checkpoint.resolve()),
                 "calibration": str(calibration_path.resolve()),
                 "operating_point": str(operating_point_path.resolve()),
                 "final_test_diagnostics": str(final_test_path.resolve()),
+                "artifact_manifest": str(artifact_manifest_path.resolve()),
                 "best_validation_losses": best_losses,
                 "event_positive_weights": loss_weights["event_positive_weights"],
                 "checkpoint_metadata": metadata,

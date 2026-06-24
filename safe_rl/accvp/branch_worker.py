@@ -137,6 +137,7 @@ def _branch_outcome(job: dict[str, Any]) -> dict[str, Any]:
             censor_time = float(horizon_steps) * float(env.step_length)
         tensor_path = output_dir / f"{branch_id}.npz"
         _write_npz_atomic(tensor_path, actor_response=actor_response, actor_valid_mask=actor_valid)
+        secondary_risk = dict(root.metadata.get("secondary_risk", {}).get(str(action.index), {}))
         return {
             "counterfactual_schema_version": COUNTERFACTUAL_SCHEMA_VERSION,
             "root_id": root.root_id,
@@ -144,6 +145,9 @@ def _branch_outcome(job: dict[str, Any]) -> dict[str, Any]:
             "action_id": int(action.index),
             "action_name": str(action.name),
             "snapshot_sha256": str(root.metadata["snapshot_sha256"]),
+            "scenario_config_hash": str(root.metadata.get("scenario_config_hash", "")),
+            "config_hash": str(root.metadata.get("config_hash", "")),
+            "action_execution_profile": str(root.metadata.get("action_execution_profile", "current_v1")),
             "candidate_plan_profile": ACCVP_COMMITMENT_PROFILE,
             "root_source": str(root.metadata["root_source"]),
             "traffic_profile": str(root.metadata["traffic_profile"]),
@@ -153,6 +157,9 @@ def _branch_outcome(job: dict[str, Any]) -> dict[str, Any]:
             "root_filter": str(root.metadata.get("root_filter", "all")),
             "raw_action_id": int(root.metadata.get("raw_action_id", -1)),
             "raw_action_legal": bool(root.metadata.get("raw_action_legal", False)),
+            "risk_model_fingerprint": str(root.metadata.get("risk_model_fingerprint", "")),
+            "secondary_risk": secondary_risk,
+            "secondary_safety_pass": bool(secondary_risk.get("secondary_safety_pass", False)),
             "selected_actor_ids": actor_ids,
             "selected_actor_coverage_complete": bool(root.metadata.get("selected_actor_coverage_complete", False)),
             "safety_actor_coverage_complete": bool(root.metadata.get("safety_actor_coverage_complete", False)),

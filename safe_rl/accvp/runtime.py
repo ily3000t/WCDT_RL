@@ -10,6 +10,7 @@ from safe_rl.accvp.calibration import CalibrationBundle
 from safe_rl.accvp.candidate_plan import build_commitment_plan, profile_from_config
 from safe_rl.accvp.controller import ACCVPController
 from safe_rl.accvp.model import ACCVP_ARCHITECTURE_VERSION, ACCVPPredictor, model_kwargs_from_config
+from safe_rl.accvp.schema import file_sha256, read_json
 from safe_rl.prediction.wcdt_v3_predictor import build_v3_runtime_batch
 from safe_rl.sim.action_space import CandidateAction
 
@@ -23,7 +24,7 @@ def _require_torch():
 
 
 class ACCVPRuntimePredictor:
-    def __init__(self, config: Any, checkpoint: str | Path):
+    def __init__(self, config: Any, checkpoint: str | Path, *, use_inference_worker: bool = True):
         torch = _require_torch()
         self.config = config
         self.torch = torch
@@ -58,10 +59,41 @@ class ACCVPRuntimePredictor:
                 calibration_payload = json.load(handle)
         if calibration_payload:
             self.calibration = CalibrationBundle.from_dict(calibration_payload)
+        self._inference_worker = None
+        if use_inference_worker and bool(config.accvp.get("inference_worker", {}).get("enabled", True)):
+            from safe_rl.accvp.inference_worker import PersistentACCVPInferenceWorker
 
-    def score_candidates(self, context: dict[str, Any], legal_actions: list[CandidateAction]) -> list[dict[str, Any]]:
+            self._inference_worker = PersistentACCVPInferenceWorker(config, self.checkpoint_path)
+
+    def validate_artifact_bundle(self, operating_point: str | Path | None) -> None:
+        manifest_path = self.config.accvp.get("artifact_manifest")
+        if not manifest_path:
+            raise FileNotFoundError("enabled ACCVP runtime requires accvp.artifact_manifest")
+        manifest = read_json(manifest_path)
+        if str(manifest.get("artifact_kind", "")) != "accvp_v1_artifact_bundle":
+            raise ValueError("invalid ACCVP artifact manifest kind")
+        expected = {
+            "predictor_sha256": file_sha256(self.checkpoint_path),
+        }
+        calibration_path = self.config.accvp.get("calibration_bundle")
+        if not calibration_path:
+            raise FileNotFoundError("enabled ACCVP runtime requires accvp.calibration_bundle")
+        expected["calibration_sha256"] = file_sha256(calibration_path)
+        if operating_point:
+            expected["operating_point_sha256"] = file_sha256(operating_point)
+        for key, value in expected.items():
+            if str(manifest.get(key, "")) != value:
+                raise ValueError(f"ACCVP artifact bundle mismatch for {key}")
+        risk_checkpoint = self.config.accvp.get("risk_checkpoint")
+        if not risk_checkpoint:
+            raise FileNotFoundError("enabled ACCVP runtime requires accvp.risk_checkpoint")
+        fingerprint = f"risk_checkpoint:{file_sha256(risk_checkpoint)}"
+        if str(manifest.get("risk_model_fingerprint", "")) != fingerprint:
+            raise ValueError("ACCVP artifact Risk Module fingerprint mismatch")
+
+    def prepare_candidates(self, context: dict[str, Any], legal_actions: list[CandidateAction]) -> dict[str, Any]:
         if not legal_actions:
-            return []
+            raise ValueError("cannot prepare ACCVP inference without legal actions")
         ego = context.get("ego")
         history = context.get("history")
         if ego is None or history is None:
@@ -86,29 +118,40 @@ class ACCVPRuntimePredictor:
             ],
             axis=0,
         )
-        torch = self.torch
-        def tensor(name: str, dtype: Any):
-            array = np.asarray(runtime[name])
-            return torch.as_tensor(array, dtype=dtype)
-        root_inputs = {
-            "history_features": tensor("history_features", torch.float32),
-            "history_valid_mask": tensor("history_valid_mask", torch.float32),
-            "history_lane_ids": tensor("history_lane_ids", torch.long),
-            "history_edge_role_ids": tensor("history_edge_role_ids", torch.long),
-            "role_ids": tensor("role_ids", torch.long),
-            "lane_ids": tensor("lane_ids", torch.long),
-            "edge_role_ids": tensor("edge_role_ids", torch.long),
-            "actor_mask": tensor("mask", torch.float32),
+        return {
+            "root_inputs": {
+                "history_features": np.asarray(runtime["history_features"], dtype=np.float32),
+                "history_valid_mask": np.asarray(runtime["history_valid_mask"], dtype=np.float32),
+                "history_lane_ids": np.asarray(runtime["history_lane_ids"], dtype=np.int64),
+                "history_edge_role_ids": np.asarray(runtime["history_edge_role_ids"], dtype=np.int64),
+                "role_ids": np.asarray(runtime["role_ids"], dtype=np.int64),
+                "lane_ids": np.asarray(runtime["lane_ids"], dtype=np.int64),
+                "edge_role_ids": np.asarray(runtime["edge_role_ids"], dtype=np.int64),
+                "actor_mask": np.asarray(runtime["mask"], dtype=np.float32),
+            },
+            "candidate_plans": candidate_plans.astype(np.float32),
+            "action_ids": np.asarray([action.index for action in legal_actions], dtype=np.int64),
         }
-        action_ids = torch.as_tensor([action.index for action in legal_actions], dtype=torch.long)
-        plans = torch.as_tensor(candidate_plans, dtype=torch.float32)
+
+    def score_prepared(self, prepared: dict[str, Any]) -> list[dict[str, Any]]:
+        torch = self.torch
+        root_inputs = {
+            name: torch.as_tensor(
+                np.asarray(value),
+                dtype=torch.long if name in {"history_lane_ids", "history_edge_role_ids", "role_ids", "lane_ids", "edge_role_ids"} else torch.float32,
+            )
+            for name, value in dict(prepared["root_inputs"]).items()
+        }
+        action_ids = torch.as_tensor(np.asarray(prepared["action_ids"]), dtype=torch.long)
+        plans = torch.as_tensor(np.asarray(prepared["candidate_plans"]), dtype=torch.float32)
+        candidate_count = int(action_ids.shape[0])
         event_members = []
         geometry_members = []
         with torch.no_grad():
             for model in self.models:
                 scene = model.encode_scene(**root_inputs)
-                expanded_scene = scene.expand(len(legal_actions), -1, -1)
-                expanded_mask = root_inputs["actor_mask"].expand(len(legal_actions), -1)
+                expanded_scene = scene.expand(candidate_count, -1, -1)
+                expanded_mask = root_inputs["actor_mask"].expand(candidate_count, -1)
                 output = model.forward_from_scene(expanded_scene, expanded_mask, plans, action_ids)
                 event_members.append(torch.sigmoid(output["event_logits"]).cpu().numpy())
                 geometry_members.append(output["geometry"].cpu().numpy())
@@ -116,11 +159,11 @@ class ACCVPRuntimePredictor:
         geometry = np.stack(geometry_members, axis=0)
         # Conservative ensemble aggregation: risk heads use max, viability uses min.
         result: list[dict[str, Any]] = []
-        for index, action in enumerate(legal_actions):
+        for index, action_id in enumerate(np.asarray(prepared["action_ids"], dtype=np.int64)):
             q = np.median(geometry[:, index], axis=0)
             result.append(
                 {
-                    "action_id": int(action.index),
+                    "action_id": int(action_id),
                     "p_proxy_collision": float(events[:, index, 0].max()),
                     "p_safety_violation": float(events[:, index, 1].max()),
                     "p_taper_miss": float(events[:, index, 2].max()),
@@ -134,6 +177,28 @@ class ACCVPRuntimePredictor:
                 }
             )
         return result
+
+    def score_candidates(
+        self,
+        context: dict[str, Any],
+        legal_actions: list[CandidateAction],
+        *,
+        timeout_s: float | None = None,
+    ) -> list[dict[str, Any]]:
+        if not legal_actions:
+            return []
+        prepared = self.prepare_candidates(context, legal_actions)
+        if self._inference_worker is not None:
+            return self._inference_worker.score(
+                prepared,
+                float(self.config.accvp.max_decision_latency_s) if timeout_s is None else float(timeout_s),
+            )
+        return self.score_prepared(prepared)
+
+    def close(self) -> None:
+        if self._inference_worker is not None:
+            self._inference_worker.close()
+            self._inference_worker = None
 
 
 def build_accvp_controller(config: Any) -> ACCVPController | None:
@@ -159,4 +224,5 @@ def build_accvp_controller(config: Any) -> ACCVPController | None:
         config.accvp["merge_viability_lower_bound"] = float(selected["merge_viability_lower_bound"])
     elif str(config.accvp.get("mode", "off")) == "viability_branch":
         raise FileNotFoundError("accvp viability_branch requires accvp.operating_point from the held-out tuning split")
+    predictor.validate_artifact_bundle(operating_point)
     return ACCVPController(config, predictor, predictor.calibration)

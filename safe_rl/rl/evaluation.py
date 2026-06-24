@@ -65,6 +65,7 @@ def _step_safety_record(
         "accvp_replacement": bool(info.get("accvp_replacement", False)),
         "accvp_replacement_reason": str(info.get("accvp_replacement_reason", "")),
         "accvp_bypass_reason": str(info.get("accvp_bypass_reason", "")),
+        "accvp_skip_reason": str(info.get("accvp_skip_reason", "")),
         "accvp_no_feasible_action": bool(info.get("accvp_no_feasible_action", False)),
         "accvp_commitment_cancelled": bool(info.get("accvp_commitment_cancelled", False)),
         "accvp_decision_latency_s": _safe_float(info.get("decision_latency_s"), 0.0),

@@ -367,19 +367,22 @@ class SumoHighwayMergeEnv(gym.Env):
     def step(self, action):
         decision_index = int(self._decision_index)
         raw_action = decode_action(int(action))
-        final_action = raw_action
+        shield_input_action = raw_action
+        if self.accvp_controller is not None:
+            shield_input_action = self.accvp_controller.proposed_action(raw_action, decision_index)
+        final_action = shield_input_action
         intervention = None
         context = self.get_risk_context()
         self._record_merge_opportunity(context, raw_action)
         if self.shield is not None and self.shield.enabled:
-            final_action, intervention = self.shield.select_action(raw_action, context)
+            final_action, intervention = self.shield.select_action(shield_input_action, context)
             intervention["step"] = int(self._episode_step)
             intervention["decision_index"] = decision_index
             self._interventions.append(intervention)
         safety_shield_action = final_action
         safety_shield_replaced = bool(
             intervention is not None
-            and int(intervention.get("final_action", raw_action.index)) != int(raw_action.index)
+            and int(intervention.get("final_action", shield_input_action.index)) != int(shield_input_action.index)
         )
         accvp_debug: dict[str, Any] = {}
         if self.accvp_controller is not None:
@@ -389,6 +392,7 @@ class SumoHighwayMergeEnv(gym.Env):
                 safety_shield_action=safety_shield_action,
                 safety_shield_replaced=safety_shield_replaced,
                 shield=self.shield,
+                shield_input_action=shield_input_action,
             )
             accvp_debug.update({"step": int(self._episode_step), "decision_index": decision_index})
             self._accvp_records.append(dict(accvp_debug))
@@ -410,10 +414,12 @@ class SumoHighwayMergeEnv(gym.Env):
                 self._forecast_ranking_replacements.append(forecast_replacement)
 
         execution_path = "policy"
-        if safety_shield_replaced:
-            execution_path = "safety_shield"
+        if bool(intervention is not None and intervention.get("emergency_fallback", False)):
+            execution_path = "emergency_fallback"
         elif bool(accvp_debug.get("accvp_replacement", False)):
             execution_path = "accvp"
+        elif safety_shield_replaced:
+            execution_path = "safety_shield"
         elif task_replacement is not None:
             execution_path = "task_backstop"
         elif forecast_ranking_replacement is not None:
@@ -423,6 +429,8 @@ class SumoHighwayMergeEnv(gym.Env):
             "decision_index": decision_index,
             "raw_action": int(raw_action.index),
             "raw_action_name": str(raw_action.name),
+            "shield_input_action": int(shield_input_action.index),
+            "shield_input_action_name": str(shield_input_action.name),
             "safety_shield_action": int(safety_shield_action.index),
             "safety_shield_action_name": str(safety_shield_action.name),
             "safety_shield_replaced": safety_shield_replaced,
@@ -546,6 +554,8 @@ class SumoHighwayMergeEnv(gym.Env):
         return obs, float(reward), bool(terminated), bool(truncated), info
 
     def close(self):
+        if self.accvp_controller is not None and hasattr(self.accvp_controller, "close"):
+            self.accvp_controller.close()
         self._close_sumo()
 
     def _start_sumo(self) -> None:
@@ -2349,6 +2359,7 @@ class SumoHighwayMergeEnv(gym.Env):
         )
         task_replacement_count = len(self._task_replacements)
         forecast_ranking_replacement_count = len(self._forecast_ranking_replacements)
+        execution_path_counts = Counter(str(item.get("execution_path", "policy")) for item in self._action_execution_records)
         task_replacement_reason_counts = Counter(
             str(item.get("replacement_reason", ""))
             for item in self._task_replacements
@@ -2545,12 +2556,12 @@ class SumoHighwayMergeEnv(gym.Env):
             "task_replacement_reason_counts": dict(task_replacement_reason_counts),
             "accvp_mode": str(self.config.accvp.get("mode", "off")),
             "accvp_record_count": int(len(self._accvp_records)),
-            "accvp_replacement_count": int(
-                sum(1 for item in self._accvp_records if bool(item.get("accvp_replacement", False)))
-            ),
+            "final_execution_path_counts": dict(execution_path_counts),
+            "safety_shield_final_replacement_count": int(execution_path_counts.get("safety_shield", 0)),
+            "emergency_fallback_final_count": int(execution_path_counts.get("emergency_fallback", 0)),
+            "accvp_replacement_count": int(execution_path_counts.get("accvp", 0)),
             "accvp_replacement_rate": float(
-                sum(1 for item in self._accvp_records if bool(item.get("accvp_replacement", False)))
-                / max(1, len(self._accvp_records))
+                execution_path_counts.get("accvp", 0) / max(1, len(self._action_execution_records))
             ),
             "accvp_bypass_count": int(
                 sum(1 for item in self._accvp_records if str(item.get("accvp_bypass_reason", "")))
