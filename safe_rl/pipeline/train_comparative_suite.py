@@ -4,7 +4,7 @@ import argparse
 import hashlib
 import json
 from pathlib import Path
-from typing import Any
+from typing import Any, Mapping
 
 import yaml
 
@@ -17,6 +17,9 @@ from safe_rl.utils.stage1_dataset import (
     open_stage1_dataset,
     sha256_file,
 )
+
+
+COMPARATIVE_STATE_VERSION = 1
 
 
 def _run_dir(base_run_id: str) -> Path:
@@ -44,6 +47,91 @@ def _write_yaml(path: Path, payload: dict[str, Any]) -> Path:
     with path.open("w", encoding="utf-8") as file:
         yaml.safe_dump(payload, file, sort_keys=False, allow_unicode=True)
     return path
+
+
+def _write_json_atomic(path: Path, payload: Mapping[str, Any]) -> Path:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_suffix(path.suffix + ".tmp")
+    temporary.write_text(json.dumps(dict(payload), indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    temporary.replace(path)
+    return path
+
+
+def _read_json(path: Path) -> dict[str, Any]:
+    return dict(json.loads(path.read_text(encoding="utf-8")))
+
+
+def _validate_input_provenance(existing: Mapping[str, Any], expected: Mapping[str, Any]) -> None:
+    mismatches = {
+        key: (existing.get(key), value)
+        for key, value in expected.items()
+        if existing.get(key) != value
+    }
+    if mismatches:
+        raise ValueError(
+            "Comparative resume input provenance mismatch; use a new experiment id. "
+            f"mismatches={mismatches}"
+        )
+
+
+def _initial_comparative_state(input_provenance_path: Path) -> dict[str, Any]:
+    return {
+        "schema_version": COMPARATIVE_STATE_VERSION,
+        "input_provenance_sha256": sha256_file(input_provenance_path),
+        "tasks": {},
+    }
+
+
+def _set_task_state(state: dict[str, Any], name: str, *, status: str, path: Path, **extra: Any) -> None:
+    tasks = state.setdefault("tasks", {})
+    tasks[name] = {
+        "status": str(status),
+        "path": str(path),
+        "sha256": sha256_file(path),
+        **extra,
+    }
+
+
+def _validate_existing_wcdt_v1_checkpoint(checkpoint: Path, cfg: Any) -> dict[str, Any]:
+    """Validate the top-level v1 payload written before Stage2 report generation."""
+
+    if not checkpoint.is_file() or checkpoint.stat().st_size <= 0:
+        raise FileNotFoundError(f"WcDT v1 checkpoint is missing or empty: {checkpoint}")
+    try:
+        import torch
+    except ImportError as exc:  # pragma: no cover - environment dependent
+        raise ImportError("Comparative resume requires torch to validate WcDT v1 checkpoints") from exc
+    payload = torch.load(checkpoint, map_location="cpu")
+    if not isinstance(payload, dict) or not isinstance(payload.get("model_state_dict"), dict):
+        raise ValueError(f"Invalid WcDT v1 checkpoint payload: {checkpoint}")
+    expected_hash = actor_selection_config_hash(cfg)
+    checks: dict[str, tuple[Any, Any]] = {
+        "architecture_version": (
+            payload.get("architecture_version"),
+            "wcdt_v1_adapted_multimodal_selector_v2",
+        ),
+        "actor_selection_config_hash": (payload.get("actor_selection_config_hash"), expected_hash),
+        "max_actor_count": (int(payload.get("max_actor_count", 0)), int(cfg.prediction.wcdt_v1_max_agents)),
+    }
+    mismatches = {key: value for key, value in checks.items() if value[0] != value[1]}
+    if int(payload.get("stage1_buffer_schema_version", 0)) < STAGE1_BUFFER_SCHEMA_VERSION:
+        mismatches["stage1_buffer_schema_version"] = (
+            payload.get("stage1_buffer_schema_version"),
+            f">={STAGE1_BUFFER_SCHEMA_VERSION}",
+        )
+    if int(payload.get("trajectory_schema_version", 0)) < 4:
+        mismatches["trajectory_schema_version"] = (payload.get("trajectory_schema_version"), ">=4")
+    if mismatches:
+        raise ValueError(f"Existing WcDT v1 checkpoint is incompatible with comparative config: {mismatches}")
+    return {
+        "best_epoch": payload.get("best_epoch"),
+        "best_val_score": payload.get("best_val_score"),
+    }
+
+
+def _validate_existing_policy_checkpoint(path: Path) -> None:
+    if not path.is_file() or path.stat().st_size <= 0:
+        raise FileNotFoundError(f"Comparative policy checkpoint is missing or empty: {path}")
 
 
 def _provenance(base: Path, *, stage1: Path, risk: Path, v3: Path) -> dict[str, Any]:
@@ -105,6 +193,7 @@ def run(
     upstream_commit: str = "6baa2330fc3f620863d358b5d7f36323b4bfccae",
     allowed_differences: list[str] | None = None,
     formal: bool = False,
+    resume: bool = False,
 ) -> Path:
     seeds = training_seeds or [101]
     if int(stage5_episodes) <= 0:
@@ -125,27 +214,45 @@ def run(
     comparative_root = base / "comparative_eval"
     experiment_root = comparative_root / experiment_id
     manifests = experiment_root / "manifests"
-    manifests.mkdir(parents=True, exist_ok=False)
     provenance = _provenance(base, stage1=stage1, risk=risk, v3=v3)
-    if upstream_root is not None:
-        from safe_rl.tools.audit_wcdt_upstream import run as audit_upstream
-
-        source_diff = manifests / "source_diff_manifest.json"
-        audit = audit_upstream(
-            upstream_root=Path(upstream_root),
-            output=source_diff,
-            upstream_commit=upstream_commit,
-            allowed_differences=set(allowed_differences or []) or None,
-        )
-        provenance["source_diff_manifest"] = str(source_diff)
-        provenance["source_fidelity"] = str(audit["source_fidelity"])
+    input_provenance_path = manifests / "input_provenance.json"
+    state_path = manifests / "comparative_state.json"
+    if experiment_root.exists():
+        if not resume:
+            raise FileExistsError(
+                f"Comparative experiment already exists: {experiment_root}; pass --resume after verifying its inputs"
+            )
+        if not input_provenance_path.is_file():
+            raise FileNotFoundError(
+                f"Comparative resume requires immutable input provenance: {input_provenance_path}"
+            )
+        existing_provenance = _read_json(input_provenance_path)
+        _validate_input_provenance(existing_provenance, provenance)
+        if formal and str(existing_provenance.get("source_fidelity", "")) != "verified":
+            raise ValueError("Formal comparative resume requires verified source fidelity in input_provenance.json.")
+        provenance = existing_provenance
+        state = _read_json(state_path) if state_path.is_file() else _initial_comparative_state(input_provenance_path)
     else:
-        provenance["source_fidelity"] = "unverified"
-    if formal and provenance["source_fidelity"] != "verified":
-        raise ValueError("Formal comparative runs require a verified source_diff_manifest.json.")
-    (manifests / "input_provenance.json").write_text(
-        json.dumps(provenance, indent=2, sort_keys=True) + "\n", encoding="utf-8"
-    )
+        manifests.mkdir(parents=True, exist_ok=False)
+        if upstream_root is not None:
+            from safe_rl.tools.audit_wcdt_upstream import run as audit_upstream
+
+            source_diff = manifests / "source_diff_manifest.json"
+            audit = audit_upstream(
+                upstream_root=Path(upstream_root),
+                output=source_diff,
+                upstream_commit=upstream_commit,
+                allowed_differences=set(allowed_differences or []) or None,
+            )
+            provenance["source_diff_manifest"] = str(source_diff)
+            provenance["source_fidelity"] = str(audit["source_fidelity"])
+        else:
+            provenance["source_fidelity"] = "unverified"
+        if formal and provenance["source_fidelity"] != "verified":
+            raise ValueError("Formal comparative runs require a verified source_diff_manifest.json.")
+        _write_json_atomic(input_provenance_path, provenance)
+        state = _initial_comparative_state(input_provenance_path)
+    _write_json_atomic(state_path, state)
 
     # Predictor-only Stage2 run: uses the immutable base buffer and never trains or
     # overwrites a Risk Module in the comparison namespace.
@@ -159,14 +266,33 @@ def run(
     v1_cfg.prediction["wcdt_v2_train_enabled"] = False
     v1_cfg.prediction["wcdt_v3_train_enabled"] = False
     v1_cfg.prediction["wcdt_v1_max_agents"] = 6
-    stage2_train_prediction_risk.run(v1_cfg)
     v1_checkpoint = experiment_root / "stage2" / "wcdt_predictor.pt"
-    if not v1_checkpoint.exists():
-        raise FileNotFoundError(f"WcDT v1 checkpoint was not produced: {v1_checkpoint}")
-    provenance["wcdt_v1_checkpoint"] = str(v1_checkpoint)
-    provenance["wcdt_v1_checkpoint_sha256"] = sha256_file(v1_checkpoint)
-    (manifests / "input_provenance.json").write_text(
-        json.dumps(provenance, indent=2, sort_keys=True) + "\n", encoding="utf-8"
+    if v1_checkpoint.exists():
+        if not resume:
+            raise FileExistsError(f"WcDT v1 checkpoint already exists: {v1_checkpoint}")
+        v1_summary = _validate_existing_wcdt_v1_checkpoint(v1_checkpoint, v1_cfg)
+        _set_task_state(state, "wcdt_v1_predictor", status="recovered", path=v1_checkpoint, **v1_summary)
+    else:
+        partial_stage2 = experiment_root / "stage2"
+        if resume and partial_stage2.exists() and any(partial_stage2.iterdir()):
+            raise RuntimeError(
+                "Comparative Stage2 contains partial output without wcdt_predictor.pt; "
+                "use a new experiment id rather than overwriting it."
+            )
+        stage2_train_prediction_risk.run(v1_cfg)
+        v1_summary = _validate_existing_wcdt_v1_checkpoint(v1_checkpoint, v1_cfg)
+        _set_task_state(state, "wcdt_v1_predictor", status="completed", path=v1_checkpoint, **v1_summary)
+    _write_json_atomic(state_path, state)
+    _write_json_atomic(
+        manifests / "resolved_artifacts.json",
+        {
+            "wcdt_v1_checkpoint": str(v1_checkpoint),
+            "wcdt_v1_checkpoint_sha256": sha256_file(v1_checkpoint),
+            "risk_checkpoint": str(risk),
+            "risk_checkpoint_sha256": sha256_file(risk),
+            "wcdt_v3_checkpoint": str(v3),
+            "wcdt_v3_checkpoint_sha256": sha256_file(v3),
+        },
     )
 
     model_paths: dict[str, dict[int, Path]] = {}
@@ -186,8 +312,24 @@ def run(
             cfg.shield["task_backstop_enabled"] = False
             for section, values in _forecast_settings(source, v1_checkpoint, v3_checkpoint).items():
                 cfg[section].update(values)
-            stage3_train_ppo.run(cfg)
             path = policy_root / f"seed_{seed}" / "stage3" / str(cfg.stage3.model_name)
+            task_name = f"policy:{source}:seed_{seed}"
+            if path.exists():
+                if not resume:
+                    raise FileExistsError(f"Comparative policy checkpoint already exists: {path}")
+                _validate_existing_policy_checkpoint(path)
+                _set_task_state(state, task_name, status="recovered", path=path)
+            else:
+                partial_stage3 = path.parent
+                if resume and partial_stage3.exists() and any(partial_stage3.iterdir()):
+                    raise RuntimeError(
+                        "Comparative Stage3 contains partial output without its model checkpoint; "
+                        f"use a new experiment id rather than overwriting {partial_stage3}."
+                    )
+                stage3_train_ppo.run(cfg)
+                _validate_existing_policy_checkpoint(path)
+                _set_task_state(state, task_name, status="completed", path=path)
+            _write_json_atomic(state_path, state)
             model_paths[source][seed] = path
 
     groups: list[dict[str, Any]] = [
@@ -245,6 +387,13 @@ def run(
         },
     }
     _write_yaml(experiment_root / "configs" / "stage5_comparative_groups.yaml", payload)
+    _set_task_state(
+        state,
+        "stage5_comparative_config",
+        status="completed",
+        path=experiment_root / "configs" / "stage5_comparative_groups.yaml",
+    )
+    _write_json_atomic(state_path, state)
     return experiment_root
 
 
@@ -259,6 +408,7 @@ def main() -> None:
     parser.add_argument("--upstream-commit", default="6baa2330fc3f620863d358b5d7f36323b4bfccae")
     parser.add_argument("--allowed-difference", action="append", default=[])
     parser.add_argument("--formal", action="store_true")
+    parser.add_argument("--resume", action="store_true", help="Resume only after immutable provenance and completed artifacts validate.")
     args = parser.parse_args()
     run(
         base_run_id=str(args.base_run_id),
@@ -270,6 +420,7 @@ def main() -> None:
         upstream_commit=str(args.upstream_commit),
         allowed_differences=list(args.allowed_difference),
         formal=bool(args.formal),
+        resume=bool(args.resume),
     )
 
 
