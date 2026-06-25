@@ -251,6 +251,8 @@ def train_accvp(config: Any, dataset_dir: str | Path) -> Path:
         "artifact_kind": "accvp_v1_artifact_bundle",
         "architecture_version": metadata["architecture_version"],
         "counterfactual_schema_version": int(metadata["counterfactual_schema_version"]),
+        "accvp_activation_distance_m": float(dataset_manifest.get("accvp_activation_distance_m", -1.0)),
+        "data_contract_hash": str(dataset_manifest.get("data_contract_hash", "")),
         "predictor_sha256": file_sha256(checkpoint),
         "calibration_sha256": file_sha256(calibration_path),
         "operating_point_sha256": file_sha256(operating_point_path),

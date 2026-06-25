@@ -5,6 +5,7 @@ from typing import Any
 
 import numpy as np
 
+from safe_rl.accvp.schema import COUNTERFACTUAL_SCHEMA_VERSION
 from safe_rl.prediction.wcdt_v3_predictor import (
     ARCHITECTURE_VERSION as WCDT_V3_ARCHITECTURE_VERSION,
     WcDTV3TemporalInteractionPredictor,
@@ -294,7 +295,7 @@ def accvp_loss(output: dict[str, Any], batch: dict[str, Any], weights: dict[str,
 def checkpoint_metadata(config: Any, *, warm_start: dict[str, Any]) -> dict[str, Any]:
     return {
         "architecture_version": ACCVP_ARCHITECTURE_VERSION,
-        "counterfactual_schema_version": 1,
+        "counterfactual_schema_version": COUNTERFACTUAL_SCHEMA_VERSION,
         "wcdt_v3_architecture_version": WCDT_V3_ARCHITECTURE_VERSION,
         "model_kwargs": model_kwargs_from_config(config),
         "warm_start": warm_start,

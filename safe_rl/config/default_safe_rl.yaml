@@ -342,7 +342,7 @@ accvp:
   operating_point: null
   artifact_manifest: null
   risk_checkpoint: null
-  schema_version: 1
+  schema_version: 2
   candidate_plan_profile: "accvp_commitment_v1"
   response_horizon_s: 3.0
   viability_horizon_s: 8.0
@@ -350,6 +350,9 @@ accvp:
   candidate_plan_horizon_steps: 80
   actor_count: 6
   ensemble_size: 3
+  # Explicit ACV-Shield window. Null preserves the historical 120 m value
+  # below for existing configurations; formal ACCVP-240 configs set 240.0.
+  activation_distance: null
   deadline_distance: 120.0
   proxy_collision_upper_bound: 0.10
   safety_violation_upper_bound: 0.15
@@ -386,6 +389,7 @@ accvp:
     safety_violation_upper_bounds: [0.05, 0.10, 0.15, 0.20]
     merge_viability_lower_bounds: [0.40, 0.50, 0.60, 0.70]
   counterfactual:
+    collection_phase: "ad_hoc"  # ad_hoc | pilot | formal
     root_budget: 5000
     roots_per_episode_limit: 3
     workers: 2
@@ -411,7 +415,7 @@ accvp:
       ppo: null
       merge_timing: null
     risk_checkpoint: null
-    output_name: "accvp_counterfactual_v1"
+    output_name: "accvp_counterfactual_v2"
 
 stage1:
   episodes: 500

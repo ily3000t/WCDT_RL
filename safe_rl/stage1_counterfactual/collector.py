@@ -9,8 +9,22 @@ from typing import Any, Iterable
 import numpy as np
 
 from safe_rl.accvp.branch_worker import run_branch_job
+from safe_rl.accvp.protocol import (
+    activation_bin as _activation_bin,
+    counterfactual_data_contract,
+    data_contract_hash,
+    effective_activation_distance,
+    legacy_deadline_bin,
+)
 from safe_rl.accvp.root_context import capture_root_context, synchronise_root_state
-from safe_rl.accvp.schema import canonical_json, file_sha256, stable_hash, write_json_atomic
+from safe_rl.accvp.schema import (
+    COUNTERFACTUAL_SCHEMA_VERSION,
+    COUNTERFACTUAL_SHARD_MANIFEST_VERSION,
+    canonical_json,
+    file_sha256,
+    stable_hash,
+    write_json_atomic,
+)
 from safe_rl.accvp.shards import assert_new_shard, immutable_shard_dir
 from safe_rl.accvp.snapshot_store import CounterfactualSnapshotStore
 from safe_rl.risk.merge_local import is_candidate_legal
@@ -22,13 +36,9 @@ from safe_rl.utils.progress import stage_log
 
 
 def _deadline_bin(context: dict[str, Any], deadline_distance: float) -> str:
-    local = context.get("merge_local")
-    if local is None or not bool(local.ego_on_auxiliary):
-        return "not_auxiliary"
-    distance = float(local.merge_distance)
-    if distance <= 0.0:
-        return "past_taper"
-    return "deadline" if distance <= float(deadline_distance) else "pre_deadline"
+    """Compatibility classifier retained for schema-v1 callers and tests."""
+
+    return legacy_deadline_bin(_activation_bin(context, deadline_distance))
 
 
 class _RootPolicy:
@@ -39,6 +49,7 @@ class _RootPolicy:
         self.policy_name = policy_name
         self.model = None
         self.rule = None
+        self.checkpoint_fingerprint = "not_applicable"
         if policy_name in {"ppo", "merge_timing"}:
             checkpoint = cfg.accvp.counterfactual.policy_checkpoints.get(policy_name)
             if not checkpoint:
@@ -48,12 +59,16 @@ class _RootPolicy:
             from safe_rl.rl.ppo import _training_device, load_ppo
 
             self.model = load_ppo(checkpoint, device=_training_device(cfg))
+            self.checkpoint_fingerprint = f"ppo_checkpoint:{file_sha256(checkpoint)}"
         elif policy_name == "rule":
             from safe_rl.baselines import RuleGapAcceptancePolicy
 
             self.rule = RuleGapAcceptancePolicy(cfg)
+            self.checkpoint_fingerprint = "rule_gap_acceptance_v1"
         elif policy_name != "mixed":
             raise ValueError(f"unsupported counterfactual root_policy={policy_name!r}")
+        else:
+            self.checkpoint_fingerprint = "mixed_sampler_v1"
 
     def select(self, env: Any, observation: Any, rng: np.random.Generator) -> int:
         if self.policy_name == "mixed":
@@ -72,9 +87,11 @@ class _RootPolicy:
 def _root_filter_matches(root_filter: str, deadline_bin: str) -> bool:
     if root_filter == "all":
         return True
-    if root_filter == "deadline":
-        return deadline_bin == "deadline"
-    raise ValueError(f"unsupported counterfactual root_filter={root_filter!r}; expected 'all' or 'deadline'")
+    if root_filter in {"deadline", "activation_window"}:
+        return deadline_bin in {"deadline", "activation_window"}
+    raise ValueError(
+        f"unsupported counterfactual root_filter={root_filter!r}; expected 'all', 'deadline', or 'activation_window'"
+    )
 
 
 def _cache_dir(cfg: Any, output_name: str, counterfactual: Any) -> Path:
@@ -185,6 +202,8 @@ def collect(
     episodes: int | None = None,
     root_source: str | None = None,
     collection_id: str | None = None,
+    collection_source: str | None = None,
+    collection_job: dict[str, Any] | None = None,
 ) -> Path:
     """Collect bounded roots without ever loading state on the root connection.
 
@@ -200,13 +219,16 @@ def collect(
     # Compatibility with the former overloaded source name.
     if policy_name == "deadline_hard":
         policy_name, filter_name = "mixed", "deadline"
-    root_budget = max(1, int(counterfactual.root_budget))
-    roots_per_episode = max(1, int(counterfactual.roots_per_episode_limit))
+    configured_budget = int(counterfactual.root_budget)
+    root_budget = None if configured_budget <= 0 else configured_budget
+    configured_episode_limit = int(counterfactual.roots_per_episode_limit)
+    roots_per_episode = None if configured_episode_limit <= 0 else configured_episode_limit
     workers = max(1, int(counterfactual.workers))
     output_name = str(counterfactual.output_name)
     stage_dir = prepare_run_dir(cfg, "stage1_counterfactual")
     seed_schedule = _seed_schedule(cfg, episode_seeds, episodes)
     shard_id = _collection_id(counterfactual, policy_name, filter_name, seed_schedule, collection_id)
+    source_name = str(collection_source or policy_name)
     shard_dir = assert_new_shard(immutable_shard_dir(stage_dir, output_name, shard_id))
     store = CounterfactualSnapshotStore(
         shard_dir,
@@ -216,12 +238,15 @@ def collect(
     branch_tensor_dir.mkdir(parents=True, exist_ok=True)
     stage_log(
         "stage1_counterfactual",
-        f"collection_id={shard_id} root_policy={policy_name} root_filter={filter_name} root_budget={root_budget} workers={workers} seeds={len(seed_schedule)}",
+        f"collection_id={shard_id} source={source_name} root_policy={policy_name} root_filter={filter_name} root_budget={root_budget or 'unbounded'} workers={workers} seeds={len(seed_schedule)}",
     )
     cfg.accvp["_counterfactual_collection_enabled"] = True
     env = make_env(cfg, seed=int(seed_schedule[0] if seed_schedule else cfg.run.seed), shield_enabled=False)
     policy = _RootPolicy(cfg, policy_name)
     secondary_risk = _SecondaryRiskEvaluator(cfg)
+    activation_distance = effective_activation_distance(cfg)
+    contract = counterfactual_data_contract(cfg, secondary_risk.fingerprint)
+    contract_hash = data_contract_hash(contract)
     root_rows: list[dict[str, Any]] = []
     branch_rows: list[dict[str, Any]] = []
     pending: dict[Any, tuple[str, int]] = {}
@@ -229,7 +254,7 @@ def collect(
     try:
         with concurrent.futures.ProcessPoolExecutor(max_workers=workers) as pool:
             for episode_index, episode_seed in enumerate(seed_schedule):
-                if collected >= root_budget:
+                if root_budget is not None and collected >= root_budget:
                     break
                 rng = np.random.default_rng(np.random.SeedSequence([int(episode_seed), episode_index]))
                 observation, _info = env.reset(seed=int(episode_seed))
@@ -237,23 +262,26 @@ def collect(
                 roots_this_episode = 0
                 while not (terminated or truncated):
                     context = env.get_risk_context()
-                    deadline_bin = _deadline_bin(context, float(cfg.accvp.deadline_distance))
+                    activation = _activation_bin(context, activation_distance)
+                    deadline_bin = legacy_deadline_bin(activation)
                     raw_action = policy.select(env, observation, rng)
                     raw_action_legal = bool(
                         next((is_candidate_legal(action, context) for action in ACTIONS if action.index == raw_action), False)
                     )
                     collect_this = (
                         int(env._decision_index) > 0
-                        and roots_this_episode < roots_per_episode
-                        and collected < root_budget
-                        and _root_filter_matches(filter_name, deadline_bin)
+                        and (roots_per_episode is None or roots_this_episode < roots_per_episode)
+                        and (root_budget is None or collected < root_budget)
+                        and _root_filter_matches(filter_name, activation)
                     )
                     if collect_this:
                         # Align root metadata to the live state before saveState.
                         synchronise_root_state(env)
                         context = env.get_risk_context()
+                        activation = _activation_bin(context, activation_distance)
+                        deadline_bin = legacy_deadline_bin(activation)
                         legal_ids = [int(action.index) for action in ACTIONS if is_candidate_legal(action, context)]
-                        if legal_ids:
+                        if legal_ids and _root_filter_matches(filter_name, activation):
                             # The raw action may have been chosen from a stale
                             # subscription view. Oracle semantics must use the
                             # same synchronised state as the snapshot.
@@ -271,10 +299,14 @@ def collect(
                                 traffic_profile=str(context.get("curriculum_profile", "unknown")),
                                 deadline_bin=deadline_bin,
                                 snapshot_path=snapshot_path,
+                                activation_bin=activation,
+                                activation_distance_m=activation_distance,
+                                data_contract=contract,
                             )
                             root.metadata["secondary_risk"] = secondary_scores
                             root.metadata["risk_model_fingerprint"] = secondary_risk.fingerprint
                             root.metadata["collection_id"] = shard_id
+                            root.metadata["collection_source"] = source_name
                             metadata_path, tensor_path = store.write_root(root, legal_ids)
                             root_rows.append(
                                 {
@@ -284,10 +316,18 @@ def collect(
                                     "root_source": policy_name,
                                     "root_policy": policy_name,
                                     "root_filter": filter_name,
+                                    "collection_source": source_name,
                                     "raw_action_id": int(raw_action),
                                     "raw_action_legal": bool(raw_action_legal),
                                     "traffic_profile": str(context.get("curriculum_profile", "unknown")),
                                     "deadline_bin": deadline_bin,
+                                    "activation_bin": activation,
+                                    "accvp_activation_distance_m": activation_distance,
+                                    "response_horizon_s": float(cfg.accvp.response_horizon_s),
+                                    "viability_horizon_s": float(cfg.accvp.viability_horizon_s),
+                                    "data_contract": contract,
+                                    "data_contract_hash": contract_hash,
+                                    "root_state_fingerprint": str(root.metadata["root_state_fingerprint"]),
                                     "scenario_config_hash": str(root.metadata["scenario_config_hash"]),
                                     "config_hash": str(root.metadata["config_hash"]),
                                     "action_execution_profile": str(root.metadata["action_execution_profile"]),
@@ -328,9 +368,12 @@ def collect(
             handle.write(canonical_json(row) + "\n")
     scenario_config_hash = stable_hash(dict(cfg.scenario))
     dataset_manifest = {
-        "artifact_kind": "counterfactual_shard_v1",
-        "counterfactual_schema_version": 1,
+        "artifact_kind": "counterfactual_shard_v2",
+        "counterfactual_schema_version": COUNTERFACTUAL_SCHEMA_VERSION,
+        "counterfactual_shard_manifest_version": COUNTERFACTUAL_SHARD_MANIFEST_VERSION,
         "collection_id": shard_id,
+        "collection_source": source_name,
+        "collection_phase": str(counterfactual.get("collection_phase", "ad_hoc")),
         "root_policy": policy_name,
         "root_filter": filter_name,
         "episode_seeds": seed_schedule,
@@ -338,13 +381,19 @@ def collect(
         "collected_roots": collected,
         "complete_roots": sum(1 for row in root_rows if row.get("complete")),
         "failed_branches": sum(1 for row in branch_rows if row.get("branch_status") != "completed"),
-        "collection_jobs": list(counterfactual.get("collection_jobs", [])),
+        "collection_job": dict(collection_job or {}),
         "cache_dir": str(store.cache_dir),
         "config_hash": stable_hash(dict(cfg)),
         "scenario_config_hash": scenario_config_hash,
         "action_execution_profile": str(cfg.scenario.get("action_execution_profile", "current_v1")),
         "candidate_plan_profile": str(cfg.accvp.candidate_plan_profile),
         "risk_model_fingerprint": secondary_risk.fingerprint,
+        "root_policy_checkpoint_fingerprint": policy.checkpoint_fingerprint,
+        "accvp_activation_distance_m": activation_distance,
+        "response_horizon_s": float(cfg.accvp.response_horizon_s),
+        "viability_horizon_s": float(cfg.accvp.viability_horizon_s),
+        "data_contract": contract,
+        "data_contract_hash": contract_hash,
         "branch_status_counts": dict(Counter(str(row.get("branch_status", "failed")) for row in branch_rows)),
     }
     write_json_atomic(manifests / "dataset_manifest.json", dataset_manifest)

@@ -1,0 +1,32 @@
+# Frozen WcDT-v3 merge-timing PPO oracle collection for ACCVP Go/No-Go.
+# This is deliberately collection-only: ACCVP runtime control remains off.
+run:
+  output_root: "safe_rl_output/runs"
+  tensorboard: false
+
+rl:
+  use_wcdt_forecast_features: true
+  reward_profile: "merge_timing_forecast"
+  shield_guided_reward:
+    risk_checkpoint: "safe_rl_output/runs/safe_rl_comparison_schema9_validation_001/stage2/risk_module.pt"
+
+forecast_features:
+  enabled: true
+  use_for_ppo_observation: true
+  source: "wcdt_v3"
+  checkpoint: "safe_rl_output/runs/safe_rl_comparison_schema9_validation_001/stage2/wcdt_v3_predictor.pt"
+  allow_heuristic_fallback: false
+
+accvp:
+  enabled: false
+  mode: "off"
+  # Explicit historical diagnostic window; this is not the ACCVP-240 protocol.
+  activation_distance: 120.0
+  counterfactual:
+    root_budget: 6
+    roots_per_episode_limit: 3
+    workers: 2
+    output_name: "accvp_counterfactual_v2"
+    risk_checkpoint: "safe_rl_output/runs/safe_rl_comparison_schema9_validation_001/stage2/risk_module.pt"
+    policy_checkpoints:
+      merge_timing: "safe_rl_output/runs/safe_rl_comparison_schema9_validation_001_forecast_wcdt_v3/stage3/ppo_model.zip"

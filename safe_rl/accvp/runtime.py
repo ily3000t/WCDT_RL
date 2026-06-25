@@ -10,7 +10,8 @@ from safe_rl.accvp.calibration import CalibrationBundle
 from safe_rl.accvp.candidate_plan import build_commitment_plan, profile_from_config
 from safe_rl.accvp.controller import ACCVPController
 from safe_rl.accvp.model import ACCVP_ARCHITECTURE_VERSION, ACCVPPredictor, model_kwargs_from_config
-from safe_rl.accvp.schema import file_sha256, read_json
+from safe_rl.accvp.protocol import counterfactual_data_contract, data_contract_hash, effective_activation_distance
+from safe_rl.accvp.schema import COUNTERFACTUAL_SCHEMA_VERSION, file_sha256, read_json
 from safe_rl.prediction.wcdt_v3_predictor import build_v3_runtime_batch
 from safe_rl.sim.action_space import CandidateAction
 
@@ -33,7 +34,7 @@ class ACCVPRuntimePredictor:
         metadata = dict(payload.get("metadata", {}))
         if metadata.get("architecture_version") != ACCVP_ARCHITECTURE_VERSION:
             raise ValueError("ACCVP checkpoint architecture_version mismatch")
-        if int(metadata.get("counterfactual_schema_version", -1)) != 1:
+        if int(metadata.get("counterfactual_schema_version", -1)) != COUNTERFACTUAL_SCHEMA_VERSION:
             raise ValueError("ACCVP checkpoint counterfactual schema mismatch")
         expected = model_kwargs_from_config(config)
         checkpoint_kwargs = dict(metadata.get("model_kwargs", {}))
@@ -90,6 +91,14 @@ class ACCVPRuntimePredictor:
         fingerprint = f"risk_checkpoint:{file_sha256(risk_checkpoint)}"
         if str(manifest.get("risk_model_fingerprint", "")) != fingerprint:
             raise ValueError("ACCVP artifact Risk Module fingerprint mismatch")
+        if int(manifest.get("counterfactual_schema_version", -1)) != COUNTERFACTUAL_SCHEMA_VERSION:
+            raise ValueError("ACCVP artifact counterfactual schema mismatch")
+        expected_activation = effective_activation_distance(self.config)
+        if abs(float(manifest.get("accvp_activation_distance_m", -1.0)) - expected_activation) > 1.0e-9:
+            raise ValueError("ACCVP artifact activation window mismatch")
+        expected_contract = counterfactual_data_contract(self.config, fingerprint)
+        if str(manifest.get("data_contract_hash", "")) != data_contract_hash(expected_contract):
+            raise ValueError("ACCVP artifact counterfactual data-contract mismatch")
 
     def prepare_candidates(self, context: dict[str, Any], legal_actions: list[CandidateAction]) -> dict[str, Any]:
         if not legal_actions:

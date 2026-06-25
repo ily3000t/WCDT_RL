@@ -7,6 +7,7 @@ from typing import Any
 
 from safe_rl.accvp.calibration import CalibrationBundle
 from safe_rl.accvp.selection import select_viability_action
+from safe_rl.accvp.protocol import effective_activation_distance
 from safe_rl.sim.action_space import ACTIONS, CandidateAction
 
 
@@ -175,6 +176,7 @@ class ACCVPController:
             "candidate_set_available": False,
             "raw_feasible": False,
             "decision_latency_s": 0.0,
+            "accvp_activation_distance_m": effective_activation_distance(self.config),
             "raw_action": int(raw.index),
             "safety_shield_action": int(shield_action.index),
         }
@@ -237,7 +239,7 @@ class ACCVPController:
         return bool(
             local is not None
             and local.ego_on_auxiliary
-            and 0.0 < float(local.merge_distance) <= float(self.config.accvp.deadline_distance)
+            and 0.0 < float(local.merge_distance) <= effective_activation_distance(self.config)
         )
 
     @staticmethod

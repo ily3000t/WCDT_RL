@@ -22,6 +22,12 @@ SPLIT_RATIOS = {
 }
 
 
+def _is_activation_window(row: dict[str, Any]) -> bool:
+    """Use v2 terminology while retaining read-only support for v1 diagnostics."""
+
+    return str(row.get("activation_bin", row.get("deadline_bin", ""))) in {"activation_window", "deadline"}
+
+
 def _jsonl(path: Path) -> list[dict[str, Any]]:
     if not path.exists():
         return []
@@ -71,12 +77,13 @@ def build_split_manifest(
     quotas = _split_quotas(len(grouped), require_all_splits)
     group_items = []
     for group_id, members in grouped.items():
-        # Balance the three meaningful marginals without creating the sparse
-        # combinatorial signature that previously produced singleton strata.
+        # Balance independent marginals without creating a sparse
+        # combinatorial signature that would produce singleton strata.
         policy = str(members[0].get("root_policy", members[0].get("root_source", "unknown")))
+        source = str(members[0].get("collection_source", policy))
         traffic = str(members[0].get("traffic_profile", "unknown"))
-        deadline = str(members[0].get("deadline_bin", "unknown"))
-        marginals = (f"policy:{policy}", f"traffic:{traffic}", f"deadline:{deadline}")
+        activation = str(members[0].get("activation_bin", members[0].get("deadline_bin", "unknown")))
+        marginals = (f"policy:{policy}", f"source:{source}", f"traffic:{traffic}", f"activation:{activation}")
         digest = hashlib.sha256(f"{seed}:{group_id}".encode("utf-8")).hexdigest()
         group_items.append((marginals, digest, group_id, members))
     marginal_sizes = Counter(marginal for item in group_items for marginal in item[0])
@@ -108,7 +115,10 @@ def build_split_manifest(
                     "root_id": root["root_id"],
                     "root_episode_id": group_id,
                     "episode_seed": int(root["episode_seed"]),
-                    "primary_stratum": f"{root.get('root_policy', root.get('root_source', 'unknown'))}:{root.get('deadline_bin', 'unknown')}",
+                    "primary_stratum": (
+                        f"{root.get('root_policy', root.get('root_source', 'unknown'))}:"
+                        f"{root.get('activation_bin', root.get('deadline_bin', 'unknown'))}"
+                    ),
                     "split": assignments[group_id],
                 }
             )
@@ -120,12 +130,32 @@ def build_split_manifest(
             name: dict(Counter(str(root.get("root_policy", root.get("root_source", "unknown"))) for root in roots if assignments[_root_group_id(root)] == name))
             for name in SPLIT_RATIOS
         },
+        "collection_source_counts": {
+            name: dict(
+                Counter(
+                    str(root.get("collection_source", root.get("root_policy", root.get("root_source", "unknown"))))
+                    for root in roots
+                    if assignments[_root_group_id(root)] == name
+                )
+            )
+            for name in SPLIT_RATIOS
+        },
         "traffic_profile_counts": {
             name: dict(Counter(str(root.get("traffic_profile", "unknown")) for root in roots if assignments[_root_group_id(root)] == name))
             for name in SPLIT_RATIOS
         },
         "deadline_bin_counts": {
             name: dict(Counter(str(root.get("deadline_bin", "unknown")) for root in roots if assignments[_root_group_id(root)] == name))
+            for name in SPLIT_RATIOS
+        },
+        "activation_bin_counts": {
+            name: dict(
+                Counter(
+                    str(root.get("activation_bin", root.get("deadline_bin", "unknown")))
+                    for root in roots
+                    if assignments[_root_group_id(root)] == name
+                )
+            )
             for name in SPLIT_RATIOS
         },
         "unsupported_marginals": {
@@ -184,10 +214,7 @@ class ACCVPBranchDataset:
             horizon_steps=int(metadata.get("candidate_plan_horizon_steps", 80)),
         ).states
         observed = float(bool(row["event_observed"]))
-        viability_eligible = float(
-            bool(row["event_observed"])
-            and str(root_row.get("deadline_bin", row.get("deadline_bin", ""))) == "deadline"
-        )
+        viability_eligible = float(bool(row["event_observed"]) and _is_activation_window(root_row))
         target_entry = row.get("target_lane_entry_time_s")
         entry_target = float(target_entry) if target_entry is not None else float(row["censor_time"])
         return {

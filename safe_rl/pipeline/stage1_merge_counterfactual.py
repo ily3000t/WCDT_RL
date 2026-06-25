@@ -19,6 +19,11 @@ def main() -> None:
         args.shard,
         args.output,
         require_frozen_risk_model=bool(cfg.accvp.counterfactual.get("require_frozen_risk_model", True)),
+        expected_collection_phase=(
+            str(cfg.accvp.counterfactual.get("collection_phase"))
+            if str(cfg.accvp.counterfactual.get("collection_phase", "ad_hoc")) in {"pilot", "formal"}
+            else None
+        ),
     )
     print(output)
 

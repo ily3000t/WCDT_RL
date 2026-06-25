@@ -1,0 +1,32 @@
+# Earlier-window feasibility diagnosis for the same frozen merge-timing PPO.
+# It does not change the scenario or action semantics; only the diagnostic
+# intervention window is expanded from 120 m to 240 m.
+run:
+  output_root: "safe_rl_output/runs"
+  tensorboard: false
+
+rl:
+  use_wcdt_forecast_features: true
+  reward_profile: "merge_timing_forecast"
+  shield_guided_reward:
+    risk_checkpoint: "safe_rl_output/runs/safe_rl_comparison_schema9_validation_001/stage2/risk_module.pt"
+
+forecast_features:
+  enabled: true
+  use_for_ppo_observation: true
+  source: "wcdt_v3"
+  checkpoint: "safe_rl_output/runs/safe_rl_comparison_schema9_validation_001/stage2/wcdt_v3_predictor.pt"
+  allow_heuristic_fallback: false
+
+accvp:
+  enabled: false
+  mode: "off"
+  activation_distance: 240.0
+  counterfactual:
+    root_budget: 12
+    roots_per_episode_limit: 6
+    workers: 2
+    output_name: "accvp_counterfactual_v2"
+    risk_checkpoint: "safe_rl_output/runs/safe_rl_comparison_schema9_validation_001/stage2/risk_module.pt"
+    policy_checkpoints:
+      merge_timing: "safe_rl_output/runs/safe_rl_comparison_schema9_validation_001_forecast_wcdt_v3/stage3/ppo_model.zip"

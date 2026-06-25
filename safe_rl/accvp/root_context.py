@@ -4,7 +4,7 @@ import json
 import uuid
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, Mapping
 
 import numpy as np
 
@@ -85,6 +85,9 @@ def capture_root_context(
     traffic_profile: str,
     deadline_bin: str,
     snapshot_path: str | Path,
+    activation_bin: str | None = None,
+    activation_distance_m: float | None = None,
+    data_contract: Mapping[str, Any] | None = None,
 ) -> RootContext:
     """Capture root metadata on the collector connection; never calls loadState()."""
 
@@ -105,6 +108,17 @@ def capture_root_context(
     root_id = root_id or f"seed{int(env.seed_value)}_decision{int(env._decision_index)}_{uuid.uuid4().hex[:12]}"
     scenario_hash = stable_hash(dict(env.config.scenario))
     config_hash = stable_hash(dict(env.config))
+    root_state_fingerprint = stable_hash(
+        {
+            "episode_seed": int(env.seed_value),
+            "decision_index": int(env._decision_index),
+            "sim_step": int(env._episode_step),
+            "root_ego": ego.to_dict(),
+            "history_frames": _serialise_history(env),
+            "selected_actor_ids": selected_actor_ids,
+        }
+    )
+    contract = dict(data_contract or {})
     metadata = {
         "counterfactual_schema_version": COUNTERFACTUAL_SCHEMA_VERSION,
         "root_id": root_id,
@@ -122,6 +136,16 @@ def capture_root_context(
         "raw_action_legal": bool(raw_action_legal),
         "traffic_profile": str(traffic_profile),
         "deadline_bin": str(deadline_bin),
+        "activation_bin": str(activation_bin or deadline_bin),
+        "accvp_activation_distance_m": float(
+            activation_distance_m
+            if activation_distance_m is not None
+            else (
+                env.config.accvp.get("activation_distance")
+                if env.config.accvp.get("activation_distance") is not None
+                else env.config.accvp.deadline_distance
+            )
+        ),
         "snapshot_path": str(snapshot.resolve()),
         "snapshot_sha256": file_sha256(snapshot),
         "scenario_config_hash": scenario_hash,
@@ -129,6 +153,10 @@ def capture_root_context(
         "sumo_version": str(env.config.scenario.get("sumo_version", "unknown")),
         "action_execution_profile": str(env.config.scenario.get("action_execution_profile", "current_v1")),
         "candidate_plan_profile": str(env.config.accvp.candidate_plan_profile),
+        "response_horizon_s": float(env.config.accvp.response_horizon_s),
+        "viability_horizon_s": float(env.config.accvp.viability_horizon_s),
+        "data_contract": contract,
+        "data_contract_hash": stable_hash(contract) if contract else "",
         "step_length": float(env.config.scenario.step_length),
         "candidate_plan_horizon_steps": int(env.config.accvp.candidate_plan_horizon_steps),
         "ego_id": str(env.ego_id),
@@ -140,6 +168,7 @@ def capture_root_context(
         "safety_actor_coverage_complete": bool(safety_actor_coverage_complete),
         "selector": selection,
         "root_ego": ego.to_dict(),
+        "root_state_fingerprint": root_state_fingerprint,
         "root_context_hash": "",
     }
     metadata["root_context_hash"] = stable_hash({key: value for key, value in metadata.items() if key != "snapshot_path"})

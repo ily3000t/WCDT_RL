@@ -7,9 +7,12 @@ from pathlib import Path
 from typing import Any, Mapping
 
 
-COUNTERFACTUAL_SCHEMA_VERSION = 1
-COUNTERFACTUAL_SHARD_MANIFEST_VERSION = 1
-COUNTERFACTUAL_DATASET_MANIFEST_VERSION = 1
+# Schema v2 makes the ACV-Shield activation protocol part of the immutable
+# data contract.  Schema-v1 artifacts remain diagnostic history and cannot be
+# mixed into a formal v2 training dataset.
+COUNTERFACTUAL_SCHEMA_VERSION = 2
+COUNTERFACTUAL_SHARD_MANIFEST_VERSION = 2
+COUNTERFACTUAL_DATASET_MANIFEST_VERSION = 2
 VIABILITY_STATUSES = frozenset({"observed_success", "observed_failure", "censored"})
 BRANCH_REQUIRED_FIELDS = frozenset(
     {
@@ -19,6 +22,8 @@ BRANCH_REQUIRED_FIELDS = frozenset(
         "action_id",
         "snapshot_sha256",
         "candidate_plan_profile",
+        "accvp_activation_distance_m",
+        "data_contract_hash",
         "risk_model_fingerprint",
         "secondary_safety_pass",
         "event_observed",

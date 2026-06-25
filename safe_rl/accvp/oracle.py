@@ -6,6 +6,7 @@ from pathlib import Path
 from typing import Any, Iterable
 
 from safe_rl.accvp.schema import file_sha256, read_json, write_json_atomic
+from safe_rl.accvp.protocol import effective_activation_distance
 
 
 ORACLE_STATES = frozenset({"insufficient_coverage", "no_safe_viable_alternative", "go"})
@@ -27,19 +28,25 @@ def _dataset_provenance(dataset: Path) -> dict[str, Any]:
         return {"formal_dataset": False}
     manifest = read_json(dataset_manifest_path)
     return {
-        "formal_dataset": str(manifest.get("artifact_kind", "")) == "counterfactual_dataset_v1",
+        "formal_dataset": str(manifest.get("artifact_kind", "")) == "counterfactual_dataset_v2",
+        "collection_phase": str(manifest.get("collection_phase", "")),
         "dataset_manifest_sha256": file_sha256(dataset_manifest_path),
         "roots_manifest_sha256": file_sha256(roots_path),
         "branches_manifest_sha256": file_sha256(branches_path),
         "dataset_fingerprint": str(manifest.get("dataset_fingerprint", "")),
         "config_hash": str(manifest.get("config_hash", "")),
+        "data_contract_hash": str(manifest.get("data_contract_hash", "")),
+        "accvp_activation_distance_m": manifest.get("accvp_activation_distance_m"),
         "risk_model_fingerprint": str(manifest.get("risk_model_fingerprint", "")),
     }
 
 
 def _safe_viable(candidate: dict[str, Any]) -> bool:
+    """Match the ACV-Shield feasible set, not only physical branch outcomes."""
+
     return (
-        not bool(candidate.get("proxy_collision_within_horizon", False))
+        bool(candidate.get("secondary_safety_pass", False))
+        and not bool(candidate.get("proxy_collision_within_horizon", False))
         and not bool(candidate.get("safety_violation_within_horizon", False))
         and str(candidate.get("viability_observation_status", "")) == "observed_success"
         and bool(candidate.get("merge_before_taper_observed", False))
@@ -114,6 +121,7 @@ def counterfactual_oracle_report(
                 "root_policy": str(root.get("root_policy", root.get("root_source", ""))),
                 "root_filter": str(root.get("root_filter", "all")),
                 "deadline_bin": str(root.get("deadline_bin", "")),
+                "activation_bin": str(root.get("activation_bin", root.get("deadline_bin", ""))),
                 "raw_action_id": raw_action,
                 "raw_action_legal": bool(root.get("raw_action_legal", False)),
                 "raw_infeasible": raw_infeasible,
@@ -129,7 +137,7 @@ def counterfactual_oracle_report(
             row
             for row in root_rows
             if row["episode_seed"] == seed
-            and row["deadline_bin"] == "deadline"
+            and row["activation_bin"] in {"activation_window", "deadline"}
             and (root_policy is None or row["root_policy"] == root_policy)
         ]
         evaluated = [row for row in deadline_roots if row["raw_infeasible"] is not None]
@@ -205,7 +213,15 @@ def validate_oracle_for_training(config: Any, dataset_dir: str | Path) -> dict[s
     expected = dict(report.get("dataset_provenance", {}))
     if not bool(current.get("formal_dataset", False)):
         raise ValueError("ACCVP training requires a merged formal counterfactual dataset")
-    for key in ("dataset_manifest_sha256", "roots_manifest_sha256", "branches_manifest_sha256", "dataset_fingerprint"):
+    if str(current.get("collection_phase", "")) != "formal":
+        raise ValueError("ACCVP training requires a dataset merged from formal collection shards")
+    for key in (
+        "dataset_manifest_sha256",
+        "roots_manifest_sha256",
+        "branches_manifest_sha256",
+        "dataset_fingerprint",
+        "data_contract_hash",
+    ):
         if not expected.get(key) or expected.get(key) != current.get(key):
             raise ValueError(f"ACCVP oracle report provenance mismatch for {key}")
     risk_fingerprint = str(current.get("risk_model_fingerprint", ""))
@@ -216,4 +232,7 @@ def validate_oracle_for_training(config: Any, dataset_dir: str | Path) -> dict[s
         expected_fingerprint = f"risk_checkpoint:{file_sha256(configured_risk)}"
         if expected_fingerprint != risk_fingerprint:
             raise ValueError("ACCVP Risk Module checkpoint does not match the counterfactual dataset")
+    expected_activation = float(current.get("accvp_activation_distance_m", -1.0))
+    if expected_activation <= 0.0 or abs(effective_activation_distance(config) - expected_activation) > 1.0e-9:
+        raise ValueError("ACCVP activation window does not match the formal counterfactual dataset")
     return report

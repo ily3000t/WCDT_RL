@@ -9,11 +9,16 @@ from safe_rl.accvp.candidate_plan import ACCVP_COMMITMENT_PROFILE, build_commitm
 from safe_rl.accvp.calibration import CalibrationBundle, OneSidedBinnedCalibrator, selected_action_metrics
 from safe_rl.accvp.controller import ACCVPController
 from safe_rl.accvp.dataset import build_split_manifest
+from safe_rl.accvp.model import checkpoint_metadata
 from safe_rl.accvp.oracle import counterfactual_oracle_report
+from safe_rl.accvp.pilot import validate_pilot_dataset
+from safe_rl.accvp.protocol import counterfactual_data_contract, data_contract_hash, effective_activation_distance
 from safe_rl.accvp.root_context import RootContext
+from safe_rl.accvp.schema import COUNTERFACTUAL_SCHEMA_VERSION, stable_hash
 from safe_rl.accvp.selection import select_viability_action
 from safe_rl.accvp.shards import merge_counterfactual_shards
 from safe_rl.accvp.snapshot_store import CounterfactualSnapshotStore
+from safe_rl.pipeline.stage1_collect_accvp_jobs import materialise_collection_job, validate_required_pilot
 from safe_rl.stage1_counterfactual.collector import _cache_dir, _root_filter_matches, _seed_schedule
 from safe_rl.sim.action_space import decode_action
 from safe_rl.sim.types import VehicleState
@@ -85,6 +90,27 @@ def test_raw_feasible_is_retained():
     assert debug["accvp_replacement"] is False
 
 
+def test_explicit_activation_distance_overrides_legacy_deadline_without_mutating_it():
+    cfg = clone_with_overrides(_cfg("shadow"), {"accvp": {"activation_distance": 240.0}})
+    assert effective_activation_distance(cfg) == 240.0
+    assert cfg.accvp.deadline_distance == 200.0
+    controller = ACCVPController(cfg, _Predictor([_score(4), _score(7)]))
+    action, debug = controller.decide(
+        context={"decision_index": 0, "merge_local": SimpleNamespace(ego_on_auxiliary=True, merge_distance=220.0)},
+        raw_action=decode_action(4),
+        safety_shield_action=decode_action(4),
+        safety_shield_replaced=False,
+        shield=_Shield(),
+    )
+    assert action == decode_action(4)
+    assert debug["accvp_activation_distance_m"] == 240.0
+
+
+def test_checkpoint_metadata_tracks_counterfactual_schema_v2():
+    metadata = checkpoint_metadata(load_config(), warm_start={})
+    assert metadata["counterfactual_schema_version"] == COUNTERFACTUAL_SCHEMA_VERSION
+
+
 def test_only_raw_infeasible_allows_accvp_replacement_and_commitment():
     raw = decode_action(4)
     merge = decode_action(7)
@@ -147,10 +173,12 @@ def test_snapshot_is_deleted_only_after_all_expected_branches_complete(tmp_path:
     assert store.snapshots_dir == tmp_path / ".cache" / "accvp" / "snapshots"
     store.write_root(root, [0, 1])
     base = {
-        "counterfactual_schema_version": 1,
+        "counterfactual_schema_version": COUNTERFACTUAL_SCHEMA_VERSION,
         "root_id": "root",
         "snapshot_sha256": "hash",
         "candidate_plan_profile": ACCVP_COMMITMENT_PROFILE,
+        "accvp_activation_distance_m": 240.0,
+        "data_contract_hash": "contract",
         "risk_model_fingerprint": "risk_checkpoint:test",
         "secondary_safety_pass": True,
         "event_observed": False,
@@ -241,7 +269,7 @@ def test_oracle_requires_safe_viable_counterfactual_for_each_failure_seed(tmp_pa
     ]
     branches = [
         {"root_id": "seed2", "branch_status": "completed", "action_id": 4, "proxy_collision_within_horizon": True, "safety_violation_within_horizon": True, "merge_before_taper_observed": False, "viability_observation_status": "observed_failure"},
-        {"root_id": "seed2", "branch_status": "completed", "action_id": 7, "proxy_collision_within_horizon": False, "safety_violation_within_horizon": False, "merge_before_taper_observed": True, "viability_observation_status": "observed_success"},
+        {"root_id": "seed2", "branch_status": "completed", "action_id": 7, "proxy_collision_within_horizon": False, "safety_violation_within_horizon": False, "merge_before_taper_observed": True, "viability_observation_status": "observed_success", "secondary_safety_pass": True},
         {"root_id": "seed5", "branch_status": "completed", "action_id": 4, "proxy_collision_within_horizon": True, "safety_violation_within_horizon": True, "merge_before_taper_observed": False, "viability_observation_status": "observed_failure"},
     ]
     (manifests / "roots.jsonl").write_text("".join(__import__("json").dumps(row) + "\n" for row in roots), encoding="utf-8")
@@ -251,6 +279,20 @@ def test_oracle_requires_safe_viable_counterfactual_for_each_failure_seed(tmp_pa
     assert report["required_failure_seed_results"]["5"]["state"] == "no_safe_viable_alternative"
     assert report["oracle_state"] == "no_safe_viable_alternative"
     assert report["go_for_training"] is False
+
+
+def test_oracle_rejects_physical_success_vetoed_by_secondary_risk(tmp_path: Path):
+    manifests = tmp_path / "manifests"
+    manifests.mkdir()
+    root = {"root_id": "seed2", "episode_seed": 2, "root_policy": "merge_timing", "deadline_bin": "deadline", "raw_action_id": 4, "raw_action_legal": True, "complete": True}
+    branches = [
+        {"root_id": "seed2", "branch_status": "completed", "action_id": 4, "proxy_collision_within_horizon": True, "safety_violation_within_horizon": True, "merge_before_taper_observed": False, "viability_observation_status": "observed_failure", "secondary_safety_pass": True},
+        {"root_id": "seed2", "branch_status": "completed", "action_id": 7, "proxy_collision_within_horizon": False, "safety_violation_within_horizon": False, "merge_before_taper_observed": True, "viability_observation_status": "observed_success", "secondary_safety_pass": False},
+    ]
+    (manifests / "roots.jsonl").write_text(__import__("json").dumps(root) + "\n", encoding="utf-8")
+    (manifests / "branches.jsonl").write_text("".join(__import__("json").dumps(row) + "\n" for row in branches), encoding="utf-8")
+    report = counterfactual_oracle_report(tmp_path, required_seeds=[2], root_policy="merge_timing")
+    assert report["oracle_state"] == "no_safe_viable_alternative"
 
 
 def test_oracle_distinguishes_missing_deadline_coverage(tmp_path: Path):
@@ -272,6 +314,7 @@ def test_oracle_distinguishes_missing_deadline_coverage(tmp_path: Path):
 def test_root_policy_filter_and_exact_seed_schedule_are_independent():
     cfg = load_config()
     assert _root_filter_matches("deadline", "deadline") is True
+    assert _root_filter_matches("activation_window", "activation_window") is True
     assert _root_filter_matches("deadline", "pre_deadline") is False
     assert _seed_schedule(cfg, [2, 5], None) == [2, 5]
 
@@ -287,30 +330,73 @@ def test_default_counterfactual_cache_is_under_output_tree_not_repository_root(t
 
 def test_immutable_shards_merge_without_overwriting_sources(tmp_path: Path):
     shards = []
+    contract = {
+        "protocol_version": "accvp_240_v1",
+        "scenario_config_hash": "scenario",
+        "scenario_route_hash": "route",
+        "action_execution_profile": "current_v1",
+        "candidate_plan_profile": ACCVP_COMMITMENT_PROFILE,
+        "activation_distance_m": 240.0,
+        "response_horizon_s": 3.0,
+        "response_horizon_steps": 30,
+        "viability_horizon_s": 8.0,
+        "candidate_plan_horizon_steps": 80,
+        "actor_count": 6,
+        "actor_selection_config_hash": "actors",
+        "safety_metric_version": "obb",
+        "event_definition_version": "events",
+        "risk_model_fingerprint": "risk_checkpoint:fixture",
+    }
     for index in range(2):
         shard = tmp_path / f"shard_{index}"
         manifests = shard / "manifests"
         manifests.mkdir(parents=True)
         root_id = f"root_{index}"
         (manifests / "roots.jsonl").write_text(
-            __import__("json").dumps({"root_id": root_id, "complete": True, "root_policy": "merge_timing", "traffic_profile": "hard", "deadline_bin": "deadline"}) + "\n",
+            __import__("json").dumps(
+                {
+                    "root_id": root_id,
+                    "complete": True,
+                    "root_policy": "merge_timing",
+                    "collection_source": "merge_timing",
+                    "traffic_profile": "hard",
+                    "deadline_bin": "deadline",
+                    "activation_bin": "activation_window",
+                    "data_contract_hash": stable_hash(contract),
+                    "root_state_fingerprint": f"state_{index}",
+                }
+            )
+            + "\n",
             encoding="utf-8",
         )
         (manifests / "branches.jsonl").write_text(
-            __import__("json").dumps({"root_id": root_id, "action_id": 4, "branch_status": "completed", "secondary_safety_pass": True, "risk_model_fingerprint": "risk_checkpoint:fixture"}) + "\n",
+            __import__("json").dumps(
+                {
+                    "root_id": root_id,
+                    "action_id": 4,
+                    "branch_status": "completed",
+                    "secondary_safety_pass": True,
+                    "risk_model_fingerprint": "risk_checkpoint:fixture",
+                    "data_contract_hash": stable_hash(contract),
+                }
+            )
+            + "\n",
             encoding="utf-8",
         )
         (manifests / "dataset_manifest.json").write_text(
             __import__("json").dumps(
                 {
-                    "artifact_kind": "counterfactual_shard_v1",
-                    "counterfactual_schema_version": 1,
+                    "artifact_kind": "counterfactual_shard_v2",
+                    "counterfactual_schema_version": COUNTERFACTUAL_SCHEMA_VERSION,
                     "collection_id": f"job_{index}",
+                    "collection_source": "merge_timing",
                     "scenario_config_hash": "scenario",
                     "action_execution_profile": "current_v1",
                     "candidate_plan_profile": ACCVP_COMMITMENT_PROFILE,
                     "risk_model_fingerprint": "risk_checkpoint:fixture",
-                    "config_hash": "config",
+                    "config_hash": f"config_{index}",
+                    "data_contract": contract,
+                    "data_contract_hash": stable_hash(contract),
                 }
             ),
             encoding="utf-8",
@@ -322,3 +408,168 @@ def test_immutable_shards_merge_without_overwriting_sources(tmp_path: Path):
     assert (shards[0] / "manifests" / "roots.jsonl").exists()
     with __import__("pytest").raises(FileExistsError):
         merge_counterfactual_shards(shards, output)
+
+
+def test_shard_merge_rejects_mismatched_protocol_contract(tmp_path: Path):
+    base = {
+        "artifact_kind": "counterfactual_shard_v2",
+        "counterfactual_schema_version": COUNTERFACTUAL_SCHEMA_VERSION,
+        "collection_id": "one",
+        "scenario_config_hash": "scenario",
+        "action_execution_profile": "current_v1",
+        "candidate_plan_profile": ACCVP_COMMITMENT_PROFILE,
+        "risk_model_fingerprint": "risk_checkpoint:fixture",
+        "config_hash": "source_config",
+    }
+    shards = []
+    for name, distance in (("one", 240.0), ("two", 120.0)):
+        shard = tmp_path / name
+        manifests = shard / "manifests"
+        manifests.mkdir(parents=True)
+        contract = {
+            "protocol_version": "accvp_240_v1",
+            "scenario_config_hash": "scenario",
+            "scenario_route_hash": "route",
+            "action_execution_profile": "current_v1",
+            "candidate_plan_profile": ACCVP_COMMITMENT_PROFILE,
+            "activation_distance_m": distance,
+            "response_horizon_s": 3.0,
+            "response_horizon_steps": 30,
+            "viability_horizon_s": 8.0,
+            "candidate_plan_horizon_steps": 80,
+            "actor_count": 6,
+            "actor_selection_config_hash": "actors",
+            "safety_metric_version": "obb",
+            "event_definition_version": "events",
+            "risk_model_fingerprint": "risk_checkpoint:fixture",
+        }
+        (manifests / "roots.jsonl").write_text("", encoding="utf-8")
+        (manifests / "branches.jsonl").write_text("", encoding="utf-8")
+        (manifests / "dataset_manifest.json").write_text(
+            __import__("json").dumps(
+                {
+                    **base,
+                    "collection_id": name,
+                    "data_contract": contract,
+                    "data_contract_hash": stable_hash(contract),
+                }
+            ),
+            encoding="utf-8",
+        )
+        shards.append(shard)
+    with __import__("pytest").raises(ValueError, match="data contract"):
+        merge_counterfactual_shards(shards, tmp_path / "formal")
+
+
+def test_collection_job_can_override_policy_observation_config_without_mutating_parent():
+    cfg = load_config()
+    job_cfg, job = materialise_collection_job(
+        cfg,
+        {
+            "name": "ppo_240",
+            "root_policy": "ppo",
+            "root_filter": "all",
+            "root_budget": 100,
+            "root_policy_checkpoint": "baseline.zip",
+            "config_overrides": {"forecast_features": {"enabled": False}, "rl": {"use_wcdt_forecast_features": False}},
+        },
+    )
+    assert job["name"] == "ppo_240"
+    assert job_cfg.accvp.counterfactual.root_budget == 100
+    assert job_cfg.accvp.counterfactual.policy_checkpoints.ppo == "baseline.zip"
+    assert job_cfg.forecast_features.enabled is False
+    assert cfg.accvp.counterfactual.root_budget != 100
+
+
+def test_formal_collection_requires_matching_pilot_report(tmp_path: Path):
+    risk = tmp_path / "risk.pt"
+    risk.write_bytes(b"risk")
+    report_path = tmp_path / "pilot.json"
+    cfg = clone_with_overrides(
+        load_config(),
+        {
+            "accvp": {
+                "activation_distance": 240.0,
+                "counterfactual": {"risk_checkpoint": str(risk), "required_pilot_report": str(report_path)},
+            }
+        },
+    )
+    fingerprint = f"risk_checkpoint:{__import__('hashlib').sha256(risk.read_bytes()).hexdigest()}"
+    report_path.write_text(
+        __import__("json").dumps(
+            {
+                "pilot_state": "pass",
+                "accvp_activation_distance_m": 240.0,
+                "data_contract_hash": data_contract_hash(counterfactual_data_contract(cfg, fingerprint)),
+            }
+        ),
+        encoding="utf-8",
+    )
+    validate_required_pilot(cfg)
+    report_path.write_text(__import__("json").dumps({"pilot_state": "fail"}), encoding="utf-8")
+    with __import__("pytest").raises(ValueError, match="pilot_state"):
+        validate_required_pilot(cfg)
+
+
+def test_pilot_validator_requires_source_quality_and_matching_seed_oracle(tmp_path: Path):
+    source = tmp_path / "source"
+    source_manifests = source / "manifests"
+    source_manifests.mkdir(parents=True)
+    (source_manifests / "dataset_manifest.json").write_text(
+        __import__("json").dumps(
+            {
+                "collection_id": "mixed_240",
+                "collection_source": "mixed",
+                "branch_status_counts": {"completed": 1},
+            }
+        ),
+        encoding="utf-8",
+    )
+    dataset = tmp_path / "dataset"
+    manifests = dataset / "manifests"
+    manifests.mkdir(parents=True)
+    (manifests / "roots.jsonl").write_text(
+        __import__("json").dumps(
+            {"root_id": "root", "complete": True, "collection_source": "mixed", "activation_bin": "activation_window"}
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    (manifests / "branches.jsonl").write_text(
+        __import__("json").dumps(
+            {"root_id": "root", "branch_status": "completed", "activation_bin": "activation_window", "event_observed": True}
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    (manifests / "dataset_manifest.json").write_text(
+        __import__("json").dumps(
+            {
+                "artifact_kind": "counterfactual_dataset_v2",
+                "collection_phase": "pilot",
+                "dataset_fingerprint": "dataset",
+                "data_contract_hash": "contract",
+                "accvp_activation_distance_m": 240.0,
+                "source_shards": [{"path": str(source)}],
+            }
+        ),
+        encoding="utf-8",
+    )
+    oracle = tmp_path / "oracle.json"
+    oracle.write_text(
+        __import__("json").dumps(
+            {
+                "oracle_state": "go",
+                "required_seeds": [2, 5],
+                "root_policy": "merge_timing",
+                "dataset_provenance": {"dataset_fingerprint": "dataset"},
+            }
+        ),
+        encoding="utf-8",
+    )
+    report = validate_pilot_dataset(
+        dataset,
+        expected_root_counts={"mixed": 1},
+        oracle_report_path=oracle,
+    )
+    assert report["pilot_state"] == "pass"
