@@ -244,6 +244,46 @@ def test_empty_calibration_bin_is_conservative_and_selector_retains_raw():
     assert decision["raw_feasible"] is True
 
 
+def test_selector_replacement_requires_merge_intent():
+    thresholds = {
+        "proxy_collision_upper_bound": 0.2,
+        "safety_violation_upper_bound": 0.2,
+        "merge_viability_lower_bound": 0.5,
+    }
+    decision = select_viability_action(
+        [
+            {"action_id": 3, "pU_proxy_collision": 0.1, "pU_safety_violation": 0.1, "pL_merge_before_taper": 0.99, "secondary_safety_pass": True},
+            {"action_id": 4, "pU_proxy_collision": 0.9, "pU_safety_violation": 0.9, "pL_merge_before_taper": 0.99, "secondary_safety_pass": True},
+            {"action_id": 7, "pU_proxy_collision": 0.1, "pU_safety_violation": 0.1, "pL_merge_before_taper": 0.60, "secondary_safety_pass": True},
+        ],
+        raw_action_id=4,
+        thresholds=thresholds,
+    )
+    assert decision["selected"]["action_id"] == 7
+    assert decode_action(decision["selected"]["action_id"]).lateral_cmd > 0
+    assert decision["replacement"] is True
+
+
+def test_selector_keeps_shield_action_when_only_non_merge_actions_pass():
+    thresholds = {
+        "proxy_collision_upper_bound": 0.2,
+        "safety_violation_upper_bound": 0.2,
+        "merge_viability_lower_bound": 0.5,
+    }
+    decision = select_viability_action(
+        [
+            {"action_id": 1, "pU_proxy_collision": 0.1, "pU_safety_violation": 0.1, "pL_merge_before_taper": 0.99, "secondary_safety_pass": True},
+            {"action_id": 3, "pU_proxy_collision": 0.1, "pU_safety_violation": 0.1, "pL_merge_before_taper": 0.99, "secondary_safety_pass": True},
+            {"action_id": 4, "pU_proxy_collision": 0.9, "pU_safety_violation": 0.9, "pL_merge_before_taper": 0.99, "secondary_safety_pass": True},
+        ],
+        raw_action_id=4,
+        thresholds=thresholds,
+    )
+    assert decision["selected"] is None
+    assert decision["candidate_set_available"] is False
+    assert decision["reason"] == "no_merge_intent_feasible_action"
+
+
 def test_split_keeps_all_roots_of_same_episode_seed_together(tmp_path: Path):
     manifests = tmp_path / "manifests"
     manifests.mkdir()
@@ -363,7 +403,7 @@ def test_immutable_shards_merge_without_overwriting_sources(tmp_path: Path):
                     "deadline_bin": "deadline",
                     "activation_bin": "activation_window",
                     "data_contract_hash": stable_hash(contract),
-                    "root_state_fingerprint": f"state_{index}",
+                    "root_state_fingerprint": "same_physical_state",
                 }
             )
             + "\n",
@@ -405,6 +445,10 @@ def test_immutable_shards_merge_without_overwriting_sources(tmp_path: Path):
     output = merge_counterfactual_shards(shards, tmp_path / "formal")
     manifest = __import__("json").loads((output / "manifests" / "dataset_manifest.json").read_text(encoding="utf-8"))
     assert manifest["root_count"] == 2
+    assert manifest["unique_root_state_fingerprint_count"] == 1
+    assert manifest["duplicate_root_state_fingerprint_count"] == 1
+    assert manifest["duplicate_root_state_fingerprints"][0]["first_root_id"] == "root_0"
+    assert manifest["duplicate_root_state_fingerprints"][0]["duplicate_root_id"] == "root_1"
     assert (shards[0] / "manifests" / "roots.jsonl").exists()
     with __import__("pytest").raises(FileExistsError):
         merge_counterfactual_shards(shards, output)

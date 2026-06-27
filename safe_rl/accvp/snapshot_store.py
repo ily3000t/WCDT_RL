@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import json
+import os
+import time
 from pathlib import Path
 from typing import Any
 
@@ -101,10 +103,18 @@ class CounterfactualSnapshotStore:
 
     def _write_root_manifest(self, root_id: str, row: dict[str, Any]) -> None:
         path = self._manifest_path(root_id)
-        temporary = path.with_suffix(".json.tmp")
+        temporary = path.with_name(f"{path.stem}.{os.getpid()}.{time.time_ns()}.json.tmp")
         with temporary.open("w", encoding="utf-8") as handle:
             handle.write(canonical_json(row))
-        temporary.replace(path)
+        last_error: Exception | None = None
+        for attempt in range(10):
+            try:
+                temporary.replace(path)
+                return
+            except PermissionError as exc:
+                last_error = exc
+                time.sleep(0.05 * (attempt + 1))
+        raise last_error if last_error is not None else PermissionError(path)
 
     def _load_root_manifest(self, root_id: str) -> dict[str, Any]:
         with self._manifest_path(root_id).open("r", encoding="utf-8") as handle:

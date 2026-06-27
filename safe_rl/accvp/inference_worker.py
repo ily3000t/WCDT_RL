@@ -42,6 +42,12 @@ def _score(prepared: dict[str, Any]) -> list[dict[str, Any]]:
     return _SCORER.score_prepared(prepared)
 
 
+def _ping() -> bool:
+    if _SCORER is None:  # pragma: no cover - process initialisation contract
+        raise RuntimeError("ACCVP inference worker was not initialised")
+    return True
+
+
 class PersistentACCVPInferenceWorker:
     """One model-owning process. A timed-out process is discarded before reuse."""
 
@@ -59,6 +65,14 @@ class PersistentACCVPInferenceWorker:
                 initargs=(self._payload, self._checkpoint),
             )
         return self._executor
+
+    def start(self, timeout_s: float = 15.0) -> None:
+        future = self._ensure_executor().submit(_ping)
+        try:
+            future.result(timeout=max(0.001, float(timeout_s)))
+        except concurrent.futures.TimeoutError as exc:
+            self._restart_after_timeout()
+            raise TimeoutError("ACCVP inference worker startup exceeded the budget") from exc
 
     def score(self, prepared: dict[str, Any], timeout_s: float) -> list[dict[str, Any]]:
         future = self._ensure_executor().submit(_score, prepared)

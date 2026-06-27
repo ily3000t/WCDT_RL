@@ -57,6 +57,7 @@ def tune_operating_point(models: list[Any], dataset: ACCVPBranchDataset, calibra
         raise ValueError("operating-point split has no observed deadline viability rows")
     required = float(tuning.required_availability)
     candidates: list[dict[str, Any]] = []
+    evaluated_points: list[dict[str, Any]] = []
     for collision_bound, safety_bound, viability_bound in product(
         tuning.proxy_collision_upper_bounds,
         tuning.safety_violation_upper_bounds,
@@ -76,23 +77,39 @@ def tune_operating_point(models: list[Any], dataset: ACCVPBranchDataset, calibra
         ]
         selected = [decision["selected"] for decision in decisions if decision["selected"] is not None]
         availability = float(len(selected) / max(1, len(by_root)))
-        if availability < required:
-            continue
         observed = [row for row in selected if row["merge_observed"]]
-        candidates.append(
-            {
-                "proxy_collision_upper_bound": float(collision_bound),
-                "safety_violation_upper_bound": float(safety_bound),
-                "merge_viability_lower_bound": float(viability_bound),
-                "candidate_set_availability": availability,
-                "selected_safety_ucb": float(np.mean([row["pU_safety_violation"] for row in selected])),
-                "selected_viability_lcb": float(np.mean([row["pL_merge_before_taper"] for row in selected])),
-                "selected_observed_safety_rate": float(np.mean([row["safety_violation"] for row in selected])),
-                "selected_observed_viability_rate": float(np.mean([row["merge_before_taper"] for row in observed])) if observed else float("nan"),
-            }
-        )
+        point = {
+            "proxy_collision_upper_bound": float(collision_bound),
+            "safety_violation_upper_bound": float(safety_bound),
+            "merge_viability_lower_bound": float(viability_bound),
+            "candidate_set_availability": availability,
+            "selected_count": int(len(selected)),
+            "decision_count": int(len(by_root)),
+            "selected_safety_ucb": float(np.mean([row["pU_safety_violation"] for row in selected])) if selected else float("inf"),
+            "selected_viability_lcb": float(np.mean([row["pL_merge_before_taper"] for row in selected])) if selected else float("-inf"),
+            "selected_observed_safety_rate": float(np.mean([row["safety_violation"] for row in selected])) if selected else float("nan"),
+            "selected_observed_viability_rate": float(np.mean([row["merge_before_taper"] for row in observed])) if observed else float("nan"),
+        }
+        evaluated_points.append(point)
+        if availability >= required:
+            candidates.append(point)
     if not candidates:
-        raise RuntimeError("no operating point satisfies required ACCVP candidate-set availability")
+        best = max(
+            evaluated_points,
+            key=lambda row: (
+                row["candidate_set_availability"],
+                -row["selected_safety_ucb"],
+                row["selected_viability_lcb"],
+            ),
+        )
+        raise RuntimeError(
+            "no operating point satisfies required ACCVP candidate-set availability; "
+            f"required={required:.6f} best_availability={best['candidate_set_availability']:.6f} "
+            f"selected={best['selected_count']}/{best['decision_count']} "
+            f"best_thresholds={{'proxy_collision_upper_bound': {best['proxy_collision_upper_bound']}, "
+            f"'safety_violation_upper_bound': {best['safety_violation_upper_bound']}, "
+            f"'merge_viability_lower_bound': {best['merge_viability_lower_bound']}}}"
+        )
     selected = min(
         candidates,
         key=lambda row: (

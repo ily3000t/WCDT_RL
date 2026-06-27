@@ -167,16 +167,24 @@ def configure_sumo_python(installation: SumoInstallation) -> None:
     importlib.invalidate_caches()
 
 
+def _prepend_unique_path(value: str, entry: str) -> str:
+    parts = [part for part in value.split(os.pathsep) if part]
+    key = str(Path(entry).resolve())
+    if os.name == "nt":
+        key_cmp = key.lower()
+        filtered = [part for part in parts if str(Path(part).resolve()).lower() != key_cmp]
+    else:
+        filtered = [part for part in parts if str(Path(part).resolve()) != key]
+    return os.pathsep.join([key, *filtered])
+
+
 def sumo_subprocess_environment(installation: SumoInstallation) -> dict[str, str]:
     env = dict(os.environ)
     env["SUMO_HOME"] = installation.sumo_home
     current_path = env.get("PATH", "")
     bin_directory = str(Path(installation.sumo_binary).parent)
-    if bin_directory.lower() not in current_path.lower():
-        env["PATH"] = f"{bin_directory}{os.pathsep}{current_path}"
+    env["PATH"] = _prepend_unique_path(current_path, bin_directory)
     current_python_path = env.get("PYTHONPATH", "")
     tools = installation.tools_directory
-    env["PYTHONPATH"] = (
-        f"{tools}{os.pathsep}{current_python_path}" if current_python_path else tools
-    )
+    env["PYTHONPATH"] = _prepend_unique_path(current_python_path, tools)
     return env

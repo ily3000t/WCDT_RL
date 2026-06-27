@@ -47,6 +47,12 @@ def select_viability_action(
             "replacement": False,
             "reason": "raw_feasible",
         }
+    # In the highway-merge task, ACCVP is allowed to rescue an infeasible raw
+    # action only by choosing a merge-intent action.  Replacing a left/merge
+    # request with keep/right may look safer over the short horizon but can
+    # consume the remaining taper window and recreate the Full-Ranking failure
+    # mode that ACCVP is meant to avoid.
+    replacement_candidates = [row for row in accepted if int(_candidate_action(row).lateral_cmd) > 0]
     if not accepted:
         return {
             "selected": None,
@@ -56,9 +62,18 @@ def select_viability_action(
             "replacement": False,
             "reason": "no_feasible_action",
         }
+    if not replacement_candidates:
+        return {
+            "selected": None,
+            "accepted": accepted,
+            "raw_feasible": False,
+            "candidate_set_available": False,
+            "replacement": False,
+            "reason": "no_merge_intent_feasible_action",
+        }
     raw_action = decode_action(int(raw_action_id))
     selected = min(
-        accepted,
+        replacement_candidates,
         key=lambda row: (
             -float(row["pL_merge_before_taper"]),
             float(row["pU_safety_violation"]),

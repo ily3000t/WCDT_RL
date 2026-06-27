@@ -65,6 +65,9 @@ class ACCVPRuntimePredictor:
             from safe_rl.accvp.inference_worker import PersistentACCVPInferenceWorker
 
             self._inference_worker = PersistentACCVPInferenceWorker(config, self.checkpoint_path)
+            worker_cfg = config.accvp.get("inference_worker", {})
+            if bool(worker_cfg.get("prewarm_on_init", True)):
+                self._inference_worker.start(float(worker_cfg.get("startup_timeout_s", 15.0)))
 
     def validate_artifact_bundle(self, operating_point: str | Path | None) -> None:
         manifest_path = self.config.accvp.get("artifact_manifest")

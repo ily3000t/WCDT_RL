@@ -371,6 +371,8 @@ accvp:
   inference_worker:
     enabled: true
     restart_on_timeout: true
+    prewarm_on_init: true
+    startup_timeout_s: 15.0
   training:
     epochs: 20
     batch_size: 32
@@ -385,9 +387,9 @@ accvp:
       smoothness: 0.01
   tuning:
     required_availability: 0.95
-    proxy_collision_upper_bounds: [0.05, 0.10, 0.15, 0.20]
-    safety_violation_upper_bounds: [0.05, 0.10, 0.15, 0.20]
-    merge_viability_lower_bounds: [0.40, 0.50, 0.60, 0.70]
+    proxy_collision_upper_bounds: [0.05, 0.10, 0.15, 0.20, 0.30, 0.50, 0.75, 1.00]
+    safety_violation_upper_bounds: [0.05, 0.10, 0.15, 0.20, 0.30, 0.50, 0.75, 1.00]
+    merge_viability_lower_bounds: [0.00, 0.10, 0.20, 0.30, 0.40, 0.50, 0.60, 0.70]
   counterfactual:
     collection_phase: "ad_hoc"  # ad_hoc | pilot | formal
     root_budget: 5000

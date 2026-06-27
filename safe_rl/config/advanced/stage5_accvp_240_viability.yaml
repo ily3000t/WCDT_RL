@@ -1,0 +1,47 @@
+run:
+  run_id: "accvp_240_stage5_viability"
+  output_root: "safe_rl_output/runs"
+  tensorboard: false
+
+accvp:
+  enabled: false
+  mode: "off"
+  schema_version: 2
+  activation_distance: 240.0
+
+stage5:
+  paired_eval: true
+  same_seed: true
+  compare_shield_off_on: false
+  replay_enabled: true
+  episodes_per_group: 50
+  seeds: [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42, 43, 44, 45, 46, 47, 48, 49, 50]
+  risk_checkpoint: "safe_rl_output/runs/safe_rl_comparison_schema9_validation_001/stage2/risk_module.pt"
+  groups:
+    - name: "wcdt_v3_prediction_shield"
+      forecast_features: true
+      forecast_source: "wcdt_v3"
+      forecast_checkpoint: "safe_rl_output/runs/safe_rl_comparison_schema9_validation_001/stage2/wcdt_v3_predictor.pt"
+      shield: true
+      model_path: "safe_rl_output/runs/safe_rl_comparison_schema9_validation_001_forecast_wcdt_v3/stage3/ppo_model.zip"
+      shield_overrides: {forecast_aware_candidate_ranking_mode: "off", task_backstop_enabled: false}
+    - name: "wcdt_v3_prediction_shield_accvp_240_viability"
+      forecast_features: true
+      forecast_source: "wcdt_v3"
+      forecast_checkpoint: "safe_rl_output/runs/safe_rl_comparison_schema9_validation_001/stage2/wcdt_v3_predictor.pt"
+      shield: true
+      model_path: "safe_rl_output/runs/safe_rl_comparison_schema9_validation_001_forecast_wcdt_v3/stage3/ppo_model.zip"
+      raw_policy: "ppo_wcdt_v3_merge_timing"
+      counterfactual_predictor: "accvp_v1_240"
+      controller: "acv_shield_240"
+      shield_overrides: {forecast_aware_candidate_ranking_mode: "off", task_backstop_enabled: false}
+      accvp:
+        enabled: true
+        mode: "viability_branch"
+        schema_version: 2
+        activation_distance: 240.0
+        checkpoint: "safe_rl_output/runs/accvp_240_train/accvp/accvp_v1_predictor.pt"
+        calibration_bundle: "safe_rl_output/runs/accvp_240_train/accvp/accvp_v1_calibration.json"
+        operating_point: "safe_rl_output/runs/accvp_240_train/accvp/accvp_v1_operating_point.json"
+        artifact_manifest: "safe_rl_output/runs/accvp_240_train/accvp/accvp_v1_artifact_manifest.json"
+        risk_checkpoint: "safe_rl_output/runs/safe_rl_comparison_schema9_validation_001/stage2/risk_module.pt"

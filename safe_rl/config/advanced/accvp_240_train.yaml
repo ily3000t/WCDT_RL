@@ -1,0 +1,27 @@
+run:
+  run_id: "accvp_240_train"
+  output_root: "safe_rl_output/runs"
+  tensorboard: false
+
+accvp:
+  enabled: false
+  mode: "off"
+  schema_version: 2
+  activation_distance: 240.0
+  dataset_dir: "safe_rl_output/runs/accvp_240_formal_dataset"
+  oracle_report: "safe_rl_output/runs/accvp_240_formal_dataset/manifests/oracle_report.json"
+  risk_checkpoint: "safe_rl_output/runs/safe_rl_comparison_schema9_validation_001/stage2/risk_module.pt"
+  response_horizon_s: 3.0
+  response_horizon_steps: 30
+  viability_horizon_s: 8.0
+  candidate_plan_horizon_steps: 80
+  warm_start:
+    enabled: true
+    checkpoint: "safe_rl_output/runs/safe_rl_comparison_schema9_validation_001/stage2/wcdt_v3_predictor.pt"
+    freeze_encoder_epochs: 5
+    encoder_lr_multiplier: 0.1
+  tuning:
+    required_availability: 0.95
+    proxy_collision_upper_bounds: [0.05, 0.10, 0.15, 0.20, 0.30, 0.50, 0.75, 1.00]
+    safety_violation_upper_bounds: [0.05, 0.10, 0.15, 0.20, 0.30, 0.50, 0.75, 1.00]
+    merge_viability_lower_bounds: [0.00, 0.10, 0.20, 0.30, 0.40, 0.50, 0.60, 0.70]

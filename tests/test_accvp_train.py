@@ -9,6 +9,7 @@ import pytest
 torch = pytest.importorskip("torch")
 
 from safe_rl.accvp.dataset import build_split_manifest
+from safe_rl.accvp.protocol import effective_activation_distance
 from safe_rl.accvp.schema import file_sha256
 from safe_rl.accvp.train import train_accvp
 from safe_rl.sim.types import VehicleState
@@ -104,8 +105,11 @@ def _write_minimal_formal_dataset(dataset: Path, cfg) -> None:
     (manifests / "roots.jsonl").write_text("".join(json.dumps(row) + "\n" for row in roots), encoding="utf-8")
     (manifests / "branches.jsonl").write_text("".join(json.dumps(row) + "\n" for row in branches), encoding="utf-8")
     manifest = {
-        "artifact_kind": "counterfactual_dataset_v1",
+        "artifact_kind": "counterfactual_dataset_v2",
+        "collection_phase": "formal",
         "dataset_fingerprint": "fixture-dataset",
+        "data_contract_hash": "fixture-contract",
+        "accvp_activation_distance_m": effective_activation_distance(cfg),
         "risk_model_fingerprint": "risk_checkpoint:fixture",
     }
     (manifests / "dataset_manifest.json").write_text(json.dumps(manifest), encoding="utf-8")
@@ -121,6 +125,7 @@ def _write_minimal_formal_dataset(dataset: Path, cfg) -> None:
             "roots_manifest_sha256": file_sha256(manifests / "roots.jsonl"),
             "branches_manifest_sha256": file_sha256(manifests / "branches.jsonl"),
             "dataset_fingerprint": manifest["dataset_fingerprint"],
+            "data_contract_hash": manifest["data_contract_hash"],
         },
     }
     oracle_path = manifests / "oracle_report.json"

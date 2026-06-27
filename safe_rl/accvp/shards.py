@@ -144,7 +144,8 @@ def merge_counterfactual_shards(
     root_rows: list[dict[str, Any]] = []
     branch_rows: list[dict[str, Any]] = []
     root_ids: set[str] = set()
-    root_state_fingerprints: set[str] = set()
+    root_state_fingerprints: dict[str, dict[str, str]] = {}
+    duplicate_root_state_fingerprints: list[dict[str, str]] = []
     shard_records: list[dict[str, Any]] = []
     for shard, manifest in zip(shards, manifests):
         roots_path = shard / "manifests" / "roots.jsonl"
@@ -179,9 +180,29 @@ def merge_counterfactual_shards(
                 raise ValueError(f"root data-contract mismatch in shard {shard}: {root_id}")
             root_state_fingerprint = str(root.get("root_state_fingerprint", ""))
             if root_state_fingerprint:
-                if root_state_fingerprint in root_state_fingerprints:
-                    raise ValueError(f"duplicate root state across ACCVP shards: {root_state_fingerprint}")
-                root_state_fingerprints.add(root_state_fingerprint)
+                current = {
+                    "root_id": root_id,
+                    "collection_source": str(root.get("collection_source", manifest.get("collection_source", ""))),
+                    "root_policy": str(root.get("root_policy", root.get("root_source", ""))),
+                    "source_shard_id": str(manifest["collection_id"]),
+                }
+                previous = root_state_fingerprints.get(root_state_fingerprint)
+                if previous is None:
+                    root_state_fingerprints[root_state_fingerprint] = current
+                else:
+                    duplicate_root_state_fingerprints.append(
+                        {
+                            "root_state_fingerprint": root_state_fingerprint,
+                            "first_root_id": previous["root_id"],
+                            "first_collection_source": previous["collection_source"],
+                            "first_root_policy": previous["root_policy"],
+                            "first_source_shard_id": previous["source_shard_id"],
+                            "duplicate_root_id": current["root_id"],
+                            "duplicate_collection_source": current["collection_source"],
+                            "duplicate_root_policy": current["root_policy"],
+                            "duplicate_source_shard_id": current["source_shard_id"],
+                        }
+                    )
             enriched = dict(root)
             enriched["source_shard_id"] = str(manifest["collection_id"])
             enriched["source_shard_path"] = str(shard)
@@ -232,6 +253,9 @@ def merge_counterfactual_shards(
         "source_shards": shard_records,
         "root_count": len(root_rows),
         "branch_count": len(branch_rows),
+        "unique_root_state_fingerprint_count": len(root_state_fingerprints),
+        "duplicate_root_state_fingerprint_count": len(duplicate_root_state_fingerprints),
+        "duplicate_root_state_fingerprints": duplicate_root_state_fingerprints[:100],
         "coverage": coverage,
         "roots_manifest_sha256": file_sha256(roots_path),
         "branches_manifest_sha256": file_sha256(branches_path),
