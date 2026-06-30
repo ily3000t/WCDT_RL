@@ -7,6 +7,7 @@ import numpy as np
 
 from safe_rl.accvp.candidate_plan import ACCVP_COMMITMENT_PROFILE, build_commitment_plan
 from safe_rl.accvp.calibration import CalibrationBundle, OneSidedBinnedCalibrator, selected_action_metrics
+from safe_rl.accvp.availability import audit_risk_secondary_false_negatives, diagnose_oracle_availability, model_gate_failure_diagnostics
 from safe_rl.accvp.controller import ACCVPController
 from safe_rl.accvp.dataset import build_split_manifest
 from safe_rl.accvp.model import checkpoint_metadata
@@ -282,6 +283,147 @@ def test_selector_keeps_shield_action_when_only_non_merge_actions_pass():
     assert decision["selected"] is None
     assert decision["candidate_set_available"] is False
     assert decision["reason"] == "no_merge_intent_feasible_action"
+
+
+def test_availability_diagnostic_separates_oracle_and_risk_ceilings(tmp_path: Path):
+    manifests = tmp_path / "manifests"
+    manifests.mkdir()
+    roots = []
+    branches = []
+
+    def add_root(root_id: str, raw_success: bool, left_rows: list[dict]):
+        roots.append(
+            {
+                "root_id": root_id,
+                "episode_seed": len(roots),
+                "root_policy": "merge_timing",
+                "collection_source": "merge_timing",
+                "traffic_profile": "hard",
+                "activation_bin": "activation_window",
+                "deadline_bin": "deadline",
+                "raw_action_id": 4,
+                "complete": True,
+            }
+        )
+        branches.append(
+            {
+                "root_id": root_id,
+                "branch_status": "completed",
+                "event_observed": True,
+                "action_id": 4,
+                "candidate_legal": True,
+                "secondary_safety_pass": True,
+                "proxy_collision_within_horizon": not raw_success,
+                "safety_violation_within_horizon": not raw_success,
+                "merge_before_taper_observed": raw_success,
+                "viability_observation_status": "observed_success" if raw_success else "observed_failure",
+            }
+        )
+        for row in left_rows:
+            branches.append({"root_id": root_id, "branch_status": "completed", "event_observed": True, **row})
+
+    add_root("raw_ok", True, [])
+    add_root("no_left", False, [])
+    add_root("risk_fail", False, [{"action_id": 7, "candidate_legal": True, "secondary_safety_pass": False, "proxy_collision_within_horizon": False, "safety_violation_within_horizon": False, "merge_before_taper_observed": True, "viability_observation_status": "observed_success"}])
+    add_root("unsafe", False, [{"action_id": 7, "candidate_legal": True, "secondary_safety_pass": True, "proxy_collision_within_horizon": True, "safety_violation_within_horizon": True, "merge_before_taper_observed": False, "viability_observation_status": "observed_failure"}])
+    add_root("left_ok", False, [{"action_id": 8, "candidate_legal": True, "secondary_safety_pass": True, "proxy_collision_within_horizon": False, "safety_violation_within_horizon": False, "merge_before_taper_observed": True, "viability_observation_status": "observed_success"}])
+
+    (manifests / "roots.jsonl").write_text("".join(__import__("json").dumps(row) + "\n" for row in roots), encoding="utf-8")
+    (manifests / "branches.jsonl").write_text("".join(__import__("json").dumps(row) + "\n" for row in branches), encoding="utf-8")
+    (manifests / "split_manifest.jsonl").write_text(
+        "".join(__import__("json").dumps({"root_id": row["root_id"], "split": "operating_point"}) + "\n" for row in roots),
+        encoding="utf-8",
+    )
+
+    report = diagnose_oracle_availability(tmp_path, split="operating_point")
+    assert report["decision_count"] == 5
+    assert report["oracle_merge_intent_ceiling_availability"] == 0.4
+    assert report["risk_secondary_pass_ceiling_availability"] == 0.6
+    assert report["reason_counts"]["raw already feasible"] == 1
+    assert report["reason_counts"]["no legal merge-left candidate"] == 1
+    assert report["reason_counts"]["merge-left candidate Risk secondary failed"] == 1
+    assert report["reason_counts"]["merge-left physically unsafe"] == 1
+    assert report["reason_counts"]["oracle merge-left feasible"] == 1
+    assert report["left_action_stats"]["7"]["count"] == 2
+    assert report["left_action_stats"]["8"]["observed_success_count"] == 1
+
+
+def test_risk_secondary_audit_reports_physical_ceiling_and_false_negatives(tmp_path: Path):
+    manifests = tmp_path / "manifests"
+    manifests.mkdir()
+    roots = [
+        {"root_id": "raw_ok", "episode_seed": 1, "root_policy": "merge_timing", "activation_bin": "activation_window", "deadline_bin": "deadline", "raw_action_id": 4, "complete": True},
+        {"root_id": "risk_fn", "episode_seed": 2, "root_policy": "merge_timing", "activation_bin": "activation_window", "deadline_bin": "deadline", "raw_action_id": 4, "complete": True},
+        {"root_id": "unsafe", "episode_seed": 3, "root_policy": "merge_timing", "activation_bin": "activation_window", "deadline_bin": "deadline", "raw_action_id": 4, "complete": True},
+    ]
+    branches = [
+        {"root_id": "raw_ok", "branch_status": "completed", "event_observed": True, "action_id": 4, "candidate_legal": True, "secondary_safety_pass": True, "proxy_collision_within_horizon": False, "safety_violation_within_horizon": False, "merge_before_taper_observed": True, "viability_observation_status": "observed_success"},
+        {"root_id": "risk_fn", "branch_status": "completed", "event_observed": True, "action_id": 4, "candidate_legal": True, "secondary_safety_pass": True, "proxy_collision_within_horizon": True, "safety_violation_within_horizon": True, "merge_before_taper_observed": False, "viability_observation_status": "observed_failure"},
+        {"root_id": "risk_fn", "branch_status": "completed", "event_observed": True, "action_id": 7, "candidate_legal": True, "secondary_safety_pass": False, "secondary_risk": {"risk_score": 0.9}, "proxy_collision_within_horizon": False, "safety_violation_within_horizon": False, "merge_before_taper_observed": True, "viability_observation_status": "observed_success"},
+        {"root_id": "unsafe", "branch_status": "completed", "event_observed": True, "action_id": 4, "candidate_legal": True, "secondary_safety_pass": True, "proxy_collision_within_horizon": True, "safety_violation_within_horizon": True, "merge_before_taper_observed": False, "viability_observation_status": "observed_failure"},
+        {"root_id": "unsafe", "branch_status": "completed", "event_observed": True, "action_id": 8, "candidate_legal": True, "secondary_safety_pass": False, "secondary_risk": {"risk_score": 0.8}, "proxy_collision_within_horizon": True, "safety_violation_within_horizon": True, "merge_before_taper_observed": False, "viability_observation_status": "observed_failure"},
+    ]
+    (manifests / "roots.jsonl").write_text("".join(__import__("json").dumps(row) + "\n" for row in roots), encoding="utf-8")
+    (manifests / "branches.jsonl").write_text("".join(__import__("json").dumps(row) + "\n" for row in branches), encoding="utf-8")
+    (manifests / "split_manifest.jsonl").write_text(
+        "".join(__import__("json").dumps({"root_id": row["root_id"], "split": "operating_point"}) + "\n" for row in roots),
+        encoding="utf-8",
+    )
+
+    report = audit_risk_secondary_false_negatives(tmp_path, split="operating_point")
+    assert report["decision_count"] == 3
+    assert report["physical_oracle_ceiling_ignore_risk"] == 2 / 3
+    assert report["risk_gated_physical_ceiling"] == 1 / 3
+    assert report["risk_false_negative_root_count"] == 1
+    assert report["risk_false_negative_action_count"] == 1
+    assert report["left_action_stats"]["7"]["risk_false_negative_count"] == 1
+    assert report["false_negative_risk_score_summary"]["count"] == 1
+
+
+def test_model_gate_diagnostic_identifies_viability_gate_failure():
+    thresholds = {
+        "proxy_collision_upper_bound": 0.2,
+        "safety_violation_upper_bound": 0.2,
+        "merge_viability_lower_bound": 0.5,
+    }
+    report = model_gate_failure_diagnostics(
+        [
+            {
+                "root_id": "root",
+                "raw_action_id": 4,
+                "action_id": 4,
+                "candidate_legal": True,
+                "secondary_safety_pass": True,
+                "pU_proxy_collision": 0.9,
+                "pU_safety_violation": 0.9,
+                "pL_merge_before_taper": 0.9,
+                "proxy_collision": 1.0,
+                "safety_violation": 1.0,
+                "merge_before_taper": 0.0,
+                "merge_observed": True,
+            },
+            {
+                "root_id": "root",
+                "raw_action_id": 4,
+                "action_id": 7,
+                "candidate_legal": True,
+                "secondary_safety_pass": True,
+                "pU_proxy_collision": 0.1,
+                "pU_safety_violation": 0.1,
+                "pL_merge_before_taper": 0.1,
+                "proxy_collision": 0.0,
+                "safety_violation": 0.0,
+                "merge_before_taper": 1.0,
+                "merge_observed": True,
+            },
+        ],
+        thresholds,
+        required_availability=0.95,
+    )
+    assert report["deployable_artifact"] is False
+    assert report["model_gate_best_availability"] == 0.0
+    assert report["reason_counts"]["model pL_viability gate failed"] == 1
+    assert report["per_action_gate_pass_rate"]["7"]["viability_gate_pass_count"] == 0
 
 
 def test_split_keeps_all_roots_of_same_episode_seed_together(tmp_path: Path):

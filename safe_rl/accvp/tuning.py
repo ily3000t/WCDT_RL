@@ -7,6 +7,7 @@ from typing import Any
 import numpy as np
 
 from safe_rl.accvp.calibration import CalibrationBundle
+from safe_rl.accvp.availability import OperatingPointAvailabilityError, model_gate_failure_diagnostics
 from safe_rl.accvp.dataset import ACCVPBranchDataset, collate_numpy
 from safe_rl.accvp.selection import select_viability_action
 from safe_rl.accvp.train import _model_output, _tensor_batch
@@ -102,13 +103,26 @@ def tune_operating_point(models: list[Any], dataset: ACCVPBranchDataset, calibra
                 row["selected_viability_lcb"],
             ),
         )
-        raise RuntimeError(
+        best_thresholds = {
+            "proxy_collision_upper_bound": float(best["proxy_collision_upper_bound"]),
+            "safety_violation_upper_bound": float(best["safety_violation_upper_bound"]),
+            "merge_viability_lower_bound": float(best["merge_viability_lower_bound"]),
+        }
+        diagnostics = model_gate_failure_diagnostics(
+            rows,
+            best_thresholds,
+            required_availability=required,
+            split="operating_point",
+            evaluated_points=evaluated_points,
+        )
+        raise OperatingPointAvailabilityError(
             "no operating point satisfies required ACCVP candidate-set availability; "
             f"required={required:.6f} best_availability={best['candidate_set_availability']:.6f} "
             f"selected={best['selected_count']}/{best['decision_count']} "
             f"best_thresholds={{'proxy_collision_upper_bound': {best['proxy_collision_upper_bound']}, "
             f"'safety_violation_upper_bound': {best['safety_violation_upper_bound']}, "
-            f"'merge_viability_lower_bound': {best['merge_viability_lower_bound']}}}"
+            f"'merge_viability_lower_bound': {best['merge_viability_lower_bound']}}}",
+            diagnostics=diagnostics,
         )
     selected = min(
         candidates,

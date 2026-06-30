@@ -8,6 +8,7 @@ import pytest
 
 torch = pytest.importorskip("torch")
 
+from safe_rl.accvp.availability import OperatingPointAvailabilityError
 from safe_rl.accvp.dataset import build_split_manifest
 from safe_rl.accvp.protocol import effective_activation_distance
 from safe_rl.accvp.schema import file_sha256
@@ -171,3 +172,38 @@ def test_formal_training_requires_strict_oracle_report(tmp_path: Path):
     cfg = clone_with_overrides(load_config(), {"accvp": {"oracle_report": None}})
     with pytest.raises(FileNotFoundError, match="oracle_report"):
         train_accvp(cfg, tmp_path / "dataset")
+
+
+def test_tuning_failure_writes_non_deployable_diagnostics_without_artifact(tmp_path: Path):
+    cfg = clone_with_overrides(
+        load_config(),
+        {
+            "run": {"output_root": str(tmp_path / "output"), "run_id": "accvp_train_failure_test", "tensorboard": False},
+            "prediction": {
+                "wcdt_v3_hidden_dim": 16,
+                "wcdt_v3_temporal_layers": 1,
+                "wcdt_v3_actor_attention_layers": 1,
+                "wcdt_v3_num_heads": 4,
+            },
+            "accvp": {
+                "ensemble_size": 1,
+                "response_horizon_steps": 2,
+                "candidate_plan_horizon_steps": 4,
+                "warm_start": {"enabled": False, "freeze_encoder_epochs": 0, "encoder_lr_multiplier": 0.1},
+                "training": {"epochs": 1, "batch_size": 1, "learning_rate": 0.001, "weight_decay": 0.0, "ensemble_seed_offset": 1, "loss_weights": {"trajectory": 1.0, "events": 1.0, "geometry": 0.25, "ordering": 0.1, "smoothness": 0.01}},
+                "tuning": {"required_availability": 0.95, "proxy_collision_upper_bounds": [-0.1], "safety_violation_upper_bounds": [1.0], "merge_viability_lower_bounds": [0.0]},
+            },
+        },
+    )
+    dataset = tmp_path / "dataset"
+    _write_minimal_formal_dataset(dataset, cfg)
+    build_split_manifest(dataset, seed=3)
+    with pytest.raises(OperatingPointAvailabilityError):
+        train_accvp(cfg, dataset)
+    output = tmp_path / "output" / "accvp_train_failure_test" / "accvp"
+    failure = output / "accvp_v1_tuning_failure_diagnostics.json"
+    assert failure.exists()
+    payload = json.loads(failure.read_text(encoding="utf-8"))
+    assert payload["deployable_artifact"] is False
+    assert "model_gate_best_availability" in payload
+    assert not (output / "accvp_v1_artifact_manifest.json").exists()

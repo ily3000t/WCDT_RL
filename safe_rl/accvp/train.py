@@ -6,6 +6,7 @@ from typing import Any
 
 import numpy as np
 
+from safe_rl.accvp.availability import OperatingPointAvailabilityError
 from safe_rl.accvp.calibration import CalibrationBundle, OneSidedBinnedCalibrator
 from safe_rl.accvp.dataset import ACCVPBranchDataset, build_split_manifest, collate_numpy
 from safe_rl.accvp.model import (
@@ -93,6 +94,30 @@ def _event_positive_weights(dataset: ACCVPBranchDataset) -> list[float]:
     return np.clip(negatives / np.maximum(positives, 1.0), 1.0, 50.0).tolist()
 
 
+def _clear_deployable_accvp_artifacts(output_dir: Path) -> None:
+    for name in (
+        "accvp_v1_predictor.pt",
+        "accvp_v1_calibration.json",
+        "accvp_v1_operating_point.json",
+        "accvp_v1_final_test_diagnostics.json",
+        "accvp_v1_artifact_manifest.json",
+        "training_manifest.json",
+    ):
+        path = output_dir / name
+        if path.exists():
+            path.unlink()
+
+
+def _write_tuning_failure_diagnostics(output_dir: Path, error: OperatingPointAvailabilityError) -> Path:
+    diagnostics = dict(error.diagnostics)
+    diagnostics["deployable_artifact"] = False
+    diagnostics["error"] = str(error)
+    path = output_dir / "accvp_v1_tuning_failure_diagnostics.json"
+    with path.open("w", encoding="utf-8") as handle:
+        json.dump(diagnostics, handle, indent=2, sort_keys=True)
+    return path
+
+
 def _calibrate(models: list[Any], dataset: ACCVPBranchDataset, torch: Any, calibration_config: Any) -> CalibrationBundle:
     if not len(dataset):
         raise ValueError("ACCVP calibration split is empty")
@@ -165,6 +190,7 @@ def train_accvp(config: Any, dataset_dir: str | Path) -> Path:
     loss_weights = dict(training.loss_weights)
     loss_weights["event_positive_weights"] = _event_positive_weights(train_set)
     output_dir = prepare_run_dir(config, "accvp")
+    _clear_deployable_accvp_artifacts(output_dir)
     warm = config.accvp.warm_start
     warm_source = Path(str(warm.checkpoint)) if warm.get("checkpoint") else None
     source_payload = None
@@ -221,7 +247,12 @@ def train_accvp(config: Any, dataset_dir: str | Path) -> Path:
     from safe_rl.accvp.tuning import tune_operating_point
     from safe_rl.accvp.diagnostics import final_test_diagnostics
 
-    operating_point = tune_operating_point(models, operating_set, calibration, torch, config.accvp.tuning)
+    try:
+        operating_point = tune_operating_point(models, operating_set, calibration, torch, config.accvp.tuning)
+    except OperatingPointAvailabilityError as exc:
+        _clear_deployable_accvp_artifacts(output_dir)
+        _write_tuning_failure_diagnostics(output_dir, exc)
+        raise
     final_test = final_test_diagnostics(models, test_set, calibration, operating_point, torch)
     metadata = checkpoint_metadata(
         config,
