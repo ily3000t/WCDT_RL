@@ -278,11 +278,18 @@ rl:
     uncertainty_threshold: 0.40
     use_calibrated_risk: false
   merge_timing_reward:
+    reward_version: "opportunity_window_v2"
     deadline_distance: 120.0
+    opportunity_window_start_distance: 240.0
+    opportunity_window_end_distance: 120.0
+    opportunity_accept_bonus: 2.0
     missed_opportunity_weight: -2.0
     taper_deadline_weight: -4.0
     taper_miss_penalty: -35.0
-    early_safe_merge_bonus: 1.5
+    # Legacy target-lane-entry bonus. Disabled by default so the policy is
+    # rewarded for accepting a safe opportunity, not for merging monotonically
+    # earlier regardless of traffic context.
+    early_safe_merge_bonus: 0.0
     bonus_min_distance_to_taper: 60.0
     consecutive_missed_grace: 2
 

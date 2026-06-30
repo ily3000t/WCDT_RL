@@ -892,12 +892,38 @@ def test_merge_timing_reward_respects_missed_opportunity_grace():
     cfg = load_config()
     cfg.rl["merge_timing_reward"]["consecutive_missed_grace"] = 2
     env = SumoHighwayMergeEnv(cfg, seed=1, reward_risk_model=_StaticRiskModel({4: 0.10}))
-    context = _merge_timing_context(cfg, distance_to_taper=30.0)
+    context = _merge_timing_context(cfg, distance_to_taper=180.0)
     env._record_merge_opportunity(context, decode_action(5))
     penalty, debug = env._merge_timing_reward_adjustment(context["ego"], "", decode_action(5), context)
     assert debug["task_consecutive_missed_count"] == 1
+    assert debug["task_opportunity_window_active"]
+    assert debug["task_opportunity_missed"]
     assert debug["merge_timing_missed_penalty"] == pytest.approx(0.0)
-    assert penalty < 0.0  # deadline penalty still applies near taper.
+    assert penalty == pytest.approx(0.0)
+
+
+def test_merge_timing_reward_rewards_safe_merge_request_in_opportunity_window():
+    cfg = load_config()
+    cfg.rl["merge_timing_reward"]["opportunity_accept_bonus"] = 2.0
+    env = SumoHighwayMergeEnv(cfg, seed=1, reward_risk_model=_StaticRiskModel({7: 0.10}))
+    context = _merge_timing_context(cfg, distance_to_taper=180.0)
+    reward, debug = env._merge_timing_reward_adjustment(context["ego"], "", decode_action(7), context)
+    assert debug["task_opportunity_window_active"]
+    assert debug["task_opportunity_accepted"]
+    assert debug["merge_timing_opportunity_accept_bonus"] == pytest.approx(1.0)
+    assert reward == pytest.approx(1.0)
+
+
+def test_merge_timing_reward_does_not_reward_merge_before_opportunity_window():
+    cfg = load_config()
+    env = SumoHighwayMergeEnv(cfg, seed=1, reward_risk_model=_StaticRiskModel({7: 0.10}))
+    context = _merge_timing_context(cfg, distance_to_taper=260.0)
+    reward, debug = env._merge_timing_reward_adjustment(context["ego"], "", decode_action(7), context)
+    assert not debug["task_opportunity_window_active"]
+    assert not debug["task_opportunity_accepted"]
+    assert debug["merge_timing_opportunity_accept_bonus"] == pytest.approx(0.0)
+    assert debug["merge_timing_early_safe_merge_bonus"] == pytest.approx(0.0)
+    assert reward == pytest.approx(0.0)
 
 
 def test_merge_timing_reward_does_not_bonus_unsafe_gap():
