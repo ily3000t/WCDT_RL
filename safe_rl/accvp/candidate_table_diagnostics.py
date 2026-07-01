@@ -61,6 +61,21 @@ def _secondary_safety_pass(row: dict[str, Any]) -> bool:
     return bool(row.get("secondary_safety_pass", secondary.get("secondary_safety_pass", False)))
 
 
+def _secondary_risk_score(row: dict[str, Any]) -> float:
+    secondary = dict(row.get("secondary_risk", {}) or {})
+    return float(row.get("secondary_risk_score", secondary.get("risk_score", 0.0)))
+
+
+def _secondary_risk_uncertainty(row: dict[str, Any]) -> float:
+    secondary = dict(row.get("secondary_risk", {}) or {})
+    return float(row.get("secondary_risk_uncertainty", secondary.get("risk_uncertainty", 0.0)))
+
+
+def _secondary_veto_reason(row: dict[str, Any]) -> str:
+    secondary = dict(row.get("secondary_risk", {}) or {})
+    return str(row.get("secondary_veto_reason", secondary.get("veto_reason", "")))
+
+
 def _finite(values: list[float]) -> list[float]:
     return [float(value) for value in values if np.isfinite(float(value))]
 
@@ -106,8 +121,11 @@ def _pair_contrast(
     correct = 0.0
     tie_count = 0
     for rows in grouped.values():
-        positives = [row for row in rows if float(row.get(label, 0.0)) >= 0.5]
-        negatives = [row for row in rows if float(row.get(label, 0.0)) < 0.5]
+        comparable = rows
+        if label == "merge_before_taper":
+            comparable = [row for row in rows if bool(row.get("merge_observed", False))]
+        positives = [row for row in comparable if float(row.get(label, 0.0)) >= 0.5]
+        negatives = [row for row in comparable if float(row.get(label, 0.0)) < 0.5]
         for positive in positives:
             for negative in negatives:
                 pair_count += 1
@@ -134,7 +152,13 @@ def _action_stats(records: list[dict[str, Any]], thresholds: dict[str, float]) -
             "is_left_action": bool(action_id in LEFT_ACTION_IDS),
             "candidate_legal_rate": _rate([bool(row.get("candidate_legal", False)) for row in rows]),
             "secondary_safety_pass_rate": _rate([bool(row.get("secondary_safety_pass", False)) for row in rows]),
-            "observed_success_rate": _rate([float(row.get("merge_before_taper", 0.0)) >= 0.5 for row in rows]),
+            "observed_success_rate": _rate(
+                [
+                    float(row.get("merge_before_taper", 0.0)) >= 0.5
+                    for row in rows
+                    if bool(row.get("merge_observed", False))
+                ]
+            ),
             "taper_miss_rate": _rate([float(row.get("taper_miss", 0.0)) >= 0.5 for row in rows]),
             "safety_event_rate": _rate(
                 [
@@ -381,7 +405,7 @@ def candidate_records_from_dataset(
     eligible_indices = [
         index
         for index, row in enumerate(dataset.rows)
-        if bool(row.get("event_observed", False)) and _activation_window(dataset.roots[str(row["root_id"])])
+        if _activation_window(dataset.roots[str(row["root_id"])])
     ]
     with torch.no_grad():
         for start in range(0, len(eligible_indices), max(1, int(batch_size))):
@@ -413,9 +437,10 @@ def candidate_records_from_dataset(
                 records.append(
                     {
                         "root_id": str(row["root_id"]),
+                        "episode_seed": int(root.get("episode_seed", row.get("episode_seed", -1))),
                         "action_id": int(row["action_id"]),
-                        "raw_action_id": root.get("raw_action_id"),
-                        "raw_action_legal": bool(root.get("raw_action_legal", False)),
+                        "raw_action_id": root.get("raw_action_id", row.get("raw_action_id")),
+                        "raw_action_legal": bool(root.get("raw_action_legal", row.get("raw_action_legal", False))),
                         "root_policy": str(root.get("root_policy", root.get("root_source", ""))),
                         "collection_source": str(root.get("collection_source", root.get("root_policy", ""))),
                         "traffic_profile": str(root.get("traffic_profile", "unknown")),
@@ -440,6 +465,15 @@ def candidate_records_from_dataset(
                         "merge_observed": bool(batch_np["event_mask"][local, 3]),
                         "candidate_legal": _candidate_legal(row),
                         "secondary_safety_pass": _secondary_safety_pass(row),
+                        "secondary_risk_score": _secondary_risk_score(row),
+                        "secondary_risk_uncertainty": _secondary_risk_uncertainty(row),
+                        "secondary_veto_reason": _secondary_veto_reason(row),
+                        "oracle_min_obb_distance": (
+                            None if row.get("min_obb_distance") is None else float(row.get("min_obb_distance", 0.0))
+                        ),
+                        "oracle_min_ttc": None if row.get("min_ttc") is None else float(row.get("min_ttc", 0.0)),
+                        "oracle_max_drac": None if row.get("max_drac") is None else float(row.get("max_drac", 0.0)),
+                        "oracle_geometric_overlap": bool(row.get("geometric_overlap_within_horizon", False)),
                     }
                 )
     return records

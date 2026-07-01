@@ -2048,6 +2048,26 @@ def test_stage5_rejects_insufficient_seeds():
         _select_eval_seeds(cfg)
 
 
+def test_stage5_can_load_targeted_seed_file(tmp_path: Path):
+    seed_file = tmp_path / "targeted_seeds.json"
+    seed_file.write_text(__import__("json").dumps({"seeds": [104, 201, 305]}), encoding="utf-8")
+    cfg = load_config()
+    cfg.stage5["episodes_per_group"] = 2
+    cfg.stage5["seed_file"] = str(seed_file)
+    cfg.stage5["seeds"] = []
+    assert _select_eval_seeds(cfg) == [104, 201]
+
+
+def test_stage5_can_use_all_targeted_seed_file_entries(tmp_path: Path):
+    seed_file = tmp_path / "targeted_seeds.json"
+    seed_file.write_text(__import__("json").dumps({"seeds": [4012, 7607]}), encoding="utf-8")
+    cfg = load_config()
+    cfg.stage5["episodes_per_group"] = 0
+    cfg.stage5["seed_file"] = str(seed_file)
+    cfg.stage5["seeds"] = []
+    assert _select_eval_seeds(cfg) == [4012, 7607]
+
+
 def test_default_reward_profile_is_reward_v2_and_legacy_overlay_restores_default():
     cfg = load_config()
     assert cfg.rl.reward_profile == "merge_timing_forecast"

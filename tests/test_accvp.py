@@ -21,6 +21,8 @@ from safe_rl.accvp.schema import COUNTERFACTUAL_SCHEMA_VERSION, stable_hash
 from safe_rl.accvp.selection import select_viability_action, select_viability_lite_action
 from safe_rl.accvp.shards import merge_counterfactual_shards
 from safe_rl.accvp.snapshot_store import CounterfactualSnapshotStore
+from safe_rl.accvp.viability_lite import evaluate_lite_thresholds, tune_viability_lite_operating_point
+from safe_rl.accvp.viability_lite_audit import audit_lite_replacements
 from safe_rl.pipeline.stage1_collect_accvp_jobs import materialise_collection_job, validate_required_pilot
 from safe_rl.stage1_counterfactual.collector import _cache_dir, _root_filter_matches, _seed_schedule
 from safe_rl.sim.action_space import decode_action
@@ -424,6 +426,104 @@ def test_viability_lite_does_not_replace_with_keep_or_below_margin_left():
     )
     assert margin["replacement"] is False
     assert margin["reason"] == "best_left_below_improvement_margin"
+
+
+def test_viability_lite_does_not_replace_when_raw_is_illegal_or_missing():
+    decision = select_viability_lite_action(
+        [
+            {"action_id": 3, "raw_action_legal": False, "candidate_legal": True, "secondary_safety_pass": True, "p_merge_before_taper": 0.2, "target_lane_entry_time_s": 8.0, "ensemble_disagreement": 0.0},
+            {"action_id": 8, "raw_action_legal": False, "candidate_legal": True, "secondary_safety_pass": True, "p_merge_before_taper": 0.95, "target_lane_entry_time_s": 1.0, "ensemble_disagreement": 0.0},
+        ],
+        raw_action_id=2,
+        thresholds=_lite_thresholds(),
+    )
+    assert decision["replacement"] is False
+    assert decision["reason"] == "raw_action_illegal_or_missing"
+
+
+def _lite_record(root_id: str, seed: int, action_id: int, raw_id: int, *, p_merge: float, success: bool, safe: bool = True, risk_pass: bool = True, risk_score: float = 0.0):
+    return {
+        "root_id": root_id,
+        "episode_seed": seed,
+        "action_id": action_id,
+        "raw_action_id": raw_id,
+        "root_policy": "merge_timing",
+        "collection_source": "merge_timing",
+        "traffic_profile": "hard",
+        "activation_bin": "activation_window",
+        "candidate_legal": True,
+        "secondary_safety_pass": risk_pass,
+        "secondary_risk_score": risk_score,
+        "secondary_risk_uncertainty": 0.0,
+        "secondary_veto_reason": "" if risk_pass else "risk_score",
+        "p_merge_before_taper": p_merge,
+        "p_proxy_collision": 0.1,
+        "p_safety_violation": 0.1,
+        "target_lane_entry_time_s": 2.0,
+        "ensemble_disagreement": 0.0,
+        "merge_observed": True,
+        "merge_before_taper": 1.0 if success else 0.0,
+        "proxy_collision": 0.0 if safe else 1.0,
+        "safety_violation": 0.0 if safe else 1.0,
+        "oracle_min_obb_distance": 4.0 if safe else 0.1,
+        "oracle_min_ttc": 10.0 if safe else 0.1,
+        "oracle_max_drac": 1.0 if safe else 8.0,
+    }
+
+
+def test_viability_lite_audit_separates_replacement_failure_modes():
+    thresholds = {
+        "min_p_merge_before_taper": 0.8,
+        "min_improvement_over_raw": 0.01,
+        "max_target_entry_time_s": 6.0,
+        "max_ensemble_disagreement": 0.1,
+        "max_secondary_risk_score": 0.2,
+    }
+    records = [
+        _lite_record("unsafe_replacement", 101, 4, 4, p_merge=0.1, success=False),
+        _lite_record("unsafe_replacement", 101, 8, 4, p_merge=0.9, success=True, safe=False, risk_score=0.1),
+        _lite_record("risk_false_negative", 102, 4, 4, p_merge=0.1, success=False),
+        _lite_record("risk_false_negative", 102, 7, 4, p_merge=0.9, success=True, risk_pass=False, risk_score=0.9),
+        _lite_record("unnecessary", 103, 4, 4, p_merge=0.1, success=True),
+        _lite_record("unnecessary", 103, 8, 4, p_merge=0.9, success=True, risk_score=0.1),
+        _lite_record("targeted", 104, 4, 4, p_merge=0.1, success=False),
+        _lite_record("targeted", 104, 8, 4, p_merge=0.9, success=True, risk_score=0.1),
+    ]
+    report = audit_lite_replacements(records, thresholds, split="test")
+    assert report["actual_replacement_count"] == 3
+    assert report["replacement_safety_event_root_count"] == 1
+    assert report["risk_failed_but_success_root_count"] == 1
+    assert report["unnecessary_replacement_root_count"] == 1
+    assert report["targeted_seeds"] == [104]
+    assert report["replacement_action_safety_event_rate"] == __import__("pytest").approx(1 / 3)
+    assert report["summary_from_tuning_metric"]["replacement_action_risk_pass_rate"] == 1.0
+
+
+def test_viability_lite_tuning_uses_replacement_only_metrics_and_secondary_risk_grid():
+    records = [
+        _lite_record("low_risk_repair", 201, 4, 4, p_merge=0.1, success=False),
+        _lite_record("low_risk_repair", 201, 8, 4, p_merge=0.9, success=True, risk_score=0.03),
+    ]
+    cfg = clone_with_overrides(
+        load_config(),
+        {
+            "accvp": {
+                "viability_lite": {
+                    "min_left_p_merge_before_taper_grid": [0.8],
+                    "min_improvement_over_raw_grid": [0.01],
+                    "max_target_entry_time_s_grid": [6.0],
+                    "max_ensemble_disagreement_grid": [0.1],
+                    "max_secondary_risk_score_grid": [0.05, 1.0],
+                    "max_replacement_rate": 0.5,
+                }
+            }
+        },
+    )
+    report = tune_viability_lite_operating_point(records, cfg, split="operating_point")
+    assert report["selected"]["max_secondary_risk_score"] == 0.05
+    assert report["selected_metrics"]["replacement_action_risk_pass_rate"] == 1.0
+    assert report["selected_metrics"]["replacement_action_safety_event_rate"] == 0.0
+    assert report["selected_metrics"]["replacement_repairable_capture_rate"] == 1.0
 
 
 def test_availability_diagnostic_separates_oracle_and_risk_ceilings(tmp_path: Path):

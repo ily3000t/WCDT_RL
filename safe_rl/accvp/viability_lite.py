@@ -41,6 +41,10 @@ def _risk_pass(row: dict[str, Any]) -> bool:
     return bool(row.get("candidate_legal", True)) and bool(row.get("secondary_safety_pass", True))
 
 
+def _rate_or_nan(values: list[bool]) -> float:
+    return float(np.mean([bool(value) for value in values])) if values else float("nan")
+
+
 def _repairable(candidates: list[dict[str, Any]]) -> bool:
     raw_action_id = int(candidates[0].get("raw_action_id", -1))
     raw = next((row for row in candidates if int(row["action_id"]) == raw_action_id), None)
@@ -101,6 +105,11 @@ def evaluate_lite_thresholds(
                 repairable_captured += 1
     selected_observed = [row for row in selected if bool(row.get("merge_observed", False))]
     replacement_observed = [row for row in replacements if bool(row.get("merge_observed", False))]
+    replacement_risk_pass_rate = _rate_or_nan([_risk_pass(row) for row in replacements])
+    replacement_safety_event_rate = _rate_or_nan([not _safe(row) for row in replacements])
+    replacement_merge_success_rate = _rate_or_nan([_success(row) for row in replacement_observed])
+    replacement_unnecessary_rate = float(unnecessary_replacements / max(1, len(replacements)))
+    replacement_repairable_capture_rate = float(repairable_captured / max(1, repairable_count))
     return {
         "split": split,
         "thresholds": dict(thresholds),
@@ -111,6 +120,7 @@ def evaluate_lite_thresholds(
         "raw_retention_rate": float(raw_retained / max(1, len(grouped))),
         "repairable_root_count": int(repairable_count),
         "repairable_root_capture_rate": float(repairable_captured / max(1, repairable_count)),
+        "replacement_repairable_capture_rate": replacement_repairable_capture_rate,
         "selected_action_risk_pass_rate": (
             float(np.mean([_risk_pass(row) for row in selected])) if selected else float("nan")
         ),
@@ -123,7 +133,11 @@ def evaluate_lite_thresholds(
         "replacement_merge_success_rate": (
             float(np.mean([_success(row) for row in replacement_observed])) if replacement_observed else float("nan")
         ),
-        "unnecessary_replacement_rate": float(unnecessary_replacements / max(1, len(replacements))),
+        "replacement_action_risk_pass_rate": replacement_risk_pass_rate,
+        "replacement_action_safety_event_rate": replacement_safety_event_rate,
+        "replacement_action_merge_success_rate": replacement_merge_success_rate,
+        "replacement_unnecessary_rate": replacement_unnecessary_rate,
+        "unnecessary_replacement_rate": replacement_unnecessary_rate,
         "left_action_selection_histogram": {
             key: value for key, value in sorted(action_counts.items(), key=lambda item: int(item[0])) if int(key) in LEFT_ACTION_IDS
         },
@@ -160,18 +174,21 @@ def tune_viability_lite_operating_point(
     feasible = [
         row
         for row in evaluated
-        if float(row["selected_action_risk_pass_rate"]) == 1.0
+        if int(row["replacement_count"]) > 0
+        and float(row["replacement_action_risk_pass_rate"]) == 1.0
+        and float(row["replacement_action_safety_event_rate"]) == 0.0
         and float(row["replacement_rate"]) <= max_replacement_rate
     ]
     candidates = feasible or evaluated
     selected = max(
         candidates,
         key=lambda row: (
-            float(row["repairable_root_capture_rate"]),
-            float(row["selected_action_merge_success_rate"]) if np.isfinite(float(row["selected_action_merge_success_rate"])) else -1.0,
-            -float(row["selected_action_safety_event_rate"]) if np.isfinite(float(row["selected_action_safety_event_rate"])) else -1.0,
-            -float(row["unnecessary_replacement_rate"]),
+            float(row["replacement_repairable_capture_rate"]),
+            float(row["replacement_action_merge_success_rate"]) if np.isfinite(float(row["replacement_action_merge_success_rate"])) else -1.0,
+            -float(row["replacement_action_safety_event_rate"]) if np.isfinite(float(row["replacement_action_safety_event_rate"])) else -1.0,
+            -float(row["replacement_unnecessary_rate"]),
             -float(row["replacement_rate"]),
+            -float(row["thresholds"].get("max_secondary_risk_score", 1.0)),
             -float(row["thresholds"]["min_improvement_over_raw"]),
         ),
     )
@@ -197,11 +214,13 @@ def write_lite_artifacts(
     calibration: str | Path,
     operating_point: dict[str, Any],
     final_test: dict[str, Any],
+    artifact_prefix: str = "accvp_v1_lite",
 ) -> dict[str, Path]:
     output = Path(output_dir)
     output.mkdir(parents=True, exist_ok=True)
-    operating_path = output / "accvp_v1_lite_operating_point.json"
-    final_path = output / "accvp_v1_lite_final_test_diagnostics.json"
+    prefix = str(artifact_prefix).strip() or "accvp_v1_lite"
+    operating_path = output / f"{prefix}_operating_point.json"
+    final_path = output / f"{prefix}_final_test_diagnostics.json"
     write_json_atomic(operating_path, operating_point)
     write_json_atomic(final_path, final_test)
     dataset_dir = Path(dataset_dir)
@@ -228,7 +247,7 @@ def write_lite_artifacts(
         "config_hash": stable_hash(dict(config)),
     }
     manifest["artifact_fingerprint"] = stable_hash(manifest)
-    manifest_path = write_json_atomic(output / "accvp_v1_lite_task_artifact_manifest.json", manifest)
+    manifest_path = write_json_atomic(output / f"{prefix}_task_artifact_manifest.json", manifest)
     return {
         "operating_point": operating_path,
         "final_test": final_path,

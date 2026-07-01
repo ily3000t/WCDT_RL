@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import re
 from pathlib import Path
 from typing import Any
@@ -27,11 +28,22 @@ def _risk_path(cfg) -> Path:
 
 def _select_eval_seeds(cfg) -> list[int]:
     requested = int(cfg.stage5.episodes_per_group)
-    seeds = [int(seed) for seed in cfg.stage5.seeds]
+    seed_file = cfg.stage5.get("seed_file")
+    if seed_file:
+        with Path(seed_file).open("r", encoding="utf-8") as handle:
+            payload = json.load(handle)
+        source = payload.get("seeds", payload) if isinstance(payload, dict) else payload
+        seeds = [int(seed) for seed in source]
+    else:
+        seeds = [int(seed) for seed in cfg.stage5.seeds]
+    if requested <= 0:
+        if not seeds:
+            raise ValueError("stage5.episodes_per_group<=0 requires at least one configured seed")
+        return seeds
     if len(seeds) < requested:
         raise ValueError(
             f"stage5.episodes_per_group={requested} requires at least {requested} seeds, "
-            f"but stage5.seeds has {len(seeds)}"
+            f"but {'stage5.seed_file' if seed_file else 'stage5.seeds'} has {len(seeds)}"
         )
     return seeds[:requested]
 

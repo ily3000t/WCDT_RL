@@ -142,6 +142,19 @@ def select_viability_lite_action(
 
     accepted = gate_viability_lite_candidates(candidates, thresholds)
     raw = next((row for row in candidates if int(row["action_id"]) == int(raw_action_id)), None)
+    raw_action_legal = bool(candidates[0].get("raw_action_legal", True)) if candidates else False
+    if raw is None or not raw_action_legal:
+        return {
+            "selected": None,
+            "accepted": accepted,
+            "raw_feasible": False,
+            "raw_task_feasible": False,
+            "candidate_set_available": False,
+            "replacement": False,
+            "reason": "raw_action_illegal_or_missing",
+            "best_left": None,
+            "p_merge_improvement": 0.0,
+        }
     raw_task_feasible = bool(raw is not None and _lite_task_pass(raw, thresholds))
     replacement_candidates = [row for row in accepted if int(row["action_id"]) in LEFT_ACTION_IDS]
     raw_p_merge = float(raw.get("p_merge_before_taper", 0.0)) if raw is not None else 0.0

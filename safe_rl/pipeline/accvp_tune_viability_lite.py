@@ -47,8 +47,22 @@ def main() -> None:
     cfg = load_config(args.config)
     output_dir = _resolve(args.output_dir) if args.output_dir else _artifact_dir(cfg)
     dataset = _resolve(args.dataset or cfg.accvp.dataset_dir)
-    checkpoint = _resolve(args.checkpoint) if args.checkpoint else output_dir / "accvp_v1_predictor.pt"
-    calibration_path = _resolve(args.calibration) if args.calibration else output_dir / "accvp_v1_calibration.json"
+    checkpoint = (
+        _resolve(args.checkpoint)
+        if args.checkpoint
+        else _resolve(cfg.accvp.checkpoint)
+        if cfg.accvp.get("checkpoint")
+        else output_dir / "accvp_v1_predictor.pt"
+    )
+    calibration_path = (
+        _resolve(args.calibration)
+        if args.calibration
+        else _resolve(cfg.accvp.calibration_bundle)
+        if cfg.accvp.get("calibration_bundle")
+        else output_dir / "accvp_v1_calibration.json"
+    )
+    lite_cfg = cfg.accvp.get("viability_lite", {}) or {}
+    artifact_prefix = str(lite_cfg.get("artifact_prefix", "accvp_v1_lite"))
     models = load_models_from_checkpoint(cfg, checkpoint, torch)
     calibration = load_calibration(calibration_path)
     operating_set = ACCVPBranchDataset(dataset, "operating_point")
@@ -65,6 +79,7 @@ def main() -> None:
         calibration=calibration_path,
         operating_point=operating_point,
         final_test=final_test,
+        artifact_prefix=artifact_prefix,
     )
     summary = {
         "artifact_kind": "accvp_viability_lite_tuning_summary",
@@ -74,7 +89,7 @@ def main() -> None:
         "final_test": final_test,
         "artifacts": {key: str(value.resolve()) for key, value in artifacts.items()},
     }
-    write_report(output_dir / "accvp_v1_lite_tuning_summary.json", summary)
+    write_report(output_dir / f"{artifact_prefix}_tuning_summary.json", summary)
     print(
         "accvp_viability_lite_tuning "
         f"repair_capture={operating_point['selected_metrics']['repairable_root_capture_rate']:.6f} "
