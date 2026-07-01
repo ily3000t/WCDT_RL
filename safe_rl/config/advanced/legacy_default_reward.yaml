@@ -1,0 +1,3 @@
+rl:
+  training_semantics_version: "legacy_default_reward_001"
+  reward_profile: "default"

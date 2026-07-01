@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import re
 from pathlib import Path
+from typing import Any
 
 from safe_rl.pipeline.common import latest_stage_file, load_stage_config, parse_config_arg, write_report
 from safe_rl.rl.evaluation import evaluate_policy
@@ -270,8 +271,19 @@ def _add_delta(target: dict, key: str, a_report: dict | None, b_report: dict | N
         target[key] = delta
 
 
-def _build_paired_delta(group_reports: dict) -> dict:
+def _normalised_pairs(cfg_stage5: Any) -> list[dict[str, Any]]:
+    return [dict(item) for item in list(cfg_stage5.get("pairs", []) or [])]
+
+
+def _build_paired_delta(group_reports: dict, pairs: list[dict[str, Any]] | None = None) -> dict:
     paired_delta: dict = {}
+    for pair in pairs or []:
+        _add_delta(
+            paired_delta,
+            str(pair["name"]),
+            group_reports.get(str(pair["left"])),
+            group_reports.get(str(pair["right"])),
+        )
     _add_delta(paired_delta, "ppo_vs_ppo_shield", group_reports.get("ppo"), group_reports.get("ppo_shield"))
     for base_name, shield_name in (
         ("ppo_cv_features", "cv_prediction_shield"),
@@ -327,8 +339,159 @@ def _build_paired_delta(group_reports: dict) -> dict:
     return paired_delta
 
 
-def _build_acceptance(group_reports: dict) -> dict:
+def _episode_records(report: dict) -> dict[int, dict]:
+    return {int(item["seed"]): item for item in report.get("episodes", []) if "seed" in item}
+
+
+def _action_sequence(episode: dict, key: str) -> list[int]:
+    return [int(item.get(key, -999)) for item in list(episode.get("action_execution_records", []) or [])]
+
+
+def _mainline_reward_v2_acceptance(
+    baseline: dict | None,
+    candidate: dict | None,
+    *,
+    profile_config: dict[str, Any] | None = None,
+) -> dict:
+    if not baseline or not candidate or "metrics" not in baseline or "metrics" not in candidate:
+        return {"available": False, "regression": False}
+    profile_config = dict(profile_config or {})
+    max_replacement = float(profile_config.get("max_actual_replacement_rate", 0.05))
+    base = baseline["metrics"]
+    item = candidate["metrics"]
+    checks = {
+        "proxy_collision_not_worse": float(item.get("proxy_collision_rate", 0.0))
+        <= float(base.get("proxy_collision_rate", 0.0)),
+        "safety_violation_not_worse": float(item.get("safety_violation_rate", 0.0))
+        <= float(base.get("safety_violation_rate", 0.0)),
+        "geometric_overlap_not_worse": float(item.get("geometric_overlap_rate", 0.0))
+        <= float(base.get("geometric_overlap_rate", 0.0)),
+        "fallback_rate_zero": float(item.get("fallback_rate", 0.0)) == 0.0,
+        "taper_miss_not_worse": float(item.get("taper_miss_rate", 0.0))
+        <= float(base.get("taper_miss_rate", 0.0)),
+        "timely_merge_success_not_worse": float(item.get("timely_merge_success_rate", 0.0))
+        >= float(base.get("timely_merge_success_rate", 0.0)),
+        "actual_replacement_rate_within_limit": float(item.get("actual_replacement_rate", 0.0))
+        <= max_replacement,
+    }
+    return {
+        "available": True,
+        "profile": "mainline_reward_v2",
+        "max_actual_replacement_rate": max_replacement,
+        "checks": checks,
+        "regression": not all(checks.values()),
+    }
+
+
+def _shadow_noop_acceptance(
+    baseline: dict | None,
+    shadow: dict | None,
+    *,
+    profile_config: dict[str, Any] | None = None,
+) -> dict:
+    if not baseline or not shadow or "episodes" not in baseline or "episodes" not in shadow:
+        return {"available": False, "regression": False}
+    profile_config = dict(profile_config or {})
+    reward_tolerance = float(profile_config.get("reward_tolerance", 1.0e-6))
+    right = _episode_records(shadow)
+    mismatches: list[dict[str, Any]] = []
+    compared = 0
+    for left_episode in baseline.get("episodes", []):
+        seed = int(left_episode.get("seed", -1))
+        right_episode = right.get(seed)
+        if right_episode is None:
+            mismatches.append({"seed": seed, "reason": "missing_shadow_episode"})
+            continue
+        compared += 1
+        checks = {
+            "raw_actions": _action_sequence(left_episode, "raw_action")
+            == _action_sequence(right_episode, "raw_action"),
+            "safety_shield_actions": _action_sequence(left_episode, "safety_shield_action")
+            == _action_sequence(right_episode, "safety_shield_action"),
+            "final_actions": _action_sequence(left_episode, "final_action")
+            == _action_sequence(right_episode, "final_action"),
+            "done_reason": str(left_episode.get("done_reason", "")) == str(right_episode.get("done_reason", "")),
+            "taper_miss": bool(left_episode.get("taper_miss", False))
+            == bool(right_episode.get("taper_miss", False)),
+            "merge_success": bool(left_episode.get("merge_success", False))
+            == bool(right_episode.get("merge_success", False)),
+            "proxy_collision": bool(left_episode.get("proxy_collision", False))
+            == bool(right_episode.get("proxy_collision", False)),
+            "safety_violation": bool(left_episode.get("safety_violation", False))
+            == bool(right_episode.get("safety_violation", False)),
+            "geometric_overlap": bool(left_episode.get("geometric_overlap", False))
+            == bool(right_episode.get("geometric_overlap", False)),
+            "episode_reward": abs(
+                float(left_episode.get("episode_reward", 0.0))
+                - float(right_episode.get("episode_reward", 0.0))
+            )
+            <= reward_tolerance,
+            "no_accvp_replacement": int(right_episode.get("accvp_replacement_count", 0)) == 0,
+        }
+        if not all(checks.values()):
+            mismatches.append({"seed": seed, "failed_checks": [name for name, ok in checks.items() if not ok]})
+    checks = {
+        "all_expected_seeds_compared": compared == len(baseline.get("episodes", [])),
+        "raw_action_sequence_identical": not any(
+            "raw_actions" in item.get("failed_checks", []) for item in mismatches
+        ),
+        "safety_shield_action_sequence_identical": not any(
+            "safety_shield_actions" in item.get("failed_checks", []) for item in mismatches
+        ),
+        "final_action_sequence_identical": not any(
+            "final_actions" in item.get("failed_checks", []) for item in mismatches
+        ),
+        "outcomes_identical": not any(
+            set(item.get("failed_checks", [])).intersection(
+                {"done_reason", "taper_miss", "merge_success", "proxy_collision", "safety_violation", "geometric_overlap"}
+            )
+            for item in mismatches
+        ),
+        "episode_reward_identical_within_tolerance": not any(
+            "episode_reward" in item.get("failed_checks", []) for item in mismatches
+        ),
+        "no_accvp_replacements": not any(
+            "no_accvp_replacement" in item.get("failed_checks", []) for item in mismatches
+        ),
+    }
+    return {
+        "available": True,
+        "profile": "shadow_noop",
+        "reward_tolerance": reward_tolerance,
+        "checks": checks,
+        "mismatch_count": len(mismatches),
+        "mismatches": mismatches[:20],
+        "regression": bool(mismatches) or not all(checks.values()),
+    }
+
+
+def _configured_pair_acceptance(group_reports: dict, cfg_stage5: Any) -> dict:
     acceptance: dict = {}
+    profile_configs = dict(cfg_stage5.get("acceptance", {}) or {})
+    for pair in _normalised_pairs(cfg_stage5):
+        name = str(pair["name"])
+        left = group_reports.get(str(pair["left"]))
+        right = group_reports.get(str(pair["right"]))
+        profile = str(pair.get("acceptance_profile", "")).strip()
+        profile_config = dict(profile_configs.get(profile, {}) or {})
+        if profile == "mainline_reward_v2":
+            acceptance[name] = _mainline_reward_v2_acceptance(left, right, profile_config=profile_config)
+        elif profile == "shadow_noop":
+            acceptance[name] = _shadow_noop_acceptance(left, right, profile_config=profile_config)
+        else:
+            acceptance[name] = {
+                "available": False,
+                "profile": profile,
+                "regression": False,
+                "reason": f"unknown acceptance_profile={profile}",
+            }
+    return acceptance
+
+
+def _build_acceptance(group_reports: dict, cfg_stage5: Any | None = None) -> dict:
+    acceptance: dict = {}
+    if cfg_stage5 is not None:
+        acceptance.update(_configured_pair_acceptance(group_reports, cfg_stage5))
     if "ppo_shield" in group_reports:
         acceptance["ppo_shield"] = _shield_acceptance(group_reports.get("ppo"), group_reports.get("ppo_shield"))
     if "cv_prediction_shield" in group_reports:
@@ -449,6 +612,10 @@ def run(cfg) -> Path:
     group_reports = {}
     for group_idx, group in enumerate(cfg.stage5.groups):
         group_cfg = clone_with_overrides(cfg, _group_overrides(group))
+        if str(group_cfg.rl.get("reward_profile", "default")) in {"shield_guided_forecast", "merge_timing_forecast"}:
+            group_cfg.rl.shield_guided_reward["risk_checkpoint"] = str(
+                group_cfg.rl.shield_guided_reward.get("risk_checkpoint") or risk_checkpoint
+            )
         policy_type = str(group.get("policy_type", "sb3_ppo"))
         if policy_type == "rule_gap_acceptance" and (
             bool(group.shield) or bool(group.forecast_features)
@@ -500,8 +667,9 @@ def run(cfg) -> Path:
     shield_off = {name: report for name, report in group_reports.items() if not bool(report.get("shield_enabled", False))}
     shield_on = {name: report for name, report in group_reports.items() if bool(report.get("shield_enabled", False))}
     forecast_baseline = _forecast_baseline_group(group_reports)
-    paired_delta = _build_paired_delta(group_reports)
-    acceptance = _build_acceptance(group_reports)
+    configured_pairs = _normalised_pairs(cfg.stage5)
+    paired_delta = _build_paired_delta(group_reports, configured_pairs)
+    acceptance = _build_acceptance(group_reports, cfg.stage5)
     write_report(stage_dir / "shield_off_metrics.json", shield_off)
     write_report(stage_dir / "shield_on_metrics.json", shield_on)
     report = {
@@ -511,7 +679,9 @@ def run(cfg) -> Path:
             cfg.risk_module.get("safety_metric_version", SAFETY_METRIC_VERSION)
         ),
         "seeds": seeds,
+        "experiment": dict(cfg.get("experiment", {}) or {}),
         "groups": group_reports,
+        "configured_pairs": configured_pairs,
         "forecast_baseline_group": forecast_baseline,
         "paired_delta": paired_delta,
         "acceptance": acceptance,

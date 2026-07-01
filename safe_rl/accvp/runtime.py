@@ -74,8 +74,19 @@ class ACCVPRuntimePredictor:
         if not manifest_path:
             raise FileNotFoundError("enabled ACCVP runtime requires accvp.artifact_manifest")
         manifest = read_json(manifest_path)
-        if str(manifest.get("artifact_kind", "")) != "accvp_v1_artifact_bundle":
+        if str(manifest.get("artifact_kind", "")) not in {
+            "accvp_v1_artifact_bundle",
+            "accvp_v1_shadow_artifact_bundle",
+        }:
             raise ValueError("invalid ACCVP artifact manifest kind")
+        deployable = bool(
+            manifest.get(
+                "deployable_artifact",
+                str(manifest.get("artifact_kind", "")) == "accvp_v1_artifact_bundle",
+            )
+        )
+        if str(self.config.accvp.get("mode", "off")) == "viability_branch" and not deployable:
+            raise ValueError("ACCVP viability_branch requires deployable_artifact=true")
         expected = {
             "predictor_sha256": file_sha256(self.checkpoint_path),
         }

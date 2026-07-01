@@ -101,6 +101,7 @@ def _clear_deployable_accvp_artifacts(output_dir: Path) -> None:
         "accvp_v1_operating_point.json",
         "accvp_v1_final_test_diagnostics.json",
         "accvp_v1_artifact_manifest.json",
+        "accvp_v1_shadow_artifact_manifest.json",
         "training_manifest.json",
     ):
         path = output_dir / name
@@ -164,7 +165,99 @@ def _calibrate(models: list[Any], dataset: ACCVPBranchDataset, torch: Any, calib
     )
 
 
-def train_accvp(config: Any, dataset_dir: str | Path) -> Path:
+def _write_predictor_and_calibration(
+    *,
+    output_dir: Path,
+    config: Any,
+    dataset_dir: Path,
+    models: list[Any],
+    calibration: CalibrationBundle,
+    warm_records: list[dict[str, Any]],
+    best_losses: list[float],
+    loss_weights: dict[str, Any],
+    oracle_report: dict[str, Any],
+    torch: Any,
+    mode: str,
+    operating_point: dict[str, Any] | None = None,
+    final_test: dict[str, Any] | None = None,
+) -> Path:
+    metadata = checkpoint_metadata(
+        config,
+        warm_start={"members": warm_records, "config_hash": stable_hash(dict(config))},
+    )
+    payload = {
+        "metadata": metadata,
+        "model_state_dicts": [model.state_dict() for model in models],
+        "calibration": calibration.to_dict(),
+        "best_validation_losses": best_losses,
+    }
+    checkpoint = output_dir / "accvp_v1_predictor.pt"
+    torch.save(payload, checkpoint)
+    calibration_path = output_dir / "accvp_v1_calibration.json"
+    with calibration_path.open("w", encoding="utf-8") as handle:
+        json.dump(calibration.to_dict(), handle, indent=2, sort_keys=True)
+    operating_point_path = None
+    final_test_path = None
+    if operating_point is not None:
+        operating_point_path = output_dir / "accvp_v1_operating_point.json"
+        with operating_point_path.open("w", encoding="utf-8") as handle:
+            json.dump(operating_point, handle, indent=2, sort_keys=True)
+    if final_test is not None:
+        final_test_path = output_dir / "accvp_v1_final_test_diagnostics.json"
+        with final_test_path.open("w", encoding="utf-8") as handle:
+            json.dump(final_test, handle, indent=2, sort_keys=True)
+    dataset_manifest_path = dataset_dir / "manifests" / "dataset_manifest.json"
+    split_manifest_path = dataset_dir / "manifests" / "split_manifest.jsonl"
+    dataset_manifest = read_json(dataset_manifest_path)
+    deployable = mode == "deployable"
+    artifact_manifest = {
+        "artifact_kind": "accvp_v1_artifact_bundle" if deployable else "accvp_v1_shadow_artifact_bundle",
+        "deployable_artifact": deployable,
+        "architecture_version": metadata["architecture_version"],
+        "counterfactual_schema_version": int(metadata["counterfactual_schema_version"]),
+        "accvp_activation_distance_m": float(dataset_manifest.get("accvp_activation_distance_m", -1.0)),
+        "data_contract_hash": str(dataset_manifest.get("data_contract_hash", "")),
+        "predictor_sha256": file_sha256(checkpoint),
+        "calibration_sha256": file_sha256(calibration_path),
+        "dataset_manifest_sha256": file_sha256(dataset_manifest_path),
+        "split_manifest_sha256": file_sha256(split_manifest_path),
+        "dataset_fingerprint": str(dataset_manifest.get("dataset_fingerprint", "")),
+        "risk_model_fingerprint": str(dataset_manifest.get("risk_model_fingerprint", "")),
+        "config_hash": stable_hash(dict(config)),
+        "oracle_report": oracle_report,
+    }
+    if operating_point_path is not None:
+        artifact_manifest["operating_point_sha256"] = file_sha256(operating_point_path)
+    artifact_manifest["artifact_fingerprint"] = stable_hash(artifact_manifest)
+    manifest_name = "accvp_v1_artifact_manifest.json" if deployable else "accvp_v1_shadow_artifact_manifest.json"
+    artifact_manifest_path = write_json_atomic(output_dir / manifest_name, artifact_manifest)
+    with (output_dir / "training_manifest.json").open("w", encoding="utf-8") as handle:
+        json.dump(
+            {
+                "dataset_dir": str(dataset_dir.resolve()),
+                "oracle_report": oracle_report,
+                "checkpoint": str(checkpoint.resolve()),
+                "calibration": str(calibration_path.resolve()),
+                "operating_point": "" if operating_point_path is None else str(operating_point_path.resolve()),
+                "final_test_diagnostics": "" if final_test_path is None else str(final_test_path.resolve()),
+                "artifact_manifest": str(artifact_manifest_path.resolve()),
+                "deployable_artifact": deployable,
+                "mode": mode,
+                "best_validation_losses": best_losses,
+                "event_positive_weights": loss_weights["event_positive_weights"],
+                "checkpoint_metadata": metadata,
+            },
+            handle,
+            indent=2,
+            sort_keys=True,
+        )
+    return checkpoint
+
+
+def train_accvp(config: Any, dataset_dir: str | Path, *, mode: str = "deployable") -> Path:
+    mode = str(mode).strip().lower()
+    if mode not in {"shadow", "deployable"}:
+        raise ValueError("ACCVP training mode must be 'shadow' or 'deployable'")
     torch = _torch()
     dataset_dir = Path(dataset_dir)
     oracle_report = validate_oracle_for_training(config, dataset_dir)
@@ -244,6 +337,20 @@ def train_accvp(config: Any, dataset_dir: str | Path) -> Path:
         warm_record["freeze_encoder_epochs"] = int(warm.freeze_encoder_epochs)
         warm_records.append(warm_record)
     calibration = _calibrate(models, calibration_set, torch, config.accvp.calibration)
+    if mode == "shadow":
+        return _write_predictor_and_calibration(
+            output_dir=output_dir,
+            config=config,
+            dataset_dir=dataset_dir,
+            models=models,
+            calibration=calibration,
+            warm_records=warm_records,
+            best_losses=best_losses,
+            loss_weights=loss_weights,
+            oracle_report=oracle_report,
+            torch=torch,
+            mode="shadow",
+        )
     from safe_rl.accvp.tuning import tune_operating_point
     from safe_rl.accvp.diagnostics import final_test_diagnostics
 
@@ -254,64 +361,18 @@ def train_accvp(config: Any, dataset_dir: str | Path) -> Path:
         _write_tuning_failure_diagnostics(output_dir, exc)
         raise
     final_test = final_test_diagnostics(models, test_set, calibration, operating_point, torch)
-    metadata = checkpoint_metadata(
-        config,
-        warm_start={"members": warm_records, "config_hash": stable_hash(dict(config))},
+    return _write_predictor_and_calibration(
+        output_dir=output_dir,
+        config=config,
+        dataset_dir=dataset_dir,
+        models=models,
+        calibration=calibration,
+        warm_records=warm_records,
+        best_losses=best_losses,
+        loss_weights=loss_weights,
+        oracle_report=oracle_report,
+        torch=torch,
+        mode="deployable",
+        operating_point=operating_point,
+        final_test=final_test,
     )
-    payload = {
-        "metadata": metadata,
-        "model_state_dicts": [model.state_dict() for model in models],
-        "calibration": calibration.to_dict(),
-        "best_validation_losses": best_losses,
-    }
-    checkpoint = output_dir / "accvp_v1_predictor.pt"
-    torch.save(payload, checkpoint)
-    calibration_path = output_dir / "accvp_v1_calibration.json"
-    with calibration_path.open("w", encoding="utf-8") as handle:
-        json.dump(calibration.to_dict(), handle, indent=2, sort_keys=True)
-    operating_point_path = output_dir / "accvp_v1_operating_point.json"
-    with operating_point_path.open("w", encoding="utf-8") as handle:
-        json.dump(operating_point, handle, indent=2, sort_keys=True)
-    final_test_path = output_dir / "accvp_v1_final_test_diagnostics.json"
-    with final_test_path.open("w", encoding="utf-8") as handle:
-        json.dump(final_test, handle, indent=2, sort_keys=True)
-    dataset_manifest_path = dataset_dir / "manifests" / "dataset_manifest.json"
-    split_manifest_path = dataset_dir / "manifests" / "split_manifest.jsonl"
-    dataset_manifest = read_json(dataset_manifest_path)
-    artifact_manifest = {
-        "artifact_kind": "accvp_v1_artifact_bundle",
-        "architecture_version": metadata["architecture_version"],
-        "counterfactual_schema_version": int(metadata["counterfactual_schema_version"]),
-        "accvp_activation_distance_m": float(dataset_manifest.get("accvp_activation_distance_m", -1.0)),
-        "data_contract_hash": str(dataset_manifest.get("data_contract_hash", "")),
-        "predictor_sha256": file_sha256(checkpoint),
-        "calibration_sha256": file_sha256(calibration_path),
-        "operating_point_sha256": file_sha256(operating_point_path),
-        "dataset_manifest_sha256": file_sha256(dataset_manifest_path),
-        "split_manifest_sha256": file_sha256(split_manifest_path),
-        "dataset_fingerprint": str(dataset_manifest.get("dataset_fingerprint", "")),
-        "risk_model_fingerprint": str(dataset_manifest.get("risk_model_fingerprint", "")),
-        "config_hash": stable_hash(dict(config)),
-        "oracle_report": oracle_report,
-    }
-    artifact_manifest["artifact_fingerprint"] = stable_hash(artifact_manifest)
-    artifact_manifest_path = write_json_atomic(output_dir / "accvp_v1_artifact_manifest.json", artifact_manifest)
-    with (output_dir / "training_manifest.json").open("w", encoding="utf-8") as handle:
-        json.dump(
-            {
-                "dataset_dir": str(dataset_dir.resolve()),
-                "oracle_report": oracle_report,
-                "checkpoint": str(checkpoint.resolve()),
-                "calibration": str(calibration_path.resolve()),
-                "operating_point": str(operating_point_path.resolve()),
-                "final_test_diagnostics": str(final_test_path.resolve()),
-                "artifact_manifest": str(artifact_manifest_path.resolve()),
-                "best_validation_losses": best_losses,
-                "event_positive_weights": loss_weights["event_positive_weights"],
-                "checkpoint_metadata": metadata,
-            },
-            handle,
-            indent=2,
-            sort_keys=True,
-        )
-    return checkpoint

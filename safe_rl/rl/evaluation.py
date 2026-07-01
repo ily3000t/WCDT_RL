@@ -313,9 +313,10 @@ def evaluate_policy(
                 )
         finally:
             env.close()
-    metrics = aggregate_episode_reports(reports)
+    metrics = aggregate_episode_reports(reports, task_quality=dict(cfg.stage5.get("task_quality", {}) or {}))
     metrics["average_reward"] = float(np.mean(rewards)) if rewards else 0.0
     metrics["merge_success_rate"] = float(np.mean([float(item.get("merge_success", False)) for item in reports])) if reports else 0.0
+    metrics["terminal_success_rate"] = metrics["merge_success_rate"]
     stage_log("stage5", f"group={group_name or 'ppo'} metrics={metrics}")
     return {
         "episodes": reports,

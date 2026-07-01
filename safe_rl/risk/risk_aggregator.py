@@ -25,9 +25,104 @@ def _report_proxy_collision(report: dict) -> float:
     return float(float(report.get("min_distance", 1.0e6)) <= 0.25)
 
 
-def aggregate_episode_reports(reports: list[dict]) -> dict:
+def _task_quality_thresholds(task_quality: dict | None) -> dict[str, float]:
+    task_quality = dict(task_quality or {})
+    result = {
+        "timely_entry_distance_threshold_m": float(
+            task_quality.get("timely_entry_distance_threshold_m", 80.0)
+        ),
+        "late_merge_request_threshold_m": float(
+            task_quality.get("late_merge_request_threshold_m", 60.0)
+        ),
+    }
+    return result
+
+
+def _quantile_summary(values: list[float]) -> dict[str, float | None]:
+    if not values:
+        return {"mean": None, "p50": None, "p95": None}
+    arr = np.asarray(values, dtype=np.float32)
+    return {
+        "mean": float(np.mean(arr)),
+        "p50": float(np.percentile(arr, 50)),
+        "p95": float(np.percentile(arr, 95)),
+    }
+
+
+def _accvp_shadow_metrics(reports: list[dict]) -> dict:
+    records = [record for report in reports for record in list(report.get("accvp_records", []) or [])]
+    if not records:
+        return {
+            "accvp_shadow_record_count": 0,
+            "accvp_shadow_candidate_set_available_rate": 0.0,
+            "accvp_shadow_raw_feasible_rate": 0.0,
+            "accvp_shadow_recommended_diff_rate": 0.0,
+            "accvp_shadow_recommended_merge_intent_rate": 0.0,
+            "accvp_shadow_bypass_rate": 0.0,
+            "accvp_shadow_timeout_rate": 0.0,
+            "accvp_shadow_latency_p50": 0.0,
+            "accvp_shadow_latency_p95": 0.0,
+            "accvp_shadow_per_action_gate_pass_rate": {},
+            "accvp_shadow_raw_bounds": {},
+        }
+    merge_intent = {6, 7, 8}
+    candidate_available = [bool(record.get("candidate_set_available", False)) for record in records]
+    raw_feasible = [bool(record.get("raw_feasible", False)) for record in records]
+    recommended = [record.get("accvp_shadow_recommended_action") for record in records]
+    raw_actions = [record.get("raw_action") for record in records]
+    bypass = [bool(str(record.get("accvp_bypass_reason", ""))) for record in records]
+    timeout = [str(record.get("accvp_bypass_reason", "")) == "timeout" for record in records]
+    latency = [float(record.get("decision_latency_s", 0.0)) for record in records]
+    per_action_counts: dict[str, int] = {}
+    per_action_pass: dict[str, int] = {}
+    raw_pu_proxy: list[float] = []
+    raw_pu_safety: list[float] = []
+    raw_pl_viability: list[float] = []
+    for record in records:
+        raw_action = int(record.get("raw_action", -1))
+        for candidate in list(record.get("accvp_shadow_candidates", []) or []):
+            action_id = str(int(candidate.get("action_id", -1)))
+            per_action_counts[action_id] = per_action_counts.get(action_id, 0) + 1
+            if bool(candidate.get("gate_pass", False)):
+                per_action_pass[action_id] = per_action_pass.get(action_id, 0) + 1
+            if int(candidate.get("action_id", -999)) == raw_action:
+                raw_pu_proxy.append(float(candidate.get("pU_proxy_collision", 0.0)))
+                raw_pu_safety.append(float(candidate.get("pU_safety_violation", 0.0)))
+                raw_pl_viability.append(float(candidate.get("pL_merge_before_taper", 0.0)))
+    pass_rate = {
+        action_id: float(per_action_pass.get(action_id, 0) / max(1, count))
+        for action_id, count in sorted(per_action_counts.items(), key=lambda item: int(item[0]))
+    }
+    return {
+        "accvp_shadow_record_count": int(len(records)),
+        "accvp_shadow_candidate_set_available_rate": float(np.mean(candidate_available)),
+        "accvp_shadow_raw_feasible_rate": float(np.mean(raw_feasible)),
+        "accvp_shadow_recommended_diff_rate": float(
+            np.mean([
+                item is not None and raw is not None and int(item) != int(raw)
+                for item, raw in zip(recommended, raw_actions)
+            ])
+        ),
+        "accvp_shadow_recommended_merge_intent_rate": float(
+            np.mean([item is not None and int(item) in merge_intent for item in recommended])
+        ),
+        "accvp_shadow_bypass_rate": float(np.mean(bypass)),
+        "accvp_shadow_timeout_rate": float(np.mean(timeout)),
+        "accvp_shadow_latency_p50": float(np.percentile(latency, 50)),
+        "accvp_shadow_latency_p95": float(np.percentile(latency, 95)),
+        "accvp_shadow_per_action_gate_pass_rate": pass_rate,
+        "accvp_shadow_raw_bounds": {
+            "pU_proxy_collision": _quantile_summary(raw_pu_proxy),
+            "pU_safety_violation": _quantile_summary(raw_pu_safety),
+            "pL_merge_before_taper": _quantile_summary(raw_pl_viability),
+        },
+    }
+
+
+def aggregate_episode_reports(reports: list[dict], task_quality: dict | None = None) -> dict:
     if not reports:
         return {}
+    thresholds = _task_quality_thresholds(task_quality)
     collisions = np.asarray([float(report.get("collision", False)) for report in reports], dtype=np.float32)
     near_misses = np.asarray([float(report.get("near_miss", False)) for report in reports], dtype=np.float32)
     proxy_collisions = np.asarray([_report_proxy_collision(report) for report in reports], dtype=np.float32)
@@ -104,6 +199,69 @@ def aggregate_episode_reports(reports: list[dict]) -> dict:
             float(report["first_target_lane_entry_distance_to_taper"])
             for report in reports
             if report.get("first_target_lane_entry_distance_to_taper") is not None
+        ],
+        dtype=np.float32,
+    )
+    terminal_successes = np.asarray(
+        [
+            float(
+                bool(report.get("merge_success", False))
+                or str(report.get("done_reason", "")) == "merge_success"
+            )
+            for report in reports
+        ],
+        dtype=np.float32,
+    )
+    timely_merge_successes = np.asarray(
+        [
+            float(
+                (
+                    bool(report.get("merge_success", False))
+                    or str(report.get("done_reason", "")) == "merge_success"
+                )
+                and report.get("first_target_lane_entry_distance_to_taper") is not None
+                and float(report.get("first_target_lane_entry_distance_to_taper", -1.0))
+                >= thresholds["timely_entry_distance_threshold_m"]
+            )
+            for report in reports
+        ],
+        dtype=np.float32,
+    )
+    timely_merge_requests = np.asarray(
+        [
+            float(
+                report.get("first_merge_request_distance_to_taper") is not None
+                and float(report.get("first_merge_request_distance_to_taper", -1.0))
+                >= thresholds["late_merge_request_threshold_m"]
+            )
+            for report in reports
+        ],
+        dtype=np.float32,
+    )
+    late_merge_requests = np.asarray(
+        [
+            float(
+                report.get("first_merge_request_distance_to_taper") is None
+                or float(report.get("first_merge_request_distance_to_taper", -1.0))
+                < thresholds["late_merge_request_threshold_m"]
+            )
+            for report in reports
+        ],
+        dtype=np.float32,
+    )
+    safety_clean_successes = np.asarray(
+        [
+            float(
+                (
+                    bool(report.get("merge_success", False))
+                    or str(report.get("done_reason", "")) == "merge_success"
+                )
+                and not bool(report.get("proxy_collision", False))
+                and not bool(report.get("safety_violation", False))
+                and not bool(report.get("geometric_overlap", False))
+                and int(report.get("fallback_count", 0)) == 0
+            )
+            for report in reports
         ],
         dtype=np.float32,
     )
@@ -249,22 +407,50 @@ def aggregate_episode_reports(reports: list[dict]) -> dict:
         "emergency_fallback_count": int(np.sum(emergency_fallbacks)),
         "taper_miss_rate": float(np.mean(taper_misses)) if taper_misses.size else 0.0,
         "taper_miss_count": int(np.sum(taper_misses)),
+        "task_quality_thresholds": thresholds,
+        "terminal_success_rate": float(np.mean(terminal_successes)),
+        "terminal_success_count": int(np.sum(terminal_successes)),
+        "timely_merge_success_rate": float(np.mean(timely_merge_successes)),
+        "timely_merge_success_count": int(np.sum(timely_merge_successes)),
+        "timely_merge_request_rate": float(np.mean(timely_merge_requests)),
+        "timely_merge_request_count": int(np.sum(timely_merge_requests)),
+        "safety_clean_success_rate": float(np.mean(safety_clean_successes)),
+        "safety_clean_success_count": int(np.sum(safety_clean_successes)),
+        "late_merge_request_rate": float(np.mean(late_merge_requests)),
+        "late_merge_request_count": int(np.sum(late_merge_requests)),
         "first_merge_request_distance_to_taper_mean": (
             float(np.mean(first_merge_request_distance)) if first_merge_request_distance.size else None
+        ),
+        "first_merge_request_distance_to_taper_p10": (
+            float(np.percentile(first_merge_request_distance, 10)) if first_merge_request_distance.size else None
         ),
         "first_merge_request_distance_to_taper_p50": (
             float(np.percentile(first_merge_request_distance, 50)) if first_merge_request_distance.size else None
         ),
+        "first_merge_request_distance_to_taper_p90": (
+            float(np.percentile(first_merge_request_distance, 90)) if first_merge_request_distance.size else None
+        ),
         "first_target_lane_entry_distance_to_taper_mean": (
             float(np.mean(first_target_entry_distance)) if first_target_entry_distance.size else None
         ),
+        "first_target_lane_entry_distance_to_taper_p10": (
+            float(np.percentile(first_target_entry_distance, 10)) if first_target_entry_distance.size else None
+        ),
         "first_target_lane_entry_distance_to_taper_p50": (
             float(np.percentile(first_target_entry_distance, 50)) if first_target_entry_distance.size else None
+        ),
+        "first_target_lane_entry_distance_to_taper_p90": (
+            float(np.percentile(first_target_entry_distance, 90)) if first_target_entry_distance.size else None
         ),
         "safe_merge_opportunity_count": safe_merge_opportunities,
         "missed_safe_merge_opportunity_count": missed_safe_merge_opportunities,
         "missed_safe_merge_opportunity_rate": (
             float(missed_safe_merge_opportunities / safe_merge_opportunities)
+            if safe_merge_opportunities
+            else 0.0
+        ),
+        "opportunity_capture_step_rate": (
+            float(1.0 - missed_safe_merge_opportunities / safe_merge_opportunities)
             if safe_merge_opportunities
             else 0.0
         ),
@@ -281,6 +467,9 @@ def aggregate_episode_reports(reports: list[dict]) -> dict:
         "deadline_missed_safe_merge_count": deadline_missed,
         "deadline_missed_safe_merge_rate": (
             float(deadline_missed / deadline_opportunities) if deadline_opportunities else 0.0
+        ),
+        "deadline_opportunity_capture_rate": (
+            float(1.0 - deadline_missed / deadline_opportunities) if deadline_opportunities else 0.0
         ),
         "missed_safe_merge_after_urgency_0_5_count": urgency_missed,
         "safe_merge_after_urgency_0_5_count": urgency_opportunities,
@@ -368,3 +557,5 @@ def aggregate_episode_reports(reports: list[dict]) -> dict:
             forecast_ranking_replacement_reason_counts
         ),
     }
+    result.update(_accvp_shadow_metrics(reports))
+    return result

@@ -7,7 +7,7 @@ from safe_rl.prediction.forecast_feature_augmentor import ForecastFeatureAugment
 from safe_rl.prediction.actor_selector import actor_selection_config_hash
 from safe_rl.prediction.forecast_rollout_bundle import FORECAST_ROLLOUT_BUNDLE_VERSION
 from safe_rl.prediction.trajectory_postprocess import TRAJECTORY_POSTPROCESS_VERSION
-from safe_rl.pipeline.common import load_stage_config, make_env, parse_config_arg, write_report
+from safe_rl.pipeline.common import latest_stage_file, load_stage_config, make_env, parse_config_arg, write_report
 from safe_rl.rl.ppo import train_ppo
 from safe_rl.sim.metrics import SAFETY_METRIC_VERSION
 from safe_rl.utils.config import prepare_run_dir
@@ -110,6 +110,13 @@ def run(cfg):
     stage_log("stage3", f"SUMO config={cfg.scenario.sumocfg}")
     stage_log("stage3", f"total_timesteps={cfg.rl.total_timesteps}")
     stage_log("stage3", f"forecast_features={bool(cfg.forecast_features.enabled or cfg.rl.use_wcdt_forecast_features)}")
+    reward_profile = str(cfg.rl.get("reward_profile", "default"))
+    reward_risk_checkpoint = None
+    if reward_profile in {"shield_guided_forecast", "merge_timing_forecast"}:
+        configured_reward_risk = cfg.rl.get("shield_guided_reward", {}).get("risk_checkpoint")
+        reward_risk_checkpoint = str(configured_reward_risk or latest_stage_file(cfg, "stage2", "risk_module.pt"))
+        cfg.rl.shield_guided_reward["risk_checkpoint"] = reward_risk_checkpoint
+        stage_log("stage3", f"reward_profile={reward_profile} reward_risk_checkpoint={reward_risk_checkpoint}")
     stage_log(
         "stage3",
         f"device={cfg.get('training', {}).get('ppo_device', cfg.get('training', {}).get('device', 'auto'))}",
@@ -122,6 +129,7 @@ def run(cfg):
         worker_rank=0,
         num_envs=max(1, int(cfg.get("training", {}).get("ppo_num_envs", 1))),
         advance_episode_seed=True,
+        reward_risk_checkpoint=reward_risk_checkpoint,
     )
     try:
         observation_shape = list(env.observation_space.shape)
@@ -153,7 +161,35 @@ def run(cfg):
         "source": str(cfg.forecast_features.get("source", "")),
     } if report["forecast_features_enabled"] else None
     shield_guided_cfg = dict(cfg.rl.get("shield_guided_reward", {}) or {})
-    reward_profile = str(cfg.rl.get("reward_profile", "default"))
+    merge_timing_cfg = dict(cfg.rl.get("merge_timing_reward", {}) or {})
+    report["training_semantics_version"] = str(
+        cfg.rl.get("training_semantics_version", "legacy_unspecified")
+    )
+    report["reward_profile"] = reward_profile
+    report["merge_timing_reward_version"] = (
+        str(merge_timing_cfg.get("reward_version", ""))
+        if reward_profile == "merge_timing_forecast"
+        else ""
+    )
+    report["merge_timing_reward_summary"] = (
+        {
+            "reward_version": str(merge_timing_cfg.get("reward_version", "")),
+            "deadline_distance": float(merge_timing_cfg.get("deadline_distance", 0.0)),
+            "opportunity_window_start_distance": float(
+                merge_timing_cfg.get("opportunity_window_start_distance", 0.0)
+            ),
+            "opportunity_window_end_distance": float(
+                merge_timing_cfg.get("opportunity_window_end_distance", 0.0)
+            ),
+            "opportunity_accept_bonus": float(merge_timing_cfg.get("opportunity_accept_bonus", 0.0)),
+            "missed_opportunity_weight": float(merge_timing_cfg.get("missed_opportunity_weight", 0.0)),
+            "taper_deadline_weight": float(merge_timing_cfg.get("taper_deadline_weight", 0.0)),
+            "taper_miss_penalty": float(merge_timing_cfg.get("taper_miss_penalty", 0.0)),
+            "consecutive_missed_grace": int(merge_timing_cfg.get("consecutive_missed_grace", 0)),
+        }
+        if reward_profile == "merge_timing_forecast"
+        else None
+    )
     report["reward_risk_checkpoint"] = (
         str(shield_guided_cfg.get("risk_checkpoint", ""))
         if reward_profile in {"shield_guided_forecast", "merge_timing_forecast"}
@@ -162,9 +198,7 @@ def run(cfg):
     report["shield_guided_reward_config"] = (
         shield_guided_cfg if reward_profile in {"shield_guided_forecast", "merge_timing_forecast"} else None
     )
-    report["merge_timing_reward_config"] = (
-        dict(cfg.rl.get("merge_timing_reward", {}) or {}) if reward_profile == "merge_timing_forecast" else None
-    )
+    report["merge_timing_reward_config"] = merge_timing_cfg if reward_profile == "merge_timing_forecast" else None
     report["observation_dim"] = int(observation_shape[0]) if observation_shape else 0
     report["observation_shape"] = observation_shape
     report["safety_metric_version"] = str(

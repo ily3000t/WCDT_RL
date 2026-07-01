@@ -165,7 +165,43 @@ def test_formal_training_initializes_training_before_loss_weights_and_writes_fin
     assert diagnostics["split"] == "test"
     assert "post_selection" in diagnostics
     assert (output / "accvp_v1_operating_point.json").exists()
-    assert (output / "accvp_v1_artifact_manifest.json").exists()
+    manifest = json.loads((output / "accvp_v1_artifact_manifest.json").read_text(encoding="utf-8"))
+    assert manifest["deployable_artifact"] is True
+
+
+def test_shadow_training_writes_non_deployable_shadow_artifact(tmp_path: Path):
+    cfg = clone_with_overrides(
+        load_config(),
+        {
+            "run": {"output_root": str(tmp_path / "output"), "run_id": "accvp_shadow_train_test", "tensorboard": False},
+            "prediction": {
+                "wcdt_v3_hidden_dim": 16,
+                "wcdt_v3_temporal_layers": 1,
+                "wcdt_v3_actor_attention_layers": 1,
+                "wcdt_v3_num_heads": 4,
+            },
+            "accvp": {
+                "ensemble_size": 1,
+                "response_horizon_steps": 2,
+                "candidate_plan_horizon_steps": 4,
+                "warm_start": {"enabled": False, "freeze_encoder_epochs": 0, "encoder_lr_multiplier": 0.1},
+                "training": {"epochs": 1, "batch_size": 1, "learning_rate": 0.001, "weight_decay": 0.0, "ensemble_seed_offset": 1, "loss_weights": {"trajectory": 1.0, "events": 1.0, "geometry": 0.25, "ordering": 0.1, "smoothness": 0.01}},
+                "tuning": {"required_availability": 1.0, "proxy_collision_upper_bounds": [1.0], "safety_violation_upper_bounds": [1.0], "merge_viability_lower_bounds": [0.0]},
+            },
+        },
+    )
+    dataset = tmp_path / "dataset"
+    _write_minimal_formal_dataset(dataset, cfg)
+    build_split_manifest(dataset, seed=3)
+    checkpoint = train_accvp(cfg, dataset, mode="shadow")
+    output = checkpoint.parent
+    assert checkpoint.exists()
+    assert (output / "accvp_v1_calibration.json").exists()
+    assert not (output / "accvp_v1_operating_point.json").exists()
+    assert not (output / "accvp_v1_artifact_manifest.json").exists()
+    manifest = json.loads((output / "accvp_v1_shadow_artifact_manifest.json").read_text(encoding="utf-8"))
+    assert manifest["artifact_kind"] == "accvp_v1_shadow_artifact_bundle"
+    assert manifest["deployable_artifact"] is False
 
 
 def test_formal_training_requires_strict_oracle_report(tmp_path: Path):

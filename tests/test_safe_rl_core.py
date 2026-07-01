@@ -2048,6 +2048,17 @@ def test_stage5_rejects_insufficient_seeds():
         _select_eval_seeds(cfg)
 
 
+def test_default_reward_profile_is_reward_v2_and_legacy_overlay_restores_default():
+    cfg = load_config()
+    assert cfg.rl.reward_profile == "merge_timing_forecast"
+    assert cfg.rl.training_semantics_version == "reward_v2_mainline_001"
+    assert cfg.rl.merge_timing_reward.reward_version == "opportunity_window_v2"
+
+    legacy = load_config("safe_rl/config/advanced/legacy_default_reward.yaml")
+    assert legacy.rl.reward_profile == "default"
+    assert legacy.rl.training_semantics_version == "legacy_default_reward_001"
+
+
 def test_stage5_rejects_ppo_observation_shape_mismatch():
     model = SimpleNamespace(observation_space=SimpleNamespace(shape=(52,)))
     env = SimpleNamespace(observation_space=SimpleNamespace(shape=(63,)))
@@ -2135,6 +2146,69 @@ def test_stage5_metrics_distinguish_shield_calls_from_replacements():
     assert metrics["ego_speed_mean"] == pytest.approx(19.0)
     assert metrics["ego_speed_p10"] == pytest.approx(12.3)
     assert metrics["hard_brake_rate"] == pytest.approx(0.125)
+
+
+def test_stage5_task_quality_metrics_are_pre_registered():
+    metrics = aggregate_episode_reports(
+        [
+            {
+                "done_reason": "merge_success",
+                "merge_success": True,
+                "proxy_collision": False,
+                "safety_violation": False,
+                "geometric_overlap": False,
+                "fallback_count": 0,
+                "first_merge_request_distance_to_taper": 120.0,
+                "first_target_lane_entry_distance_to_taper": 100.0,
+                "safe_merge_opportunity_count": 10,
+                "missed_safe_merge_opportunity_count": 2,
+                "deadline_safe_merge_opportunity_count": 4,
+                "deadline_missed_safe_merge_count": 1,
+            },
+            {
+                "done_reason": "taper_miss",
+                "merge_success": False,
+                "taper_miss": True,
+                "proxy_collision": False,
+                "safety_violation": False,
+                "geometric_overlap": False,
+                "fallback_count": 0,
+                "first_merge_request_distance_to_taper": 40.0,
+                "first_target_lane_entry_distance_to_taper": None,
+                "safe_merge_opportunity_count": 10,
+                "missed_safe_merge_opportunity_count": 8,
+                "deadline_safe_merge_opportunity_count": 6,
+                "deadline_missed_safe_merge_count": 5,
+                "no_merge_request_before_taper_count": 0,
+            },
+            {
+                "done_reason": "taper_miss",
+                "merge_success": False,
+                "taper_miss": True,
+                "proxy_collision": False,
+                "safety_violation": False,
+                "geometric_overlap": False,
+                "fallback_count": 0,
+                "first_merge_request_distance_to_taper": None,
+                "first_target_lane_entry_distance_to_taper": None,
+                "safe_merge_opportunity_count": 0,
+                "missed_safe_merge_opportunity_count": 0,
+                "deadline_safe_merge_opportunity_count": 0,
+                "deadline_missed_safe_merge_count": 0,
+                "no_merge_request_before_taper_count": 1,
+            },
+        ],
+        task_quality={"timely_entry_distance_threshold_m": 80.0, "late_merge_request_threshold_m": 60.0},
+    )
+    assert metrics["terminal_success_rate"] == pytest.approx(1 / 3)
+    assert metrics["timely_merge_success_rate"] == pytest.approx(1 / 3)
+    assert metrics["timely_merge_request_rate"] == pytest.approx(1 / 3)
+    assert metrics["late_merge_request_rate"] == pytest.approx(2 / 3)
+    assert metrics["safety_clean_success_rate"] == pytest.approx(1 / 3)
+    assert metrics["opportunity_capture_step_rate"] == pytest.approx(0.5)
+    assert metrics["deadline_opportunity_capture_rate"] == pytest.approx(0.4)
+    assert metrics["first_merge_request_distance_to_taper_p10"] == pytest.approx(48.0)
+    assert metrics["first_target_lane_entry_distance_to_taper_p90"] == pytest.approx(100.0)
 
 
 def test_episode_report_includes_efficiency_and_comfort_metrics():
@@ -3329,6 +3403,70 @@ def test_stage5_dynamic_paired_delta_and_acceptance_for_optional_forecast_groups
     single_acceptance = _build_acceptance(single)
     assert "forecast_wcdt_vs_cv" not in single_acceptance
     assert single_acceptance["wcdt_prediction_shield"]["available"]
+
+
+def test_stage5_configured_pairs_support_reward_v2_and_shadow_noop_profiles():
+    left = _fake_group([(1, 100.0)], 100.0)
+    right = _fake_group([(1, 101.0)], 101.0)
+    left["metrics"].update({"timely_merge_success_rate": 0.8, "taper_miss_rate": 0.1})
+    right["metrics"].update({"timely_merge_success_rate": 0.8, "taper_miss_rate": 0.0, "actual_replacement_rate": 0.04})
+    for report in (left, right):
+        report["episodes"][0].update(
+            {
+                "done_reason": "merge_success",
+                "merge_success": True,
+                "taper_miss": False,
+                "action_execution_records": [
+                    {"raw_action": 5, "safety_shield_action": 5, "final_action": 5},
+                    {"raw_action": 7, "safety_shield_action": 7, "final_action": 7},
+                ],
+            }
+        )
+    shadow = json.loads(json.dumps(right))
+    shadow["episodes"][0]["accvp_replacement_count"] = 0
+    reports = {
+        "ppo_wcdt_v3_merge_timing_reward_v2": left,
+        "wcdt_v3_merge_timing_reward_v2_prediction_shield": right,
+        "wcdt_v3_merge_timing_reward_v2_prediction_shield_accvp_shadow": shadow,
+    }
+    pairs = [
+        {
+            "name": "reward_v2_vs_shield",
+            "left": "ppo_wcdt_v3_merge_timing_reward_v2",
+            "right": "wcdt_v3_merge_timing_reward_v2_prediction_shield",
+            "acceptance_profile": "mainline_reward_v2",
+        },
+        {
+            "name": "shield_vs_accvp_shadow",
+            "left": "wcdt_v3_merge_timing_reward_v2_prediction_shield",
+            "right": "wcdt_v3_merge_timing_reward_v2_prediction_shield_accvp_shadow",
+            "acceptance_profile": "shadow_noop",
+        },
+    ]
+    paired = _build_paired_delta(reports, pairs)
+    assert set(paired) == {"reward_v2_vs_shield", "shield_vs_accvp_shadow"}
+    acceptance = _build_acceptance(
+        reports,
+        {
+            "pairs": pairs,
+            "acceptance": {
+                "mainline_reward_v2": {"max_actual_replacement_rate": 0.05},
+                "shadow_noop": {"reward_tolerance": 1.0e-6},
+            },
+        },
+    )
+    assert not acceptance["reward_v2_vs_shield"]["regression"]
+    assert not acceptance["shield_vs_accvp_shadow"]["regression"]
+
+    shadow["episodes"][0]["action_execution_records"][1]["final_action"] = 4
+    failed = _build_acceptance(reports, {"pairs": [pairs[1]], "acceptance": {}})
+    assert failed["shield_vs_accvp_shadow"]["regression"]
+    assert "final_actions" in failed["shield_vs_accvp_shadow"]["mismatches"][0]["failed_checks"]
+
+    right["metrics"]["actual_replacement_rate"] = 0.06
+    failed_mainline = _build_acceptance(reports, {"pairs": [pairs[0]], "acceptance": {"mainline_reward_v2": {"max_actual_replacement_rate": 0.05}}})
+    assert failed_mainline["reward_v2_vs_shield"]["regression"]
+    assert not failed_mainline["reward_v2_vs_shield"]["checks"]["actual_replacement_rate_within_limit"]
 
 
 def test_stage5_failure_audit_identifies_min_distance_zero_and_writes_replay_commands(tmp_path, monkeypatch):

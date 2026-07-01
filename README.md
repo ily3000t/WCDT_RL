@@ -1,17 +1,82 @@
-# WcDT_RL：基于 WcDT 预测的 SAFE_RL 高速汇入实验
+# WcDT_RL / SAFE_RL：Reward-v2 主线与 ACCVP 反事实可行性规划
 
 本仓库在原始 WcDT 交通场景生成代码基础上，新增了 `safe_rl/` 包，用于构建 SUMO `highway_merge` 场景中的分层安全强化学习框架。
 
-核心目标不是“用 WcDT 替代强化学习决策”，而是：
+当前主线是：
+
+```text
+Reward-v2 PPO learns proactive merge timing.
+Risk/Safety Shield provides local safety fallback.
+ACCVP provides action-conditioned counterfactual viability estimation.
+```
+
+也就是说，当前方法不再把“更大的 WcDT 预测器”作为最终创新点。WcDT v3 仍然保留，但主要定位为：
+
+```text
+1. action-independent forecast baseline
+2. ACCVP scene encoder warm-start
+3. prediction interface ablation
+```
+
+ACCVP 的角色是 action-conditioned counterfactual viability estimator：给定同一状态和 9 个候选 ego action，估计每个动作的安全性、taper 前合流可行性和不确定性。当前 Step 1 只运行 ACCVP shadow：输出 candidate viability table 和推荐动作诊断，不改变 final action，也不提出 deployable controller claim。
+
+运行时主线：
 
 ```text
 SUMO highway_merge 场景
-  -> WcDT-style 未来交通预测
-  -> Risk Module 候选动作风险评估
-  -> PPO 学习驾驶策略
-  -> Shield 在高风险动作出现时替换动作
-  -> paired evaluation 验证闭环安全收益
+  -> Reward-v2 PPO 输出 raw action
+  -> Risk/Safety Shield 检查局部硬安全
+  -> ACCVP shadow 记录每个候选动作的反事实可行性
+  -> paired evaluation 验证动作序列、任务质量和安全收益
 ```
+
+后续 deployable 版本才会启用 ACV-Shield：
+
+```text
+PPO raw action
+  -> Safety Shield
+  -> ACV-Shield:
+       if raw/shield action safe and viable: keep
+       else choose safe + viable candidate
+  -> final action
+```
+
+从 `codex/reward-v2-mainline-accvp-shadow` 起，默认训练 reward 语义切换为：
+
+```yaml
+rl:
+  training_semantics_version: "reward_v2_mainline_001"
+  reward_profile: "merge_timing_forecast"
+  merge_timing_reward:
+    reward_version: "opportunity_window_v2"
+```
+
+旧版默认 reward 对照必须显式加载：
+
+```text
+safe_rl/config/advanced/legacy_default_reward.yaml
+```
+
+Current 50-seed evidence on `stage5_merge_timing_reward_v2_eval`:
+
+```text
+wcdt_v3_prediction_shield_baseline:
+  taper_miss = 7 / 50
+  merge_success = 43 / 50
+  first_merge_request_distance_to_taper_mean ≈ 95.9 m
+
+ppo_wcdt_v3_merge_timing_reward_v2:
+  taper_miss = 0 / 50
+  merge_success = 50 / 50
+  first_merge_request_distance_to_taper_mean ≈ 162.4 m
+
+wcdt_v3_merge_timing_reward_v2_prediction_shield:
+  taper_miss = 0 / 50
+  merge_success = 50 / 50
+  safety violation / proxy collision / fallback = 0
+```
+
+这些数值是当前 run 和 seed 集上的 evidence，不是跨场景、跨交通密度或跨版本的永久结论。
 
 ## 目录结构
 

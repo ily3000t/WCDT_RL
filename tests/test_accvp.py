@@ -15,6 +15,7 @@ from safe_rl.accvp.oracle import counterfactual_oracle_report
 from safe_rl.accvp.pilot import validate_pilot_dataset
 from safe_rl.accvp.protocol import counterfactual_data_contract, data_contract_hash, effective_activation_distance
 from safe_rl.accvp.root_context import RootContext
+from safe_rl.accvp.runtime import ACCVPRuntimePredictor
 from safe_rl.accvp.schema import COUNTERFACTUAL_SCHEMA_VERSION, stable_hash
 from safe_rl.accvp.selection import select_viability_action
 from safe_rl.accvp.shards import merge_counterfactual_shards
@@ -110,6 +111,28 @@ def test_explicit_activation_distance_overrides_legacy_deadline_without_mutating
 def test_checkpoint_metadata_tracks_counterfactual_schema_v2():
     metadata = checkpoint_metadata(load_config(), warm_start={})
     assert metadata["counterfactual_schema_version"] == COUNTERFACTUAL_SCHEMA_VERSION
+
+
+def test_viability_branch_rejects_shadow_artifact_manifest(tmp_path: Path):
+    manifest = tmp_path / "accvp_v1_shadow_artifact_manifest.json"
+    manifest.write_text(
+        __import__("json").dumps(
+            {
+                "artifact_kind": "accvp_v1_shadow_artifact_bundle",
+                "deployable_artifact": False,
+            }
+        ),
+        encoding="utf-8",
+    )
+    cfg = clone_with_overrides(
+        load_config(),
+        {"accvp": {"enabled": True, "mode": "viability_branch", "artifact_manifest": str(manifest)}},
+    )
+    predictor = ACCVPRuntimePredictor.__new__(ACCVPRuntimePredictor)
+    predictor.config = cfg
+    predictor.checkpoint_path = tmp_path / "accvp_v1_predictor.pt"
+    with __import__("pytest").raises(ValueError, match="deployable_artifact=true"):
+        predictor.validate_artifact_bundle(operating_point=tmp_path / "accvp_v1_operating_point.json")
 
 
 def test_only_raw_infeasible_allows_accvp_replacement_and_commitment():
@@ -657,7 +680,10 @@ def test_collection_job_can_override_policy_observation_config_without_mutating_
             "root_filter": "all",
             "root_budget": 100,
             "root_policy_checkpoint": "baseline.zip",
-            "config_overrides": {"forecast_features": {"enabled": False}, "rl": {"use_wcdt_forecast_features": False}},
+            "config_overrides": {
+                "forecast_features": {"enabled": False},
+                "rl": {"reward_profile": "default", "use_wcdt_forecast_features": False},
+            },
         },
     )
     assert job["name"] == "ppo_240"

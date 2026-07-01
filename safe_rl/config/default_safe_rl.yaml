@@ -238,7 +238,10 @@ risk_module:
 rl:
   backend: "sb3"
   use_wcdt_forecast_features: false
-  reward_profile: "default"
+  # Reward-v2 is the default mainline from codex/reward-v2-mainline-accvp-shadow.
+  # Use safe_rl/config/advanced/legacy_default_reward.yaml for historical default-reward runs.
+  training_semantics_version: "reward_v2_mainline_001"
+  reward_profile: "merge_timing_forecast"
   total_timesteps: 20000
   learning_rate: 0.0003
   n_steps: 1024
@@ -498,6 +501,13 @@ stage5:
   replay_enabled: true
   episodes_per_group: 20
   seeds: [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20]
+  task_quality:
+    timely_entry_distance_threshold_m: 80.0
+    late_merge_request_threshold_m: 60.0
+  acceptance:
+    mainline_reward_v2:
+      max_actual_replacement_rate: 0.05
+      reward_tolerance: 1.0e-6
   groups:
     - name: "ppo"
       forecast_features: false

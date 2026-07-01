@@ -1,0 +1,76 @@
+run:
+  run_id: "stage5_reward_v2_accvp_shadow"
+  output_root: "safe_rl_output/runs"
+  tensorboard: false
+  replay: true
+
+experiment:
+  purpose: "accvp_shadow_step1"
+  deployable_claim: false
+
+stage5:
+  paired_eval: true
+  same_seed: true
+  replay_enabled: true
+  episodes_per_group: 20
+  seeds: [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20]
+  risk_checkpoint: "safe_rl_output/runs/safe_rl_comparison_schema9_validation_001/stage2/risk_module.pt"
+  task_quality:
+    timely_entry_distance_threshold_m: 80.0
+    late_merge_request_threshold_m: 60.0
+  acceptance:
+    mainline_reward_v2:
+      max_actual_replacement_rate: 0.05
+    shadow_noop:
+      reward_tolerance: 1.0e-6
+  pairs:
+    - name: "reward_v2_vs_shield"
+      left: "ppo_wcdt_v3_merge_timing_reward_v2"
+      right: "wcdt_v3_merge_timing_reward_v2_prediction_shield"
+      acceptance_profile: "mainline_reward_v2"
+    - name: "shield_vs_accvp_shadow"
+      left: "wcdt_v3_merge_timing_reward_v2_prediction_shield"
+      right: "wcdt_v3_merge_timing_reward_v2_prediction_shield_accvp_shadow"
+      acceptance_profile: "shadow_noop"
+  groups:
+    - name: "ppo_wcdt_v3_merge_timing_reward_v2"
+      forecast_features: true
+      shield: false
+      model_path: "safe_rl_output/runs/safe_rl_comparison_schema9_validation_001_forecast_wcdt_v3_merge_timing_reward_v2/stage3/ppo_model.zip"
+      forecast_source: "wcdt_v3"
+      forecast_checkpoint: "safe_rl_output/runs/safe_rl_comparison_schema9_validation_001/stage2/wcdt_v3_predictor.pt"
+      raw_policy: "ppo_wcdt_v3_merge_timing_reward_v2"
+    - name: "wcdt_v3_merge_timing_reward_v2_prediction_shield"
+      forecast_features: true
+      shield: true
+      model_path: "safe_rl_output/runs/safe_rl_comparison_schema9_validation_001_forecast_wcdt_v3_merge_timing_reward_v2/stage3/ppo_model.zip"
+      forecast_source: "wcdt_v3"
+      forecast_checkpoint: "safe_rl_output/runs/safe_rl_comparison_schema9_validation_001/stage2/wcdt_v3_predictor.pt"
+      raw_policy: "ppo_wcdt_v3_merge_timing_reward_v2"
+      shield_overrides:
+        forecast_aware_candidate_ranking_mode: "off"
+        forecast_task_shadow_enabled: false
+        task_backstop_enabled: false
+    - name: "wcdt_v3_merge_timing_reward_v2_prediction_shield_accvp_shadow"
+      forecast_features: true
+      shield: true
+      model_path: "safe_rl_output/runs/safe_rl_comparison_schema9_validation_001_forecast_wcdt_v3_merge_timing_reward_v2/stage3/ppo_model.zip"
+      forecast_source: "wcdt_v3"
+      forecast_checkpoint: "safe_rl_output/runs/safe_rl_comparison_schema9_validation_001/stage2/wcdt_v3_predictor.pt"
+      raw_policy: "ppo_wcdt_v3_merge_timing_reward_v2"
+      counterfactual_predictor: "accvp_v1_240_shadow"
+      controller: "acv_shield_240_shadow"
+      shield_overrides:
+        forecast_aware_candidate_ranking_mode: "off"
+        forecast_task_shadow_enabled: false
+        task_backstop_enabled: false
+      accvp:
+        enabled: true
+        mode: "shadow"
+        schema_version: 2
+        activation_distance: 240.0
+        ensemble_size: 1
+        checkpoint: "safe_rl_output/runs/accvp_240_shadow_train/accvp/accvp_v1_predictor.pt"
+        calibration_bundle: "safe_rl_output/runs/accvp_240_shadow_train/accvp/accvp_v1_calibration.json"
+        artifact_manifest: "safe_rl_output/runs/accvp_240_shadow_train/accvp/accvp_v1_shadow_artifact_manifest.json"
+        risk_checkpoint: "safe_rl_output/runs/safe_rl_comparison_schema9_validation_001/stage2/risk_module.pt"
