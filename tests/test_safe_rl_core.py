@@ -2148,6 +2148,82 @@ def test_stage5_metrics_distinguish_shield_calls_from_replacements():
     assert metrics["hard_brake_rate"] == pytest.approx(0.125)
 
 
+def test_stage5_metrics_include_accvp_lite_shadow_aggregates():
+    metrics = aggregate_episode_reports(
+        [
+            {
+                "collision": False,
+                "near_miss": False,
+                "min_distance": 5.0,
+                "ttc_p1": 2.0,
+                "drac_p99": 1.0,
+                "drac_p99_raw": 1.0,
+                "drac_p99_capped": 1.0,
+                "proxy_collision": False,
+                "safety_violation": False,
+                "steps": 100,
+                "completion_time": 10.0,
+                "ego_speed_mean": 20.0,
+                "ego_speed_p10": 15.0,
+                "hard_brake_rate": 0.0,
+                "intervention_count": 1,
+                "shield_call_count": 1,
+                "actual_replacement_count": 0,
+                "fallback_count": 0,
+                "emergency_fallback_count": 0,
+                "accvp_records": [
+                    {
+                        "raw_action": 4,
+                        "safety_shield_action": 4,
+                        "candidate_set_available": True,
+                        "raw_feasible": False,
+                        "accvp_shadow_recommended_action": 8,
+                        "accvp_bypass_reason": "",
+                        "decision_latency_s": 0.02,
+                        "accvp_lite_raw_task_feasible": False,
+                        "accvp_lite_best_left_action": 8,
+                        "accvp_lite_p_merge_improvement": 0.4,
+                        "accvp_shadow_candidates": [
+                            {
+                                "action_id": 4,
+                                "p_proxy_collision": 0.1,
+                                "p_safety_violation": 0.1,
+                                "p_merge_before_taper": 0.4,
+                                "pU_proxy_collision": 0.1,
+                                "pU_safety_violation": 0.1,
+                                "pL_merge_before_taper": 0.4,
+                                "ensemble_disagreement": 0.01,
+                                "gate_pass": False,
+                                "lite_gate_pass": False,
+                            },
+                            {
+                                "action_id": 8,
+                                "p_proxy_collision": 0.2,
+                                "p_safety_violation": 0.2,
+                                "p_merge_before_taper": 0.8,
+                                "pU_proxy_collision": 0.2,
+                                "pU_safety_violation": 0.2,
+                                "pL_merge_before_taper": 0.8,
+                                "ensemble_disagreement": 0.02,
+                                "gate_pass": False,
+                                "lite_gate_pass": True,
+                            },
+                        ],
+                    }
+                ],
+            }
+        ]
+    )
+    assert metrics["accvp_shadow_record_count"] == 1
+    assert metrics["accvp_shadow_candidate_set_available_rate"] == 1.0
+    assert metrics["accvp_shadow_recommended_diff_rate"] == 1.0
+    assert metrics["accvp_shadow_recommended_merge_intent_rate"] == 1.0
+    assert metrics["accvp_lite_replacement_would_trigger_rate"] == 1.0
+    assert metrics["accvp_lite_best_left_action_counts"] == {"8": 1}
+    assert metrics["accvp_lite_per_action_gate_pass_rate"]["8"] == 1.0
+    assert metrics["accvp_shadow_raw_probabilities"]["p_merge_before_taper"]["mean"] == pytest.approx(0.4)
+
+
 def test_stage5_task_quality_metrics_are_pre_registered():
     metrics = aggregate_episode_reports(
         [

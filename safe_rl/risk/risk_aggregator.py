@@ -67,6 +67,11 @@ def _accvp_shadow_metrics(reports: list[dict]) -> dict:
             "accvp_shadow_recommended_action_counts": {},
             "accvp_shadow_raw_probabilities": {},
             "accvp_shadow_raw_bounds": {},
+            "accvp_lite_raw_task_feasible_rate": 0.0,
+            "accvp_lite_replacement_would_trigger_rate": 0.0,
+            "accvp_lite_best_left_action_counts": {},
+            "accvp_lite_p_merge_improvement": {},
+            "accvp_lite_per_action_gate_pass_rate": {},
         }
     merge_intent = {6, 7, 8}
     candidate_available = [bool(record.get("candidate_set_available", False)) for record in records]
@@ -86,6 +91,13 @@ def _accvp_shadow_metrics(reports: list[dict]) -> dict:
     raw_pu_proxy: list[float] = []
     raw_pu_safety: list[float] = []
     raw_pl_viability: list[float] = []
+    lite_task_feasible = [bool(record.get("accvp_lite_raw_task_feasible", False)) for record in records]
+    lite_best_left = [record.get("accvp_lite_best_left_action") for record in records]
+    lite_improvement = [float(record.get("accvp_lite_p_merge_improvement", 0.0)) for record in records]
+    lite_best_left_counts: Counter[str] = Counter()
+    per_action_lite_pass: dict[str, int] = {}
+    for item in lite_best_left:
+        lite_best_left_counts["None" if item is None else str(int(item))] += 1
     for item in recommended:
         recommended_counts["None" if item is None else str(int(item))] += 1
     for record in records:
@@ -110,6 +122,8 @@ def _accvp_shadow_metrics(reports: list[dict]) -> dict:
                     values.append(float(candidate.get(key, 0.0)))
             if bool(candidate.get("gate_pass", False)):
                 per_action_pass[action_id] = per_action_pass.get(action_id, 0) + 1
+            if bool(candidate.get("lite_gate_pass", False)):
+                per_action_lite_pass[action_id] = per_action_lite_pass.get(action_id, 0) + 1
             if int(candidate.get("action_id", -999)) == raw_action:
                 raw_p_proxy.append(float(candidate.get("p_proxy_collision", 0.0)))
                 raw_p_safety.append(float(candidate.get("p_safety_violation", 0.0)))
@@ -119,6 +133,10 @@ def _accvp_shadow_metrics(reports: list[dict]) -> dict:
                 raw_pl_viability.append(float(candidate.get("pL_merge_before_taper", 0.0)))
     pass_rate = {
         action_id: float(per_action_pass.get(action_id, 0) / max(1, count))
+        for action_id, count in sorted(per_action_counts.items(), key=lambda item: int(item[0]))
+    }
+    lite_pass_rate = {
+        action_id: float(per_action_lite_pass.get(action_id, 0) / max(1, count))
         for action_id, count in sorted(per_action_counts.items(), key=lambda item: int(item[0]))
     }
     per_action_summary = {
@@ -161,6 +179,18 @@ def _accvp_shadow_metrics(reports: list[dict]) -> dict:
             "pU_safety_violation": _quantile_summary(raw_pu_safety),
             "pL_merge_before_taper": _quantile_summary(raw_pl_viability),
         },
+        "accvp_lite_raw_task_feasible_rate": float(np.mean(lite_task_feasible)),
+        "accvp_lite_replacement_would_trigger_rate": float(
+            np.mean([
+                item is not None and raw is not None and int(item) != int(raw)
+                for item, raw in zip(recommended, raw_actions)
+            ])
+        ),
+        "accvp_lite_best_left_action_counts": dict(
+            sorted(lite_best_left_counts.items(), key=lambda item: 999 if item[0] == "None" else int(item[0]))
+        ),
+        "accvp_lite_p_merge_improvement": _quantile_summary(lite_improvement),
+        "accvp_lite_per_action_gate_pass_rate": lite_pass_rate,
     }
 
 
@@ -404,7 +434,7 @@ def aggregate_episode_reports(reports: list[dict], task_quality: dict | None = N
         forecast_ranking_replacement_reason_counts.update(
             report.get("forecast_ranking_replacement_reason_counts", {}) or {}
         )
-    return {
+    result = {
         "episodes": len(reports),
         "collision_rate": float(np.mean(collisions)),
         "near_miss_rate": float(np.mean(near_misses)),

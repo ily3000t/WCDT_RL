@@ -369,6 +369,18 @@ accvp:
   merge_viability_lower_bound: 0.50
   max_decision_latency_s: 0.5
   lateral_commitment_s: 1.0
+  viability_lite:
+    min_p_merge_before_taper: 0.75
+    min_improvement_over_raw: 0.01
+    max_target_entry_time_s: 8.0
+    max_ensemble_disagreement: 0.20
+    max_secondary_risk_score: 1.0
+    max_replacement_rate: 0.50
+    min_left_p_merge_before_taper_grid: [0.70, 0.75, 0.78, 0.80]
+    min_improvement_over_raw_grid: [0.005, 0.01, 0.02, 0.03]
+    max_target_entry_time_s_grid: [4.0, 6.0, 8.0]
+    max_ensemble_disagreement_grid: [0.05, 0.10, 0.20]
+    max_secondary_risk_score_grid: [1.0]
   warm_start:
     enabled: true
     checkpoint: null

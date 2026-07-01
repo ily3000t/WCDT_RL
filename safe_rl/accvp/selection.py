@@ -7,8 +7,18 @@ from typing import Any
 from safe_rl.sim.action_space import action_distance, decode_action
 
 
+LEFT_ACTION_IDS = {6, 7, 8}
+
+
 def _candidate_action(row: dict[str, Any]):
     return row.get("action") or decode_action(int(row["action_id"]))
+
+
+def _secondary_risk_score(row: dict[str, Any]) -> float:
+    if row.get("secondary_risk_score") is not None:
+        return float(row.get("secondary_risk_score", 0.0))
+    secondary = dict(row.get("secondary_risk", {}) or {})
+    return float(secondary.get("risk_score", 0.0))
 
 
 def gate_candidates(candidates: list[dict[str, Any]], thresholds: dict[str, float]) -> list[dict[str, Any]]:
@@ -90,4 +100,109 @@ def select_viability_action(
         "candidate_set_available": True,
         "replacement": True,
         "reason": "raw_infeasible_viable_candidate",
+    }
+
+
+def _lite_task_pass(row: dict[str, Any], thresholds: dict[str, float]) -> bool:
+    return (
+        bool(row.get("candidate_legal", True))
+        and bool(row.get("secondary_safety_pass", True))
+        and float(row.get("p_merge_before_taper", 0.0)) >= float(thresholds["min_p_merge_before_taper"])
+        and float(row.get("target_lane_entry_time_s", float("inf"))) <= float(thresholds["max_target_entry_time_s"])
+        and float(row.get("ensemble_disagreement", 0.0)) <= float(thresholds["max_ensemble_disagreement"])
+        and _secondary_risk_score(row) <= float(thresholds.get("max_secondary_risk_score", float("inf")))
+    )
+
+
+def gate_viability_lite_candidates(candidates: list[dict[str, Any]], thresholds: dict[str, float]) -> list[dict[str, Any]]:
+    """Task-only gate: Risk/Shield owns safety; ACCVP owns merge viability."""
+
+    accepted: list[dict[str, Any]] = []
+    for row in candidates:
+        task_pass = _lite_task_pass(row, thresholds)
+        row["accvp_lite_task_pass"] = bool(task_pass)
+        row["accvp_lite_gate_pass"] = bool(task_pass)
+        if task_pass:
+            accepted.append(row)
+    return accepted
+
+
+def select_viability_lite_action(
+    candidates: list[dict[str, Any]],
+    *,
+    raw_action_id: int,
+    thresholds: dict[str, float],
+) -> dict[str, Any]:
+    """Select a merge-intent rescue using only Risk safety and ACCVP task viability.
+
+    Unlike ``select_viability_action``, this function intentionally ignores
+    ACCVP pU safety heads.  It is the selector for ACV-Shield-lite where the
+    Risk Module / Safety Shield remains the only safety authority.
+    """
+
+    accepted = gate_viability_lite_candidates(candidates, thresholds)
+    raw = next((row for row in candidates if int(row["action_id"]) == int(raw_action_id)), None)
+    raw_task_feasible = bool(raw is not None and _lite_task_pass(raw, thresholds))
+    replacement_candidates = [row for row in accepted if int(row["action_id"]) in LEFT_ACTION_IDS]
+    raw_p_merge = float(raw.get("p_merge_before_taper", 0.0)) if raw is not None else 0.0
+    if raw_task_feasible:
+        return {
+            "selected": raw,
+            "accepted": accepted,
+            "raw_feasible": True,
+            "raw_task_feasible": True,
+            "candidate_set_available": True,
+            "replacement": False,
+            "reason": "raw_task_feasible",
+            "best_left": None,
+            "p_merge_improvement": 0.0,
+        }
+    if not replacement_candidates:
+        return {
+            "selected": None,
+            "accepted": accepted,
+            "raw_feasible": False,
+            "raw_task_feasible": False,
+            "candidate_set_available": False,
+            "replacement": False,
+            "reason": "no_risk_safe_task_viable_left_action",
+            "best_left": None,
+            "p_merge_improvement": 0.0,
+        }
+    raw_action = decode_action(int(raw_action_id))
+    best_left = min(
+        replacement_candidates,
+        key=lambda row: (
+            -float(row["p_merge_before_taper"]),
+            float(row.get("target_lane_entry_time_s", float("inf"))),
+            _secondary_risk_score(row),
+            float(row.get("ensemble_disagreement", 0.0)),
+            abs(float(_candidate_action(row).accel_cmd)),
+            action_distance(_candidate_action(row), raw_action),
+            int(row["action_id"]),
+        ),
+    )
+    improvement = float(best_left["p_merge_before_taper"]) - raw_p_merge
+    if improvement < float(thresholds["min_improvement_over_raw"]):
+        return {
+            "selected": raw,
+            "accepted": accepted,
+            "raw_feasible": False,
+            "raw_task_feasible": False,
+            "candidate_set_available": False,
+            "replacement": False,
+            "reason": "best_left_below_improvement_margin",
+            "best_left": best_left,
+            "p_merge_improvement": improvement,
+        }
+    return {
+        "selected": best_left,
+        "accepted": accepted,
+        "raw_feasible": False,
+        "raw_task_feasible": False,
+        "candidate_set_available": True,
+        "replacement": True,
+        "reason": "raw_task_infeasible_lite_viable_left",
+        "best_left": best_left,
+        "p_merge_improvement": improvement,
     }

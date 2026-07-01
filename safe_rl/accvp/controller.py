@@ -6,7 +6,7 @@ from dataclasses import dataclass
 from typing import Any
 
 from safe_rl.accvp.calibration import CalibrationBundle
-from safe_rl.accvp.selection import select_viability_action
+from safe_rl.accvp.selection import select_viability_action, select_viability_lite_action
 from safe_rl.accvp.protocol import effective_activation_distance
 from safe_rl.sim.action_space import ACTIONS, CandidateAction
 
@@ -92,10 +92,10 @@ class ACCVPController:
                 )
                 return self._commitment.action, debug
             self._commitment = None
-        if self.mode == "viability_branch" and safety_shield_replaced:
+        if self.mode in {"viability_branch", "viability_lite", "viability_lite_shadow"} and safety_shield_replaced:
             debug["accvp_skip_reason"] = "shield_replaced_raw"
             return safety_shield_action, debug
-        if self.mode == "viability_branch" and not self._deadline_auxiliary(context):
+        if self.mode in {"viability_branch", "viability_lite", "viability_lite_shadow"} and not self._deadline_auxiliary(context):
             debug["accvp_skip_reason"] = "outside_deadline_window"
             return safety_shield_action, debug
         started = time.perf_counter()
@@ -111,7 +111,7 @@ class ACCVPController:
                 raw_scores = scorer(context, legal_actions)
             scored = self._apply_calibration(raw_scores)
             self._attach_secondary_safety(scored, context, shield)
-            decision = select_viability_action(scored, raw_action_id=raw_action.index, thresholds=self._thresholds())
+            decision = self._select(scored, raw_action)
             debug.update(self._shadow_debug(scored, raw_action))
             debug.update(self._selection_debug(scored, decision))
             elapsed = time.perf_counter() - started
@@ -129,9 +129,9 @@ class ACCVPController:
             debug["accvp_bypass_reason"] = "model_error"
             return safety_shield_action, debug
 
-        if self.mode == "shadow":
+        if self.mode in {"shadow", "viability_lite_shadow"}:
             return safety_shield_action, debug
-        if self.mode != "viability_branch":
+        if self.mode not in {"viability_branch", "viability_lite"}:
             debug["accvp_bypass_reason"] = "invalid_bundle"
             return safety_shield_action, debug
         if bool(decision["raw_feasible"]):
@@ -234,6 +234,25 @@ class ACCVPController:
             "merge_viability_lower_bound": float(self.config.accvp.merge_viability_lower_bound),
         }
 
+    def _lite_thresholds(self) -> dict[str, float]:
+        lite = self.config.accvp.get("viability_lite", {}) or {}
+        return {
+            "min_p_merge_before_taper": float(lite.get("min_p_merge_before_taper", 0.75)),
+            "min_improvement_over_raw": float(lite.get("min_improvement_over_raw", 0.01)),
+            "max_target_entry_time_s": float(lite.get("max_target_entry_time_s", 8.0)),
+            "max_ensemble_disagreement": float(lite.get("max_ensemble_disagreement", 0.20)),
+            "max_secondary_risk_score": float(lite.get("max_secondary_risk_score", 1.0)),
+        }
+
+    def _select(self, scores: list[dict[str, Any]], raw_action: CandidateAction) -> dict[str, Any]:
+        if self.mode in {"viability_lite", "viability_lite_shadow"}:
+            return select_viability_lite_action(
+                scores,
+                raw_action_id=int(raw_action.index),
+                thresholds=self._lite_thresholds(),
+            )
+        return select_viability_action(scores, raw_action_id=int(raw_action.index), thresholds=self._thresholds())
+
     def _deadline_auxiliary(self, context: dict[str, Any]) -> bool:
         local = context.get("merge_local")
         return bool(
@@ -260,6 +279,11 @@ class ACCVPController:
             "raw_feasible": bool(decision.get("raw_feasible", False)),
             "accepted_action_ids": [int(row["action_id"]) for row in decision.get("accepted", [])],
             "accvp_shadow_recommended_action": None if selected is None else int(selected["action_id"]),
+            "accvp_lite_raw_task_feasible": bool(decision.get("raw_task_feasible", False)),
+            "accvp_lite_best_left_action": (
+                None if decision.get("best_left") is None else int(decision["best_left"]["action_id"])
+            ),
+            "accvp_lite_p_merge_improvement": float(decision.get("p_merge_improvement", 0.0)),
             "accvp_shadow_candidates": [
                 {
                     "action_id": int(row["action_id"]),
@@ -272,6 +296,9 @@ class ACCVPController:
                     "secondary_safety_pass": bool(row.get("secondary_safety_pass", False)),
                     "candidate_legal": bool(row.get("candidate_legal", False)),
                     "gate_pass": bool(row.get("accvp_gate_pass", False)),
+                    "lite_gate_pass": bool(row.get("accvp_lite_gate_pass", False)),
+                    "lite_task_pass": bool(row.get("accvp_lite_task_pass", False)),
+                    "secondary_risk_score": float(row.get("secondary_risk_score", 0.0)),
                     "ensemble_disagreement": float(row.get("ensemble_disagreement", 0.0)),
                 }
                 for row in scores

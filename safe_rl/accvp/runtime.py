@@ -77,16 +77,26 @@ class ACCVPRuntimePredictor:
         if str(manifest.get("artifact_kind", "")) not in {
             "accvp_v1_artifact_bundle",
             "accvp_v1_shadow_artifact_bundle",
+            "accvp_v1_lite_task_artifact_bundle",
         }:
             raise ValueError("invalid ACCVP artifact manifest kind")
+        mode = str(self.config.accvp.get("mode", "off"))
+        kind = str(manifest.get("artifact_kind", ""))
         deployable = bool(
             manifest.get(
                 "deployable_artifact",
-                str(manifest.get("artifact_kind", "")) == "accvp_v1_artifact_bundle",
+                kind == "accvp_v1_artifact_bundle",
             )
         )
-        if str(self.config.accvp.get("mode", "off")) == "viability_branch" and not deployable:
+        if mode == "viability_branch" and not deployable:
             raise ValueError("ACCVP viability_branch requires deployable_artifact=true")
+        if mode == "viability_lite" and kind not in {"accvp_v1_lite_task_artifact_bundle", "accvp_v1_artifact_bundle"}:
+            raise ValueError("ACCVP viability_lite requires a lite task artifact or deployable_artifact=true")
+        if mode == "viability_lite" and kind == "accvp_v1_lite_task_artifact_bundle":
+            if str(manifest.get("deployable_claim", "")) != "task_viability_only":
+                raise ValueError("ACCVP viability_lite requires deployable_claim='task_viability_only'")
+            if bool(manifest.get("accvp_safety_head_hard_gate", True)):
+                raise ValueError("ACCVP viability_lite artifact must not use ACCVP safety head as a hard gate")
         expected = {
             "predictor_sha256": file_sha256(self.checkpoint_path),
         }
@@ -235,17 +245,38 @@ def build_accvp_controller(config: Any) -> ACCVPController | None:
     if operating_point:
         with Path(operating_point).open("r", encoding="utf-8") as handle:
             selected = dict(json.load(handle).get("selected", {}))
-        required = {
-            "proxy_collision_upper_bound",
-            "safety_violation_upper_bound",
-            "merge_viability_lower_bound",
-        }
-        if required.difference(selected):
-            raise ValueError("ACCVP operating-point bundle is missing selected gate thresholds")
-        config.accvp["proxy_collision_upper_bound"] = float(selected["proxy_collision_upper_bound"])
-        config.accvp["safety_violation_upper_bound"] = float(selected["safety_violation_upper_bound"])
-        config.accvp["merge_viability_lower_bound"] = float(selected["merge_viability_lower_bound"])
-    elif str(config.accvp.get("mode", "off")) == "viability_branch":
-        raise FileNotFoundError("accvp viability_branch requires accvp.operating_point from the held-out tuning split")
+        mode = str(config.accvp.get("mode", "off"))
+        if mode in {"viability_lite", "viability_lite_shadow"}:
+            required = {
+                "min_p_merge_before_taper",
+                "min_improvement_over_raw",
+                "max_target_entry_time_s",
+                "max_ensemble_disagreement",
+            }
+            if required.difference(selected):
+                raise ValueError("ACCVP-lite operating-point bundle is missing selected task-viability thresholds")
+            config.accvp.setdefault("viability_lite", {})
+            config.accvp.viability_lite["min_p_merge_before_taper"] = float(selected["min_p_merge_before_taper"])
+            config.accvp.viability_lite["min_improvement_over_raw"] = float(selected["min_improvement_over_raw"])
+            config.accvp.viability_lite["max_target_entry_time_s"] = float(selected["max_target_entry_time_s"])
+            config.accvp.viability_lite["max_ensemble_disagreement"] = float(selected["max_ensemble_disagreement"])
+            config.accvp.viability_lite["max_secondary_risk_score"] = float(
+                selected.get("max_secondary_risk_score", config.accvp.viability_lite.get("max_secondary_risk_score", 1.0))
+            )
+        else:
+            required = {
+                "proxy_collision_upper_bound",
+                "safety_violation_upper_bound",
+                "merge_viability_lower_bound",
+            }
+            if required.difference(selected):
+                raise ValueError("ACCVP operating-point bundle is missing selected gate thresholds")
+            config.accvp["proxy_collision_upper_bound"] = float(selected["proxy_collision_upper_bound"])
+            config.accvp["safety_violation_upper_bound"] = float(selected["safety_violation_upper_bound"])
+            config.accvp["merge_viability_lower_bound"] = float(selected["merge_viability_lower_bound"])
+    elif str(config.accvp.get("mode", "off")) in {"viability_branch", "viability_lite"}:
+        raise FileNotFoundError(
+            f"accvp {config.accvp.get('mode')} requires accvp.operating_point from the held-out tuning split"
+        )
     predictor.validate_artifact_bundle(operating_point)
     return ACCVPController(config, predictor, predictor.calibration)

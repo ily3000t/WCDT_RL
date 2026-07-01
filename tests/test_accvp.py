@@ -18,7 +18,7 @@ from safe_rl.accvp.protocol import counterfactual_data_contract, data_contract_h
 from safe_rl.accvp.root_context import RootContext
 from safe_rl.accvp.runtime import ACCVPRuntimePredictor
 from safe_rl.accvp.schema import COUNTERFACTUAL_SCHEMA_VERSION, stable_hash
-from safe_rl.accvp.selection import select_viability_action
+from safe_rl.accvp.selection import select_viability_action, select_viability_lite_action
 from safe_rl.accvp.shards import merge_counterfactual_shards
 from safe_rl.accvp.snapshot_store import CounterfactualSnapshotStore
 from safe_rl.pipeline.stage1_collect_accvp_jobs import materialise_collection_job, validate_required_pilot
@@ -136,6 +136,28 @@ def test_viability_branch_rejects_shadow_artifact_manifest(tmp_path: Path):
         predictor.validate_artifact_bundle(operating_point=tmp_path / "accvp_v1_operating_point.json")
 
 
+def test_viability_lite_rejects_plain_shadow_artifact_manifest(tmp_path: Path):
+    manifest = tmp_path / "accvp_v1_shadow_artifact_manifest.json"
+    manifest.write_text(
+        __import__("json").dumps(
+            {
+                "artifact_kind": "accvp_v1_shadow_artifact_bundle",
+                "deployable_artifact": False,
+            }
+        ),
+        encoding="utf-8",
+    )
+    cfg = clone_with_overrides(
+        load_config(),
+        {"accvp": {"enabled": True, "mode": "viability_lite", "artifact_manifest": str(manifest)}},
+    )
+    predictor = ACCVPRuntimePredictor.__new__(ACCVPRuntimePredictor)
+    predictor.config = cfg
+    predictor.checkpoint_path = tmp_path / "accvp_v1_predictor.pt"
+    with __import__("pytest").raises(ValueError, match="viability_lite requires"):
+        predictor.validate_artifact_bundle(operating_point=tmp_path / "accvp_v1_lite_operating_point.json")
+
+
 def test_only_raw_infeasible_allows_accvp_replacement_and_commitment():
     raw = decode_action(4)
     merge = decode_action(7)
@@ -177,6 +199,39 @@ def test_shadow_never_replaces():
     assert action == raw
     assert debug["accvp_replacement"] is False
     assert debug["accvp_shadow_scored_actions"] == 2
+
+
+def test_viability_lite_shadow_never_replaces_but_recommends_left():
+    raw = decode_action(4)
+    controller = ACCVPController(
+        _cfg("viability_lite_shadow"),
+        _Predictor([_score(4, viability=0.2), _score(7, viability=0.95)]),
+    )
+    action, debug = controller.decide(
+        context=_context(), raw_action=raw, safety_shield_action=raw, safety_shield_replaced=False, shield=_Shield()
+    )
+    assert action == raw
+    assert debug["accvp_replacement"] is False
+    assert debug["accvp_shadow_recommended_action"] == 7
+    assert debug["accvp_lite_raw_task_feasible"] is False
+    assert debug["accvp_lite_best_left_action"] == 7
+    assert debug["accvp_lite_p_merge_improvement"] > 0.0
+
+
+def test_viability_lite_active_replaces_and_starts_commitment():
+    raw = decode_action(4)
+    merge = decode_action(7)
+    controller = ACCVPController(
+        _cfg("viability_lite"),
+        _Predictor([_score(4, viability=0.2), _score(7, viability=0.95)]),
+    )
+    action, debug = controller.decide(
+        context=_context(), raw_action=raw, safety_shield_action=raw, safety_shield_replaced=False, shield=_Shield()
+    )
+    assert action == merge
+    assert debug["accvp_replacement"] is True
+    assert debug["accvp_replacement_reason"] == "raw_task_infeasible_lite_viable_left"
+    assert debug["accvp_commitment_started"] is True
 
 
 def test_candidate_plan_is_versioned_and_has_fixed_speed_continuation():
@@ -307,6 +362,68 @@ def test_selector_keeps_shield_action_when_only_non_merge_actions_pass():
     assert decision["selected"] is None
     assert decision["candidate_set_available"] is False
     assert decision["reason"] == "no_merge_intent_feasible_action"
+
+
+def _lite_thresholds():
+    return {
+        "min_p_merge_before_taper": 0.75,
+        "min_improvement_over_raw": 0.05,
+        "max_target_entry_time_s": 8.0,
+        "max_ensemble_disagreement": 0.2,
+        "max_secondary_risk_score": 1.0,
+    }
+
+
+def test_viability_lite_retains_raw_when_task_feasible_and_ignores_accvp_safety_head():
+    decision = select_viability_lite_action(
+        [
+            {"action_id": 4, "candidate_legal": True, "secondary_safety_pass": True, "secondary_risk_score": 0.1, "p_merge_before_taper": 0.80, "pU_proxy_collision": 1.0, "pU_safety_violation": 1.0, "target_lane_entry_time_s": 4.0, "ensemble_disagreement": 0.0},
+            {"action_id": 7, "candidate_legal": True, "secondary_safety_pass": True, "secondary_risk_score": 0.1, "p_merge_before_taper": 0.95, "target_lane_entry_time_s": 2.0, "ensemble_disagreement": 0.0},
+        ],
+        raw_action_id=4,
+        thresholds=_lite_thresholds(),
+    )
+    assert decision["selected"]["action_id"] == 4
+    assert decision["raw_task_feasible"] is True
+    assert decision["replacement"] is False
+
+
+def test_viability_lite_replaces_only_with_risk_safe_left_action():
+    decision = select_viability_lite_action(
+        [
+            {"action_id": 4, "candidate_legal": True, "secondary_safety_pass": True, "secondary_risk_score": 0.1, "p_merge_before_taper": 0.20, "target_lane_entry_time_s": 8.0, "ensemble_disagreement": 0.0},
+            {"action_id": 7, "candidate_legal": True, "secondary_safety_pass": False, "secondary_risk_score": 0.9, "p_merge_before_taper": 0.99, "target_lane_entry_time_s": 1.0, "ensemble_disagreement": 0.0},
+            {"action_id": 8, "candidate_legal": True, "secondary_safety_pass": True, "secondary_risk_score": 0.2, "p_merge_before_taper": 0.90, "target_lane_entry_time_s": 2.0, "ensemble_disagreement": 0.0},
+        ],
+        raw_action_id=4,
+        thresholds=_lite_thresholds(),
+    )
+    assert decision["selected"]["action_id"] == 8
+    assert decision["replacement"] is True
+    assert decision["reason"] == "raw_task_infeasible_lite_viable_left"
+
+
+def test_viability_lite_does_not_replace_with_keep_or_below_margin_left():
+    keep_only = select_viability_lite_action(
+        [
+            {"action_id": 4, "candidate_legal": True, "secondary_safety_pass": True, "p_merge_before_taper": 0.2, "target_lane_entry_time_s": 8.0, "ensemble_disagreement": 0.0},
+            {"action_id": 5, "candidate_legal": True, "secondary_safety_pass": True, "p_merge_before_taper": 0.99, "target_lane_entry_time_s": 1.0, "ensemble_disagreement": 0.0},
+        ],
+        raw_action_id=4,
+        thresholds=_lite_thresholds(),
+    )
+    assert keep_only["selected"] is None
+    assert keep_only["candidate_set_available"] is False
+    margin = select_viability_lite_action(
+        [
+            {"action_id": 4, "candidate_legal": True, "secondary_safety_pass": True, "p_merge_before_taper": 0.74, "target_lane_entry_time_s": 8.0, "ensemble_disagreement": 0.0},
+            {"action_id": 7, "candidate_legal": True, "secondary_safety_pass": True, "p_merge_before_taper": 0.78, "target_lane_entry_time_s": 1.0, "ensemble_disagreement": 0.0},
+        ],
+        raw_action_id=4,
+        thresholds=_lite_thresholds(),
+    )
+    assert margin["replacement"] is False
+    assert margin["reason"] == "best_left_below_improvement_margin"
 
 
 def test_availability_diagnostic_separates_oracle_and_risk_ceilings(tmp_path: Path):
