@@ -8,6 +8,7 @@ import numpy as np
 from safe_rl.accvp.candidate_plan import ACCVP_COMMITMENT_PROFILE, build_commitment_plan
 from safe_rl.accvp.calibration import CalibrationBundle, OneSidedBinnedCalibrator, selected_action_metrics
 from safe_rl.accvp.availability import audit_risk_secondary_false_negatives, diagnose_oracle_availability, model_gate_failure_diagnostics
+from safe_rl.accvp.candidate_table_diagnostics import candidate_table_summary
 from safe_rl.accvp.controller import ACCVPController
 from safe_rl.accvp.dataset import build_split_manifest
 from safe_rl.accvp.model import checkpoint_metadata
@@ -447,6 +448,62 @@ def test_model_gate_diagnostic_identifies_viability_gate_failure():
     assert report["model_gate_best_availability"] == 0.0
     assert report["reason_counts"]["model pL_viability gate failed"] == 1
     assert report["per_action_gate_pass_rate"]["7"]["viability_gate_pass_count"] == 0
+
+
+def test_candidate_table_diagnostic_reports_viability_only_pass():
+    thresholds = {
+        "proxy_collision_upper_bound": 0.2,
+        "safety_violation_upper_bound": 0.2,
+        "merge_viability_lower_bound": 0.5,
+    }
+    records = [
+        {
+            "root_id": "repairable",
+            "raw_action_id": 4,
+            "action_id": 4,
+            "candidate_legal": True,
+            "secondary_safety_pass": True,
+            "p_proxy_collision": 0.1,
+            "p_safety_violation": 0.1,
+            "p_taper_miss": 0.8,
+            "p_merge_before_taper": 0.1,
+            "pU_proxy_collision": 0.1,
+            "pU_safety_violation": 0.1,
+            "pL_merge_before_taper": 0.1,
+            "proxy_collision": 0.0,
+            "safety_violation": 0.0,
+            "taper_miss": 1.0,
+            "merge_before_taper": 0.0,
+            "merge_observed": True,
+        },
+        {
+            "root_id": "repairable",
+            "raw_action_id": 4,
+            "action_id": 7,
+            "candidate_legal": True,
+            "secondary_safety_pass": True,
+            "p_proxy_collision": 0.1,
+            "p_safety_violation": 0.1,
+            "p_taper_miss": 0.1,
+            "p_merge_before_taper": 0.9,
+            "pU_proxy_collision": 0.1,
+            "pU_safety_violation": 0.1,
+            "pL_merge_before_taper": 0.9,
+            "proxy_collision": 0.0,
+            "safety_violation": 0.0,
+            "taper_miss": 0.0,
+            "merge_before_taper": 1.0,
+            "merge_observed": True,
+        },
+    ]
+    report = candidate_table_summary(records, split="test", thresholds=thresholds)
+    assert report["verdict"]["deployable_claim"] is False
+    assert report["verdict"]["step1_5_state"] == "viability_only_pass"
+    assert report["pairwise_contrast"]["viability"]["accuracy"] == 1.0
+    assert report["raw_fail_left_success"]["raw_fail_left_success_root_count"] == 1
+    assert report["raw_fail_left_success"]["best_left_pmerge_gt_raw_rate"] == 1.0
+    assert report["per_action"]["7"]["is_left_action"] is True
+    assert report["raw_probability_recommendation"]["best_p_merge_action_counts"]["7"] == 1
 
 
 def test_split_keeps_all_roots_of_same_episode_seed_together(tmp_path: Path):

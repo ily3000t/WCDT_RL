@@ -63,6 +63,9 @@ def _accvp_shadow_metrics(reports: list[dict]) -> dict:
             "accvp_shadow_latency_p50": 0.0,
             "accvp_shadow_latency_p95": 0.0,
             "accvp_shadow_per_action_gate_pass_rate": {},
+            "accvp_shadow_per_action_summary": {},
+            "accvp_shadow_recommended_action_counts": {},
+            "accvp_shadow_raw_probabilities": {},
             "accvp_shadow_raw_bounds": {},
         }
     merge_intent = {6, 7, 8}
@@ -75,23 +78,56 @@ def _accvp_shadow_metrics(reports: list[dict]) -> dict:
     latency = [float(record.get("decision_latency_s", 0.0)) for record in records]
     per_action_counts: dict[str, int] = {}
     per_action_pass: dict[str, int] = {}
+    per_action_values: dict[str, dict[str, list[float]]] = {}
+    recommended_counts: Counter[str] = Counter()
+    raw_p_proxy: list[float] = []
+    raw_p_safety: list[float] = []
+    raw_p_viability: list[float] = []
     raw_pu_proxy: list[float] = []
     raw_pu_safety: list[float] = []
     raw_pl_viability: list[float] = []
+    for item in recommended:
+        recommended_counts["None" if item is None else str(int(item))] += 1
     for record in records:
         raw_action = int(record.get("raw_action", -1))
         for candidate in list(record.get("accvp_shadow_candidates", []) or []):
             action_id = str(int(candidate.get("action_id", -1)))
             per_action_counts[action_id] = per_action_counts.get(action_id, 0) + 1
+            per_action_values.setdefault(
+                action_id,
+                {
+                    "p_proxy_collision": [],
+                    "p_safety_violation": [],
+                    "p_merge_before_taper": [],
+                    "pU_proxy_collision": [],
+                    "pU_safety_violation": [],
+                    "pL_merge_before_taper": [],
+                    "ensemble_disagreement": [],
+                },
+            )
+            for key, values in per_action_values[action_id].items():
+                if candidate.get(key) is not None:
+                    values.append(float(candidate.get(key, 0.0)))
             if bool(candidate.get("gate_pass", False)):
                 per_action_pass[action_id] = per_action_pass.get(action_id, 0) + 1
             if int(candidate.get("action_id", -999)) == raw_action:
+                raw_p_proxy.append(float(candidate.get("p_proxy_collision", 0.0)))
+                raw_p_safety.append(float(candidate.get("p_safety_violation", 0.0)))
+                raw_p_viability.append(float(candidate.get("p_merge_before_taper", 0.0)))
                 raw_pu_proxy.append(float(candidate.get("pU_proxy_collision", 0.0)))
                 raw_pu_safety.append(float(candidate.get("pU_safety_violation", 0.0)))
                 raw_pl_viability.append(float(candidate.get("pL_merge_before_taper", 0.0)))
     pass_rate = {
         action_id: float(per_action_pass.get(action_id, 0) / max(1, count))
         for action_id, count in sorted(per_action_counts.items(), key=lambda item: int(item[0]))
+    }
+    per_action_summary = {
+        action_id: {
+            "count": int(per_action_counts.get(action_id, 0)),
+            "gate_pass_rate": pass_rate.get(action_id, 0.0),
+            **{key: _quantile_summary(values) for key, values in values_by_key.items()},
+        }
+        for action_id, values_by_key in sorted(per_action_values.items(), key=lambda item: int(item[0]))
     }
     return {
         "accvp_shadow_record_count": int(len(records)),
@@ -111,6 +147,15 @@ def _accvp_shadow_metrics(reports: list[dict]) -> dict:
         "accvp_shadow_latency_p50": float(np.percentile(latency, 50)),
         "accvp_shadow_latency_p95": float(np.percentile(latency, 95)),
         "accvp_shadow_per_action_gate_pass_rate": pass_rate,
+        "accvp_shadow_per_action_summary": per_action_summary,
+        "accvp_shadow_recommended_action_counts": dict(
+            sorted(recommended_counts.items(), key=lambda item: 999 if item[0] == "None" else int(item[0]))
+        ),
+        "accvp_shadow_raw_probabilities": {
+            "p_proxy_collision": _quantile_summary(raw_p_proxy),
+            "p_safety_violation": _quantile_summary(raw_p_safety),
+            "p_merge_before_taper": _quantile_summary(raw_p_viability),
+        },
         "accvp_shadow_raw_bounds": {
             "pU_proxy_collision": _quantile_summary(raw_pu_proxy),
             "pU_safety_violation": _quantile_summary(raw_pu_safety),
