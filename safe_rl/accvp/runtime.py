@@ -92,11 +92,14 @@ class ACCVPRuntimePredictor:
             raise ValueError("ACCVP viability_branch requires deployable_artifact=true")
         if mode == "viability_lite" and kind not in {"accvp_v1_lite_task_artifact_bundle", "accvp_v1_artifact_bundle"}:
             raise ValueError("ACCVP viability_lite requires a lite task artifact or deployable_artifact=true")
-        if mode == "viability_lite" and kind == "accvp_v1_lite_task_artifact_bundle":
+        if mode in {"viability_lite", "viability_lite_shadow"} and kind == "accvp_v1_lite_task_artifact_bundle":
             if str(manifest.get("deployable_claim", "")) != "task_viability_only":
                 raise ValueError("ACCVP viability_lite requires deployable_claim='task_viability_only'")
             if bool(manifest.get("accvp_safety_head_hard_gate", True)):
                 raise ValueError("ACCVP viability_lite artifact must not use ACCVP safety head as a hard gate")
+            expected_profile = str(self.config.accvp.get("viability_lite", {}).get("secondary_safety_profile", "strict"))
+            if str(manifest.get("secondary_safety_profile", "strict")) != expected_profile:
+                raise ValueError("ACCVP-lite artifact secondary_safety_profile mismatch")
         expected = {
             "predictor_sha256": file_sha256(self.checkpoint_path),
         }
@@ -262,6 +265,12 @@ def build_accvp_controller(config: Any) -> ACCVPController | None:
             config.accvp.viability_lite["max_ensemble_disagreement"] = float(selected["max_ensemble_disagreement"])
             config.accvp.viability_lite["max_secondary_risk_score"] = float(
                 selected.get("max_secondary_risk_score", config.accvp.viability_lite.get("max_secondary_risk_score", 1.0))
+            )
+            config.accvp.viability_lite["secondary_safety_profile"] = str(
+                selected.get(
+                    "secondary_safety_profile",
+                    config.accvp.viability_lite.get("secondary_safety_profile", "strict"),
+                )
             )
         else:
             required = {

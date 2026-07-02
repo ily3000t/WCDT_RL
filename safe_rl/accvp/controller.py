@@ -242,6 +242,7 @@ class ACCVPController:
             "max_target_entry_time_s": float(lite.get("max_target_entry_time_s", 8.0)),
             "max_ensemble_disagreement": float(lite.get("max_ensemble_disagreement", 0.20)),
             "max_secondary_risk_score": float(lite.get("max_secondary_risk_score", 1.0)),
+            "secondary_safety_profile": str(lite.get("secondary_safety_profile", "strict")),
         }
 
     def _select(self, scores: list[dict[str, Any]], raw_action: CandidateAction) -> dict[str, Any]:
@@ -277,6 +278,7 @@ class ACCVPController:
         return {
             "candidate_set_available": bool(decision.get("candidate_set_available", False)),
             "raw_feasible": bool(decision.get("raw_feasible", False)),
+            "accvp_selection_reason": str(decision.get("reason", "")),
             "accepted_action_ids": [int(row["action_id"]) for row in decision.get("accepted", [])],
             "accvp_shadow_recommended_action": None if selected is None else int(selected["action_id"]),
             "accvp_lite_raw_task_feasible": bool(decision.get("raw_task_feasible", False)),
@@ -298,6 +300,8 @@ class ACCVPController:
                     "gate_pass": bool(row.get("accvp_gate_pass", False)),
                     "lite_gate_pass": bool(row.get("accvp_lite_gate_pass", False)),
                     "lite_task_pass": bool(row.get("accvp_lite_task_pass", False)),
+                    "lite_secondary_pass": bool(row.get("accvp_lite_secondary_pass", False)),
+                    "lite_secondary_safety_profile": str(row.get("accvp_lite_secondary_safety_profile", "strict")),
                     "secondary_risk_score": float(row.get("secondary_risk_score", 0.0)),
                     "ensemble_disagreement": float(row.get("ensemble_disagreement", 0.0)),
                 }

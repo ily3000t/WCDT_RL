@@ -1,0 +1,45 @@
+run:
+  run_id: "accvp_240_lite_v3"
+  output_root: "safe_rl_output/runs"
+  tensorboard: false
+
+experiment:
+  purpose: "accvp_viability_lite_v3_tuning"
+  deployable_claim: "task_viability_only"
+
+accvp:
+  enabled: false
+  mode: "off"
+  schema_version: 2
+  activation_distance: 240.0
+  dataset_dir: "safe_rl_output/runs/accvp_240_formal_dataset"
+  checkpoint: "safe_rl_output/runs/accvp_240_shadow_train/accvp/accvp_v1_predictor.pt"
+  calibration_bundle: "safe_rl_output/runs/accvp_240_shadow_train/accvp/accvp_v1_calibration.json"
+  operating_point: "safe_rl_output/runs/accvp_240_lite_v3/accvp/accvp_v1_lite_v3_operating_point.json"
+  risk_checkpoint: "safe_rl_output/runs/safe_rl_comparison_schema9_validation_001/stage2/risk_module.pt"
+  response_horizon_s: 3.0
+  response_horizon_steps: 30
+  viability_horizon_s: 8.0
+  candidate_plan_horizon_steps: 80
+  ensemble_size: 1
+  viability_lite:
+    artifact_prefix: "accvp_v1_lite_v3"
+    secondary_safety_profile: "audited_merge_left_v1"
+    min_p_merge_before_taper: 0.80
+    min_improvement_over_raw: 0.005
+    max_target_entry_time_s: 6.0
+    max_ensemble_disagreement: 0.05
+    max_secondary_risk_score: 1.0
+    min_left_p_merge_before_taper_grid: [0.80, 0.82, 0.85, 0.90]
+    min_improvement_over_raw_grid: [0.005, 0.01, 0.02, 0.05, 0.10]
+    max_target_entry_time_s_grid: [4.0, 6.0, 8.0]
+    max_ensemble_disagreement_grid: [0.02, 0.05, 0.10]
+    max_secondary_risk_score_grid: [0.05]
+    max_replacement_rate: 0.10
+    acceptance:
+      require_replacement: true
+      max_replacement_safety_event_rate: 0.0
+      min_replacement_merge_success_rate: 0.90
+      max_replacement_unnecessary_rate: 0.25
+      max_replacement_rate: 0.10
+      min_replacement_repairable_capture_rate: 0.05

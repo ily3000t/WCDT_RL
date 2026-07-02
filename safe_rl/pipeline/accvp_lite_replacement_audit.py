@@ -39,6 +39,7 @@ def _thresholds_from_operating_point(path: Path | None, cfg) -> dict[str, float]
         "max_target_entry_time_s": float(selected["max_target_entry_time_s"]),
         "max_ensemble_disagreement": float(selected["max_ensemble_disagreement"]),
         "max_secondary_risk_score": float(selected.get("max_secondary_risk_score", 1.0)),
+        "secondary_safety_profile": str(selected.get("secondary_safety_profile", "strict")),
     }
 
 

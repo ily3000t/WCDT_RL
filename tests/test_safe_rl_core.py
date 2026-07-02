@@ -2242,6 +2242,92 @@ def test_stage5_metrics_include_accvp_lite_shadow_aggregates():
     assert metrics["accvp_lite_best_left_action_counts"] == {"8": 1}
     assert metrics["accvp_lite_per_action_gate_pass_rate"]["8"] == 1.0
     assert metrics["accvp_shadow_raw_probabilities"]["p_merge_before_taper"]["mean"] == pytest.approx(0.4)
+    assert metrics["accvp_active_replacement_count"] == 0
+    assert metrics["accvp_active_replacement_episode_rate"] == 0.0
+
+
+def test_stage5_metrics_include_accvp_active_replacements():
+    metrics = aggregate_episode_reports(
+        [
+            {
+                "collision": False,
+                "near_miss": False,
+                "min_distance": 5.0,
+                "ttc_p1": 2.0,
+                "drac_p99": 1.0,
+                "proxy_collision": False,
+                "safety_violation": False,
+                "steps": 100,
+                "completion_time": 10.0,
+                "ego_speed_mean": 20.0,
+                "ego_speed_p10": 15.0,
+                "hard_brake_rate": 0.0,
+                "intervention_count": 0,
+                "shield_call_count": 0,
+                "actual_replacement_count": 0,
+                "fallback_count": 0,
+                "emergency_fallback_count": 0,
+                "accvp_record_count": 3,
+                "accvp_replacement_count": 1,
+                "accvp_records": [
+                    {
+                        "accvp_replacement": True,
+                        "accvp_replacement_reason": "raw_task_infeasible_lite_viable_left",
+                        "accvp_selected_action": 8,
+                        "raw_action": 5,
+                        "safety_shield_action": 5,
+                        "candidate_set_available": True,
+                        "raw_feasible": False,
+                        "accvp_shadow_recommended_action": 8,
+                        "accvp_bypass_reason": "",
+                        "decision_latency_s": 0.02,
+                        "accvp_lite_raw_task_feasible": False,
+                        "accvp_lite_best_left_action": 8,
+                        "accvp_lite_p_merge_improvement": 0.1,
+                    },
+                    {
+                        "accvp_replacement": True,
+                        "accvp_replacement_reason": "lateral_commitment",
+                        "accvp_selected_action": 8,
+                        "raw_action": 5,
+                        "safety_shield_action": 5,
+                        "candidate_set_available": True,
+                        "raw_feasible": False,
+                        "accvp_shadow_recommended_action": 8,
+                        "accvp_bypass_reason": "",
+                        "decision_latency_s": 0.01,
+                        "accvp_lite_raw_task_feasible": False,
+                        "accvp_lite_best_left_action": 8,
+                        "accvp_lite_p_merge_improvement": 0.1,
+                    },
+                    {
+                        "accvp_replacement": False,
+                        "accvp_replacement_reason": "",
+                        "accvp_selected_action": 5,
+                        "raw_action": 5,
+                        "safety_shield_action": 5,
+                        "candidate_set_available": True,
+                        "raw_feasible": True,
+                        "accvp_shadow_recommended_action": 5,
+                        "accvp_bypass_reason": "",
+                        "decision_latency_s": 0.01,
+                        "accvp_lite_raw_task_feasible": True,
+                        "accvp_lite_best_left_action": None,
+                        "accvp_lite_p_merge_improvement": 0.0,
+                    },
+                ],
+            }
+        ]
+    )
+    assert metrics["mean_actual_replacements"] == 0.0
+    assert metrics["accvp_active_replacement_count"] == 1
+    assert metrics["accvp_active_replacement_episode_rate"] == 1.0
+    assert metrics["accvp_active_replacement_per_decision_rate"] == pytest.approx(1 / 3)
+    assert metrics["accvp_active_commitment_replacement_count"] == 1
+    assert metrics["accvp_active_replacement_reason_counts"] == {
+        "raw_task_infeasible_lite_viable_left": 1
+    }
+    assert metrics["accvp_active_replacement_selected_action_counts"] == {"8": 1}
 
 
 def test_stage5_task_quality_metrics_are_pre_registered():

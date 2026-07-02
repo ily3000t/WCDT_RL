@@ -21,6 +21,33 @@ def _secondary_risk_score(row: dict[str, Any]) -> float:
     return float(secondary.get("risk_score", 0.0))
 
 
+def _candidate_legal(row: dict[str, Any]) -> bool:
+    return bool(row.get("candidate_legal", True))
+
+
+def _strict_secondary_pass(row: dict[str, Any]) -> bool:
+    return _candidate_legal(row) and bool(row.get("secondary_safety_pass", True))
+
+
+def lite_secondary_safety_pass(row: dict[str, Any], thresholds: dict[str, Any]) -> bool:
+    """Versioned secondary safety predicate for ACV-Shield-lite.
+
+    ``strict`` preserves the existing Risk secondary pass semantics.  The
+    audited profile is intentionally narrow: it can only affect merge-left
+    candidates and still relies on the Risk score rather than ACCVP safety
+    heads.
+    """
+
+    if not _candidate_legal(row):
+        return False
+    max_score = float(thresholds.get("max_secondary_risk_score", float("inf")))
+    profile = str(thresholds.get("secondary_safety_profile", "strict"))
+    action_id = int(row.get("action_id", -1))
+    if profile == "audited_merge_left_v1" and action_id in LEFT_ACTION_IDS:
+        return _secondary_risk_score(row) <= max_score
+    return _strict_secondary_pass(row) and _secondary_risk_score(row) <= max_score
+
+
 def gate_candidates(candidates: list[dict[str, Any]], thresholds: dict[str, float]) -> list[dict[str, Any]]:
     accepted: list[dict[str, Any]] = []
     for source in candidates:
@@ -105,12 +132,10 @@ def select_viability_action(
 
 def _lite_task_pass(row: dict[str, Any], thresholds: dict[str, float]) -> bool:
     return (
-        bool(row.get("candidate_legal", True))
-        and bool(row.get("secondary_safety_pass", True))
+        lite_secondary_safety_pass(row, thresholds)
         and float(row.get("p_merge_before_taper", 0.0)) >= float(thresholds["min_p_merge_before_taper"])
         and float(row.get("target_lane_entry_time_s", float("inf"))) <= float(thresholds["max_target_entry_time_s"])
         and float(row.get("ensemble_disagreement", 0.0)) <= float(thresholds["max_ensemble_disagreement"])
-        and _secondary_risk_score(row) <= float(thresholds.get("max_secondary_risk_score", float("inf")))
     )
 
 
@@ -120,6 +145,8 @@ def gate_viability_lite_candidates(candidates: list[dict[str, Any]], thresholds:
     accepted: list[dict[str, Any]] = []
     for row in candidates:
         task_pass = _lite_task_pass(row, thresholds)
+        row["accvp_lite_secondary_pass"] = bool(lite_secondary_safety_pass(row, thresholds))
+        row["accvp_lite_secondary_safety_profile"] = str(thresholds.get("secondary_safety_profile", "strict"))
         row["accvp_lite_task_pass"] = bool(task_pass)
         row["accvp_lite_gate_pass"] = bool(task_pass)
         if task_pass:

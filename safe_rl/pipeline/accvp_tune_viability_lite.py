@@ -30,6 +30,41 @@ def _artifact_dir(cfg) -> Path:
     return output_root / str(cfg.run.run_id) / "accvp"
 
 
+def _finite_float(value, default: float = float("nan")) -> float:
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def _lite_acceptance_failures(final_test: dict, cfg) -> list[str]:
+    acceptance = dict((cfg.accvp.get("viability_lite", {}) or {}).get("acceptance", {}) or {})
+    if not acceptance:
+        return []
+    failures: list[str] = []
+    replacement_count = int(final_test.get("replacement_count", 0))
+    if bool(acceptance.get("require_replacement", False)) and replacement_count <= 0:
+        failures.append("replacement_count<=0")
+    checks = [
+        ("replacement_action_safety_event_rate", "<=", acceptance.get("max_replacement_safety_event_rate")),
+        ("replacement_action_merge_success_rate", ">=", acceptance.get("min_replacement_merge_success_rate")),
+        ("replacement_unnecessary_rate", "<=", acceptance.get("max_replacement_unnecessary_rate")),
+        ("replacement_rate", "<=", acceptance.get("max_replacement_rate")),
+        ("replacement_repairable_capture_rate", ">", acceptance.get("min_replacement_repairable_capture_rate")),
+    ]
+    for key, op, limit in checks:
+        if limit is None:
+            continue
+        value = _finite_float(final_test.get(key))
+        if op == "<=" and not (value <= float(limit)):
+            failures.append(f"{key}>{limit}")
+        if op == ">=" and not (value >= float(limit)):
+            failures.append(f"{key}<{limit}")
+        if op == ">" and not (value > float(limit)):
+            failures.append(f"{key}<={limit}")
+    return failures
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="Tune ACV-Shield-lite task-viability operating point")
     parser.add_argument("--config", required=True, help="ACCVP shadow training config")
@@ -71,6 +106,20 @@ def main() -> None:
     test_records = candidate_records_from_dataset(models, test_set, calibration, torch)
     operating_point = tune_viability_lite_operating_point(operating_records, cfg, split="operating_point")
     final_test = evaluate_lite_thresholds(test_records, operating_point["selected"], split="test")
+    acceptance_failures = _lite_acceptance_failures(final_test, cfg)
+    if acceptance_failures:
+        failure = {
+            "artifact_kind": "accvp_viability_lite_tuning_failure",
+            "deployable_artifact": False,
+            "failures": acceptance_failures,
+            "operating_point": operating_point,
+            "final_test": final_test,
+        }
+        write_report(output_dir / f"{artifact_prefix}_tuning_failure_diagnostics.json", failure)
+        raise SystemExit(
+            "ACCVP-lite operating point failed acceptance; "
+            f"wrote {output_dir / f'{artifact_prefix}_tuning_failure_diagnostics.json'}"
+        )
     artifacts = write_lite_artifacts(
         output_dir=output_dir,
         config=cfg,

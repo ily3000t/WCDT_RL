@@ -18,11 +18,14 @@ from safe_rl.accvp.protocol import counterfactual_data_contract, data_contract_h
 from safe_rl.accvp.root_context import RootContext
 from safe_rl.accvp.runtime import ACCVPRuntimePredictor
 from safe_rl.accvp.schema import COUNTERFACTUAL_SCHEMA_VERSION, stable_hash
+from safe_rl.accvp.risk_secondary_audit import audit_risk_secondary
+from safe_rl.accvp.online_trigger_audit import audit_online_triggers
 from safe_rl.accvp.selection import select_viability_action, select_viability_lite_action
 from safe_rl.accvp.shards import merge_counterfactual_shards
 from safe_rl.accvp.snapshot_store import CounterfactualSnapshotStore
 from safe_rl.accvp.viability_lite import evaluate_lite_thresholds, tune_viability_lite_operating_point
 from safe_rl.accvp.viability_lite_audit import audit_lite_replacements
+from safe_rl.pipeline.accvp_tune_viability_lite import _lite_acceptance_failures
 from safe_rl.pipeline.stage1_collect_accvp_jobs import materialise_collection_job, validate_required_pilot
 from safe_rl.stage1_counterfactual.collector import _cache_dir, _root_filter_matches, _seed_schedule
 from safe_rl.sim.action_space import decode_action
@@ -524,6 +527,126 @@ def test_viability_lite_tuning_uses_replacement_only_metrics_and_secondary_risk_
     assert report["selected_metrics"]["replacement_action_risk_pass_rate"] == 1.0
     assert report["selected_metrics"]["replacement_action_safety_event_rate"] == 0.0
     assert report["selected_metrics"]["replacement_repairable_capture_rate"] == 1.0
+
+
+def test_viability_lite_audited_profile_can_recover_risk_failed_left_only():
+    thresholds = {
+        "min_p_merge_before_taper": 0.8,
+        "min_improvement_over_raw": 0.01,
+        "max_target_entry_time_s": 6.0,
+        "max_ensemble_disagreement": 0.1,
+        "max_secondary_risk_score": 0.95,
+        "secondary_safety_profile": "audited_merge_left_v1",
+    }
+    decision = select_viability_lite_action(
+        [
+            _lite_record("root", 301, 4, 4, p_merge=0.1, success=False, risk_pass=False, risk_score=0.1),
+            _lite_record("root", 301, 8, 4, p_merge=0.9, success=True, risk_pass=False, risk_score=0.9),
+        ],
+        raw_action_id=4,
+        thresholds=thresholds,
+    )
+    assert decision["replacement"] is True
+    assert int(decision["selected"]["action_id"]) == 8
+    assert decision["selected"]["accvp_lite_secondary_safety_profile"] == "audited_merge_left_v1"
+
+
+def test_risk_secondary_audit_reports_false_negatives_and_safe_sweep():
+    records = [
+        _lite_record("risk_fn", 401, 4, 4, p_merge=0.1, success=False),
+        _lite_record("risk_fn", 401, 8, 4, p_merge=0.9, success=True, risk_pass=False, risk_score=0.8),
+    ]
+    base = {
+        "min_p_merge_before_taper": 0.8,
+        "min_improvement_over_raw": 0.01,
+        "max_target_entry_time_s": 6.0,
+        "max_ensemble_disagreement": 0.1,
+        "max_secondary_risk_score": 0.2,
+        "max_replacement_rate": 1.0,
+        "secondary_safety_profile": "strict",
+    }
+    report = audit_risk_secondary(records, base, split="test", risk_score_grid=[0.2, 0.9])
+    assert report["confusion"]["risk_fail_clean_success"] == 1
+    assert report["selected_audited_profile"]["secondary_safety_profile"] == "audited_merge_left_v1"
+    assert report["selected_audited_profile"]["max_secondary_risk_score"] == 0.9
+    assert report["threshold_sweep"][1]["safe_success_recovered_count"] == 1
+    assert report["threshold_sweep"][1]["unsafe_pass_count"] == 0
+
+
+def test_viability_lite_acceptance_detects_failed_final_test():
+    cfg = clone_with_overrides(
+        load_config(),
+        {
+            "accvp": {
+                "viability_lite": {
+                    "acceptance": {
+                        "require_replacement": True,
+                        "max_replacement_safety_event_rate": 0.0,
+                        "min_replacement_merge_success_rate": 0.9,
+                        "max_replacement_unnecessary_rate": 0.25,
+                        "max_replacement_rate": 0.10,
+                        "min_replacement_repairable_capture_rate": 0.05,
+                    }
+                }
+            }
+        },
+    )
+    failures = _lite_acceptance_failures(
+        {
+            "replacement_count": 1,
+            "replacement_action_safety_event_rate": 0.0,
+            "replacement_action_merge_success_rate": 0.8,
+            "replacement_unnecessary_rate": 0.5,
+            "replacement_rate": 0.02,
+            "replacement_repairable_capture_rate": 0.05,
+        },
+        cfg,
+    )
+    assert "replacement_action_merge_success_rate<0.9" in failures
+    assert "replacement_unnecessary_rate>0.25" in failures
+    assert "replacement_repairable_capture_rate<=0.05" in failures
+
+
+def test_online_trigger_audit_generates_deterministic_shadow_seed_file(tmp_path: Path):
+    replay = tmp_path / "group_seed_12.json"
+    replay.write_text(
+        __import__("json").dumps(
+            {
+                "seed": 12,
+                "group_name": "shield_accvp_lite_shadow_v3",
+                "notes": {
+                    "accvp_records": [
+                        {
+                            "accvp_mode": "viability_lite_shadow",
+                            "accvp_skip_reason": "",
+                            "accvp_bypass_reason": "",
+                            "candidate_set_available": True,
+                            "raw_feasible": False,
+                            "raw_action": 4,
+                            "safety_shield_action": 4,
+                            "accvp_shadow_recommended_action": 8,
+                            "accvp_lite_p_merge_improvement": 0.05,
+                            "step": 10,
+                            "decision_index": 2,
+                        },
+                        {
+                            "accvp_mode": "viability_lite_shadow",
+                            "accvp_skip_reason": "outside_deadline_window",
+                            "accvp_bypass_reason": "",
+                            "candidate_set_available": False,
+                            "raw_action": 5,
+                            "safety_shield_action": 5,
+                        },
+                    ]
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    report = audit_online_triggers([tmp_path], group_contains="accvp_lite_shadow")
+    assert report["online_targeted_seeds"] == [12]
+    assert report["would_trigger_count"] == 1
+    assert report["reason_counts"]["skip:outside_deadline_window"] == 1
 
 
 def test_availability_diagnostic_separates_oracle_and_risk_ceilings(tmp_path: Path):

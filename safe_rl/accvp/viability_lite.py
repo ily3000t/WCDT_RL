@@ -8,7 +8,7 @@ from typing import Any
 import numpy as np
 
 from safe_rl.accvp.schema import file_sha256, read_json, stable_hash, write_json_atomic
-from safe_rl.accvp.selection import LEFT_ACTION_IDS, select_viability_lite_action
+from safe_rl.accvp.selection import LEFT_ACTION_IDS, lite_secondary_safety_pass, select_viability_lite_action
 
 
 def lite_thresholds_from_config(config: Any) -> dict[str, float]:
@@ -19,6 +19,7 @@ def lite_thresholds_from_config(config: Any) -> dict[str, float]:
         "max_target_entry_time_s": float(lite.get("max_target_entry_time_s", 8.0)),
         "max_ensemble_disagreement": float(lite.get("max_ensemble_disagreement", 0.20)),
         "max_secondary_risk_score": float(lite.get("max_secondary_risk_score", 1.0)),
+        "secondary_safety_profile": str(lite.get("secondary_safety_profile", "strict")),
     }
 
 
@@ -37,22 +38,24 @@ def _success(row: dict[str, Any]) -> bool:
     return bool(row.get("merge_observed", False)) and float(row.get("merge_before_taper", 0.0)) >= 0.5
 
 
-def _risk_pass(row: dict[str, Any]) -> bool:
-    return bool(row.get("candidate_legal", True)) and bool(row.get("secondary_safety_pass", True))
+def _risk_pass(row: dict[str, Any], thresholds: dict[str, Any] | None = None) -> bool:
+    if thresholds is None:
+        return bool(row.get("candidate_legal", True)) and bool(row.get("secondary_safety_pass", True))
+    return lite_secondary_safety_pass(row, thresholds)
 
 
 def _rate_or_nan(values: list[bool]) -> float:
     return float(np.mean([bool(value) for value in values])) if values else float("nan")
 
 
-def _repairable(candidates: list[dict[str, Any]]) -> bool:
+def _repairable(candidates: list[dict[str, Any]], thresholds: dict[str, Any]) -> bool:
     raw_action_id = int(candidates[0].get("raw_action_id", -1))
     raw = next((row for row in candidates if int(row["action_id"]) == raw_action_id), None)
     return bool(
         raw is not None
         and bool(raw.get("merge_observed", False))
         and not _success(raw)
-        and any(int(row["action_id"]) in LEFT_ACTION_IDS and _risk_pass(row) and _safe(row) and _success(row) for row in candidates)
+        and any(int(row["action_id"]) in LEFT_ACTION_IDS and _risk_pass(row, thresholds) and _safe(row) and _success(row) for row in candidates)
     )
 
 
@@ -99,13 +102,13 @@ def evaluate_lite_thresholds(
             )
         else:
             raw_retained += 1
-        if _repairable(candidates):
+        if _repairable(candidates, thresholds):
             repairable_count += 1
             if bool(decision.get("replacement", False)) and chosen is not None and int(chosen["action_id"]) in LEFT_ACTION_IDS:
                 repairable_captured += 1
     selected_observed = [row for row in selected if bool(row.get("merge_observed", False))]
     replacement_observed = [row for row in replacements if bool(row.get("merge_observed", False))]
-    replacement_risk_pass_rate = _rate_or_nan([_risk_pass(row) for row in replacements])
+    replacement_risk_pass_rate = _rate_or_nan([_risk_pass(row, thresholds) for row in replacements])
     replacement_safety_event_rate = _rate_or_nan([not _safe(row) for row in replacements])
     replacement_merge_success_rate = _rate_or_nan([_success(row) for row in replacement_observed])
     replacement_unnecessary_rate = float(unnecessary_replacements / max(1, len(replacements)))
@@ -122,7 +125,7 @@ def evaluate_lite_thresholds(
         "repairable_root_capture_rate": float(repairable_captured / max(1, repairable_count)),
         "replacement_repairable_capture_rate": replacement_repairable_capture_rate,
         "selected_action_risk_pass_rate": (
-            float(np.mean([_risk_pass(row) for row in selected])) if selected else float("nan")
+            float(np.mean([_risk_pass(row, thresholds) for row in selected])) if selected else float("nan")
         ),
         "selected_action_safety_event_rate": (
             float(np.mean([not _safe(row) for row in selected])) if selected else float("nan")
@@ -155,6 +158,7 @@ def tune_viability_lite_operating_point(
 ) -> dict[str, Any]:
     lite = config.accvp.get("viability_lite", {}) or {}
     max_replacement_rate = float(lite.get("max_replacement_rate", 0.50))
+    secondary_safety_profile = str(lite.get("secondary_safety_profile", "strict"))
     evaluated = []
     for p_merge, improvement, entry, disagreement, risk_score in product(
         lite.get("min_left_p_merge_before_taper_grid", [0.70, 0.75, 0.78, 0.80]),
@@ -169,6 +173,7 @@ def tune_viability_lite_operating_point(
             "max_target_entry_time_s": float(entry),
             "max_ensemble_disagreement": float(disagreement),
             "max_secondary_risk_score": float(risk_score),
+            "secondary_safety_profile": secondary_safety_profile,
         }
         evaluated.append(evaluate_lite_thresholds(records, thresholds, split=split))
     feasible = [
@@ -196,6 +201,7 @@ def tune_viability_lite_operating_point(
         "split": split,
         "controller": "acv_shield_lite",
         "safety_authority": "risk_module_safety_shield",
+        "secondary_safety_profile": secondary_safety_profile,
         "accvp_safety_head_hard_gate": False,
         "deployable_claim": "task_viability_only",
         "max_replacement_rate": max_replacement_rate,
@@ -231,6 +237,7 @@ def write_lite_artifacts(
         "artifact_kind": "accvp_v1_lite_task_artifact_bundle",
         "controller": "acv_shield_lite",
         "safety_authority": "risk_module_safety_shield",
+        "secondary_safety_profile": str(config.accvp.get("viability_lite", {}).get("secondary_safety_profile", "strict")),
         "accvp_safety_head_hard_gate": False,
         "deployable_claim": "task_viability_only",
         "predictor_sha256": file_sha256(checkpoint),

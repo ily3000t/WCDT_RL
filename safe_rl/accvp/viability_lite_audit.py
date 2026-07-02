@@ -7,7 +7,7 @@ from typing import Any
 import numpy as np
 
 from safe_rl.accvp.schema import write_json_atomic
-from safe_rl.accvp.selection import LEFT_ACTION_IDS, select_viability_lite_action
+from safe_rl.accvp.selection import LEFT_ACTION_IDS, lite_secondary_safety_pass, select_viability_lite_action
 from safe_rl.accvp.viability_lite import evaluate_lite_thresholds
 
 
@@ -18,8 +18,12 @@ def _by_root(records: list[dict[str, Any]]) -> dict[str, list[dict[str, Any]]]:
     return grouped
 
 
-def _risk_pass(row: dict[str, Any]) -> bool:
+def _strict_risk_pass(row: dict[str, Any]) -> bool:
     return bool(row.get("candidate_legal", True)) and bool(row.get("secondary_safety_pass", True))
+
+
+def _risk_pass(row: dict[str, Any], thresholds: dict[str, Any]) -> bool:
+    return lite_secondary_safety_pass(row, thresholds)
 
 
 def _safe(row: dict[str, Any]) -> bool:
@@ -48,6 +52,8 @@ def _action_summary(row: dict[str, Any] | None) -> dict[str, Any] | None:
         "ensemble_disagreement": float(row.get("ensemble_disagreement", 0.0)),
         "candidate_legal": bool(row.get("candidate_legal", True)),
         "secondary_safety_pass": bool(row.get("secondary_safety_pass", True)),
+        "lite_secondary_pass": bool(row.get("accvp_lite_secondary_pass", False)),
+        "lite_secondary_safety_profile": str(row.get("accvp_lite_secondary_safety_profile", "")),
         "secondary_risk_score": float(row.get("secondary_risk_score", 0.0)),
         "secondary_risk_uncertainty": float(row.get("secondary_risk_uncertainty", 0.0)),
         "secondary_veto_reason": str(row.get("secondary_veto_reason", "")),
@@ -133,7 +139,7 @@ def audit_lite_replacements(
                 targeted_seed_candidates.append((root_id, int(candidates[0].get("episode_seed", -1))))
 
         for row in candidates:
-            if int(row["action_id"]) in LEFT_ACTION_IDS and not _risk_pass(row) and _safe(row) and _success(row):
+            if int(row["action_id"]) in LEFT_ACTION_IDS and not _strict_risk_pass(row) and _safe(row) and _success(row):
                 risk_failed_but_success_roots.append(
                     {
                         **_root_summary(root_id=root_id, candidates=candidates, raw=raw, selected=row, decision=decision),
@@ -167,10 +173,10 @@ def audit_lite_replacements(
         "replacement_rate": float(replacement_count / max(1, len(grouped))),
         "reason_counts": dict(sorted(reason_counts.items())),
         "replacement_action_histogram": dict(sorted(replacement_action_counts.items(), key=lambda item: int(item[0]))),
-        "all_selected_action_risk_pass_rate": _rate([_risk_pass(row) for row in selected_rows]),
+        "all_selected_action_risk_pass_rate": _rate([_risk_pass(row, thresholds) for row in selected_rows]),
         "all_selected_action_safety_event_rate": _rate([not _safe(row) for row in selected_rows]),
         "all_selected_action_merge_success_rate": _rate([_success(row) for row in selected_observed]),
-        "replacement_action_risk_pass_rate": _rate([_risk_pass(row) for row in replacement_rows]),
+        "replacement_action_risk_pass_rate": _rate([_risk_pass(row, thresholds) for row in replacement_rows]),
         "replacement_action_safety_event_rate": _rate([not _safe(row) for row in replacement_rows]),
         "replacement_action_merge_success_rate": _rate([_success(row) for row in replacement_observed]),
         "replacement_safety_event_root_count": int(len(replacement_safety_event_roots)),

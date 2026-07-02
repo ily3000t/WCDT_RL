@@ -51,6 +51,55 @@ def _quantile_summary(values: list[float]) -> dict[str, float | None]:
 
 def _accvp_shadow_metrics(reports: list[dict]) -> dict:
     records = [record for report in reports for record in list(report.get("accvp_records", []) or [])]
+    accvp_record_count = int(
+        sum(int(report.get("accvp_record_count", len(list(report.get("accvp_records", []) or [])))) for report in reports)
+    )
+    accvp_replacement_counts: list[int] = []
+    accvp_commitment_counts: list[int] = []
+    accvp_replacement_reason_counts: Counter[str] = Counter()
+    accvp_replacement_selected_counts: Counter[str] = Counter()
+    for report in reports:
+        report_records = list(report.get("accvp_records", []) or [])
+        if "accvp_replacement_count" in report:
+            replacement_count = int(report.get("accvp_replacement_count", 0) or 0)
+        else:
+            replacement_count = 0
+            for record in report_records:
+                reason = str(record.get("accvp_replacement_reason", ""))
+                if bool(record.get("accvp_replacement", False)) and reason != "lateral_commitment":
+                    replacement_count += 1
+        commitment_count = 0
+        for record in report_records:
+            reason = str(record.get("accvp_replacement_reason", ""))
+            if bool(record.get("accvp_replacement", False)) and reason == "lateral_commitment":
+                commitment_count += 1
+            elif bool(record.get("accvp_replacement", False)) and reason:
+                accvp_replacement_reason_counts[reason] += 1
+                selected = record.get("accvp_selected_action")
+                accvp_replacement_selected_counts["None" if selected is None else str(int(selected))] += 1
+        accvp_replacement_counts.append(replacement_count)
+        accvp_commitment_counts.append(commitment_count)
+    total_accvp_replacements = int(sum(accvp_replacement_counts))
+    total_accvp_commitments = int(sum(accvp_commitment_counts))
+    accvp_episode_denominator = max(1, len(reports))
+    accvp_decision_denominator = max(1, accvp_record_count)
+    accvp_active_defaults = {
+        "accvp_active_replacement_count": total_accvp_replacements,
+        "accvp_active_replacement_episode_rate": float(
+            sum(1 for item in accvp_replacement_counts if item > 0) / accvp_episode_denominator
+        ),
+        "accvp_active_replacement_per_decision_rate": float(
+            total_accvp_replacements / accvp_decision_denominator
+        ),
+        "accvp_active_commitment_replacement_count": total_accvp_commitments,
+        "accvp_active_replacement_reason_counts": dict(sorted(accvp_replacement_reason_counts.items())),
+        "accvp_active_replacement_selected_action_counts": dict(
+            sorted(
+                accvp_replacement_selected_counts.items(),
+                key=lambda item: 999 if item[0] == "None" else int(item[0]),
+            )
+        ),
+    }
     if not records:
         return {
             "accvp_shadow_record_count": 0,
@@ -72,6 +121,7 @@ def _accvp_shadow_metrics(reports: list[dict]) -> dict:
             "accvp_lite_best_left_action_counts": {},
             "accvp_lite_p_merge_improvement": {},
             "accvp_lite_per_action_gate_pass_rate": {},
+            **accvp_active_defaults,
         }
     merge_intent = {6, 7, 8}
     candidate_available = [bool(record.get("candidate_set_available", False)) for record in records]
@@ -191,6 +241,7 @@ def _accvp_shadow_metrics(reports: list[dict]) -> dict:
         ),
         "accvp_lite_p_merge_improvement": _quantile_summary(lite_improvement),
         "accvp_lite_per_action_gate_pass_rate": lite_pass_rate,
+        **accvp_active_defaults,
     }
 
 
