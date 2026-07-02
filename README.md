@@ -18,7 +18,14 @@ ACCVP provides action-conditioned counterfactual viability estimation.
 3. prediction interface ablation
 ```
 
-ACCVP 的角色是 action-conditioned counterfactual viability estimator：给定同一状态和 9 个候选 ego action，估计每个动作的安全性、taper 前合流可行性和不确定性。当前 Step 1 只运行 ACCVP shadow：输出 candidate viability table 和推荐动作诊断，不改变 final action，也不提出 deployable controller claim。
+ACCVP 的角色是 action-conditioned counterfactual viability estimator：给定同一状态和 9 个候选 ego action，估计每个动作的 taper 前合流可行性、目标车道进入时间和不确定性。当前主线采用职责分离：
+
+```text
+Risk Module / Safety Shield = safety authority
+ACCVP / ACV-Shield-lite    = merge-before-taper task viability authority
+```
+
+因此 ACCVP safety head 目前只用于 logging / diagnostics，不作为硬安全门控；真正的安全否决仍由 Risk Module 与 Safety Shield 执行。
 
 运行时主线：
 
@@ -26,18 +33,19 @@ ACCVP 的角色是 action-conditioned counterfactual viability estimator：给�
 SUMO highway_merge 场景
   -> Reward-v2 PPO 输出 raw action
   -> Risk/Safety Shield 检查局部硬安全
-  -> ACCVP shadow 记录每个候选动作的反事实可行性
+  -> ACCVP candidate table 记录每个候选动作的反事实可行性
+  -> ACV-Shield-lite 仅在 targeted task-infeasible 状态中低频修正
   -> paired evaluation 验证动作序列、任务质量和安全收益
 ```
 
-后续 deployable 版本才会启用 ACV-Shield：
+完整 ACV-Shield 仍保留为后续版本；当前已验证的是更窄的 ACV-Shield-lite：
 
 ```text
 PPO raw action
   -> Safety Shield
-  -> ACV-Shield:
-       if raw/shield action safe and viable: keep
-       else choose safe + viable candidate
+  -> ACV-Shield-lite:
+       if shield action task-feasible: keep
+       else choose Risk-audited left action with higher merge-before-taper viability
   -> final action
 ```
 
@@ -77,6 +85,32 @@ wcdt_v3_merge_timing_reward_v2_prediction_shield:
 ```
 
 这些数值是当前 run 和 seed 集上的 evidence，不是跨场景、跨交通密度或跨版本的永久结论。
+
+Current targeted benchmark evidence on `stage5_reward_v2_accvp_lite_targeted_benchmark_v3`:
+
+```text
+Seeds:
+  [2, 3, 4, 7, 9, 13, 17, 19]
+
+wcdt_v3_merge_timing_reward_v2_prediction_shield:
+  terminal_success_rate = 1.0
+  timely_merge_success_rate = 1.0
+  first_target_lane_entry_distance_to_taper_p50 ≈ 146.55 m
+  deadline_opportunity_capture_rate ≈ 0.3077
+  taper_miss / proxy_collision / safety_violation / fallback = 0
+
+wcdt_v3_merge_timing_reward_v2_prediction_shield_accvp_lite_v3:
+  terminal_success_rate = 1.0
+  timely_merge_success_rate = 1.0
+  first_target_lane_entry_distance_to_taper_p50 ≈ 162.17 m
+  deadline_opportunity_capture_rate ≈ 0.3696
+  true ACCVP action-change = 8
+  same-action confirm = 4
+  taper_miss / proxy_collision / safety_violation / fallback = 0
+  ACCVP p95 latency ≈ 0.026 s
+```
+
+该 targeted benchmark 只主张：在 shadow-v3 标记出的 task-infeasible targeted states 中，ACV-Shield-lite v3 能低频执行 Risk-audited left action change，并在不引入 safety regression 的情况下改善合流时机与 deadline opportunity capture。它不是自然分布统计显著性结论。
 
 ## 目录结构
 
