@@ -55,9 +55,13 @@ def _accvp_shadow_metrics(reports: list[dict]) -> dict:
         sum(int(report.get("accvp_record_count", len(list(report.get("accvp_records", []) or [])))) for report in reports)
     )
     accvp_replacement_counts: list[int] = []
+    accvp_action_change_counts: list[int] = []
+    accvp_same_action_confirm_counts: list[int] = []
     accvp_commitment_counts: list[int] = []
     accvp_replacement_reason_counts: Counter[str] = Counter()
     accvp_replacement_selected_counts: Counter[str] = Counter()
+    accvp_action_change_reason_counts: Counter[str] = Counter()
+    accvp_action_change_selected_counts: Counter[str] = Counter()
     for report in reports:
         report_records = list(report.get("accvp_records", []) or [])
         if "accvp_replacement_count" in report:
@@ -68,34 +72,75 @@ def _accvp_shadow_metrics(reports: list[dict]) -> dict:
                 reason = str(record.get("accvp_replacement_reason", ""))
                 if bool(record.get("accvp_replacement", False)) and reason != "lateral_commitment":
                     replacement_count += 1
+        action_change_count = 0
+        same_action_confirm_count = 0
         commitment_count = 0
         for record in report_records:
             reason = str(record.get("accvp_replacement_reason", ""))
+            selected = record.get("accvp_selected_action")
+            shield_action = record.get("safety_shield_action")
             if bool(record.get("accvp_replacement", False)) and reason == "lateral_commitment":
                 commitment_count += 1
             elif bool(record.get("accvp_replacement", False)) and reason:
                 accvp_replacement_reason_counts[reason] += 1
-                selected = record.get("accvp_selected_action")
                 accvp_replacement_selected_counts["None" if selected is None else str(int(selected))] += 1
+                action_change = bool(record.get("accvp_action_change", False))
+                if "accvp_action_change" not in record and selected is not None and shield_action is not None:
+                    action_change = int(selected) != int(shield_action)
+                if action_change:
+                    action_change_count += 1
+                    accvp_action_change_reason_counts[reason] += 1
+                    accvp_action_change_selected_counts[
+                        "None" if selected is None else str(int(selected))
+                    ] += 1
+                else:
+                    same_action_confirm_count += 1
         accvp_replacement_counts.append(replacement_count)
+        accvp_action_change_counts.append(action_change_count)
+        accvp_same_action_confirm_counts.append(same_action_confirm_count)
         accvp_commitment_counts.append(commitment_count)
     total_accvp_replacements = int(sum(accvp_replacement_counts))
+    total_accvp_action_changes = int(sum(accvp_action_change_counts))
+    total_accvp_same_action_confirms = int(sum(accvp_same_action_confirm_counts))
     total_accvp_commitments = int(sum(accvp_commitment_counts))
     accvp_episode_denominator = max(1, len(reports))
     accvp_decision_denominator = max(1, accvp_record_count)
     accvp_active_defaults = {
         "accvp_active_replacement_count": total_accvp_replacements,
+        "accvp_active_replacement_count_semantics": (
+            "legacy_count_of_non_commitment_accvp_replacement_flags; "
+            "use accvp_active_action_change_count for true action changes"
+        ),
         "accvp_active_replacement_episode_rate": float(
             sum(1 for item in accvp_replacement_counts if item > 0) / accvp_episode_denominator
         ),
         "accvp_active_replacement_per_decision_rate": float(
             total_accvp_replacements / accvp_decision_denominator
         ),
+        "accvp_active_action_change_count": total_accvp_action_changes,
+        "accvp_active_action_change_episode_rate": float(
+            sum(1 for item in accvp_action_change_counts if item > 0) / accvp_episode_denominator
+        ),
+        "accvp_active_action_change_per_decision_rate": float(
+            total_accvp_action_changes / accvp_decision_denominator
+        ),
+        "accvp_active_same_action_confirm_count": total_accvp_same_action_confirms,
+        "accvp_active_same_action_confirm_episode_rate": float(
+            sum(1 for item in accvp_same_action_confirm_counts if item > 0) / accvp_episode_denominator
+        ),
+        "accvp_active_commitment_count": total_accvp_commitments,
         "accvp_active_commitment_replacement_count": total_accvp_commitments,
         "accvp_active_replacement_reason_counts": dict(sorted(accvp_replacement_reason_counts.items())),
         "accvp_active_replacement_selected_action_counts": dict(
             sorted(
                 accvp_replacement_selected_counts.items(),
+                key=lambda item: 999 if item[0] == "None" else int(item[0]),
+            )
+        ),
+        "accvp_active_action_change_reason_counts": dict(sorted(accvp_action_change_reason_counts.items())),
+        "accvp_active_action_change_selected_action_counts": dict(
+            sorted(
+                accvp_action_change_selected_counts.items(),
                 key=lambda item: 999 if item[0] == "None" else int(item[0]),
             )
         ),

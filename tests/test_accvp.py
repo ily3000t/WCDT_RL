@@ -19,10 +19,11 @@ from safe_rl.accvp.root_context import RootContext
 from safe_rl.accvp.runtime import ACCVPRuntimePredictor
 from safe_rl.accvp.schema import COUNTERFACTUAL_SCHEMA_VERSION, stable_hash
 from safe_rl.accvp.risk_secondary_audit import audit_risk_secondary
-from safe_rl.accvp.online_trigger_audit import audit_online_triggers
+from safe_rl.accvp.online_trigger_audit import audit_online_triggers, write_online_trigger_audit
 from safe_rl.accvp.selection import select_viability_action, select_viability_lite_action
 from safe_rl.accvp.shards import merge_counterfactual_shards
 from safe_rl.accvp.snapshot_store import CounterfactualSnapshotStore
+from safe_rl.accvp.targeted_benchmark import build_replacement_case_table, build_targeted_benchmark_summary
 from safe_rl.accvp.viability_lite import evaluate_lite_thresholds, tune_viability_lite_operating_point
 from safe_rl.accvp.viability_lite_audit import audit_lite_replacements
 from safe_rl.pipeline.accvp_tune_viability_lite import _lite_acceptance_failures
@@ -647,6 +648,176 @@ def test_online_trigger_audit_generates_deterministic_shadow_seed_file(tmp_path:
     assert report["online_targeted_seeds"] == [12]
     assert report["would_trigger_count"] == 1
     assert report["reason_counts"]["skip:outside_deadline_window"] == 1
+    artifact = tmp_path / "manifest.json"
+    risk = tmp_path / "risk.pt"
+    artifact.write_text('{"deployable_claim":"task_viability_only"}', encoding="utf-8")
+    risk.write_text("risk", encoding="utf-8")
+    paths = write_online_trigger_audit(
+        output_dir=tmp_path / "out",
+        report=report,
+        source_replay_dirs=[tmp_path],
+        artifact_manifest=artifact,
+        risk_checkpoint=risk,
+    )
+    manifest = __import__("json").loads(paths["targeted_benchmark_seeds"].read_text(encoding="utf-8"))
+    assert manifest["seeds"] == [12]
+    assert manifest["artifact_manifest"]["sha256"]
+    assert manifest["risk_checkpoint"]["sha256"]
+
+
+def test_online_trigger_audit_splits_action_change_confirm_and_commitment(tmp_path: Path):
+    replay = tmp_path / "active_seed_3.json"
+    replay.write_text(
+        __import__("json").dumps(
+            {
+                "seed": 3,
+                "group_name": "shield_accvp_lite_v3",
+                "notes": {
+                    "accvp_records": [
+                        {
+                            "accvp_replacement": True,
+                            "accvp_replacement_reason": "raw_task_infeasible_lite_viable_left",
+                            "accvp_action_change": True,
+                            "raw_action": 5,
+                            "safety_shield_action": 5,
+                            "accvp_selected_action": 8,
+                            "step": 10,
+                            "decision_index": 2,
+                        },
+                        {
+                            "accvp_replacement": True,
+                            "accvp_replacement_reason": "best_left_below_improvement_margin",
+                            "accvp_action_change": False,
+                            "raw_action": 7,
+                            "safety_shield_action": 7,
+                            "accvp_selected_action": 7,
+                            "step": 15,
+                            "decision_index": 3,
+                        },
+                        {
+                            "accvp_replacement": True,
+                            "accvp_replacement_reason": "lateral_commitment",
+                            "accvp_selected_action": 8,
+                            "step": 20,
+                            "decision_index": 4,
+                        },
+                    ]
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    report = audit_online_triggers([tmp_path], group_contains="accvp_lite_v3")
+    assert report["actual_replacement_count"] == 2
+    assert report["actual_action_change_count"] == 1
+    assert report["same_action_confirm_count"] == 1
+    assert report["lateral_commitment_count"] == 1
+    assert report["reason_counts"]["actual_action_change"] == 1
+    assert report["reason_counts"]["same_action_confirm"] == 1
+    assert report["reason_counts"]["lateral_commitment"] == 1
+
+
+def test_targeted_benchmark_case_table_and_summary(tmp_path: Path):
+    replay_dir = tmp_path / "replay"
+    replay_dir.mkdir()
+    replay = replay_dir / "group_seed_5.json"
+    replay.write_text(
+        __import__("json").dumps(
+            {
+                "seed": 5,
+                "group_name": "shield_accvp_lite_v3",
+                "notes": {
+                    "episode_report": {
+                        "seed": 5,
+                        "done_reason": "merge_success",
+                        "proxy_collision": False,
+                        "safety_violation": False,
+                        "min_distance": 1.4,
+                        "ttc_p1": 1.0,
+                        "drac_p99": 2.0,
+                        "first_target_lane_entry_distance_to_taper": 120.0,
+                        "accvp_records": [
+                            {
+                                "accvp_replacement": True,
+                                "accvp_replacement_reason": "raw_task_infeasible_lite_viable_left",
+                                "accvp_action_change": True,
+                                "raw_action": 5,
+                                "safety_shield_action": 5,
+                                "accvp_selected_action": 8,
+                                "step": 10,
+                                "decision_index": 2,
+                                "accvp_lite_p_merge_improvement": 0.1,
+                                "accvp_shadow_candidates": [
+                                    {"action_id": 5, "p_merge_before_taper": 0.7},
+                                    {
+                                        "action_id": 8,
+                                        "p_merge_before_taper": 0.8,
+                                        "target_lane_entry_time_s": 4.0,
+                                        "secondary_risk_score": 0.04,
+                                        "lite_secondary_safety_profile": "audited_merge_left_v1",
+                                        "secondary_safety_pass": False,
+                                        "lite_secondary_pass": True,
+                                    },
+                                ],
+                            }
+                        ],
+                    }
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    stage5 = tmp_path / "stage5_report.json"
+    stage5.write_text(
+        __import__("json").dumps(
+            {
+                "groups": {
+                    "shield": {
+                        "metrics": {
+                            "collision_rate": 0.0,
+                            "proxy_collision_rate": 0.0,
+                            "safety_violation_rate": 0.0,
+                            "fallback_rate": 0.0,
+                            "taper_miss_rate": 0.0,
+                            "timely_merge_success_rate": 1.0,
+                            "first_target_lane_entry_distance_to_taper_p50": 100.0,
+                            "deadline_opportunity_capture_rate": 0.3,
+                            "late_merge_request_rate": 0.1,
+                        }
+                    },
+                    "accvp": {
+                        "metrics": {
+                            "collision_rate": 0.0,
+                            "proxy_collision_rate": 0.0,
+                            "safety_violation_rate": 0.0,
+                            "fallback_rate": 0.0,
+                            "taper_miss_rate": 0.0,
+                            "timely_merge_success_rate": 1.0,
+                            "first_target_lane_entry_distance_to_taper_p50": 120.0,
+                            "deadline_opportunity_capture_rate": 0.4,
+                            "late_merge_request_rate": 0.1,
+                            "accvp_active_action_change_count": 1,
+                            "accvp_shadow_latency_p95": 0.02,
+                        }
+                    },
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+    cases = build_replacement_case_table([replay_dir], group_contains="accvp_lite_v3")
+    assert len(cases) == 1
+    assert cases[0]["selected_action"] == 8
+    assert cases[0]["target_entry_time_s"] == 4.0
+    summary = build_targeted_benchmark_summary(
+        stage5_report=stage5,
+        cases=cases,
+        baseline_group="shield",
+        accvp_group="accvp",
+    )
+    assert summary["safety_gate_pass"]
+    assert summary["task_gate_pass"]
+    assert summary["performance_benefit_claim_allowed"]
 
 
 def test_availability_diagnostic_separates_oracle_and_risk_ceilings(tmp_path: Path):

@@ -2267,12 +2267,13 @@ def test_stage5_metrics_include_accvp_active_replacements():
                 "actual_replacement_count": 0,
                 "fallback_count": 0,
                 "emergency_fallback_count": 0,
-                "accvp_record_count": 3,
-                "accvp_replacement_count": 1,
+                "accvp_record_count": 4,
+                "accvp_replacement_count": 2,
                 "accvp_records": [
                     {
                         "accvp_replacement": True,
                         "accvp_replacement_reason": "raw_task_infeasible_lite_viable_left",
+                        "accvp_action_change": True,
                         "accvp_selected_action": 8,
                         "raw_action": 5,
                         "safety_shield_action": 5,
@@ -2284,6 +2285,22 @@ def test_stage5_metrics_include_accvp_active_replacements():
                         "accvp_lite_raw_task_feasible": False,
                         "accvp_lite_best_left_action": 8,
                         "accvp_lite_p_merge_improvement": 0.1,
+                    },
+                    {
+                        "accvp_replacement": True,
+                        "accvp_replacement_reason": "best_left_below_improvement_margin",
+                        "accvp_action_change": False,
+                        "accvp_selected_action": 7,
+                        "raw_action": 7,
+                        "safety_shield_action": 7,
+                        "candidate_set_available": True,
+                        "raw_feasible": False,
+                        "accvp_shadow_recommended_action": 7,
+                        "accvp_bypass_reason": "",
+                        "decision_latency_s": 0.01,
+                        "accvp_lite_raw_task_feasible": False,
+                        "accvp_lite_best_left_action": 7,
+                        "accvp_lite_p_merge_improvement": 0.0,
                     },
                     {
                         "accvp_replacement": True,
@@ -2320,14 +2337,23 @@ def test_stage5_metrics_include_accvp_active_replacements():
         ]
     )
     assert metrics["mean_actual_replacements"] == 0.0
-    assert metrics["accvp_active_replacement_count"] == 1
+    assert metrics["accvp_active_replacement_count"] == 2
     assert metrics["accvp_active_replacement_episode_rate"] == 1.0
-    assert metrics["accvp_active_replacement_per_decision_rate"] == pytest.approx(1 / 3)
+    assert metrics["accvp_active_replacement_per_decision_rate"] == pytest.approx(2 / 4)
+    assert metrics["accvp_active_action_change_count"] == 1
+    assert metrics["accvp_active_action_change_per_decision_rate"] == pytest.approx(1 / 4)
+    assert metrics["accvp_active_same_action_confirm_count"] == 1
+    assert metrics["accvp_active_commitment_count"] == 1
     assert metrics["accvp_active_commitment_replacement_count"] == 1
     assert metrics["accvp_active_replacement_reason_counts"] == {
+        "best_left_below_improvement_margin": 1,
         "raw_task_infeasible_lite_viable_left": 1
     }
-    assert metrics["accvp_active_replacement_selected_action_counts"] == {"8": 1}
+    assert metrics["accvp_active_replacement_selected_action_counts"] == {"7": 1, "8": 1}
+    assert metrics["accvp_active_action_change_reason_counts"] == {
+        "raw_task_infeasible_lite_viable_left": 1
+    }
+    assert metrics["accvp_active_action_change_selected_action_counts"] == {"8": 1}
 
 
 def test_stage5_task_quality_metrics_are_pre_registered():

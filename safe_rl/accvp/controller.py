@@ -80,6 +80,9 @@ class ACCVPController:
                         "accvp_commitment_active": True,
                         "accvp_replacement": True,
                         "accvp_replacement_reason": "lateral_commitment",
+                        "accvp_action_change": False,
+                        "accvp_same_action_confirm": False,
+                        "accvp_commitment_replacement": True,
                         "accvp_selected_action": int(self._commitment.action.index),
                         "accvp_selected_action_name": str(self._commitment.action.name),
                         "accvp_lane_change_duration_s": max(
@@ -141,10 +144,14 @@ class ACCVPController:
             debug["accvp_no_feasible_action"] = True
             return safety_shield_action, debug
         selected = next(action for action in ACTIONS if action.index == int(selected_row["action_id"]))
+        action_change = int(selected.index) != int(safety_shield_action.index)
         debug.update(
             {
                 "accvp_replacement": True,
                 "accvp_replacement_reason": str(decision["reason"]),
+                "accvp_action_change": bool(action_change),
+                "accvp_same_action_confirm": bool(not action_change and selected.lateral_cmd != 0),
+                "accvp_commitment_replacement": False,
                 "accvp_selected_action": int(selected.index),
                 "accvp_selected_action_name": str(selected.name),
                 "selected_pU_proxy_collision": float(selected_row["pU_proxy_collision"]),
@@ -165,6 +172,9 @@ class ACCVPController:
             "accvp_mode": self.mode,
             "accvp_replacement": False,
             "accvp_replacement_reason": "",
+            "accvp_action_change": False,
+            "accvp_same_action_confirm": False,
+            "accvp_commitment_replacement": False,
             "accvp_selected_action": int(shield_action.index),
             "accvp_selected_action_name": str(shield_action.name),
             "accvp_bypass_reason": "",
@@ -303,6 +313,9 @@ class ACCVPController:
                     "lite_secondary_pass": bool(row.get("accvp_lite_secondary_pass", False)),
                     "lite_secondary_safety_profile": str(row.get("accvp_lite_secondary_safety_profile", "strict")),
                     "secondary_risk_score": float(row.get("secondary_risk_score", 0.0)),
+                    "target_lane_entry_time_s": None
+                    if row.get("target_lane_entry_time_s") is None
+                    else float(row.get("target_lane_entry_time_s", 0.0)),
                     "ensemble_disagreement": float(row.get("ensemble_disagreement", 0.0)),
                 }
                 for row in scores
