@@ -223,6 +223,9 @@ def run(cfg):
     report["observation_shape"] = observation_shape
     report["accvp_observation_summary"] = accvp_observation_summary
     report.update(accvp_observation_summary)
+    report["accvp_observation_runtime_summary_semantics"] = (
+        "last_env_episode_only" if RiskGatedACCVPCandidateTableAugmentor.enabled(cfg) else ""
+    )
     report["total_observation_dim"] = int(observation_shape[0]) if observation_shape else 0
     report["safety_metric_version"] = str(
         cfg.risk_module.get("safety_metric_version", SAFETY_METRIC_VERSION)

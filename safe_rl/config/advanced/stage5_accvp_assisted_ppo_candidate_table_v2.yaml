@@ -1,0 +1,170 @@
+run:
+  run_id: "stage5_accvp_assisted_ppo_candidate_table_v2"
+  output_root: "safe_rl_output/runs"
+  tensorboard: false
+  replay: true
+
+experiment:
+  purpose: "accvp_assisted_ppo_candidate_table_step3_1_v2"
+  deployable_claim: false
+  observation_comparison: "no_forecast_vs_wcdt_11d_vs_risk_gated_accvp_99d_in_process"
+  previous_invalid_run: "ppo_accvp_candidate_table_reward_v2"
+  previous_invalid_reason: "accvp_table_valid_rate_activation_window=0 due to observation scorer timeout"
+
+stage5:
+  paired_eval: true
+  same_seed: true
+  replay_enabled: true
+  episodes_per_group: 20
+  seeds: [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20]
+  risk_checkpoint: "safe_rl_output/runs/safe_rl_comparison_schema9_validation_001/stage2/risk_module.pt"
+  task_quality:
+    timely_entry_distance_threshold_m: 80.0
+    late_merge_request_threshold_m: 60.0
+  acceptance:
+    mainline_reward_v2:
+      max_actual_replacement_rate: 0.20
+  pairs:
+    - name: "no_forecast_vs_wcdt_11d_v2"
+      left: "ppo_reward_v2_no_forecast_prediction_shield"
+      right: "wcdt_v3_merge_timing_reward_v2_prediction_shield"
+      acceptance_profile: "mainline_reward_v2"
+    - name: "wcdt_11d_vs_accvp_table_99d_v2"
+      left: "wcdt_v3_merge_timing_reward_v2_prediction_shield"
+      right: "ppo_accvp_candidate_table_reward_v2_v2_prediction_shield"
+      acceptance_profile: "mainline_reward_v2"
+    - name: "accvp_table_v2_shield_vs_lite"
+      left: "ppo_accvp_candidate_table_reward_v2_v2_prediction_shield"
+      right: "ppo_accvp_candidate_table_reward_v2_v2_prediction_shield_accvp_lite_v3"
+      acceptance_profile: "mainline_reward_v2"
+  groups:
+    - name: "ppo_reward_v2_no_forecast"
+      forecast_features: false
+      shield: false
+      model_path: "safe_rl_output/runs/ppo_reward_v2_no_forecast/stage3/ppo_model.zip"
+      raw_policy: "ppo_reward_v2_no_forecast"
+    - name: "ppo_reward_v2_no_forecast_prediction_shield"
+      forecast_features: false
+      shield: true
+      model_path: "safe_rl_output/runs/ppo_reward_v2_no_forecast/stage3/ppo_model.zip"
+      raw_policy: "ppo_reward_v2_no_forecast"
+      shield_overrides:
+        forecast_aware_candidate_ranking_mode: "off"
+        forecast_task_shadow_enabled: false
+        task_backstop_enabled: false
+
+    - name: "ppo_wcdt_v3_merge_timing_reward_v2"
+      forecast_features: true
+      shield: false
+      model_path: "safe_rl_output/runs/safe_rl_comparison_schema9_validation_001_forecast_wcdt_v3_merge_timing_reward_v2/stage3/ppo_model.zip"
+      forecast_source: "wcdt_v3"
+      forecast_checkpoint: "safe_rl_output/runs/safe_rl_comparison_schema9_validation_001/stage2/wcdt_v3_predictor.pt"
+      raw_policy: "ppo_wcdt_v3_merge_timing_reward_v2"
+    - name: "wcdt_v3_merge_timing_reward_v2_prediction_shield"
+      forecast_features: true
+      shield: true
+      model_path: "safe_rl_output/runs/safe_rl_comparison_schema9_validation_001_forecast_wcdt_v3_merge_timing_reward_v2/stage3/ppo_model.zip"
+      forecast_source: "wcdt_v3"
+      forecast_checkpoint: "safe_rl_output/runs/safe_rl_comparison_schema9_validation_001/stage2/wcdt_v3_predictor.pt"
+      raw_policy: "ppo_wcdt_v3_merge_timing_reward_v2"
+      shield_overrides:
+        forecast_aware_candidate_ranking_mode: "off"
+        forecast_task_shadow_enabled: false
+        task_backstop_enabled: false
+
+    - name: "ppo_accvp_candidate_table_reward_v2_v2"
+      forecast_features: false
+      shield: false
+      model_path: "safe_rl_output/runs/ppo_accvp_candidate_table_reward_v2_v2/stage3/ppo_model.zip"
+      raw_policy: "ppo_accvp_candidate_table_reward_v2_v2"
+      counterfactual_predictor: "risk_gated_accvp_candidate_table_v1"
+      accvp:
+        enabled: false
+        mode: "off"
+        activation_distance: 240.0
+        ensemble_size: 1
+        checkpoint: "safe_rl_output/runs/accvp_240_shadow_train/accvp/accvp_v1_predictor.pt"
+        calibration_bundle: "safe_rl_output/runs/accvp_240_shadow_train/accvp/accvp_v1_calibration.json"
+        operating_point: "safe_rl_output/runs/accvp_240_lite_v3/accvp/accvp_v1_lite_v3_operating_point.json"
+        artifact_manifest: "safe_rl_output/runs/accvp_240_lite_v3/accvp/accvp_v1_lite_v3_task_artifact_manifest.json"
+        risk_checkpoint: "safe_rl_output/runs/safe_rl_comparison_schema9_validation_001/stage2/risk_module.pt"
+        observation:
+          enabled: true
+          feature_version: "risk_gated_candidate_table_v1"
+          activation_distance: 240.0
+          timeout_s: 0.5
+          use_inference_worker: false
+          profile_latency: true
+          fail_closed_defaults: true
+          include_risk_secondary: true
+          secondary_safety_profile: "short_horizon_risk_v1"
+          risk_horizon_steps: 8
+          allow_with_forecast_features: false
+    - name: "ppo_accvp_candidate_table_reward_v2_v2_prediction_shield"
+      forecast_features: false
+      shield: true
+      model_path: "safe_rl_output/runs/ppo_accvp_candidate_table_reward_v2_v2/stage3/ppo_model.zip"
+      raw_policy: "ppo_accvp_candidate_table_reward_v2_v2"
+      counterfactual_predictor: "risk_gated_accvp_candidate_table_v1"
+      shield_overrides:
+        forecast_aware_candidate_ranking_mode: "off"
+        forecast_task_shadow_enabled: false
+        task_backstop_enabled: false
+      accvp:
+        enabled: false
+        mode: "off"
+        activation_distance: 240.0
+        ensemble_size: 1
+        checkpoint: "safe_rl_output/runs/accvp_240_shadow_train/accvp/accvp_v1_predictor.pt"
+        calibration_bundle: "safe_rl_output/runs/accvp_240_shadow_train/accvp/accvp_v1_calibration.json"
+        operating_point: "safe_rl_output/runs/accvp_240_lite_v3/accvp/accvp_v1_lite_v3_operating_point.json"
+        artifact_manifest: "safe_rl_output/runs/accvp_240_lite_v3/accvp/accvp_v1_lite_v3_task_artifact_manifest.json"
+        risk_checkpoint: "safe_rl_output/runs/safe_rl_comparison_schema9_validation_001/stage2/risk_module.pt"
+        observation:
+          enabled: true
+          feature_version: "risk_gated_candidate_table_v1"
+          activation_distance: 240.0
+          timeout_s: 0.5
+          use_inference_worker: false
+          profile_latency: true
+          fail_closed_defaults: true
+          include_risk_secondary: true
+          secondary_safety_profile: "short_horizon_risk_v1"
+          risk_horizon_steps: 8
+          allow_with_forecast_features: false
+    - name: "ppo_accvp_candidate_table_reward_v2_v2_prediction_shield_accvp_lite_v3"
+      forecast_features: false
+      shield: true
+      model_path: "safe_rl_output/runs/ppo_accvp_candidate_table_reward_v2_v2/stage3/ppo_model.zip"
+      raw_policy: "ppo_accvp_candidate_table_reward_v2_v2"
+      counterfactual_predictor: "risk_gated_accvp_candidate_table_v1"
+      controller: "acv_shield_lite_v3"
+      shield_overrides:
+        forecast_aware_candidate_ranking_mode: "off"
+        forecast_task_shadow_enabled: false
+        task_backstop_enabled: false
+      accvp:
+        enabled: true
+        mode: "viability_lite"
+        activation_distance: 240.0
+        ensemble_size: 1
+        checkpoint: "safe_rl_output/runs/accvp_240_shadow_train/accvp/accvp_v1_predictor.pt"
+        calibration_bundle: "safe_rl_output/runs/accvp_240_shadow_train/accvp/accvp_v1_calibration.json"
+        operating_point: "safe_rl_output/runs/accvp_240_lite_v3/accvp/accvp_v1_lite_v3_operating_point.json"
+        artifact_manifest: "safe_rl_output/runs/accvp_240_lite_v3/accvp/accvp_v1_lite_v3_task_artifact_manifest.json"
+        risk_checkpoint: "safe_rl_output/runs/safe_rl_comparison_schema9_validation_001/stage2/risk_module.pt"
+        viability_lite:
+          secondary_safety_profile: "audited_merge_left_v1"
+          max_secondary_risk_score: 0.05
+        observation:
+          enabled: true
+          feature_version: "risk_gated_candidate_table_v1"
+          activation_distance: 240.0
+          timeout_s: 0.5
+          use_inference_worker: false
+          profile_latency: true
+          fail_closed_defaults: true
+          include_risk_secondary: true
+          secondary_safety_profile: "short_horizon_risk_v1"
+          risk_horizon_steps: 8
+          allow_with_forecast_features: false

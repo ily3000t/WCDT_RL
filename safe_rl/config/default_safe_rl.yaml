@@ -374,8 +374,12 @@ accvp:
     feature_version: "risk_gated_candidate_table_v1"
     activation_distance: 240.0
     timeout_s: 0.45
+    use_inference_worker: false
+    profile_latency: true
     fail_closed_defaults: true
     include_risk_secondary: true
+    secondary_safety_profile: "risk_model_rollout_v1"
+    risk_horizon_steps: 0
     allow_with_forecast_features: false
   viability_lite:
     min_p_merge_before_taper: 0.75

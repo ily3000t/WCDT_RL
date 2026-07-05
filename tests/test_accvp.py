@@ -32,7 +32,9 @@ from safe_rl.accvp.targeted_benchmark import build_replacement_case_table, build
 from safe_rl.accvp.viability_lite import evaluate_lite_thresholds, tune_viability_lite_operating_point
 from safe_rl.accvp.viability_lite_audit import audit_lite_replacements
 from safe_rl.pipeline.accvp_tune_viability_lite import _lite_acceptance_failures
+from safe_rl.pipeline.accvp_observation_preflight import _gate as _accvp_observation_preflight_gate
 from safe_rl.pipeline.stage1_collect_accvp_jobs import materialise_collection_job, validate_required_pilot
+from safe_rl.risk.risk_aggregator import aggregate_episode_reports
 from safe_rl.stage1_counterfactual.collector import _cache_dir, _root_filter_matches, _seed_schedule
 from safe_rl.sim.action_space import decode_action
 from safe_rl.sim.types import VehicleState
@@ -164,6 +166,8 @@ def test_risk_gated_accvp_candidate_table_contract_and_masks():
     summary = augmentor.summary()
     assert summary["accvp_table_valid_rate_activation_window"] == 1.0
     assert summary["accvp_observation_feature_version"] == RISK_GATED_ACCVP_OBSERVATION_VERSION
+    assert summary["accvp_table_latency_count"] == 1
+    assert summary["accvp_table_latency_p95"] is not None
 
 
 def test_risk_gated_accvp_candidate_table_fail_closed_preserves_masks():
@@ -187,6 +191,43 @@ def test_risk_gated_accvp_candidate_table_fail_closed_preserves_masks():
     assert summary["accvp_table_fail_closed_count"] == 1
 
 
+def test_risk_gated_accvp_candidate_table_uses_in_process_prepared_path():
+    class PreparedPredictor:
+        def __init__(self):
+            self.prepare_calls = 0
+            self.score_prepared_calls = 0
+            self.score_candidates_calls = 0
+
+        def prepare_candidates(self, _context, actions):
+            self.prepare_calls += 1
+            return {"action_ids": [int(action.index) for action in actions]}
+
+        def score_prepared(self, prepared):
+            self.score_prepared_calls += 1
+            return [
+                {**_score(int(action_id), viability=0.75), "ensemble_disagreement": 0.01}
+                for action_id in prepared["action_ids"]
+            ]
+
+        def score_candidates(self, _context, _actions, *, timeout_s=None):
+            self.score_candidates_calls += 1
+            raise AssertionError("observation path should prefer in-process prepared scoring")
+
+    cfg = _observation_cfg()
+    cfg.accvp.observation["use_inference_worker"] = False
+    predictor = PreparedPredictor()
+    augmentor = RiskGatedACCVPCandidateTableAugmentor(cfg, predictor=predictor, shield=_Shield(safe=True))
+    table = augmentor.extract(_observation_context())
+    assert table.shape == (99,)
+    assert predictor.prepare_calls == 1
+    assert predictor.score_prepared_calls == 1
+    assert predictor.score_candidates_calls == 0
+    summary = augmentor.summary()
+    assert summary["accvp_observation_use_inference_worker"] is False
+    assert summary["accvp_table_latency_per_stage"]["accvp_prepare_candidates"]["p50"] is not None
+    assert summary["accvp_table_latency_per_stage"]["accvp_score"]["p50"] is not None
+
+
 def test_accvp_candidate_table_observation_rejects_legacy_forecast_mix_by_default():
     cfg = clone_with_overrides(
         _observation_cfg(),
@@ -198,6 +239,67 @@ def test_accvp_candidate_table_observation_rejects_legacy_forecast_mix_by_defaul
         assert "mutually exclusive" in str(exc)
     else:  # pragma: no cover - assertion clarity
         raise AssertionError("expected ACCVP table + legacy forecast mix to fail")
+
+
+def test_accvp_observation_metrics_aggregate_counts_and_latency():
+    reports = [
+        {
+            "accvp_table_decision_count": 2,
+            "accvp_table_activation_window_decision_count": 2,
+            "accvp_table_valid_decision_count": 2,
+            "accvp_table_activation_window_valid_decision_count": 2,
+            "accvp_table_timeout_count": 0,
+            "accvp_table_fail_closed_count": 0,
+            "accvp_table_latency_total_s": [0.10, 0.20],
+            "accvp_table_latency_stage_s": {
+                "context_legality": [0.01, 0.02],
+                "accvp_prepare_candidates": [0.02, 0.03],
+                "accvp_score": [0.03, 0.04],
+                "risk_secondary": [0.02, 0.03],
+                "table_pack": [0.01, 0.02],
+            },
+        },
+        {
+            "accvp_table_decision_count": 1,
+            "accvp_table_activation_window_decision_count": 1,
+            "accvp_table_valid_decision_count": 0,
+            "accvp_table_activation_window_valid_decision_count": 0,
+            "accvp_table_timeout_count": 1,
+            "accvp_table_fail_closed_count": 1,
+            "accvp_table_latency_total_s": [0.60],
+            "accvp_table_latency_stage_s": {"accvp_score": [0.50]},
+        },
+    ]
+    metrics = aggregate_episode_reports(reports)
+    assert metrics["accvp_table_decision_count"] == 3
+    assert metrics["accvp_table_activation_window_decision_count"] == 3
+    assert metrics["accvp_table_valid_rate_activation_window"] == 2 / 3
+    assert metrics["accvp_table_timeout_count"] == 1
+    assert metrics["accvp_table_fail_closed_rate"] == 1 / 3
+    assert metrics["accvp_table_latency_count"] == 3
+    assert metrics["accvp_table_latency_p95"] is not None
+    assert metrics["accvp_table_latency_per_stage"]["accvp_score"]["p50"] is not None
+
+
+def test_accvp_observation_preflight_gate_requires_valid_low_latency_tables():
+    passing = _accvp_observation_preflight_gate(
+        {
+            "accvp_table_valid_rate_activation_window": 0.96,
+            "accvp_table_timeout_count": 0,
+            "accvp_table_fail_closed_count": 0,
+            "accvp_table_latency_p95": 0.49,
+        }
+    )
+    failing = _accvp_observation_preflight_gate(
+        {
+            "accvp_table_valid_rate_activation_window": 1.0,
+            "accvp_table_timeout_count": 1,
+            "accvp_table_fail_closed_count": 0,
+            "accvp_table_latency_p95": 0.10,
+        }
+    )
+    assert passing["pass"] is True
+    assert failing["pass"] is False
 
 
 def test_raw_feasible_is_retained():

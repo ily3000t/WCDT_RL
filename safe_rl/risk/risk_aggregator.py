@@ -49,6 +49,69 @@ def _quantile_summary(values: list[float]) -> dict[str, float | None]:
     }
 
 
+def _latency_quantiles(values: list[float]) -> dict[str, float | None]:
+    if not values:
+        return {"p50": None, "p95": None, "max": None}
+    arr = np.asarray(values, dtype=np.float64)
+    return {
+        "p50": float(np.percentile(arr, 50)),
+        "p95": float(np.percentile(arr, 95)),
+        "max": float(np.max(arr)),
+    }
+
+
+def _accvp_observation_metrics(reports: list[dict]) -> dict:
+    decision_count = int(sum(int(report.get("accvp_table_decision_count", 0)) for report in reports))
+    activation_count = int(sum(int(report.get("accvp_table_activation_window_decision_count", 0)) for report in reports))
+    valid_count = int(sum(int(report.get("accvp_table_valid_decision_count", 0)) for report in reports))
+    activation_valid_count = int(
+        sum(int(report.get("accvp_table_activation_window_valid_decision_count", 0)) for report in reports)
+    )
+    timeout_count = int(sum(int(report.get("accvp_table_timeout_count", 0)) for report in reports))
+    fail_closed_count = int(sum(int(report.get("accvp_table_fail_closed_count", 0)) for report in reports))
+    model_error_count = int(sum(int(report.get("accvp_table_model_error_count", 0)) for report in reports))
+    invalid_bundle_count = int(sum(int(report.get("accvp_table_invalid_bundle_count", 0)) for report in reports))
+    latencies: list[float] = []
+    stage_latencies: dict[str, list[float]] = {
+        "context_legality": [],
+        "accvp_prepare_candidates": [],
+        "accvp_score": [],
+        "risk_secondary": [],
+        "table_pack": [],
+    }
+    for report in reports:
+        latencies.extend(float(value) for value in list(report.get("accvp_table_latency_total_s", []) or []))
+        stage_payload = dict(report.get("accvp_table_latency_stage_s", {}) or {})
+        for stage_name in stage_latencies:
+            stage_latencies[stage_name].extend(
+                float(value) for value in list(stage_payload.get(stage_name, []) or [])
+            )
+    latency_summary = _latency_quantiles(latencies)
+    return {
+        "accvp_table_decision_count": decision_count,
+        "accvp_table_activation_window_decision_count": activation_count,
+        "accvp_table_valid_decision_count": valid_count,
+        "accvp_table_activation_window_valid_decision_count": activation_valid_count,
+        "accvp_table_valid_rate_all_decisions": float(valid_count / decision_count) if decision_count else 0.0,
+        "accvp_table_valid_rate_activation_window": (
+            float(activation_valid_count / activation_count) if activation_count else 0.0
+        ),
+        "accvp_table_timeout_count": timeout_count,
+        "accvp_table_timeout_rate": float(timeout_count / decision_count) if decision_count else 0.0,
+        "accvp_table_fail_closed_count": fail_closed_count,
+        "accvp_table_fail_closed_rate": float(fail_closed_count / decision_count) if decision_count else 0.0,
+        "accvp_table_model_error_count": model_error_count,
+        "accvp_table_invalid_bundle_count": invalid_bundle_count,
+        "accvp_table_latency_count": int(len(latencies)),
+        "accvp_table_latency_p50": latency_summary["p50"],
+        "accvp_table_latency_p95": latency_summary["p95"],
+        "accvp_table_latency_max": latency_summary["max"],
+        "accvp_table_latency_per_stage": {
+            name: _latency_quantiles(values) for name, values in stage_latencies.items()
+        },
+    }
+
+
 def _accvp_shadow_metrics(reports: list[dict]) -> dict:
     records = [record for report in reports for record in list(report.get("accvp_records", []) or [])]
     accvp_record_count = int(
@@ -728,5 +791,6 @@ def aggregate_episode_reports(reports: list[dict], task_quality: dict | None = N
             forecast_ranking_replacement_reason_counts
         ),
     }
+    result.update(_accvp_observation_metrics(reports))
     result.update(_accvp_shadow_metrics(reports))
     return result

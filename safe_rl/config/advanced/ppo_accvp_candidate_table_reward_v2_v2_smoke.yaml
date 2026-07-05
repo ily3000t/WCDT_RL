@@ -1,0 +1,51 @@
+run:
+  run_id: "ppo_accvp_candidate_table_reward_v2_v2_smoke"
+  output_root: "safe_rl_output/runs"
+  tensorboard: true
+  replay: false
+
+experiment:
+  note: "Step3.1 v2 smoke: verifies Risk-gated ACCVP candidate table observation shape, finite values, and report wiring only."
+
+forecast_features:
+  enabled: false
+
+rl:
+  use_wcdt_forecast_features: false
+  reward_profile: "merge_timing_forecast"
+  training_semantics_version: "reward_v2_mainline_001"
+  total_timesteps: 1024
+  n_steps: 256
+  shield_guided_reward:
+    risk_checkpoint: "safe_rl_output/runs/safe_rl_comparison_schema9_validation_001/stage2/risk_module.pt"
+  merge_timing_reward:
+    reward_version: "opportunity_window_v2"
+
+stage3:
+  eval_enabled: false
+
+accvp:
+  enabled: false
+  mode: "off"
+  activation_distance: 240.0
+  ensemble_size: 1
+  checkpoint: "safe_rl_output/runs/accvp_240_shadow_train/accvp/accvp_v1_predictor.pt"
+  calibration_bundle: "safe_rl_output/runs/accvp_240_shadow_train/accvp/accvp_v1_calibration.json"
+  operating_point: "safe_rl_output/runs/accvp_240_lite_v3/accvp/accvp_v1_lite_v3_operating_point.json"
+  artifact_manifest: "safe_rl_output/runs/accvp_240_lite_v3/accvp/accvp_v1_lite_v3_task_artifact_manifest.json"
+  risk_checkpoint: "safe_rl_output/runs/safe_rl_comparison_schema9_validation_001/stage2/risk_module.pt"
+  viability_lite:
+    secondary_safety_profile: "audited_merge_left_v1"
+    max_secondary_risk_score: 0.05
+  observation:
+    enabled: true
+    feature_version: "risk_gated_candidate_table_v1"
+    activation_distance: 240.0
+    timeout_s: 0.5
+    use_inference_worker: false
+    profile_latency: true
+    fail_closed_defaults: true
+    include_risk_secondary: true
+    secondary_safety_profile: "short_horizon_risk_v1"
+    risk_horizon_steps: 8
+    allow_with_forecast_features: false
