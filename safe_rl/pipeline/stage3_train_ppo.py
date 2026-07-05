@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
+from safe_rl.accvp.observation import RiskGatedACCVPCandidateTableAugmentor
 from safe_rl.prediction.forecast_feature_augmentor import ForecastFeatureAugmentor
 from safe_rl.prediction.actor_selector import actor_selection_config_hash
 from safe_rl.prediction.forecast_rollout_bundle import FORECAST_ROLLOUT_BUNDLE_VERSION
@@ -110,6 +111,7 @@ def run(cfg):
     stage_log("stage3", f"SUMO config={cfg.scenario.sumocfg}")
     stage_log("stage3", f"total_timesteps={cfg.rl.total_timesteps}")
     stage_log("stage3", f"forecast_features={bool(cfg.forecast_features.enabled or cfg.rl.use_wcdt_forecast_features)}")
+    stage_log("stage3", f"accvp_observation={RiskGatedACCVPCandidateTableAugmentor.enabled(cfg)}")
     reward_profile = str(cfg.rl.get("reward_profile", "default"))
     reward_risk_checkpoint = None
     if reward_profile in {"shield_guided_forecast", "merge_timing_forecast"}:
@@ -133,6 +135,19 @@ def run(cfg):
     )
     try:
         observation_shape = list(env.observation_space.shape)
+        accvp_observation_summary = (
+            env.accvp_observation_augmentor.summary()
+            if env.accvp_observation_augmentor is not None
+            else {
+                "accvp_observation_enabled": False,
+                "accvp_observation_feature_version": "",
+                "accvp_observation_dim": 0,
+                "accvp_table_valid_rate_all_decisions": 0.0,
+                "accvp_table_valid_rate_activation_window": 0.0,
+                "accvp_table_timeout_rate": 0.0,
+                "accvp_table_fail_closed_rate": 0.0,
+            }
+        )
         prediction_checkpoint = None
         if env.forecast_augmentor is not None and env.forecast_augmentor.predictor is not None:
             prediction_checkpoint = getattr(env.forecast_augmentor.predictor, "checkpoint_path", None)
@@ -143,6 +158,8 @@ def run(cfg):
             stage_dir / str(cfg.stage3.model_name),
             tensorboard_dir=stage_dir / "tensorboard",
         )
+        if isinstance(report.get("accvp_observation_runtime_summary"), dict):
+            accvp_observation_summary.update(dict(report["accvp_observation_runtime_summary"]))
     finally:
         env.close()
     report["stage"] = "stage3"
@@ -162,8 +179,11 @@ def run(cfg):
     } if report["forecast_features_enabled"] else None
     shield_guided_cfg = dict(cfg.rl.get("shield_guided_reward", {}) or {})
     merge_timing_cfg = dict(cfg.rl.get("merge_timing_reward", {}) or {})
-    report["training_semantics_version"] = str(
-        cfg.rl.get("training_semantics_version", "legacy_unspecified")
+    base_semantics = str(cfg.rl.get("training_semantics_version", "legacy_unspecified"))
+    report["training_semantics_version"] = (
+        f"{base_semantics}+{RiskGatedACCVPCandidateTableAugmentor.FEATURE_VERSION}"
+        if RiskGatedACCVPCandidateTableAugmentor.enabled(cfg)
+        else base_semantics
     )
     report["reward_profile"] = reward_profile
     report["merge_timing_reward_version"] = (
@@ -201,6 +221,9 @@ def run(cfg):
     report["merge_timing_reward_config"] = merge_timing_cfg if reward_profile == "merge_timing_forecast" else None
     report["observation_dim"] = int(observation_shape[0]) if observation_shape else 0
     report["observation_shape"] = observation_shape
+    report["accvp_observation_summary"] = accvp_observation_summary
+    report.update(accvp_observation_summary)
+    report["total_observation_dim"] = int(observation_shape[0]) if observation_shape else 0
     report["safety_metric_version"] = str(
         cfg.risk_module.get("safety_metric_version", SAFETY_METRIC_VERSION)
     )

@@ -344,7 +344,7 @@ shield:
 # all existing PPO, Risk Module, WcDT and Shield experiment semantics.
 accvp:
   enabled: false
-  mode: "off"                 # off | shadow | viability_branch
+  mode: "off"                 # off | shadow | viability_branch | viability_lite_shadow | viability_lite
   dataset_dir: null
   oracle_report: null
   checkpoint: null
@@ -369,6 +369,14 @@ accvp:
   merge_viability_lower_bound: 0.50
   max_decision_latency_s: 0.5
   lateral_commitment_s: 1.0
+  observation:
+    enabled: false
+    feature_version: "risk_gated_candidate_table_v1"
+    activation_distance: 240.0
+    timeout_s: 0.45
+    fail_closed_defaults: true
+    include_risk_secondary: true
+    allow_with_forecast_features: false
   viability_lite:
     min_p_merge_before_taper: 0.75
     min_improvement_over_raw: 0.01

@@ -1,0 +1,25 @@
+run:
+  run_id: "ppo_reward_v2_no_forecast"
+  output_root: "safe_rl_output/runs"
+  tensorboard: true
+  replay: false
+
+forecast_features:
+  enabled: false
+
+rl:
+  use_wcdt_forecast_features: false
+  reward_profile: "merge_timing_forecast"
+  training_semantics_version: "reward_v2_mainline_001"
+  total_timesteps: 100000
+  shield_guided_reward:
+    risk_checkpoint: "safe_rl_output/runs/safe_rl_comparison_schema9_validation_001/stage2/risk_module.pt"
+  merge_timing_reward:
+    reward_version: "opportunity_window_v2"
+
+accvp:
+  enabled: false
+  mode: "off"
+  observation:
+    enabled: false
+

@@ -12,6 +12,11 @@ from safe_rl.accvp.candidate_table_diagnostics import candidate_table_summary
 from safe_rl.accvp.controller import ACCVPController
 from safe_rl.accvp.dataset import build_split_manifest
 from safe_rl.accvp.model import checkpoint_metadata
+from safe_rl.accvp.observation import (
+    RISK_GATED_ACCVP_OBSERVATION_VERSION,
+    RiskGatedACCVPCandidateTableAugmentor,
+    validate_accvp_observation_config,
+)
 from safe_rl.accvp.oracle import counterfactual_oracle_report
 from safe_rl.accvp.pilot import validate_pilot_dataset
 from safe_rl.accvp.protocol import counterfactual_data_contract, data_contract_hash, effective_activation_distance
@@ -49,7 +54,13 @@ class _Shield:
         self.safe = safe
 
     def evaluate_candidate(self, _action, _context):
-        return {"safety_pass": self.safe, "veto_reason": "risk_score" if not self.safe else ""}
+        return {
+            "candidate_legal": True,
+            "safety_pass": self.safe,
+            "risk_score": 0.8 if not self.safe else 0.1,
+            "risk_uncertainty": 0.0,
+            "veto_reason": "risk_score" if not self.safe else "",
+        }
 
 
 def _cfg(mode: str):
@@ -86,6 +97,107 @@ def _score(action_id: int, *, risk: float = 0.1, viability: float = 0.8):
         "p_merge_before_taper": viability,
         "target_lane_entry_time_s": 1.0,
     }
+
+
+def _observation_cfg():
+    return clone_with_overrides(
+        load_config(),
+        {
+            "forecast_features": {"enabled": False},
+            "rl": {"use_wcdt_forecast_features": False},
+            "accvp": {
+                "enabled": False,
+                "mode": "off",
+                "checkpoint": "unused.pt",
+                "risk_checkpoint": "unused_risk.pt",
+                "activation_distance": 240.0,
+                "observation": {
+                    "enabled": True,
+                    "feature_version": RISK_GATED_ACCVP_OBSERVATION_VERSION,
+                    "activation_distance": 240.0,
+                    "timeout_s": 0.45,
+                    "fail_closed_defaults": True,
+                    "include_risk_secondary": True,
+                    "allow_with_forecast_features": False,
+                },
+            },
+        },
+    )
+
+
+def _observation_context(*, active: bool = True, decision: int = 0):
+    return {
+        "episode_seed": 2,
+        "episode_step": decision * 5,
+        "decision_index": decision,
+        "merge_local": SimpleNamespace(
+            ego_on_auxiliary=bool(active),
+            merge_distance=120.0 if active else 300.0,
+        ),
+        "candidate_legal_by_action": {index: index in {4, 6, 7, 8} for index in range(9)},
+    }
+
+
+def test_risk_gated_accvp_candidate_table_contract_and_masks():
+    cfg = _observation_cfg()
+    predictor = _Predictor(
+        [
+            {**_score(4, viability=0.20), "ensemble_disagreement": 0.02},
+            {**_score(7, viability=0.85), "ensemble_disagreement": 0.03},
+        ]
+    )
+    augmentor = RiskGatedACCVPCandidateTableAugmentor(cfg, predictor=predictor, shield=_Shield(safe=True))
+    table = augmentor.extract(_observation_context())
+    assert table.shape == (99,)
+    assert RiskGatedACCVPCandidateTableAugmentor.feature_dim(cfg) == 99
+    names = RiskGatedACCVPCandidateTableAugmentor.feature_names()
+    assert names[0] == "action_0_table_valid"
+    assert names[-1] == "action_8_accel_cmd_norm"
+    rows = table.reshape((9, 11))
+    assert rows[7, 0] == 1.0  # table_valid
+    assert rows[7, 1] == 1.0  # candidate_legal
+    assert rows[7, 2] == 1.0  # risk_secondary_pass
+    assert abs(float(rows[7, 4]) - 0.85) < 1.0e-6
+    assert rows[7, 7] == 1.0  # is_left_action
+    assert rows[4, 8] == 1.0  # is_keep_action
+    assert rows[0, 0] == 0.0  # illegal / unscored keeps fail-closed mask
+    summary = augmentor.summary()
+    assert summary["accvp_table_valid_rate_activation_window"] == 1.0
+    assert summary["accvp_observation_feature_version"] == RISK_GATED_ACCVP_OBSERVATION_VERSION
+
+
+def test_risk_gated_accvp_candidate_table_fail_closed_preserves_masks():
+    class TimeoutPredictor:
+        def score_candidates(self, _context, _actions, *, timeout_s=None):
+            raise TimeoutError("boom")
+
+    cfg = _observation_cfg()
+    augmentor = RiskGatedACCVPCandidateTableAugmentor(cfg, predictor=TimeoutPredictor(), shield=_Shield(safe=True))
+    table = augmentor.extract(_observation_context())
+    assert np.isfinite(table).all()
+    rows = table.reshape((9, 11))
+    assert rows[:, 0].sum() == 0.0
+    assert rows[7, 1] == 1.0
+    assert rows[7, 3] == 1.0
+    assert rows[7, 4] == 0.0
+    assert rows[7, 7] == 1.0
+    assert rows[7, 10] == 0.0
+    summary = augmentor.summary()
+    assert summary["accvp_table_timeout_count"] == 1
+    assert summary["accvp_table_fail_closed_count"] == 1
+
+
+def test_accvp_candidate_table_observation_rejects_legacy_forecast_mix_by_default():
+    cfg = clone_with_overrides(
+        _observation_cfg(),
+        {"forecast_features": {"enabled": True, "source": "constant_velocity"}},
+    )
+    try:
+        validate_accvp_observation_config(cfg)
+    except ValueError as exc:
+        assert "mutually exclusive" in str(exc)
+    else:  # pragma: no cover - assertion clarity
+        raise AssertionError("expected ACCVP table + legacy forecast mix to fail")
 
 
 def test_raw_feasible_is_retained():

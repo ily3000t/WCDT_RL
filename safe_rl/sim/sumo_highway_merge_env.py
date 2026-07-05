@@ -14,6 +14,7 @@ import numpy as np
 
 from safe_rl.prediction.actor_selector import select_merge_relevant_actors
 from safe_rl.prediction.forecast_feature_augmentor import ForecastFeatureAugmentor
+from safe_rl.accvp.observation import RiskGatedACCVPCandidateTableAugmentor, validate_accvp_observation_config
 from safe_rl.risk.candidate_risk_ranker import CandidateRiskRanker
 from safe_rl.risk.merge_local import is_candidate_legal, merge_local_stats
 from safe_rl.shield.forecast_task_scorer import ForecastAwareTaskScorer
@@ -73,6 +74,8 @@ def configured_trajectory_actor_capacity(config: Any) -> int:
     accvp_cfg = config.get("accvp", {}) or {}
     if bool(accvp_cfg.get("_counterfactual_collection_enabled", False)):
         capacities.append(int(accvp_cfg.get("actor_count", scenario_top_k)))
+    if bool(accvp_cfg.get("observation", {}).get("enabled", False)):
+        capacities.append(int(accvp_cfg.get("actor_count", scenario_top_k)))
     forecast_cfg = config.get("forecast_features", {}) or {}
     if bool(forecast_cfg.get("enabled", False)):
         source = str(forecast_cfg.get("source", "")).lower()
@@ -126,6 +129,7 @@ class SumoHighwayMergeEnv(gym.Env):
         config: Any,
         seed: int | None = None,
         forecast_augmentor: ForecastFeatureAugmentor | None = None,
+        accvp_observation_augmentor: RiskGatedACCVPCandidateTableAugmentor | None = None,
         shield: SafetyShield | None = None,
         accvp_controller: Any | None = None,
         reward_risk_model: Any | None = None,
@@ -152,7 +156,10 @@ class SumoHighwayMergeEnv(gym.Env):
         self.trajectory_actor_capacity = configured_trajectory_actor_capacity(config)
         self.history_steps = int(config.scenario.history_steps)
         self.forecast_enabled = bool(config.forecast_features.enabled or config.rl.use_wcdt_forecast_features)
+        self.accvp_observation_enabled = RiskGatedACCVPCandidateTableAugmentor.enabled(config)
+        validate_accvp_observation_config(config)
         self.forecast_augmentor = forecast_augmentor
+        self.accvp_observation_augmentor = accvp_observation_augmentor
         self.shield = shield
         self.accvp_controller = accvp_controller
         if self.accvp_controller is not None and self.shield is None:
@@ -172,10 +179,15 @@ class SumoHighwayMergeEnv(gym.Env):
         self.action_space = spaces.Discrete(len(ACTIONS))
         self._base_obs_dim = 8 + self.top_k * 8 + 4
         self._forecast_dim = ForecastFeatureAugmentor.feature_dim(config) if self.forecast_enabled else 0
+        self._accvp_observation_dim = (
+            RiskGatedACCVPCandidateTableAugmentor.feature_dim(config)
+            if self.accvp_observation_enabled
+            else 0
+        )
         self.observation_space = spaces.Box(
             low=-np.inf,
             high=np.inf,
-            shape=(self._base_obs_dim + self._forecast_dim,),
+            shape=(self._base_obs_dim + self._forecast_dim + self._accvp_observation_dim,),
             dtype=np.float32,
         )
 
@@ -346,6 +358,8 @@ class SumoHighwayMergeEnv(gym.Env):
             self.shield.reset_episode_state()
         if self.accvp_controller is not None:
             self.accvp_controller.reset_episode_state()
+        if self.accvp_observation_augmentor is not None:
+            self.accvp_observation_augmentor.reset_episode_state()
 
         for _ in range(max(1, self.history_steps)):
             self._simulation_step()
@@ -556,6 +570,8 @@ class SumoHighwayMergeEnv(gym.Env):
     def close(self):
         if self.accvp_controller is not None and hasattr(self.accvp_controller, "close"):
             self.accvp_controller.close()
+        if self.accvp_observation_augmentor is not None and hasattr(self.accvp_observation_augmentor, "close"):
+            self.accvp_observation_augmentor.close()
         self._close_sumo()
 
     def _start_sumo(self) -> None:
@@ -884,11 +900,22 @@ class SumoHighwayMergeEnv(gym.Env):
             base = np.zeros((self._base_obs_dim,), dtype=np.float32)
         else:
             base = self._base_observation(ego, latest)
-        if not self.forecast_enabled:
+        parts = [base]
+        context: dict[str, Any] | None = None
+        if self.forecast_enabled:
+            augmentor = self.forecast_augmentor or ForecastFeatureAugmentor(self.config)
+            context = self.get_risk_context()
+            forecast = augmentor.extract(context)
+            parts.append(forecast.astype(np.float32))
+        if self.accvp_observation_enabled:
+            if self.accvp_observation_augmentor is None:
+                raise RuntimeError("accvp.observation.enabled requires an ACCVP observation augmentor")
+            context = context or self.get_risk_context()
+            accvp_table = self.accvp_observation_augmentor.extract(context)
+            parts.append(accvp_table.astype(np.float32))
+        if len(parts) == 1:
             return base
-        augmentor = self.forecast_augmentor or ForecastFeatureAugmentor(self.config)
-        forecast = augmentor.extract(self.get_risk_context())
-        return np.concatenate([base, forecast.astype(np.float32)], axis=0)
+        return np.concatenate(parts, axis=0)
 
     def _base_observation(self, ego: VehicleState, latest: dict[str, VehicleState]) -> np.ndarray:
         local = merge_local_stats(ego, list(latest.values()), self.config)
@@ -2145,6 +2172,7 @@ class SumoHighwayMergeEnv(gym.Env):
             "performance_tracker": self.performance,
             "episode_seed": int(self.seed_value),
             "decision_index": int(self._decision_index),
+            "episode_step": int(self._episode_step),
         }
         self._decision_context_cache = context
         return context
@@ -2609,6 +2637,19 @@ class SumoHighwayMergeEnv(gym.Env):
                 sum(1 for item in self._accvp_records if bool(item.get("accvp_commitment_cancelled", False)))
             ),
             "accvp_records": list(self._accvp_records),
+            **(
+                self.accvp_observation_augmentor.summary()
+                if self.accvp_observation_augmentor is not None
+                else {
+                    "accvp_observation_enabled": False,
+                    "accvp_observation_feature_version": "",
+                    "accvp_observation_dim": 0,
+                    "accvp_table_valid_rate_all_decisions": 0.0,
+                    "accvp_table_valid_rate_activation_window": 0.0,
+                    "accvp_table_timeout_rate": 0.0,
+                    "accvp_table_fail_closed_rate": 0.0,
+                }
+            ),
             "forecast_aware_candidate_ranking_mode": self._forecast_aware_candidate_ranking_mode(),
             "forecast_ranking_replacement_count": int(forecast_ranking_replacement_count),
             "forecast_ranking_replacement_rate": float(

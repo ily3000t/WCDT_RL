@@ -13,6 +13,7 @@ from safe_rl.prediction.forecast_feature_augmentor import ForecastFeatureAugment
 from safe_rl.prediction.wcdt_predictor import WcDTPredictor
 from safe_rl.risk.risk_module import RiskModuleWrapper
 from safe_rl.accvp.schema import file_sha256
+from safe_rl.accvp.observation import RiskGatedACCVPCandidateTableAugmentor
 from safe_rl.shield.safety_shield import SafetyShield
 from safe_rl.sim.sumo_highway_merge_env import SumoHighwayMergeEnv
 from safe_rl.utils.config import ConfigDict, REPO_ROOT, load_config, prepare_run_dir
@@ -117,6 +118,23 @@ def make_forecast_augmentor(cfg: ConfigDict) -> ForecastFeatureAugmentor | None:
     return ForecastFeatureAugmentor(cfg)
 
 
+def make_accvp_observation_augmentor(
+    cfg: ConfigDict,
+    *,
+    risk_checkpoint: str | None = None,
+    reward_risk_checkpoint: str | None = None,
+) -> RiskGatedACCVPCandidateTableAugmentor | None:
+    if not RiskGatedACCVPCandidateTableAugmentor.enabled(cfg):
+        return None
+    configured_risk = cfg.accvp.get("risk_checkpoint") or risk_checkpoint or reward_risk_checkpoint
+    if configured_risk:
+        cfg.accvp["risk_checkpoint"] = str(configured_risk)
+    return RiskGatedACCVPCandidateTableAugmentor(
+        cfg,
+        risk_checkpoint=str(configured_risk) if configured_risk else None,
+    )
+
+
 def make_env(
     cfg: ConfigDict,
     seed: int,
@@ -166,6 +184,11 @@ def make_env(
         if bool(reward_cfg.get("use_calibrated_risk", False)):
             reward_risk_model.apply_temperature = True
     forecast_augmentor = make_forecast_augmentor(cfg)
+    accvp_observation_augmentor = make_accvp_observation_augmentor(
+        cfg,
+        risk_checkpoint=risk_checkpoint,
+        reward_risk_checkpoint=reward_risk_checkpoint,
+    )
     accvp_controller = None
     if bool(cfg.accvp.get("enabled", False)) and str(cfg.accvp.get("mode", "off")) != "off":
         from safe_rl.accvp.runtime import build_accvp_controller
@@ -179,6 +202,7 @@ def make_env(
         cfg,
         seed=seed,
         forecast_augmentor=forecast_augmentor,
+        accvp_observation_augmentor=accvp_observation_augmentor,
         shield=shield,
         accvp_controller=accvp_controller,
         reward_risk_model=reward_risk_model,

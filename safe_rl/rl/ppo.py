@@ -292,6 +292,24 @@ def _worker_model_memory_estimate(config: Any, num_envs: int) -> dict[str, Any]:
     }
 
 
+def _accvp_observation_summary_from_env(env: Any) -> dict[str, Any] | None:
+    """Best-effort extraction for single-process PPO training reports."""
+
+    candidates = [env]
+    for attr in ("env", "unwrapped"):
+        try:
+            value = getattr(env, attr)
+        except Exception:
+            value = None
+        if value is not None and all(value is not existing for existing in candidates):
+            candidates.append(value)
+    for candidate in candidates:
+        augmentor = getattr(candidate, "accvp_observation_augmentor", None)
+        if augmentor is not None and hasattr(augmentor, "summary"):
+            return dict(augmentor.summary())
+    return None
+
+
 def train_ppo(
     config: Any,
     env: SumoHighwayMergeEnv,
@@ -400,6 +418,7 @@ def train_ppo(
             "selection_metric": selection_metric if bool(config.stage3.get("eval_enabled", False)) else None,
         }
     write_json(selection_report_path, checkpoint_selection)
+    accvp_observation_runtime_summary = _accvp_observation_summary_from_env(env)
     requested_total_timesteps = int(config.rl.total_timesteps)
     actual_total_timesteps = int(model.num_timesteps)
     rollout_quantum = int(num_envs * int(config.rl.n_steps))
@@ -441,6 +460,7 @@ def train_ppo(
                 "unspecified_legacy",
             )
         ),
+        "accvp_observation_runtime_summary": accvp_observation_runtime_summary,
     }
     env.close()
     return report
