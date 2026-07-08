@@ -63,6 +63,9 @@ def _group_overrides(group) -> dict:
         "rl": {"use_wcdt_forecast_features": bool(group.forecast_features)},
         "shield": shield_overrides,
     }
+    requested_rl_overrides = group.get("rl_overrides")
+    if requested_rl_overrides:
+        overrides["rl"].update(dict(requested_rl_overrides))
     requested_accvp = group.get("accvp")
     if requested_accvp:
         overrides["accvp"] = dict(requested_accvp)
@@ -665,6 +668,7 @@ def run(cfg) -> Path:
             group_reports[group.name]["forecast_checkpoint"] = ""
         group_reports[group.name]["shield_enabled"] = bool(group.shield)
         group_reports[group.name]["shield_overrides"] = dict(group.get("shield_overrides", {}) or {})
+        group_reports[group.name]["rl_overrides"] = dict(group.get("rl_overrides", {}) or {})
         group_reports[group.name]["risk_module_overrides"] = dict(group.get("risk_module_overrides", {}) or {})
         group_reports[group.name]["policy_type"] = policy_type
         group_reports[group.name]["raw_policy"] = str(group.get("raw_policy", group.name))

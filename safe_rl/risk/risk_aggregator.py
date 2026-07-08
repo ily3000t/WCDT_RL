@@ -112,6 +112,106 @@ def _accvp_observation_metrics(reports: list[dict]) -> dict:
     }
 
 
+def _policy_commitment_metrics(reports: list[dict]) -> dict:
+    decision_count = int(sum(len(list(report.get("action_execution_records", []) or [])) for report in reports))
+    started = int(sum(int(report.get("policy_commitment_started_count", 0) or 0) for report in reports))
+    active = int(sum(int(report.get("policy_commitment_active_count", 0) or 0) for report in reports))
+    action_change = int(sum(int(report.get("policy_commitment_action_change_count", 0) or 0) for report in reports))
+    veto = int(sum(int(report.get("policy_commitment_veto_count", 0) or 0) for report in reports))
+    target_entry_cancel = int(
+        sum(int(report.get("policy_commitment_cancelled_by_target_entry_count", 0) or 0) for report in reports)
+    )
+    released_by_risk = int(
+        sum(int(report.get("policy_commitment_released_by_risk_count", 0) or 0) for report in reports)
+    )
+    abort_penalty_applied = int(
+        sum(int(report.get("persistence_abort_penalty_applied_count", 0) or 0) for report in reports)
+    )
+    continue_bonus_applied = int(
+        sum(int(report.get("persistence_continue_bonus_applied_count", 0) or 0) for report in reports)
+    )
+    suppressed_by_risk = int(
+        sum(int(report.get("persistence_suppressed_by_risk_count", 0) or 0) for report in reports)
+    )
+    abort_count = int(sum(int(report.get("raw_left_abort_before_entry_count", 0) or 0) for report in reports))
+    left_request_count = int(sum(int(report.get("left_request_count_before_entry", 0) or 0) for report in reports))
+    first_left_success_values = [
+        float(report.get("first_left_request_to_target_entry_success_rate", 0.0) or 0.0)
+        for report in reports
+        if report.get("first_merge_request_step") is not None
+    ]
+    seed12_statuses = [
+        str(report.get("seed12_repair_status", ""))
+        for report in reports
+        if str(report.get("seed12_repair_status", ""))
+    ]
+    case_records: list[dict] = []
+    for report in reports:
+        seed = report.get("seed", report.get("episode_seed", ""))
+        final_done_reason = str(report.get("done_reason", ""))
+        entry_distance = report.get("first_target_lane_entry_distance_to_taper")
+        for record in list(report.get("action_execution_records", []) or []):
+            involved = bool(
+                record.get("policy_commitment_started", False)
+                or record.get("policy_commitment_action_changed", False)
+                or record.get("policy_commitment_vetoed", False)
+                or record.get("policy_commitment_released_by_risk", False)
+            )
+            if not involved:
+                continue
+            case_records.append(
+                {
+                    "seed": seed,
+                    "step": int(record.get("step", -1)),
+                    "decision_index": int(record.get("decision_index", -1)),
+                    "raw_action": int(record.get("raw_action", -1)),
+                    "shield_input_action": int(record.get("shield_input_action", -1)),
+                    "safety_shield_action": int(record.get("safety_shield_action", -1)),
+                    "final_action": int(record.get("final_action", -1)),
+                    "policy_commitment_started": bool(record.get("policy_commitment_started", False)),
+                    "policy_commitment_action_changed": bool(record.get("policy_commitment_action_changed", False)),
+                    "policy_commitment_vetoed": bool(record.get("policy_commitment_vetoed", False)),
+                    "policy_commitment_released_by_risk": bool(record.get("policy_commitment_released_by_risk", False)),
+                    "safety_shield_replaced": bool(record.get("safety_shield_replaced", False)),
+                    "safety_shield_replacement_reason": str(record.get("safety_shield_replacement_reason", "")),
+                    "merge_timing_persistence_abort_penalty": float(
+                        record.get("merge_timing_persistence_abort_penalty", 0.0) or 0.0
+                    ),
+                    "merge_timing_persistence_continue_bonus": float(
+                        record.get("merge_timing_persistence_continue_bonus", 0.0) or 0.0
+                    ),
+                    "merge_timing_persistence_suppressed_by_risk": bool(
+                        record.get("merge_timing_persistence_suppressed_by_risk", False)
+                    ),
+                    "min_distance": float(record.get("min_distance", 0.0) or 0.0),
+                    "min_ttc": float(record.get("min_ttc", 0.0) or 0.0),
+                    "max_drac": float(record.get("max_drac", 0.0) or 0.0),
+                    "final_done_reason": final_done_reason,
+                    "first_target_lane_entry_distance_to_taper": entry_distance,
+                }
+            )
+    return {
+        "policy_commitment_started_count": started,
+        "policy_commitment_active_count": active,
+        "policy_commitment_action_change_count": action_change,
+        "policy_commitment_veto_count": veto,
+        "policy_commitment_cancelled_by_target_entry_count": target_entry_cancel,
+        "policy_commitment_released_by_risk_count": released_by_risk,
+        "policy_commitment_action_change_per_decision_rate": float(action_change / max(1, decision_count)),
+        "persistence_abort_penalty_applied_count": abort_penalty_applied,
+        "persistence_continue_bonus_applied_count": continue_bonus_applied,
+        "persistence_suppressed_by_risk_count": suppressed_by_risk,
+        "raw_left_abort_before_entry_count": abort_count,
+        "left_request_count_before_entry": left_request_count,
+        "merge_intent_persistence_rate": float(left_request_count / max(1, left_request_count + abort_count)),
+        "first_left_request_to_target_entry_success_rate": (
+            float(np.mean(first_left_success_values)) if first_left_success_values else 0.0
+        ),
+        "seed12_repair_status": seed12_statuses[0] if seed12_statuses else "",
+        "policy_commitment_case_records": case_records,
+    }
+
+
 def _accvp_shadow_metrics(reports: list[dict]) -> dict:
     records = [record for report in reports for record in list(report.get("accvp_records", []) or [])]
     accvp_record_count = int(
@@ -510,6 +610,18 @@ def aggregate_episode_reports(reports: list[dict], task_quality: dict | None = N
         sum(int(report.get("deadline_safe_merge_opportunity_count", 0)) for report in reports)
     )
     deadline_missed = int(sum(int(report.get("deadline_missed_safe_merge_count", 0)) for report in reports))
+    pre_entry_deadline_opportunities = int(
+        sum(int(report.get("pre_entry_deadline_safe_merge_opportunity_count", 0)) for report in reports)
+    )
+    pre_entry_deadline_missed = int(
+        sum(int(report.get("pre_entry_deadline_missed_safe_merge_count", 0)) for report in reports)
+    )
+    post_entry_opportunity_excluded = int(
+        sum(int(report.get("post_entry_opportunity_excluded_count", 0)) for report in reports)
+    )
+    early_merge_success_before_deadline = int(
+        sum(int(report.get("early_merge_success_before_deadline_count", 0)) for report in reports)
+    )
     urgency_missed = int(
         sum(int(report.get("missed_safe_merge_after_urgency_0_5_count", 0)) for report in reports)
     )
@@ -705,6 +817,23 @@ def aggregate_episode_reports(reports: list[dict], task_quality: dict | None = N
         "deadline_opportunity_capture_rate": (
             float(1.0 - deadline_missed / deadline_opportunities) if deadline_opportunities else 0.0
         ),
+        "pre_entry_deadline_safe_merge_opportunity_count": pre_entry_deadline_opportunities,
+        "pre_entry_deadline_missed_safe_merge_count": pre_entry_deadline_missed,
+        "pre_entry_deadline_missed_safe_merge_rate": (
+            float(pre_entry_deadline_missed / pre_entry_deadline_opportunities)
+            if pre_entry_deadline_opportunities
+            else 0.0
+        ),
+        "pre_entry_deadline_opportunity_capture_rate": (
+            float(1.0 - pre_entry_deadline_missed / pre_entry_deadline_opportunities)
+            if pre_entry_deadline_opportunities
+            else 0.0
+        ),
+        "post_entry_opportunity_excluded_count": post_entry_opportunity_excluded,
+        "early_merge_success_before_deadline_count": early_merge_success_before_deadline,
+        "early_merge_success_before_deadline_rate": (
+            float(early_merge_success_before_deadline / len(reports)) if reports else 0.0
+        ),
         "missed_safe_merge_after_urgency_0_5_count": urgency_missed,
         "safe_merge_after_urgency_0_5_count": urgency_opportunities,
         "missed_safe_merge_after_urgency_0_5_rate": (
@@ -792,5 +921,6 @@ def aggregate_episode_reports(reports: list[dict], task_quality: dict | None = N
         ),
     }
     result.update(_accvp_observation_metrics(reports))
+    result.update(_policy_commitment_metrics(reports))
     result.update(_accvp_shadow_metrics(reports))
     return result

@@ -171,6 +171,19 @@ class SumoHighwayMergeEnv(gym.Env):
             raise ValueError("ACCVP cannot be combined with Task Backstop or Full Ranking")
         self.reward_risk_model = reward_risk_model
         self.reward_ranker = CandidateRiskRanker(config, reward_risk_model) if reward_risk_model is not None else None
+        policy_commit_cfg = dict(config.rl.get("policy_lateral_commitment", {}) or {})
+        self._policy_commitment_enabled = bool(policy_commit_cfg.get("enabled", False))
+        self._policy_commitment_profile = str(policy_commit_cfg.get("profile", "left_intent_1s_v1"))
+        if self._policy_commitment_enabled and self._policy_commitment_profile not in {
+            "left_intent_1s_v1",
+            "left_intent_1s_risk_gated_v2",
+        }:
+            raise ValueError(
+                "rl.policy_lateral_commitment.profile must be one of "
+                "'left_intent_1s_v1', 'left_intent_1s_risk_gated_v2'"
+            )
+        self._policy_commitment_duration_s = float(policy_commit_cfg.get("duration_s", 1.0))
+        self._policy_commitment_preserve_raw_accel = bool(policy_commit_cfg.get("preserve_raw_accel", True))
         task_predictor = getattr(forecast_augmentor, "predictor", None) if forecast_augmentor is not None else None
         self.forecast_task_scorer = ForecastAwareTaskScorer(config, task_predictor)
         self.record_trajectory_samples = record_trajectory_samples
@@ -223,6 +236,20 @@ class SumoHighwayMergeEnv(gym.Env):
         self._first_merge_request_distance_to_taper: float | None = None
         self._first_target_lane_entry_step: int | None = None
         self._first_target_lane_entry_distance_to_taper: float | None = None
+        self._last_raw_action_index = -1
+        self._policy_commitment_remaining_s = 0.0
+        self._policy_commitment_started_count = 0
+        self._policy_commitment_active_count = 0
+        self._policy_commitment_action_change_count = 0
+        self._policy_commitment_veto_count = 0
+        self._policy_commitment_cancelled_by_target_entry_count = 0
+        self._policy_commitment_released_by_risk_count = 0
+        self._persistence_abort_penalty_applied_count = 0
+        self._persistence_continue_bonus_applied_count = 0
+        self._persistence_suppressed_by_risk_count = 0
+        self._raw_left_abort_before_entry_count = 0
+        self._left_request_count_before_entry = 0
+        self._last_policy_commitment_debug: dict[str, Any] = {}
         self._safe_merge_opportunity_count = 0
         self._missed_safe_merge_opportunity_count = 0
         self._task_merge_records: list[dict[str, Any]] = []
@@ -345,6 +372,20 @@ class SumoHighwayMergeEnv(gym.Env):
         self._first_merge_request_distance_to_taper = None
         self._first_target_lane_entry_step = None
         self._first_target_lane_entry_distance_to_taper = None
+        self._last_raw_action_index = -1
+        self._policy_commitment_remaining_s = 0.0
+        self._policy_commitment_started_count = 0
+        self._policy_commitment_active_count = 0
+        self._policy_commitment_action_change_count = 0
+        self._policy_commitment_veto_count = 0
+        self._policy_commitment_cancelled_by_target_entry_count = 0
+        self._policy_commitment_released_by_risk_count = 0
+        self._persistence_abort_penalty_applied_count = 0
+        self._persistence_continue_bonus_applied_count = 0
+        self._persistence_suppressed_by_risk_count = 0
+        self._raw_left_abort_before_entry_count = 0
+        self._left_request_count_before_entry = 0
+        self._last_policy_commitment_debug = {}
         self._safe_merge_opportunity_count = 0
         self._missed_safe_merge_opportunity_count = 0
         self._task_merge_records.clear()
@@ -388,6 +429,13 @@ class SumoHighwayMergeEnv(gym.Env):
         intervention = None
         context = self.get_risk_context()
         self._record_merge_opportunity(context, raw_action)
+        policy_commitment_debug: dict[str, Any] = {}
+        shield_input_action, policy_commitment_debug = self._policy_commitment_pre_shield(
+            raw_action,
+            shield_input_action,
+            context,
+        )
+        final_action = shield_input_action
         if self.shield is not None and self.shield.enabled:
             final_action, intervention = self.shield.select_action(shield_input_action, context)
             intervention["step"] = int(self._episode_step)
@@ -397,6 +445,14 @@ class SumoHighwayMergeEnv(gym.Env):
         safety_shield_replaced = bool(
             intervention is not None
             and int(intervention.get("final_action", shield_input_action.index)) != int(shield_input_action.index)
+        )
+        self._policy_commitment_after_shield(
+            raw_action,
+            shield_input_action,
+            safety_shield_action,
+            safety_shield_replaced,
+            context,
+            policy_commitment_debug,
         )
         accvp_debug: dict[str, Any] = {}
         if self.accvp_controller is not None:
@@ -461,6 +517,7 @@ class SumoHighwayMergeEnv(gym.Env):
             "accvp_decision_latency_s": float(accvp_debug.get("decision_latency_s", 0.0)),
             "task_replacement": bool(task_replacement is not None),
             "forecast_ranking_replacement": bool(forecast_ranking_replacement is not None),
+            **dict(policy_commitment_debug),
         }
         self._action_execution_records.append(execution_record)
 
@@ -535,11 +592,21 @@ class SumoHighwayMergeEnv(gym.Env):
         if ego is not None:
             self._ego_speeds.append(float(ego.speed))
             self._record_target_lane_entry(ego)
+        self._policy_commitment_finalize_after_step(ego, execution_record)
 
         terminated, done_reason = self._done(metrics)
         self._last_done_reason = done_reason
         truncated = self._episode_step >= self.episode_steps
         reward = self._reward(prev_x, ego, metrics, done_reason, raw_action=raw_action, risk_context=context)
+        for key in (
+            "merge_timing_persistence_abort_penalty",
+            "merge_timing_persistence_continue_bonus",
+            "merge_timing_persistence_eligible",
+            "merge_timing_persistence_suppressed_by_risk",
+            "merge_timing_persistence_window_active",
+        ):
+            if key in self._last_reward_debug:
+                execution_record[key] = self._last_reward_debug[key]
         obs = self._build_observation()
         info = self._info(
             metrics=metrics,
@@ -556,6 +623,7 @@ class SumoHighwayMergeEnv(gym.Env):
         info["safety_shield_action_name"] = str(safety_shield_action.name)
         info["safety_shield_replaced"] = safety_shield_replaced
         info["action_execution_path"] = execution_path
+        info.update(policy_commitment_debug)
         info.update(accvp_debug)
         info["raw_action_lane_oob"] = bool(raw_action_lane_oob)
         info["final_action_lane_oob"] = bool(final_action_lane_oob)
@@ -564,6 +632,7 @@ class SumoHighwayMergeEnv(gym.Env):
         info["decision_index"] = decision_index
         self._last_ego_speed = ego.speed if ego else 0.0
         self._last_ego_x = ego.x if ego else self._last_ego_x
+        self._last_raw_action_index = int(raw_action.index)
         self._decision_index += 1
         return obs, float(reward), bool(terminated), bool(truncated), info
 
@@ -1713,7 +1782,64 @@ class SumoHighwayMergeEnv(gym.Env):
             >= float(cfg.get("bonus_min_distance_to_taper", 60.0))
         ):
             early_bonus = legacy_early_bonus
-        total = float(missed_penalty + opportunity_bonus + deadline_penalty + taper_penalty + early_bonus)
+        persistence_abort_penalty = 0.0
+        persistence_continue_bonus = 0.0
+        persistence_suppressed_by_risk = False
+        reward_version = str(cfg.get("reward_version", "opportunity_window_v2"))
+        merge_cmd = self._merge_lateral_cmd(ego)
+        commitment_window_steps = int(
+            math.ceil(float(cfg.get("merge_intent_commitment_window_s", 1.0)) / max(self.step_length, 1.0e-6))
+        )
+        within_commitment_window = bool(
+            self._first_merge_request_step is not None
+            and int(self._episode_step) - int(self._first_merge_request_step) <= commitment_window_steps
+        )
+        persistence_version_enabled = reward_version in {
+            "opportunity_window_v3_persistence",
+            "opportunity_window_v3_1_risk_gated_persistence",
+        }
+        risk_gated_persistence = reward_version == "opportunity_window_v3_1_risk_gated_persistence"
+        safe_opportunity = bool(
+            record.get("task_merge_opportunity", False)
+            and record.get("task_opportunity_window_active", False)
+        )
+        accepted_left_intent = bool(raw_action is not None and int(raw_action.lateral_cmd) == merge_cmd)
+        shield_vetoed_commitment = bool(self._last_policy_commitment_debug.get("policy_commitment_vetoed", False))
+        risk_released_commitment = bool(
+            self._last_policy_commitment_debug.get("policy_commitment_released_by_risk", False)
+        )
+        persistence_eligible = bool(
+            persistence_version_enabled
+            and ego is not None
+            and merge_cmd != 0
+            and self._first_merge_request_step is not None
+            and self._first_target_lane_entry_step is None
+            and safe_opportunity
+            and within_commitment_window
+        )
+        if risk_gated_persistence and persistence_eligible and (shield_vetoed_commitment or risk_released_commitment):
+            persistence_suppressed_by_risk = True
+            persistence_eligible = False
+        if persistence_eligible and raw_action is not None:
+            if not accepted_left_intent:
+                default_penalty = -1.0 if risk_gated_persistence else -3.0
+                persistence_abort_penalty = float(cfg.get("merge_intent_abort_penalty", default_penalty))
+                self._persistence_abort_penalty_applied_count += 1
+            else:
+                default_bonus = 0.2 if risk_gated_persistence else 0.5
+                persistence_continue_bonus = float(cfg.get("merge_intent_continue_bonus", default_bonus))
+                self._persistence_continue_bonus_applied_count += 1
+        elif persistence_suppressed_by_risk:
+            self._persistence_suppressed_by_risk_count += 1
+        total = float(
+            missed_penalty
+            + opportunity_bonus
+            + deadline_penalty
+            + taper_penalty
+            + early_bonus
+            + persistence_abort_penalty
+            + persistence_continue_bonus
+        )
         debug = {
             "merge_timing_reward_adjustment": total,
             "merge_timing_missed_penalty": float(missed_penalty),
@@ -1721,6 +1847,11 @@ class SumoHighwayMergeEnv(gym.Env):
             "merge_timing_deadline_penalty": float(deadline_penalty),
             "merge_timing_taper_miss_penalty": float(taper_penalty),
             "merge_timing_early_safe_merge_bonus": float(early_bonus),
+            "merge_timing_persistence_abort_penalty": float(persistence_abort_penalty),
+            "merge_timing_persistence_continue_bonus": float(persistence_continue_bonus),
+            "merge_timing_persistence_eligible": bool(persistence_eligible),
+            "merge_timing_persistence_suppressed_by_risk": bool(persistence_suppressed_by_risk),
+            "merge_timing_persistence_window_active": bool(within_commitment_window),
             "task_merge_opportunity": bool(record.get("task_merge_opportunity", False)),
             "task_opportunity_window_active": bool(record.get("task_opportunity_window_active", False)),
             "task_late_window_active": bool(record.get("task_late_window_active", False)),
@@ -1739,6 +1870,135 @@ class SumoHighwayMergeEnv(gym.Env):
             return 0
         return int(target_lane_index(self.config, ego.edge_id) - auxiliary_lane_index(self.config, ego.edge_id))
 
+    def _policy_commitment_active(self) -> bool:
+        return bool(self._policy_commitment_enabled and self._policy_commitment_remaining_s > 1.0e-6)
+
+    @staticmethod
+    def _left_action_for_accel(accel_cmd: int) -> Any:
+        return next(action for action in ACTIONS if int(action.lateral_cmd) == 1 and int(action.accel_cmd) == int(accel_cmd))
+
+    def _policy_commitment_pre_shield(
+        self,
+        raw_action: Any,
+        shield_input_action: Any,
+        context: dict[str, Any],
+    ) -> tuple[Any, dict[str, Any]]:
+        debug = {
+            "policy_commitment_enabled": bool(self._policy_commitment_enabled),
+            "policy_commitment_profile": str(self._policy_commitment_profile),
+            "policy_commitment_active": bool(self._policy_commitment_active()),
+            "policy_commitment_started": False,
+            "policy_commitment_action_changed": False,
+            "policy_commitment_vetoed": False,
+            "policy_commitment_cancelled_by_target_entry": False,
+            "policy_commitment_released_by_risk": False,
+            "policy_commitment_remaining_s_before": float(self._policy_commitment_remaining_s),
+            "policy_commitment_remaining_s_after": float(self._policy_commitment_remaining_s),
+            "policy_commitment_input_action": int(shield_input_action.index),
+            "policy_commitment_output_action": int(shield_input_action.index),
+            "policy_commitment_start_candidate": False,
+        }
+        if not self._policy_commitment_enabled:
+            return shield_input_action, debug
+        # ACCVP may already be carrying its own lateral commitment into the
+        # shield input. Policy-side commitment only rewrites raw PPO actions.
+        if int(shield_input_action.index) != int(raw_action.index):
+            return shield_input_action, debug
+        ego = context.get("ego")
+        local = context.get("merge_local")
+        if ego is None or local is None or not bool(getattr(local, "ego_on_auxiliary", False)):
+            return shield_input_action, debug
+        if is_target_lane(self.config, ego.edge_id, ego.lane_index):
+            self._policy_commitment_remaining_s = 0.0
+            debug["policy_commitment_active"] = False
+            debug["policy_commitment_remaining_s_after"] = 0.0
+            return shield_input_action, debug
+        if int(raw_action.lateral_cmd) > 0:
+            debug["policy_commitment_start_candidate"] = True
+            return shield_input_action, debug
+        if not self._policy_commitment_active():
+            return shield_input_action, debug
+        if self._policy_commitment_profile == "left_intent_1s_risk_gated_v2":
+            record = self._last_task_merge_record or self._task_merge_shadow(
+                context,
+                raw_action,
+                update_counters=False,
+            )
+            safe_opportunity = bool(
+                record.get("task_merge_opportunity", False)
+                and record.get("task_opportunity_window_active", False)
+            )
+            if not safe_opportunity:
+                self._policy_commitment_remaining_s = 0.0
+                self._policy_commitment_released_by_risk_count += 1
+                debug["policy_commitment_active"] = False
+                debug["policy_commitment_released_by_risk"] = True
+                debug["policy_commitment_remaining_s_after"] = 0.0
+                self._last_policy_commitment_debug = dict(debug)
+                return shield_input_action, debug
+        committed = (
+            self._left_action_for_accel(int(raw_action.accel_cmd))
+            if self._policy_commitment_preserve_raw_accel
+            else self._left_action_for_accel(0)
+        )
+        debug["policy_commitment_output_action"] = int(committed.index)
+        debug["policy_commitment_action_changed"] = int(committed.index) != int(raw_action.index)
+        return committed, debug
+
+    def _policy_commitment_after_shield(
+        self,
+        raw_action: Any,
+        shield_input_action: Any,
+        safety_shield_action: Any,
+        safety_shield_replaced: bool,
+        context: dict[str, Any],
+        debug: dict[str, Any],
+    ) -> None:
+        if not self._policy_commitment_enabled:
+            self._last_policy_commitment_debug = dict(debug)
+            return
+        was_active = bool(debug.get("policy_commitment_active", False))
+        start_candidate = bool(debug.get("policy_commitment_start_candidate", False))
+        commitment_involved = bool(was_active or start_candidate or debug.get("policy_commitment_action_changed", False))
+        if commitment_involved and safety_shield_replaced:
+            self._policy_commitment_remaining_s = 0.0
+            self._policy_commitment_veto_count += 1
+            debug["policy_commitment_vetoed"] = True
+            debug["policy_commitment_active"] = False
+            debug["policy_commitment_remaining_s_after"] = 0.0
+            self._last_policy_commitment_debug = dict(debug)
+            return
+        if start_candidate:
+            if not was_active:
+                self._policy_commitment_started_count += 1
+                debug["policy_commitment_started"] = True
+            self._policy_commitment_remaining_s = max(float(self._policy_commitment_duration_s), self.step_length)
+        if was_active or start_candidate:
+            self._policy_commitment_active_count += 1
+        if bool(debug.get("policy_commitment_action_changed", False)):
+            self._policy_commitment_action_change_count += 1
+        debug["policy_commitment_active"] = bool(was_active or start_candidate)
+        debug["policy_commitment_remaining_s_after"] = float(self._policy_commitment_remaining_s)
+        self._last_policy_commitment_debug = dict(debug)
+
+    def _policy_commitment_finalize_after_step(self, ego: VehicleState | None, execution_record: dict[str, Any]) -> None:
+        if not self._policy_commitment_enabled:
+            return
+        if self._policy_commitment_remaining_s <= 1.0e-6:
+            execution_record["policy_commitment_remaining_s_after_step"] = 0.0
+            return
+        if ego is not None and is_target_lane(self.config, ego.edge_id, ego.lane_index):
+            self._policy_commitment_remaining_s = 0.0
+            self._policy_commitment_cancelled_by_target_entry_count += 1
+            execution_record["policy_commitment_cancelled_by_target_entry"] = True
+        else:
+            interval_s = float(self.control_interval_steps * self.step_length)
+            self._policy_commitment_remaining_s = max(0.0, float(self._policy_commitment_remaining_s) - interval_s)
+        execution_record["policy_commitment_remaining_s_after_step"] = float(self._policy_commitment_remaining_s)
+        self._last_policy_commitment_debug["policy_commitment_remaining_s_after"] = float(
+            self._policy_commitment_remaining_s
+        )
+
     def _record_merge_opportunity(self, context: dict[str, Any], raw_action: Any) -> None:
         ego = context.get("ego")
         local = context.get("merge_local")
@@ -1756,12 +2016,20 @@ class SumoHighwayMergeEnv(gym.Env):
         task_record["trace_schema_version"] = 2
         self._last_task_merge_record = task_record
         self._task_merge_records.append(task_record)
+        if self._first_target_lane_entry_step is None and int(raw_action.lateral_cmd) == merge_cmd:
+            self._left_request_count_before_entry += 1
         safe_opportunity = bool(
             task_record.get("task_merge_opportunity", False)
             and task_record.get("task_opportunity_window_active", False)
         )
         if not safe_opportunity:
             return
+        if (
+            self._first_merge_request_step is not None
+            and self._first_target_lane_entry_step is None
+            and int(raw_action.lateral_cmd) != merge_cmd
+        ):
+            self._raw_left_abort_before_entry_count += 1
         self._safe_merge_opportunity_count += 1
         if int(raw_action.lateral_cmd) != merge_cmd:
             self._missed_safe_merge_opportunity_count += 1
@@ -2173,6 +2441,10 @@ class SumoHighwayMergeEnv(gym.Env):
             "episode_seed": int(self.seed_value),
             "decision_index": int(self._decision_index),
             "episode_step": int(self._episode_step),
+            "policy_commitment_active": bool(self._policy_commitment_active()),
+            "policy_commitment_remaining_s": float(self._policy_commitment_remaining_s),
+            "policy_commitment_duration_s": float(self._policy_commitment_duration_s),
+            "last_raw_action": int(self._last_raw_action_index),
         }
         self._decision_context_cache = context
         return context
@@ -2342,6 +2614,25 @@ class SumoHighwayMergeEnv(gym.Env):
             < task_deadline_distance
         ]
         deadline_missed_count = sum(1 for record in task_deadline_records if record.get("task_missed_merge"))
+        target_entry_step = self._first_target_lane_entry_step
+        pre_entry_deadline_records = [
+            record
+            for record in task_deadline_records
+            if target_entry_step is None
+            or int(record.get("step", record.get("decision_step", 0)) or 0) < int(target_entry_step)
+        ]
+        pre_entry_deadline_missed_count = sum(
+            1 for record in pre_entry_deadline_records if record.get("task_missed_merge")
+        )
+        post_entry_opportunity_excluded_count = max(
+            0,
+            int(len(task_deadline_records) - len(pre_entry_deadline_records)),
+        )
+        early_merge_success_before_deadline_count = int(
+            self._last_done_reason == "merge_success"
+            and self._first_target_lane_entry_distance_to_taper is not None
+            and float(self._first_target_lane_entry_distance_to_taper) >= task_deadline_distance
+        )
         urgency_records = [
             record
             for record in task_available_records
@@ -2748,6 +3039,35 @@ class SumoHighwayMergeEnv(gym.Env):
             "safety_shield_action_histogram": dict(safety_shield_actions),
             "executed_action_histogram": dict(executed_actions),
             "final_action_histogram": dict(executed_actions),
+            "policy_commitment_enabled": bool(self._policy_commitment_enabled),
+            "policy_commitment_profile": str(self._policy_commitment_profile),
+            "policy_commitment_started_count": int(self._policy_commitment_started_count),
+            "policy_commitment_active_count": int(self._policy_commitment_active_count),
+            "policy_commitment_action_change_count": int(self._policy_commitment_action_change_count),
+            "policy_commitment_veto_count": int(self._policy_commitment_veto_count),
+            "policy_commitment_cancelled_by_target_entry_count": int(
+                self._policy_commitment_cancelled_by_target_entry_count
+            ),
+            "policy_commitment_released_by_risk_count": int(self._policy_commitment_released_by_risk_count),
+            "persistence_abort_penalty_applied_count": int(self._persistence_abort_penalty_applied_count),
+            "persistence_continue_bonus_applied_count": int(self._persistence_continue_bonus_applied_count),
+            "persistence_suppressed_by_risk_count": int(self._persistence_suppressed_by_risk_count),
+            "raw_left_abort_before_entry_count": int(self._raw_left_abort_before_entry_count),
+            "left_request_count_before_entry": int(self._left_request_count_before_entry),
+            "merge_intent_persistence_rate": (
+                float(
+                    self._left_request_count_before_entry
+                    / max(1, self._left_request_count_before_entry + self._raw_left_abort_before_entry_count)
+                )
+            ),
+            "first_left_request_to_target_entry_success_rate": float(
+                self._first_merge_request_step is not None and self._first_target_lane_entry_step is not None
+            ),
+            "seed12_repair_status": (
+                str(self._last_done_reason)
+                if int(self.seed_value) == 12
+                else ""
+            ),
             "action_execution_records": list(self._action_execution_records),
             "safety_shield_score_records": score_records,
             "shield_score_records_semantics": "safety_shield_pre_forecast_ranking",
@@ -2780,6 +3100,21 @@ class SumoHighwayMergeEnv(gym.Env):
             "deadline_missed_safe_merge_rate": (
                 float(deadline_missed_count / len(task_deadline_records)) if task_deadline_records else 0.0
             ),
+            "pre_entry_deadline_safe_merge_opportunity_count": int(len(pre_entry_deadline_records)),
+            "pre_entry_deadline_missed_safe_merge_count": int(pre_entry_deadline_missed_count),
+            "pre_entry_deadline_missed_safe_merge_rate": (
+                float(pre_entry_deadline_missed_count / len(pre_entry_deadline_records))
+                if pre_entry_deadline_records
+                else 0.0
+            ),
+            "pre_entry_deadline_opportunity_capture_rate": (
+                float(1.0 - pre_entry_deadline_missed_count / len(pre_entry_deadline_records))
+                if pre_entry_deadline_records
+                else 0.0
+            ),
+            "post_entry_opportunity_excluded_count": int(post_entry_opportunity_excluded_count),
+            "early_merge_success_before_deadline_count": int(early_merge_success_before_deadline_count),
+            "early_merge_success_before_deadline_rate": float(early_merge_success_before_deadline_count),
             "missed_safe_merge_after_urgency_0_5_count": int(missed_after_urgency_count),
             "safe_merge_after_urgency_0_5_count": int(len(urgency_records)),
             "missed_safe_merge_after_urgency_0_5_rate": (

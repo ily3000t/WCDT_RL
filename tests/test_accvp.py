@@ -13,6 +13,7 @@ from safe_rl.accvp.controller import ACCVPController
 from safe_rl.accvp.dataset import build_split_manifest
 from safe_rl.accvp.model import checkpoint_metadata
 from safe_rl.accvp.observation import (
+    RISK_GATED_ACCVP_OBSERVATION_PERSISTENCE_VERSION,
     RISK_GATED_ACCVP_OBSERVATION_VERSION,
     RiskGatedACCVPCandidateTableAugmentor,
     validate_accvp_observation_config,
@@ -132,6 +133,10 @@ def _observation_context(*, active: bool = True, decision: int = 0):
         "episode_seed": 2,
         "episode_step": decision * 5,
         "decision_index": decision,
+        "policy_commitment_active": True,
+        "policy_commitment_remaining_s": 0.5,
+        "policy_commitment_duration_s": 1.0,
+        "last_raw_action": 3,
         "merge_local": SimpleNamespace(
             ego_on_auxiliary=bool(active),
             merge_distance=120.0 if active else 300.0,
@@ -168,6 +173,26 @@ def test_risk_gated_accvp_candidate_table_contract_and_masks():
     assert summary["accvp_observation_feature_version"] == RISK_GATED_ACCVP_OBSERVATION_VERSION
     assert summary["accvp_table_latency_count"] == 1
     assert summary["accvp_table_latency_p95"] is not None
+
+
+def test_risk_gated_accvp_candidate_table_v2_adds_policy_state_features():
+    cfg = _observation_cfg()
+    cfg.accvp.observation["feature_version"] = RISK_GATED_ACCVP_OBSERVATION_PERSISTENCE_VERSION
+    predictor = _Predictor([{**_score(7, viability=0.85), "ensemble_disagreement": 0.03}])
+    augmentor = RiskGatedACCVPCandidateTableAugmentor(cfg, predictor=predictor, shield=_Shield(safe=True))
+    table = augmentor.extract(_observation_context())
+
+    assert table.shape == (103,)
+    assert RiskGatedACCVPCandidateTableAugmentor.feature_dim(cfg) == 103
+    names = RiskGatedACCVPCandidateTableAugmentor.feature_names(cfg)
+    assert names[-4:] == [
+        "policy_commitment_active",
+        "policy_commitment_remaining_norm",
+        "last_raw_lateral_cmd_norm",
+        "last_raw_accel_cmd_norm",
+    ]
+    assert table[-4:].tolist() == [1.0, 0.5, 0.0, -1.0]
+    assert augmentor.summary()["accvp_observation_feature_version"] == RISK_GATED_ACCVP_OBSERVATION_PERSISTENCE_VERSION
 
 
 def test_risk_gated_accvp_candidate_table_fail_closed_preserves_masks():

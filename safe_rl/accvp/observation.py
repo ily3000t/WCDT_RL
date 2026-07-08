@@ -20,6 +20,7 @@ from safe_rl.utils.config import clone_with_overrides
 
 
 RISK_GATED_ACCVP_OBSERVATION_VERSION = "risk_gated_candidate_table_v1"
+RISK_GATED_ACCVP_OBSERVATION_PERSISTENCE_VERSION = "risk_gated_candidate_table_v2_persistence"
 
 
 @dataclass
@@ -119,8 +120,15 @@ class RiskGatedACCVPCandidateTableAugmentor:
         "lateral_cmd_norm",
         "accel_cmd_norm",
     )
+    POLICY_STATE_FEATURE_NAMES = (
+        "policy_commitment_active",
+        "policy_commitment_remaining_norm",
+        "last_raw_lateral_cmd_norm",
+        "last_raw_accel_cmd_norm",
+    )
     ACTION_COUNT = len(ACTIONS)
     FEATURE_VERSION = RISK_GATED_ACCVP_OBSERVATION_VERSION
+    PERSISTENCE_FEATURE_VERSION = RISK_GATED_ACCVP_OBSERVATION_PERSISTENCE_VERSION
 
     def __init__(
         self,
@@ -133,11 +141,12 @@ class RiskGatedACCVPCandidateTableAugmentor:
         self.config = config
         obs_cfg = dict(config.accvp.get("observation", {}) or {})
         feature_version = str(obs_cfg.get("feature_version", self.FEATURE_VERSION))
-        if feature_version != self.FEATURE_VERSION:
+        if feature_version not in {self.FEATURE_VERSION, self.PERSISTENCE_FEATURE_VERSION}:
             raise ValueError(
                 f"unsupported ACCVP observation feature_version={feature_version!r}; "
-                f"expected {self.FEATURE_VERSION!r}"
+                f"expected {self.FEATURE_VERSION!r} or {self.PERSISTENCE_FEATURE_VERSION!r}"
             )
+        self.feature_version = feature_version
         self.timeout_s = float(obs_cfg.get("timeout_s", config.accvp.get("max_decision_latency_s", 0.5)))
         self.use_inference_worker = bool(obs_cfg.get("use_inference_worker", False))
         self.profile_latency = bool(obs_cfg.get("profile_latency", True))
@@ -171,15 +180,24 @@ class RiskGatedACCVPCandidateTableAugmentor:
             self._shield = SafetyShield(config, risk_model)
 
     @classmethod
-    def feature_dim(cls, _config: Any | None = None) -> int:
-        return cls.ACTION_COUNT * len(cls.FEATURE_NAMES)
+    def feature_dim(cls, config: Any | None = None) -> int:
+        table_dim = cls.ACTION_COUNT * len(cls.FEATURE_NAMES)
+        if config is not None:
+            obs_cfg = dict(config.accvp.get("observation", {}) or {})
+            if str(obs_cfg.get("feature_version", cls.FEATURE_VERSION)) == cls.PERSISTENCE_FEATURE_VERSION:
+                return table_dim + len(cls.POLICY_STATE_FEATURE_NAMES)
+        return table_dim
 
     @classmethod
-    def feature_names(cls) -> list[str]:
+    def feature_names(cls, config: Any | None = None) -> list[str]:
         names: list[str] = []
         for action in ACTIONS:
             for feature in cls.FEATURE_NAMES:
                 names.append(f"action_{action.index}_{feature}")
+        if config is not None:
+            obs_cfg = dict(config.accvp.get("observation", {}) or {})
+            if str(obs_cfg.get("feature_version", cls.FEATURE_VERSION)) == cls.PERSISTENCE_FEATURE_VERSION:
+                names.extend(cls.POLICY_STATE_FEATURE_NAMES)
         return names
 
     @staticmethod
@@ -201,9 +219,9 @@ class RiskGatedACCVPCandidateTableAugmentor:
         payload.update(
             {
                 "accvp_observation_enabled": True,
-                "accvp_observation_feature_version": self.FEATURE_VERSION,
+                "accvp_observation_feature_version": self.feature_version,
                 "accvp_observation_dim": int(self.feature_dim(self.config)),
-                "accvp_observation_feature_names": self.feature_names(),
+                "accvp_observation_feature_names": self.feature_names(self.config),
                 "accvp_observation_activation_distance_m": float(self.activation_distance),
                 "accvp_observation_use_inference_worker": bool(self.use_inference_worker),
                 "accvp_observation_profile_latency": bool(self.profile_latency),
@@ -255,7 +273,7 @@ class RiskGatedACCVPCandidateTableAugmentor:
             legality_started = time.perf_counter()
             legality = self._legality_map(context)
             legal_actions = [action for action in ACTIONS if bool(legality.get(int(action.index), False))]
-            base = self._fail_closed_rows_from_legality(legality)
+            base = self._fail_closed_rows_from_legality(legality, context)
             stage_latencies["context_legality"] = time.perf_counter() - legality_started
             if not legal_actions:
                 self.stats.fail_closed_count += 1
@@ -286,7 +304,7 @@ class RiskGatedACCVPCandidateTableAugmentor:
             secondary = self._secondary_safety_many(ACTIONS, context, legality)
             stage_latencies["risk_secondary"] = time.perf_counter() - risk_started
             pack_started = time.perf_counter()
-            rows = self._rows_from_scores(scores, legality, secondary)
+            rows = self._rows_from_scores(scores, legality, secondary, context)
             stage_latencies["table_pack"] = time.perf_counter() - pack_started
             elapsed = time.perf_counter() - started
             self._record_latency(elapsed, stage_latencies)
@@ -309,6 +327,30 @@ class RiskGatedACCVPCandidateTableAugmentor:
             return self._fail_closed_rows(context)
         raise
 
+    def _append_policy_state(self, rows: np.ndarray, context: dict[str, Any]) -> np.ndarray:
+        if self.feature_version != self.PERSISTENCE_FEATURE_VERSION:
+            return rows
+        duration_s = float(context.get("policy_commitment_duration_s", 1.0) or 1.0)
+        remaining_s = float(context.get("policy_commitment_remaining_s", 0.0) or 0.0)
+        last_raw_action_id = int(context.get("last_raw_action", -1))
+        if 0 <= last_raw_action_id < len(ACTIONS):
+            last_raw = ACTIONS[last_raw_action_id]
+            last_lateral = float(last_raw.lateral_cmd)
+            last_accel = float(last_raw.accel_cmd)
+        else:
+            last_lateral = 0.0
+            last_accel = 0.0
+        state = np.asarray(
+            [
+                float(bool(context.get("policy_commitment_active", False))),
+                float(np.clip(remaining_s / max(1.0e-6, duration_s), 0.0, 1.0)),
+                float(last_lateral),
+                float(last_accel),
+            ],
+            dtype=np.float32,
+        )
+        return np.concatenate([rows.astype(np.float32, copy=False), state], axis=0)
+
     def _record_latency(self, total_s: float, stage_latencies: dict[str, float]) -> None:
         if not self.profile_latency:
             return
@@ -324,6 +366,7 @@ class RiskGatedACCVPCandidateTableAugmentor:
         scores: list[dict[str, Any]],
         legality: dict[int, bool],
         secondary_by_action: dict[int, dict[str, Any]],
+        context: dict[str, Any],
     ) -> np.ndarray:
         by_action = {int(row.get("action_id", -1)): row for row in scores}
         rows: list[float] = []
@@ -359,16 +402,16 @@ class RiskGatedACCVPCandidateTableAugmentor:
                     float(action.accel_cmd),
                 ]
             )
-        return np.asarray(rows, dtype=np.float32)
+        return self._append_policy_state(np.asarray(rows, dtype=np.float32), context)
 
     def _fail_closed_rows(self, context: dict[str, Any]) -> np.ndarray:
-        return self._fail_closed_rows_from_legality(self._legality_map(context))
+        return self._fail_closed_rows_from_legality(self._legality_map(context), context)
 
-    def _fail_closed_rows_from_legality(self, legality: dict[int, bool]) -> np.ndarray:
+    def _fail_closed_rows_from_legality(self, legality: dict[int, bool], context: dict[str, Any] | None = None) -> np.ndarray:
         rows: list[float] = []
         for action in ACTIONS:
             rows.extend(self._fail_closed_row(action, candidate_legal=bool(legality.get(int(action.index), False))))
-        return np.asarray(rows, dtype=np.float32)
+        return self._append_policy_state(np.asarray(rows, dtype=np.float32), context or {})
 
     @staticmethod
     def _fail_closed_row(action: CandidateAction, *, candidate_legal: bool) -> list[float]:
@@ -478,7 +521,10 @@ def validate_accvp_observation_config(config: Any) -> None:
     if not RiskGatedACCVPCandidateTableAugmentor.enabled(config):
         return
     obs_cfg = dict(config.accvp.get("observation", {}) or {})
-    if str(obs_cfg.get("feature_version", RISK_GATED_ACCVP_OBSERVATION_VERSION)) != RISK_GATED_ACCVP_OBSERVATION_VERSION:
+    if str(obs_cfg.get("feature_version", RISK_GATED_ACCVP_OBSERVATION_VERSION)) not in {
+        RISK_GATED_ACCVP_OBSERVATION_VERSION,
+        RISK_GATED_ACCVP_OBSERVATION_PERSISTENCE_VERSION,
+    }:
         raise ValueError("unsupported ACCVP observation feature_version")
     forecast_enabled = bool(config.forecast_features.enabled or config.rl.use_wcdt_forecast_features)
     if forecast_enabled and not bool(obs_cfg.get("allow_with_forecast_features", False)):

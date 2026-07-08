@@ -295,6 +295,14 @@ rl:
     early_safe_merge_bonus: 0.0
     bonus_min_distance_to_taper: 60.0
     consecutive_missed_grace: 2
+    merge_intent_abort_penalty: -3.0
+    merge_intent_continue_bonus: 0.5
+    merge_intent_commitment_window_s: 1.0
+  policy_lateral_commitment:
+    enabled: false
+    profile: "left_intent_1s_v1"
+    duration_s: 1.0
+    preserve_raw_accel: true
 
 shield:
   enabled: false

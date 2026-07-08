@@ -144,7 +144,7 @@ from safe_rl.sim.scenario_semantics import (
 from safe_rl.sim.scenario_snapshot import snapshot_scenario
 from safe_rl.sim.sumo_highway_merge_env import SumoHighwayMergeEnv
 from safe_rl.sim.types import StepMetrics, VehicleState
-from safe_rl.utils.config import load_config
+from safe_rl.utils.config import clone_with_overrides, load_config
 from safe_rl.utils.sumo_installation import SumoInstallation
 from safe_rl.utils.io import write_json
 
@@ -861,6 +861,7 @@ def _merge_timing_context(cfg=None, *, front_gap=20.0, rear_gap=20.0, distance_t
             target_front_gap=front_gap,
             target_rear_gap=rear_gap,
             merge_distance=distance_to_taper,
+            ego_on_auxiliary=True,
         ),
     }
 
@@ -942,6 +943,171 @@ def test_merge_timing_reward_penalizes_taper_miss_terminal():
     penalty, debug = env._merge_timing_reward_adjustment(None, "taper_miss", decode_action(4), None)
     assert penalty <= -35.0
     assert debug["merge_timing_taper_miss_penalty"] == pytest.approx(-35.0)
+
+
+def test_policy_lateral_commitment_maps_keep_to_left_and_preserves_accel():
+    cfg = clone_with_overrides(
+        load_config(),
+        {"rl": {"policy_lateral_commitment": {"enabled": True, "duration_s": 1.0, "preserve_raw_accel": True}}},
+    )
+    env = SumoHighwayMergeEnv(cfg, seed=1)
+    context = _merge_timing_context(cfg, distance_to_taper=180.0)
+
+    proposed, debug = env._policy_commitment_pre_shield(decode_action(8), decode_action(8), context)
+    assert proposed.index == 8
+    assert debug["policy_commitment_start_candidate"] is True
+    env._policy_commitment_after_shield(decode_action(8), proposed, proposed, False, context, debug)
+    assert env._policy_commitment_started_count == 1
+    assert env._policy_commitment_remaining_s == pytest.approx(1.0)
+
+    proposed, debug = env._policy_commitment_pre_shield(decode_action(3), decode_action(3), context)
+    assert proposed.index == 6
+    assert debug["policy_commitment_action_changed"] is True
+    env._policy_commitment_after_shield(decode_action(3), proposed, proposed, False, context, debug)
+    assert env._policy_commitment_action_change_count == 1
+
+
+def test_policy_lateral_commitment_shield_veto_cancels():
+    cfg = clone_with_overrides(load_config(), {"rl": {"policy_lateral_commitment": {"enabled": True}}})
+    env = SumoHighwayMergeEnv(cfg, seed=1)
+    env._policy_commitment_remaining_s = 0.5
+    context = _merge_timing_context(cfg, distance_to_taper=180.0)
+
+    proposed, debug = env._policy_commitment_pre_shield(decode_action(3), decode_action(3), context)
+    assert proposed.index == 6
+    env._policy_commitment_after_shield(decode_action(3), proposed, decode_action(4), True, context, debug)
+
+    assert env._policy_commitment_remaining_s == 0.0
+    assert env._policy_commitment_veto_count == 1
+    assert debug["policy_commitment_vetoed"] is True
+
+
+def test_policy_lateral_commitment_v2_releases_when_safe_opportunity_disappears():
+    cfg = clone_with_overrides(
+        load_config(),
+        {
+            "rl": {
+                "policy_lateral_commitment": {
+                    "enabled": True,
+                    "profile": "left_intent_1s_risk_gated_v2",
+                    "duration_s": 1.0,
+                    "preserve_raw_accel": True,
+                }
+            }
+        },
+    )
+    env = SumoHighwayMergeEnv(cfg, seed=1)
+    env._policy_commitment_remaining_s = 0.5
+    context = _merge_timing_context(cfg, front_gap=3.0, rear_gap=3.0, distance_to_taper=180.0)
+
+    proposed, debug = env._policy_commitment_pre_shield(decode_action(3), decode_action(3), context)
+
+    assert proposed.index == 3
+    assert env._policy_commitment_remaining_s == pytest.approx(0.0)
+    assert env._policy_commitment_released_by_risk_count == 1
+    assert debug["policy_commitment_released_by_risk"] is True
+    assert debug["policy_commitment_action_changed"] is False
+
+
+def test_policy_lateral_commitment_target_entry_ends_commitment(monkeypatch):
+    cfg = clone_with_overrides(load_config(), {"rl": {"policy_lateral_commitment": {"enabled": True}}})
+    env = SumoHighwayMergeEnv(cfg, seed=1)
+    env._policy_commitment_remaining_s = 0.5
+    ego = _merge_timing_context(cfg)["ego"]
+    monkeypatch.setattr("safe_rl.sim.sumo_highway_merge_env.is_target_lane", lambda *_args, **_kwargs: True)
+    record: dict[str, object] = {}
+
+    env._policy_commitment_finalize_after_step(ego, record)
+
+    assert env._policy_commitment_remaining_s == 0.0
+    assert env._policy_commitment_cancelled_by_target_entry_count == 1
+    assert record["policy_commitment_cancelled_by_target_entry"] is True
+
+
+def test_merge_timing_reward_v3_penalizes_abort_and_rewards_persistence():
+    cfg = clone_with_overrides(
+        load_config(),
+        {
+            "rl": {
+                "merge_timing_reward": {
+                    "reward_version": "opportunity_window_v3_persistence",
+                    "merge_intent_abort_penalty": -3.0,
+                    "merge_intent_continue_bonus": 0.5,
+                    "merge_intent_commitment_window_s": 1.0,
+                }
+            }
+        },
+    )
+    env = SumoHighwayMergeEnv(cfg, seed=1, reward_risk_model=_StaticRiskModel({4: 0.10}))
+    env._first_merge_request_step = 0
+    env._episode_step = 5
+    context = _merge_timing_context(cfg, distance_to_taper=180.0)
+
+    abort_reward, abort_debug = env._merge_timing_reward_adjustment(context["ego"], "", decode_action(3), context)
+    continue_reward, continue_debug = env._merge_timing_reward_adjustment(context["ego"], "", decode_action(8), context)
+
+    assert abort_debug["merge_timing_persistence_eligible"] is True
+    assert abort_debug["merge_timing_persistence_abort_penalty"] == pytest.approx(-3.0)
+    assert continue_debug["merge_timing_persistence_continue_bonus"] == pytest.approx(0.5)
+    assert abort_reward < continue_reward
+
+
+def test_merge_timing_reward_v3_1_is_risk_gated_and_less_aggressive():
+    cfg = clone_with_overrides(
+        load_config(),
+        {
+            "rl": {
+                "merge_timing_reward": {
+                    "reward_version": "opportunity_window_v3_1_risk_gated_persistence",
+                    "merge_intent_abort_penalty": -1.0,
+                    "merge_intent_continue_bonus": 0.2,
+                    "merge_intent_commitment_window_s": 1.0,
+                }
+            }
+        },
+    )
+    env = SumoHighwayMergeEnv(cfg, seed=1, reward_risk_model=_StaticRiskModel({4: 0.10}))
+    env._first_merge_request_step = 0
+    env._episode_step = 5
+    context = _merge_timing_context(cfg, distance_to_taper=180.0)
+
+    abort_reward, abort_debug = env._merge_timing_reward_adjustment(context["ego"], "", decode_action(3), context)
+    continue_reward, continue_debug = env._merge_timing_reward_adjustment(context["ego"], "", decode_action(8), context)
+
+    assert abort_debug["merge_timing_persistence_eligible"] is True
+    assert abort_debug["merge_timing_persistence_abort_penalty"] == pytest.approx(-1.0)
+    assert continue_debug["merge_timing_persistence_continue_bonus"] == pytest.approx(0.2)
+    assert env._persistence_abort_penalty_applied_count == 1
+    assert env._persistence_continue_bonus_applied_count == 1
+    assert abort_reward < continue_reward
+
+
+def test_merge_timing_reward_v3_1_suppresses_persistence_after_shield_veto():
+    cfg = clone_with_overrides(
+        load_config(),
+        {
+            "rl": {
+                "merge_timing_reward": {
+                    "reward_version": "opportunity_window_v3_1_risk_gated_persistence",
+                    "merge_intent_abort_penalty": -1.0,
+                    "merge_intent_continue_bonus": 0.2,
+                    "merge_intent_commitment_window_s": 1.0,
+                }
+            }
+        },
+    )
+    env = SumoHighwayMergeEnv(cfg, seed=1, reward_risk_model=_StaticRiskModel({4: 0.10}))
+    env._first_merge_request_step = 0
+    env._episode_step = 5
+    env._last_policy_commitment_debug = {"policy_commitment_vetoed": True}
+    context = _merge_timing_context(cfg, distance_to_taper=180.0)
+
+    _, debug = env._merge_timing_reward_adjustment(context["ego"], "", decode_action(3), context)
+
+    assert debug["merge_timing_persistence_eligible"] is False
+    assert debug["merge_timing_persistence_suppressed_by_risk"] is True
+    assert debug["merge_timing_persistence_abort_penalty"] == pytest.approx(0.0)
+    assert env._persistence_suppressed_by_risk_count == 1
 
 
 def test_forecast_aware_task_scorer_recommends_merge_near_deadline_with_safe_gap():
@@ -2112,6 +2278,31 @@ def test_stage5_metrics_distinguish_shield_calls_from_replacements():
                 "task_merge_opportunity_count": 2,
                 "task_would_merge_count": 1,
                 "task_missed_merge_count": 1,
+                "policy_commitment_started_count": 1,
+                "policy_commitment_active_count": 2,
+                "policy_commitment_action_change_count": 1,
+                "policy_commitment_veto_count": 0,
+                "policy_commitment_cancelled_by_target_entry_count": 1,
+                "policy_commitment_released_by_risk_count": 1,
+                "persistence_abort_penalty_applied_count": 2,
+                "persistence_continue_bonus_applied_count": 3,
+                "persistence_suppressed_by_risk_count": 1,
+                "raw_left_abort_before_entry_count": 1,
+                "left_request_count_before_entry": 3,
+                "first_merge_request_step": 10,
+                "first_left_request_to_target_entry_success_rate": 1.0,
+                "action_execution_records": [
+                    {
+                        "decision_index": 0,
+                        "raw_action": 3,
+                        "shield_input_action": 6,
+                        "safety_shield_action": 6,
+                        "final_action": 6,
+                        "policy_commitment_action_changed": True,
+                        "merge_timing_persistence_continue_bonus": 0.2,
+                    },
+                    {"decision_index": 1},
+                ],
             },
             {
                 "collision": False,
@@ -2136,6 +2327,21 @@ def test_stage5_metrics_distinguish_shield_calls_from_replacements():
                 "task_merge_opportunity_count": 3,
                 "task_would_merge_count": 2,
                 "task_missed_merge_count": 2,
+                "policy_commitment_started_count": 0,
+                "policy_commitment_active_count": 1,
+                "policy_commitment_action_change_count": 0,
+                "policy_commitment_veto_count": 1,
+                "policy_commitment_cancelled_by_target_entry_count": 0,
+                "policy_commitment_released_by_risk_count": 0,
+                "persistence_abort_penalty_applied_count": 1,
+                "persistence_continue_bonus_applied_count": 0,
+                "persistence_suppressed_by_risk_count": 2,
+                "raw_left_abort_before_entry_count": 1,
+                "left_request_count_before_entry": 1,
+                "first_merge_request_step": 20,
+                "first_left_request_to_target_entry_success_rate": 0.0,
+                "seed12_repair_status": "merge_success",
+                "action_execution_records": [{"decision_index": 0}],
             },
         ]
     )
@@ -2166,6 +2372,21 @@ def test_stage5_metrics_distinguish_shield_calls_from_replacements():
     assert metrics["ego_speed_mean"] == pytest.approx(19.0)
     assert metrics["ego_speed_p10"] == pytest.approx(12.3)
     assert metrics["hard_brake_rate"] == pytest.approx(0.125)
+    assert metrics["policy_commitment_started_count"] == 1
+    assert metrics["policy_commitment_active_count"] == 3
+    assert metrics["policy_commitment_action_change_count"] == 1
+    assert metrics["policy_commitment_veto_count"] == 1
+    assert metrics["policy_commitment_cancelled_by_target_entry_count"] == 1
+    assert metrics["policy_commitment_released_by_risk_count"] == 1
+    assert metrics["persistence_abort_penalty_applied_count"] == 3
+    assert metrics["persistence_continue_bonus_applied_count"] == 3
+    assert metrics["persistence_suppressed_by_risk_count"] == 3
+    assert metrics["raw_left_abort_before_entry_count"] == 2
+    assert metrics["merge_intent_persistence_rate"] == pytest.approx(4 / 6)
+    assert metrics["first_left_request_to_target_entry_success_rate"] == pytest.approx(0.5)
+    assert metrics["seed12_repair_status"] == "merge_success"
+    assert len(metrics["policy_commitment_case_records"]) == 1
+    assert metrics["policy_commitment_case_records"][0]["policy_commitment_action_changed"] is True
 
 
 def test_stage5_metrics_include_accvp_lite_shadow_aggregates():
@@ -2372,6 +2593,10 @@ def test_stage5_task_quality_metrics_are_pre_registered():
                 "missed_safe_merge_opportunity_count": 2,
                 "deadline_safe_merge_opportunity_count": 4,
                 "deadline_missed_safe_merge_count": 1,
+                "pre_entry_deadline_safe_merge_opportunity_count": 4,
+                "pre_entry_deadline_missed_safe_merge_count": 1,
+                "post_entry_opportunity_excluded_count": 2,
+                "early_merge_success_before_deadline_count": 1,
             },
             {
                 "done_reason": "taper_miss",
@@ -2387,6 +2612,10 @@ def test_stage5_task_quality_metrics_are_pre_registered():
                 "missed_safe_merge_opportunity_count": 8,
                 "deadline_safe_merge_opportunity_count": 6,
                 "deadline_missed_safe_merge_count": 5,
+                "pre_entry_deadline_safe_merge_opportunity_count": 6,
+                "pre_entry_deadline_missed_safe_merge_count": 5,
+                "post_entry_opportunity_excluded_count": 0,
+                "early_merge_success_before_deadline_count": 0,
                 "no_merge_request_before_taper_count": 0,
             },
             {
@@ -2403,6 +2632,10 @@ def test_stage5_task_quality_metrics_are_pre_registered():
                 "missed_safe_merge_opportunity_count": 0,
                 "deadline_safe_merge_opportunity_count": 0,
                 "deadline_missed_safe_merge_count": 0,
+                "pre_entry_deadline_safe_merge_opportunity_count": 0,
+                "pre_entry_deadline_missed_safe_merge_count": 0,
+                "post_entry_opportunity_excluded_count": 0,
+                "early_merge_success_before_deadline_count": 0,
                 "no_merge_request_before_taper_count": 1,
             },
         ],
@@ -2415,6 +2648,9 @@ def test_stage5_task_quality_metrics_are_pre_registered():
     assert metrics["safety_clean_success_rate"] == pytest.approx(1 / 3)
     assert metrics["opportunity_capture_step_rate"] == pytest.approx(0.5)
     assert metrics["deadline_opportunity_capture_rate"] == pytest.approx(0.4)
+    assert metrics["pre_entry_deadline_opportunity_capture_rate"] == pytest.approx(0.4)
+    assert metrics["post_entry_opportunity_excluded_count"] == 2
+    assert metrics["early_merge_success_before_deadline_rate"] == pytest.approx(1 / 3)
     assert metrics["first_merge_request_distance_to_taper_p10"] == pytest.approx(48.0)
     assert metrics["first_target_lane_entry_distance_to_taper_p90"] == pytest.approx(100.0)
 
@@ -2625,6 +2861,7 @@ def test_stage5_group_shield_overrides_update_shield_config():
                 "replacement_margin": 0.10,
             },
             "risk_module_overrides": {"calibration": {"use_for_runtime": True}},
+            "rl_overrides": {"policy_lateral_commitment": {"enabled": True}},
         }.get(key, default),
     )
     overrides = _group_overrides(group)
@@ -2632,6 +2869,7 @@ def test_stage5_group_shield_overrides_update_shield_config():
     assert overrides["shield"]["activation_risk_threshold"] == pytest.approx(0.85)
     assert overrides["shield"]["replacement_margin"] == pytest.approx(0.10)
     assert overrides["risk_module"]["calibration"]["use_for_runtime"] is True
+    assert overrides["rl"]["policy_lateral_commitment"]["enabled"] is True
 
 
 def test_stage5_shield_sweep_generates_default_threshold_variants():

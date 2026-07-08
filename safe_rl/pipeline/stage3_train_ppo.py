@@ -180,8 +180,17 @@ def run(cfg):
     shield_guided_cfg = dict(cfg.rl.get("shield_guided_reward", {}) or {})
     merge_timing_cfg = dict(cfg.rl.get("merge_timing_reward", {}) or {})
     base_semantics = str(cfg.rl.get("training_semantics_version", "legacy_unspecified"))
+    accvp_observation_cfg = dict(cfg.accvp.get("observation", {}) or {}) if "accvp" in cfg else {}
+    accvp_feature_version = str(
+        accvp_observation_cfg.get(
+            "feature_version",
+            RiskGatedACCVPCandidateTableAugmentor.FEATURE_VERSION,
+        )
+    )
     report["training_semantics_version"] = (
-        f"{base_semantics}+{RiskGatedACCVPCandidateTableAugmentor.FEATURE_VERSION}"
+        base_semantics
+        if accvp_feature_version in base_semantics
+        else f"{base_semantics}+{accvp_feature_version}"
         if RiskGatedACCVPCandidateTableAugmentor.enabled(cfg)
         else base_semantics
     )
