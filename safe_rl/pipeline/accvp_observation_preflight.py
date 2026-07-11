@@ -31,10 +31,15 @@ def parse_args() -> argparse.Namespace:
 
 
 def _gate(metrics: dict[str, Any]) -> dict[str, Any]:
+    hard_fail_closed = int(
+        metrics.get(
+            "accvp_table_hard_fail_closed_count",
+            metrics.get("accvp_table_fail_closed_count", 0),
+        )
+    )
     checks = {
         "valid_rate_activation_window": float(metrics.get("accvp_table_valid_rate_activation_window", 0.0)) >= 0.95,
-        "timeout_count_zero": int(metrics.get("accvp_table_timeout_count", 0)) == 0,
-        "fail_closed_count_zero": int(metrics.get("accvp_table_fail_closed_count", 0)) == 0,
+        "hard_fail_closed_count_zero": hard_fail_closed == 0,
         "latency_p95_within_0_5s": (
             metrics.get("accvp_table_latency_p95") is not None
             and float(metrics.get("accvp_table_latency_p95", 1.0e9)) <= 0.5
@@ -45,8 +50,7 @@ def _gate(metrics: dict[str, Any]) -> dict[str, Any]:
         "checks": checks,
         "required": {
             "valid_rate_activation_window": ">= 0.95",
-            "timeout_count": "0",
-            "fail_closed_count": "0",
+            "hard_fail_closed_count": "0",
             "latency_p95_s": "<= 0.5",
         },
     }
@@ -124,4 +128,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-

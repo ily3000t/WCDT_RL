@@ -1,0 +1,133 @@
+run:
+  run_id: "stage5_accvp_assisted_ppo_candidate_table_v3_1_runtime_stable_order_audit"
+  output_root: "safe_rl_output/runs"
+  tensorboard: false
+  replay: true
+
+experiment:
+  purpose: "accvp_candidate_table_runtime_order_audit_step3_5"
+  deployable_claim: false
+  note: "Order-audit to detect warm-cache effects for v3.1 Shield vs Lite evaluation."
+
+stage5:
+  paired_eval: true
+  same_seed: true
+  replay_enabled: true
+  require_accvp_observation_runtime_gate: false
+  episodes_per_group: 20
+  seeds: [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20]
+  risk_checkpoint: "safe_rl_output/runs/safe_rl_comparison_schema9_validation_001/stage2/risk_module.pt"
+  task_quality:
+    timely_entry_distance_threshold_m: 80.0
+    late_merge_request_threshold_m: 60.0
+  pairs:
+    - name: "v3_1_shield_repeat_order_delta"
+      left: "ppo_accvp_candidate_table_reward_v3_1_persistence_prediction_shield_first"
+      right: "ppo_accvp_candidate_table_reward_v3_1_persistence_prediction_shield_after_lite"
+      acceptance_profile: "mainline_reward_v2"
+  acceptance:
+    mainline_reward_v2:
+      max_actual_replacement_rate: 0.20
+  groups:
+    - name: "ppo_accvp_candidate_table_reward_v3_1_persistence_prediction_shield_first"
+      forecast_features: false
+      shield: true
+      model_path: "safe_rl_output/runs/ppo_accvp_candidate_table_reward_v3_1_persistence/stage3/ppo_model.zip"
+      raw_policy: "ppo_accvp_candidate_table_reward_v3_1_persistence"
+      counterfactual_predictor: "risk_gated_accvp_candidate_table_v2_persistence"
+      shield_overrides:
+        forecast_aware_candidate_ranking_mode: "off"
+        forecast_task_shadow_enabled: false
+        task_backstop_enabled: false
+      rl_overrides:
+        training_semantics_version: "reward_v3_1_persistence_001+risk_gated_accvp_candidate_table_v2_persistence"
+        policy_lateral_commitment:
+          enabled: true
+          profile: "left_intent_1s_risk_gated_v2"
+          duration_s: 1.0
+          preserve_raw_accel: true
+        merge_timing_reward:
+          reward_version: "opportunity_window_v3_1_risk_gated_persistence"
+          merge_intent_abort_penalty: -1.0
+          merge_intent_continue_bonus: 0.2
+          merge_intent_commitment_window_s: 1.0
+      accvp: &accvp_runtime_stable
+        enabled: false
+        mode: "off"
+        activation_distance: 240.0
+        ensemble_size: 1
+        checkpoint: "safe_rl_output/runs/accvp_240_shadow_train/accvp/accvp_v1_predictor.pt"
+        calibration_bundle: "safe_rl_output/runs/accvp_240_shadow_train/accvp/accvp_v1_calibration.json"
+        operating_point: "safe_rl_output/runs/accvp_240_lite_v3/accvp/accvp_v1_lite_v3_operating_point.json"
+        artifact_manifest: "safe_rl_output/runs/accvp_240_lite_v3/accvp/accvp_v1_lite_v3_task_artifact_manifest.json"
+        risk_checkpoint: "safe_rl_output/runs/safe_rl_comparison_schema9_validation_001/stage2/risk_module.pt"
+        observation:
+          enabled: true
+          feature_version: "risk_gated_candidate_table_v2_persistence"
+          activation_distance: 240.0
+          timeout_s: 0.5
+          use_inference_worker: false
+          profile_latency: true
+          fail_closed_defaults: true
+          invalid_table_strategy: "last_valid_with_invalid_mask_v1"
+          invalid_table_dropout_rate: 0.0
+          warmup_enabled: true
+          include_risk_secondary: true
+          secondary_safety_profile: "short_horizon_risk_v1"
+          risk_horizon_steps: 8
+          allow_with_forecast_features: false
+
+    - name: "ppo_accvp_candidate_table_reward_v3_1_persistence_prediction_shield_accvp_lite_v3_before_repeat"
+      forecast_features: false
+      shield: true
+      model_path: "safe_rl_output/runs/ppo_accvp_candidate_table_reward_v3_1_persistence/stage3/ppo_model.zip"
+      raw_policy: "ppo_accvp_candidate_table_reward_v3_1_persistence"
+      counterfactual_predictor: "risk_gated_accvp_candidate_table_v2_persistence"
+      controller: "acv_shield_lite_v3"
+      shield_overrides:
+        forecast_aware_candidate_ranking_mode: "off"
+        forecast_task_shadow_enabled: false
+        task_backstop_enabled: false
+      rl_overrides:
+        training_semantics_version: "reward_v3_1_persistence_001+risk_gated_accvp_candidate_table_v2_persistence"
+        policy_lateral_commitment:
+          enabled: true
+          profile: "left_intent_1s_risk_gated_v2"
+          duration_s: 1.0
+          preserve_raw_accel: true
+        merge_timing_reward:
+          reward_version: "opportunity_window_v3_1_risk_gated_persistence"
+          merge_intent_abort_penalty: -1.0
+          merge_intent_continue_bonus: 0.2
+          merge_intent_commitment_window_s: 1.0
+      accvp:
+        <<: *accvp_runtime_stable
+        enabled: true
+        mode: "viability_lite"
+        viability_lite:
+          secondary_safety_profile: "audited_merge_left_v1"
+          max_secondary_risk_score: 0.05
+
+    - name: "ppo_accvp_candidate_table_reward_v3_1_persistence_prediction_shield_after_lite"
+      forecast_features: false
+      shield: true
+      model_path: "safe_rl_output/runs/ppo_accvp_candidate_table_reward_v3_1_persistence/stage3/ppo_model.zip"
+      raw_policy: "ppo_accvp_candidate_table_reward_v3_1_persistence"
+      counterfactual_predictor: "risk_gated_accvp_candidate_table_v2_persistence"
+      shield_overrides:
+        forecast_aware_candidate_ranking_mode: "off"
+        forecast_task_shadow_enabled: false
+        task_backstop_enabled: false
+      rl_overrides:
+        training_semantics_version: "reward_v3_1_persistence_001+risk_gated_accvp_candidate_table_v2_persistence"
+        policy_lateral_commitment:
+          enabled: true
+          profile: "left_intent_1s_risk_gated_v2"
+          duration_s: 1.0
+          preserve_raw_accel: true
+        merge_timing_reward:
+          reward_version: "opportunity_window_v3_1_risk_gated_persistence"
+          merge_intent_abort_penalty: -1.0
+          merge_intent_continue_bonus: 0.2
+          merge_intent_commitment_window_s: 1.0
+      accvp: *accvp_runtime_stable

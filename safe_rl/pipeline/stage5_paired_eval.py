@@ -6,6 +6,7 @@ from pathlib import Path
 from typing import Any
 
 from safe_rl.pipeline.common import latest_stage_file, load_stage_config, parse_config_arg, write_report
+from safe_rl.pipeline.accvp_observation_preflight import _gate as _accvp_observation_runtime_gate
 from safe_rl.rl.evaluation import evaluate_policy
 from safe_rl.sim.metrics import SAFETY_METRIC_VERSION
 from safe_rl.utils.config import clone_with_overrides, prepare_run_dir
@@ -658,6 +659,18 @@ def run(cfg) -> Path:
             tensorboard_step_offset=group_idx * max(1, len(seeds)),
             policy_type=policy_type,
         )
+        if bool(group_cfg.accvp.get("observation", {}).get("enabled", False)):
+            runtime_gate = _accvp_observation_runtime_gate(dict(group_reports[group.name].get("metrics", {}) or {}))
+            group_reports[group.name]["accvp_observation_preflight_pass"] = bool(runtime_gate.get("pass", False))
+            group_reports[group.name]["accvp_observation_runtime_gate"] = runtime_gate
+            group_reports[group.name]["accvp_table_runtime_gate_pass"] = bool(runtime_gate.get("pass", False))
+            if bool(cfg.stage5.get("require_accvp_observation_runtime_gate", False)) and not bool(
+                runtime_gate.get("pass", False)
+            ):
+                raise RuntimeError(
+                    f"Stage5 group '{group.name}' failed ACCVP observation runtime gate: "
+                    f"{runtime_gate.get('checks', {})}"
+                )
         if bool(group.forecast_features):
             group_reports[group.name]["forecast_source"] = str(
                 group.get("forecast_source", group_cfg.forecast_features.get("source", ""))

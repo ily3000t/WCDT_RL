@@ -102,6 +102,15 @@ def _prediction_loss_summary_from_checkpoint(checkpoint: str) -> dict | None:
     return summary
 
 
+def _append_semantics_token(base_semantics: str, token: str, *, enabled: bool) -> str:
+    if not enabled:
+        return base_semantics
+    parts = [part for part in str(base_semantics).split("+") if part]
+    if token in parts:
+        return str(base_semantics)
+    return "+".join([*parts, token]) if parts else token
+
+
 def run(cfg):
     cfg.shield["forecast_task_shadow_enabled"] = False
     cfg.shield["task_backstop_enabled"] = False
@@ -187,12 +196,10 @@ def run(cfg):
             RiskGatedACCVPCandidateTableAugmentor.FEATURE_VERSION,
         )
     )
-    report["training_semantics_version"] = (
-        base_semantics
-        if accvp_feature_version in base_semantics
-        else f"{base_semantics}+{accvp_feature_version}"
-        if RiskGatedACCVPCandidateTableAugmentor.enabled(cfg)
-        else base_semantics
+    report["training_semantics_version"] = _append_semantics_token(
+        base_semantics,
+        accvp_feature_version,
+        enabled=RiskGatedACCVPCandidateTableAugmentor.enabled(cfg),
     )
     report["reward_profile"] = reward_profile
     report["merge_timing_reward_version"] = (

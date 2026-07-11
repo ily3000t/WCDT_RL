@@ -33,6 +33,13 @@ class ACCVPObservationStats:
     model_error_count: int = 0
     invalid_bundle_count: int = 0
     fail_closed_count: int = 0
+    hard_fail_closed_count: int = 0
+    last_valid_fallback_count: int = 0
+    no_prior_fallback_count: int = 0
+    invalid_table_dropout_count: int = 0
+    warmup_count: int = 0
+    warmup_error_count: int = 0
+    warmup_latency_s: list[float] = field(default_factory=list)
     latency_total_s: list[float] = field(default_factory=list)
     latency_context_legality_s: list[float] = field(default_factory=list)
     latency_accvp_prepare_candidates_s: list[float] = field(default_factory=list)
@@ -53,6 +60,7 @@ class ACCVPObservationStats:
 
     def to_dict(self) -> dict[str, Any]:
         total_latency = self._latency_summary(self.latency_total_s)
+        warmup_latency = self._latency_summary(self.warmup_latency_s)
         per_stage = {
             "context_legality": self._latency_summary(self.latency_context_legality_s),
             "accvp_prepare_candidates": self._latency_summary(self.latency_accvp_prepare_candidates_s),
@@ -77,18 +85,47 @@ class ACCVPObservationStats:
             "accvp_table_model_error_count": int(self.model_error_count),
             "accvp_table_invalid_bundle_count": int(self.invalid_bundle_count),
             "accvp_table_fail_closed_count": int(self.fail_closed_count),
+            "accvp_table_hard_fail_closed_count": int(self.hard_fail_closed_count),
+            "accvp_table_last_valid_fallback_count": int(self.last_valid_fallback_count),
+            "accvp_table_no_prior_fallback_count": int(self.no_prior_fallback_count),
+            "accvp_table_invalid_dropout_count": int(self.invalid_table_dropout_count),
+            "accvp_table_warmup_count": int(self.warmup_count),
+            "accvp_table_warmup_error_count": int(self.warmup_error_count),
             "accvp_table_timeout_rate": (
                 float(self.timeout_count / self.total_decisions) if self.total_decisions else 0.0
             ),
             "accvp_table_fail_closed_rate": (
                 float(self.fail_closed_count / self.total_decisions) if self.total_decisions else 0.0
             ),
+            "accvp_table_hard_fail_closed_rate": (
+                float(self.hard_fail_closed_count / self.total_decisions) if self.total_decisions else 0.0
+            ),
+            "accvp_table_last_valid_fallback_rate": (
+                float(self.last_valid_fallback_count / self.total_decisions) if self.total_decisions else 0.0
+            ),
+            "accvp_table_invalid_dropout_rate": (
+                float(self.invalid_table_dropout_count / self.total_decisions) if self.total_decisions else 0.0
+            ),
             "accvp_table_latency_count": int(len(self.latency_total_s)),
             "accvp_table_latency_p50": total_latency["p50"],
             "accvp_table_latency_p95": total_latency["p95"],
             "accvp_table_latency_max": total_latency["max"],
+            "accvp_table_warmup_latency_p50": warmup_latency["p50"],
+            "accvp_table_warmup_latency_p95": warmup_latency["p95"],
+            "accvp_table_warmup_latency_max": warmup_latency["max"],
             "accvp_table_latency_per_stage": per_stage,
+            "accvp_table_runtime_gate_pass": bool(
+                (
+                    float(self.activation_window_valid_decisions / self.activation_window_decisions)
+                    if self.activation_window_decisions
+                    else 0.0
+                )
+                >= 0.95
+                and int(self.hard_fail_closed_count) == 0
+                and (total_latency["p95"] is not None and float(total_latency["p95"]) <= 0.5)
+            ),
             "accvp_table_latency_total_s": list(self.latency_total_s),
+            "accvp_table_warmup_latency_s": list(self.warmup_latency_s),
             "accvp_table_latency_stage_s": {
                 "context_legality": list(self.latency_context_legality_s),
                 "accvp_prepare_candidates": list(self.latency_accvp_prepare_candidates_s),
@@ -151,6 +188,13 @@ class RiskGatedACCVPCandidateTableAugmentor:
         self.use_inference_worker = bool(obs_cfg.get("use_inference_worker", False))
         self.profile_latency = bool(obs_cfg.get("profile_latency", True))
         self.fail_closed_defaults = bool(obs_cfg.get("fail_closed_defaults", True))
+        self.invalid_table_strategy = str(obs_cfg.get("invalid_table_strategy", "fail_closed_v1"))
+        if self.invalid_table_strategy not in {"fail_closed_v1", "last_valid_with_invalid_mask_v1"}:
+            raise ValueError("accvp.observation.invalid_table_strategy must be fail_closed_v1 or last_valid_with_invalid_mask_v1")
+        self.invalid_table_dropout_rate = float(obs_cfg.get("invalid_table_dropout_rate", 0.0) or 0.0)
+        if not 0.0 <= self.invalid_table_dropout_rate <= 1.0:
+            raise ValueError("accvp.observation.invalid_table_dropout_rate must be in [0, 1]")
+        self.warmup_enabled = bool(obs_cfg.get("warmup_enabled", False))
         self.include_risk_secondary = bool(obs_cfg.get("include_risk_secondary", True))
         self.secondary_safety_profile = str(obs_cfg.get("secondary_safety_profile", "risk_model_rollout_v1"))
         self.risk_horizon_steps = int(obs_cfg.get("risk_horizon_steps", 0) or 0)
@@ -159,6 +203,8 @@ class RiskGatedACCVPCandidateTableAugmentor:
         self.stats = ACCVPObservationStats()
         self._cache_key: tuple[Any, ...] | None = None
         self._cache_value: np.ndarray | None = None
+        self._last_valid_value: np.ndarray | None = None
+        self._warmup_complete = False
         self._predictor = predictor
         self._shield = shield
         if self._predictor is None:
@@ -208,6 +254,7 @@ class RiskGatedACCVPCandidateTableAugmentor:
         self.stats = ACCVPObservationStats()
         self._cache_key = None
         self._cache_value = None
+        self._last_valid_value = None
 
     def close(self) -> None:
         close = getattr(self._predictor, "close", None)
@@ -225,6 +272,9 @@ class RiskGatedACCVPCandidateTableAugmentor:
                 "accvp_observation_activation_distance_m": float(self.activation_distance),
                 "accvp_observation_use_inference_worker": bool(self.use_inference_worker),
                 "accvp_observation_profile_latency": bool(self.profile_latency),
+                "accvp_observation_invalid_table_strategy": str(self.invalid_table_strategy),
+                "accvp_observation_invalid_table_dropout_rate": float(self.invalid_table_dropout_rate),
+                "accvp_observation_warmup_enabled": bool(self.warmup_enabled),
                 "accvp_observation_secondary_safety_profile": str(self.secondary_safety_profile),
                 "accvp_observation_risk_horizon_steps": int(self.risk_horizon_steps),
                 "accvp_observation_checkpoint": str(self.config.accvp.get("checkpoint", "")),
@@ -250,10 +300,43 @@ class RiskGatedACCVPCandidateTableAugmentor:
         )
         if self._cache_key == key and self._cache_value is not None:
             return self._cache_value.copy()
+        self.warmup(context)
         table = self._extract_uncached(context)
         self._cache_key = key
         self._cache_value = table.astype(np.float32, copy=True)
         return self._cache_value.copy()
+
+    def warmup(self, context: dict[str, Any] | None = None) -> None:
+        if not self.warmup_enabled or self._warmup_complete:
+            return
+        self._warmup_complete = True
+        started = time.perf_counter()
+        try:
+            if context is None:
+                return
+            legality = self._legality_map(context)
+            legal_actions = [action for action in ACTIONS if bool(legality.get(int(action.index), False))]
+            if legal_actions:
+                if (
+                    not self.use_inference_worker
+                    and hasattr(self._predictor, "prepare_candidates")
+                    and hasattr(self._predictor, "score_prepared")
+                ):
+                    prepared = self._predictor.prepare_candidates(context, legal_actions[: min(3, len(legal_actions))])
+                    self._predictor.score_prepared(prepared)
+                else:
+                    scorer = self._predictor.score_candidates
+                    if "timeout_s" in inspect.signature(scorer).parameters:
+                        scorer(context, legal_actions[: min(3, len(legal_actions))], timeout_s=self.timeout_s)
+                    else:
+                        scorer(context, legal_actions[: min(3, len(legal_actions))])
+                self._secondary_safety_many(legal_actions[: min(3, len(legal_actions))], context, legality)
+            self.stats.warmup_count += 1
+        except Exception:
+            self.stats.warmup_error_count += 1
+        finally:
+            if self.profile_latency:
+                self.stats.warmup_latency_s.append(float(time.perf_counter() - started))
 
     def _extract_uncached(self, context: dict[str, Any]) -> np.ndarray:
         self.stats.total_decisions += 1
@@ -275,8 +358,12 @@ class RiskGatedACCVPCandidateTableAugmentor:
             legal_actions = [action for action in ACTIONS if bool(legality.get(int(action.index), False))]
             base = self._fail_closed_rows_from_legality(legality, context)
             stage_latencies["context_legality"] = time.perf_counter() - legality_started
+            if self._invalid_table_dropout(context):
+                self.stats.invalid_table_dropout_count += 1
+                self._record_latency(time.perf_counter() - started, stage_latencies)
+                return self._invalid_table_rows(context, base)
             if not legal_actions:
-                self.stats.fail_closed_count += 1
+                self._record_hard_fail_closed()
                 self._record_latency(time.perf_counter() - started, stage_latencies)
                 return base
             prepare_started = time.perf_counter()
@@ -310,10 +397,10 @@ class RiskGatedACCVPCandidateTableAugmentor:
             self._record_latency(elapsed, stage_latencies)
             if elapsed > self.timeout_s:
                 self.stats.timeout_count += 1
-                self.stats.fail_closed_count += 1
-                return base
+                return self._invalid_table_rows(context, base)
             self.stats.valid_decisions += 1
             self.stats.activation_window_valid_decisions += 1
+            self._last_valid_value = rows.astype(np.float32, copy=True)
             return rows
         except TimeoutError:
             self.stats.timeout_count += 1
@@ -322,10 +409,49 @@ class RiskGatedACCVPCandidateTableAugmentor:
         except Exception:
             self.stats.model_error_count += 1
         self._record_latency(time.perf_counter() - started, stage_latencies)
-        self.stats.fail_closed_count += 1
         if self.fail_closed_defaults:
-            return self._fail_closed_rows(context)
+            return self._invalid_table_rows(context, self._fail_closed_rows(context))
         raise
+
+    def _record_hard_fail_closed(self) -> None:
+        self.stats.fail_closed_count += 1
+        self.stats.hard_fail_closed_count += 1
+        self.stats.no_prior_fallback_count += 1
+
+    def _invalid_table_rows(self, context: dict[str, Any], hard_default: np.ndarray) -> np.ndarray:
+        if self.invalid_table_strategy == "last_valid_with_invalid_mask_v1" and self._last_valid_value is not None:
+            self.stats.fail_closed_count += 1
+            self.stats.last_valid_fallback_count += 1
+            return self._last_valid_rows_with_invalid_mask(context)
+        self._record_hard_fail_closed()
+        return hard_default
+
+    def _invalid_table_dropout(self, context: dict[str, Any]) -> bool:
+        if self.invalid_table_dropout_rate <= 0.0:
+            return False
+        seed = int(context.get("episode_seed", 0))
+        decision = int(context.get("decision_index", 0))
+        step = int(context.get("episode_step", 0))
+        value = ((seed * 1_000_003 + decision * 9_176 + step * 131) % 1_000_000) / 1_000_000.0
+        return bool(value < self.invalid_table_dropout_rate)
+
+    def _last_valid_rows_with_invalid_mask(self, context: dict[str, Any]) -> np.ndarray:
+        assert self._last_valid_value is not None
+        rows = np.asarray(self._last_valid_value, dtype=np.float32).copy()
+        table_dim = self.ACTION_COUNT * len(self.FEATURE_NAMES)
+        table = rows[:table_dim].reshape((self.ACTION_COUNT, len(self.FEATURE_NAMES)))
+        legality = self._legality_map(context)
+        for action in ACTIONS:
+            index = int(action.index)
+            table[index, 0] = 0.0
+            table[index, 1] = float(bool(legality.get(index, False)))
+            table[index, 7] = float(action.lateral_cmd > 0)
+            table[index, 8] = float(action.lateral_cmd == 0)
+            table[index, 9] = float(action.lateral_cmd)
+            table[index, 10] = float(action.accel_cmd)
+        if self.feature_version == self.PERSISTENCE_FEATURE_VERSION:
+            return self._append_policy_state(table.reshape(-1).astype(np.float32), context)
+        return table.reshape(-1).astype(np.float32)
 
     def _append_policy_state(self, rows: np.ndarray, context: dict[str, Any]) -> np.ndarray:
         if self.feature_version != self.PERSISTENCE_FEATURE_VERSION:
@@ -526,6 +652,14 @@ def validate_accvp_observation_config(config: Any) -> None:
         RISK_GATED_ACCVP_OBSERVATION_PERSISTENCE_VERSION,
     }:
         raise ValueError("unsupported ACCVP observation feature_version")
+    if str(obs_cfg.get("invalid_table_strategy", "fail_closed_v1")) not in {
+        "fail_closed_v1",
+        "last_valid_with_invalid_mask_v1",
+    }:
+        raise ValueError("unsupported ACCVP observation invalid_table_strategy")
+    dropout_rate = float(obs_cfg.get("invalid_table_dropout_rate", 0.0) or 0.0)
+    if not 0.0 <= dropout_rate <= 1.0:
+        raise ValueError("unsupported ACCVP observation invalid_table_dropout_rate")
     forecast_enabled = bool(config.forecast_features.enabled or config.rl.use_wcdt_forecast_features)
     if forecast_enabled and not bool(obs_cfg.get("allow_with_forecast_features", False)):
         raise ValueError(

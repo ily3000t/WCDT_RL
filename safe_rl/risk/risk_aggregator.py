@@ -69,9 +69,16 @@ def _accvp_observation_metrics(reports: list[dict]) -> dict:
     )
     timeout_count = int(sum(int(report.get("accvp_table_timeout_count", 0)) for report in reports))
     fail_closed_count = int(sum(int(report.get("accvp_table_fail_closed_count", 0)) for report in reports))
+    hard_fail_closed_count = int(sum(int(report.get("accvp_table_hard_fail_closed_count", 0)) for report in reports))
+    last_valid_fallback_count = int(sum(int(report.get("accvp_table_last_valid_fallback_count", 0)) for report in reports))
+    no_prior_fallback_count = int(sum(int(report.get("accvp_table_no_prior_fallback_count", 0)) for report in reports))
+    invalid_dropout_count = int(sum(int(report.get("accvp_table_invalid_dropout_count", 0)) for report in reports))
+    warmup_count = int(sum(int(report.get("accvp_table_warmup_count", 0)) for report in reports))
+    warmup_error_count = int(sum(int(report.get("accvp_table_warmup_error_count", 0)) for report in reports))
     model_error_count = int(sum(int(report.get("accvp_table_model_error_count", 0)) for report in reports))
     invalid_bundle_count = int(sum(int(report.get("accvp_table_invalid_bundle_count", 0)) for report in reports))
     latencies: list[float] = []
+    warmup_latencies: list[float] = []
     stage_latencies: dict[str, list[float]] = {
         "context_legality": [],
         "accvp_prepare_candidates": [],
@@ -81,31 +88,52 @@ def _accvp_observation_metrics(reports: list[dict]) -> dict:
     }
     for report in reports:
         latencies.extend(float(value) for value in list(report.get("accvp_table_latency_total_s", []) or []))
+        warmup_latencies.extend(float(value) for value in list(report.get("accvp_table_warmup_latency_s", []) or []))
         stage_payload = dict(report.get("accvp_table_latency_stage_s", {}) or {})
         for stage_name in stage_latencies:
             stage_latencies[stage_name].extend(
                 float(value) for value in list(stage_payload.get(stage_name, []) or [])
             )
     latency_summary = _latency_quantiles(latencies)
+    warmup_latency_summary = _latency_quantiles(warmup_latencies)
+    valid_rate_activation = float(activation_valid_count / activation_count) if activation_count else 0.0
+    latency_p95 = latency_summary["p95"]
+    runtime_gate_pass = bool(
+        valid_rate_activation >= 0.95
+        and hard_fail_closed_count == 0
+        and latency_p95 is not None
+        and float(latency_p95) <= 0.5
+    )
     return {
         "accvp_table_decision_count": decision_count,
         "accvp_table_activation_window_decision_count": activation_count,
         "accvp_table_valid_decision_count": valid_count,
         "accvp_table_activation_window_valid_decision_count": activation_valid_count,
         "accvp_table_valid_rate_all_decisions": float(valid_count / decision_count) if decision_count else 0.0,
-        "accvp_table_valid_rate_activation_window": (
-            float(activation_valid_count / activation_count) if activation_count else 0.0
-        ),
+        "accvp_table_valid_rate_activation_window": valid_rate_activation,
         "accvp_table_timeout_count": timeout_count,
         "accvp_table_timeout_rate": float(timeout_count / decision_count) if decision_count else 0.0,
         "accvp_table_fail_closed_count": fail_closed_count,
         "accvp_table_fail_closed_rate": float(fail_closed_count / decision_count) if decision_count else 0.0,
+        "accvp_table_hard_fail_closed_count": hard_fail_closed_count,
+        "accvp_table_hard_fail_closed_rate": float(hard_fail_closed_count / decision_count) if decision_count else 0.0,
+        "accvp_table_last_valid_fallback_count": last_valid_fallback_count,
+        "accvp_table_last_valid_fallback_rate": float(last_valid_fallback_count / decision_count) if decision_count else 0.0,
+        "accvp_table_no_prior_fallback_count": no_prior_fallback_count,
+        "accvp_table_invalid_dropout_count": invalid_dropout_count,
+        "accvp_table_invalid_dropout_rate": float(invalid_dropout_count / decision_count) if decision_count else 0.0,
+        "accvp_table_warmup_count": warmup_count,
+        "accvp_table_warmup_error_count": warmup_error_count,
         "accvp_table_model_error_count": model_error_count,
         "accvp_table_invalid_bundle_count": invalid_bundle_count,
         "accvp_table_latency_count": int(len(latencies)),
         "accvp_table_latency_p50": latency_summary["p50"],
         "accvp_table_latency_p95": latency_summary["p95"],
         "accvp_table_latency_max": latency_summary["max"],
+        "accvp_table_warmup_latency_p50": warmup_latency_summary["p50"],
+        "accvp_table_warmup_latency_p95": warmup_latency_summary["p95"],
+        "accvp_table_warmup_latency_max": warmup_latency_summary["max"],
+        "accvp_table_runtime_gate_pass": runtime_gate_pass,
         "accvp_table_latency_per_stage": {
             name: _latency_quantiles(values) for name, values in stage_latencies.items()
         },

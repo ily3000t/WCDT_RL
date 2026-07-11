@@ -214,6 +214,41 @@ def test_risk_gated_accvp_candidate_table_fail_closed_preserves_masks():
     summary = augmentor.summary()
     assert summary["accvp_table_timeout_count"] == 1
     assert summary["accvp_table_fail_closed_count"] == 1
+    assert summary["accvp_table_hard_fail_closed_count"] == 1
+    assert summary["accvp_table_last_valid_fallback_count"] == 0
+
+
+def test_risk_gated_accvp_candidate_table_last_valid_invalid_mask_fallback():
+    class FlakyPredictor:
+        def __init__(self):
+            self.calls = 0
+
+        def score_candidates(self, _context, _actions, *, timeout_s=None):
+            self.calls += 1
+            if self.calls == 1:
+                return [{**_score(7, viability=0.85), "ensemble_disagreement": 0.03}]
+            raise TimeoutError("boom")
+
+    cfg = _observation_cfg()
+    cfg.accvp.observation["invalid_table_strategy"] = "last_valid_with_invalid_mask_v1"
+    augmentor = RiskGatedACCVPCandidateTableAugmentor(cfg, predictor=FlakyPredictor(), shield=_Shield(safe=True))
+
+    first = augmentor.extract(_observation_context(decision=0))
+    second = augmentor.extract(_observation_context(decision=1))
+    first_rows = first.reshape((9, 11))
+    second_rows = second.reshape((9, 11))
+
+    assert first_rows[7, 0] == 1.0
+    assert abs(float(first_rows[7, 4]) - 0.85) < 1.0e-6
+    assert second_rows[7, 0] == 0.0
+    assert second_rows[7, 1] == 1.0
+    assert abs(float(second_rows[7, 4]) - 0.85) < 1.0e-6
+    summary = augmentor.summary()
+    assert summary["accvp_table_valid_decision_count"] == 1
+    assert summary["accvp_table_timeout_count"] == 1
+    assert summary["accvp_table_fail_closed_count"] == 1
+    assert summary["accvp_table_hard_fail_closed_count"] == 0
+    assert summary["accvp_table_last_valid_fallback_count"] == 1
 
 
 def test_risk_gated_accvp_candidate_table_uses_in_process_prepared_path():
@@ -291,6 +326,8 @@ def test_accvp_observation_metrics_aggregate_counts_and_latency():
             "accvp_table_activation_window_valid_decision_count": 0,
             "accvp_table_timeout_count": 1,
             "accvp_table_fail_closed_count": 1,
+            "accvp_table_hard_fail_closed_count": 0,
+            "accvp_table_last_valid_fallback_count": 1,
             "accvp_table_latency_total_s": [0.60],
             "accvp_table_latency_stage_s": {"accvp_score": [0.50]},
         },
@@ -301,6 +338,8 @@ def test_accvp_observation_metrics_aggregate_counts_and_latency():
     assert metrics["accvp_table_valid_rate_activation_window"] == 2 / 3
     assert metrics["accvp_table_timeout_count"] == 1
     assert metrics["accvp_table_fail_closed_rate"] == 1 / 3
+    assert metrics["accvp_table_hard_fail_closed_count"] == 0
+    assert metrics["accvp_table_last_valid_fallback_count"] == 1
     assert metrics["accvp_table_latency_count"] == 3
     assert metrics["accvp_table_latency_p95"] is not None
     assert metrics["accvp_table_latency_per_stage"]["accvp_score"]["p50"] is not None
@@ -318,8 +357,7 @@ def test_accvp_observation_preflight_gate_requires_valid_low_latency_tables():
     failing = _accvp_observation_preflight_gate(
         {
             "accvp_table_valid_rate_activation_window": 1.0,
-            "accvp_table_timeout_count": 1,
-            "accvp_table_fail_closed_count": 0,
+            "accvp_table_hard_fail_closed_count": 1,
             "accvp_table_latency_p95": 0.10,
         }
     )
