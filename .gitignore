@@ -6,3 +6,8 @@ __pycache__/
 .pytest_cache/
 /.pytest_tmp/
 /_tmp_pytest*/
+
+# Machine-specific configuration overlays. Keep only documentation/templates.
+/safe_rl/config/local/*
+!/safe_rl/config/local/README.md
+!/safe_rl/config/local/*.example.yaml

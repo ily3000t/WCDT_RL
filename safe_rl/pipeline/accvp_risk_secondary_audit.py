@@ -54,10 +54,25 @@ def main() -> None:
     parser.add_argument("--checkpoint", default=None, help="ACCVP predictor checkpoint")
     parser.add_argument("--calibration", default=None, help="ACCVP calibration bundle")
     parser.add_argument("--operating-point", default=None, help="Lite operating point JSON")
-    parser.add_argument("--splits", nargs="+", default=["operating_point", "test"], help="Dataset splits to audit")
+    parser.add_argument(
+        "--splits",
+        nargs="+",
+        default=["operating_point"],
+        help=(
+            "Dataset splits to audit. Only operating_point may select a threshold; "
+            "all other splits are diagnostic-only."
+        ),
+    )
     parser.add_argument("--risk-score-grid", nargs="+", type=float, default=None)
     parser.add_argument("--output-dir", default=None)
     args = parser.parse_args()
+    if "operating_point" not in {str(split) for split in args.splits}:
+        raise SystemExit("Risk-secondary tuning requires the operating_point split")
+    if "test" in {str(split) for split in args.splits}:
+        raise SystemExit(
+            "The test split is sealed; evaluate its frozen profile only through "
+            "accvp_final_holdout_eval"
+        )
 
     try:
         import torch

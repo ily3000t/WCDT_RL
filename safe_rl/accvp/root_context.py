@@ -8,7 +8,17 @@ from typing import Any, Mapping
 
 import numpy as np
 
-from safe_rl.accvp.schema import COUNTERFACTUAL_SCHEMA_VERSION, canonical_json, file_sha256, stable_hash
+from safe_rl.accvp.schema import (
+    COUNTERFACTUAL_SCHEMA_VERSION,
+    ROOT_OBSERVATION_FINGERPRINT_VERSION,
+    SCENARIO_EPISODE_KEY_VERSION,
+    actor_row_mapping_hash,
+    canonical_json,
+    file_sha256,
+    root_observation_fingerprint,
+    scenario_episode_key,
+    stable_hash,
+)
 from safe_rl.prediction.wcdt_v3_predictor import build_v3_runtime_batch
 from safe_rl.sim.action_space import decode_action
 from safe_rl.sim.history_buffer import HistoryBuffer
@@ -70,8 +80,12 @@ def _tensor_fields(runtime_batch: dict[str, Any]) -> dict[str, np.ndarray]:
         "agent_width",
         "ego_length",
         "ego_width",
+        "selected_indices",
     )
-    return {name: np.asarray(runtime_batch[name]) for name in fields}
+    tensors = {name: np.asarray(runtime_batch[name]) for name in fields}
+    if tensors["selected_indices"].ndim == 1:
+        tensors["selected_indices"] = tensors["selected_indices"][None, :]
+    return tensors
 
 
 def capture_root_context(
@@ -98,7 +112,16 @@ def capture_root_context(
         raise RuntimeError("cannot capture ACCVP root without an ego state")
     runtime = build_v3_runtime_batch(env.config, env.history, env.ego_id)
     selection = runtime["actor_selection"].to_dict()
-    selected_actor_ids = [str(value) for value in runtime.get("runtime_agent_ids", [])[1:]]
+    actor_row_ids = [str(value) for value in runtime["actor_row_ids"]]
+    if len(actor_row_ids) != int(env.config.accvp.actor_count):
+        raise ValueError(
+            "ACCVP actor_count does not match WcDT selected row capacity: "
+            f"accvp={int(env.config.accvp.actor_count)}, wcdt_rows={len(actor_row_ids)}"
+        )
+    selected_actor_ids = [value for value in actor_row_ids if value]
+    actor_row_source_indices = np.asarray(runtime["selected_indices"], dtype=np.int64).reshape(-1)
+    actor_row_mask = np.asarray(runtime["mask"], dtype=np.float32)[0].reshape(-1)
+    mapping_hash = actor_row_mapping_hash(actor_row_ids, actor_row_source_indices, actor_row_mask)
     critical_actor_ids = [str(value) for value in selection.get("critical_actor_ids", [])]
     selected_actor_coverage_complete = len(selected_actor_ids) >= int(env.config.accvp.actor_count)
     safety_actor_coverage_complete = set(critical_actor_ids).issubset(set(selected_actor_ids)) and not bool(
@@ -108,21 +131,32 @@ def capture_root_context(
     root_id = root_id or f"seed{int(env.seed_value)}_decision{int(env._decision_index)}_{uuid.uuid4().hex[:12]}"
     scenario_hash = stable_hash(dict(env.config.scenario))
     config_hash = stable_hash(dict(env.config))
-    root_state_fingerprint = stable_hash(
-        {
-            "episode_seed": int(env.seed_value),
-            "decision_index": int(env._decision_index),
-            "sim_step": int(env._episode_step),
-            "root_ego": ego.to_dict(),
-            "history_frames": _serialise_history(env),
-            "selected_actor_ids": selected_actor_ids,
-        }
-    )
     contract = dict(data_contract or {})
+    tensors = _tensor_fields(runtime)
+    contract_hash = stable_hash(contract) if contract else ""
+    scenario_route_hash = str(contract.get("scenario_route_hash", ""))
+    scenario_key = (
+        scenario_episode_key(
+            scenario_route_hash=scenario_route_hash,
+            traffic_profile=str(traffic_profile),
+            episode_seed=int(env.seed_value),
+        )
+        if scenario_route_hash
+        else ""
+    )
+    observation_fingerprint = root_observation_fingerprint(
+        actor_row_ids=actor_row_ids,
+        root_ego=ego.to_dict(),
+        data_contract_hash=contract_hash,
+        tensors=tensors,
+    )
     metadata = {
         "counterfactual_schema_version": COUNTERFACTUAL_SCHEMA_VERSION,
         "root_id": root_id,
         "root_episode_id": f"{root_policy}:{int(env.seed_value)}",
+        "scenario_episode_key_version": SCENARIO_EPISODE_KEY_VERSION,
+        "scenario_episode_key": scenario_key,
+        "scenario_route_hash": scenario_route_hash,
         "episode_seed": int(env.seed_value),
         "decision_index": int(env._decision_index),
         "sim_step": int(env._episode_step),
@@ -156,23 +190,31 @@ def capture_root_context(
         "response_horizon_s": float(env.config.accvp.response_horizon_s),
         "viability_horizon_s": float(env.config.accvp.viability_horizon_s),
         "data_contract": contract,
-        "data_contract_hash": stable_hash(contract) if contract else "",
+        "data_contract_hash": contract_hash,
         "step_length": float(env.config.scenario.step_length),
         "candidate_plan_horizon_steps": int(env.config.accvp.candidate_plan_horizon_steps),
         "ego_id": str(env.ego_id),
         "history_frames": _serialise_history(env),
         "selected_actor_ids": selected_actor_ids,
+        "actor_row_ids": actor_row_ids,
+        "actor_row_source_indices": actor_row_source_indices.tolist(),
+        "actor_row_mapping_version": mapping_hash.split(":", 1)[0],
+        "actor_row_mapping_hash": mapping_hash,
         "selected_actor_count": len(selected_actor_ids),
         "selected_actor_capacity": int(env.config.accvp.actor_count),
         "selected_actor_coverage_complete": bool(selected_actor_coverage_complete),
         "safety_actor_coverage_complete": bool(safety_actor_coverage_complete),
         "selector": selection,
         "root_ego": ego.to_dict(),
-        "root_state_fingerprint": root_state_fingerprint,
+        "root_observation_fingerprint_version": ROOT_OBSERVATION_FINGERPRINT_VERSION,
+        "root_observation_fingerprint": observation_fingerprint,
+        # Retained as a compatibility alias for manifest diagnostics. Schema-v3
+        # split logic uses root_observation_fingerprint explicitly.
+        "root_state_fingerprint": observation_fingerprint,
         "root_context_hash": "",
     }
     metadata["root_context_hash"] = stable_hash({key: value for key, value in metadata.items() if key != "snapshot_path"})
-    return RootContext(metadata=metadata, tensors=_tensor_fields(runtime))
+    return RootContext(metadata=metadata, tensors=tensors)
 
 
 def restore_root_context(env: Any, root: RootContext) -> None:
@@ -203,7 +245,10 @@ def restore_root_context(env: Any, root: RootContext) -> None:
         actual = None if current_ego is None else current_ego.to_dict()
         raise RuntimeError(f"SUMO loadState root ego state does not match captured root context: expected={expected}, actual={actual}")
     latest = env.history.latest()
-    for actor_id in root.metadata.get("selected_actor_ids", []):
+    actor_ids = root.metadata.get("actor_row_ids", root.metadata.get("selected_actor_ids", []))
+    for actor_id in actor_ids:
+        if not str(actor_id):
+            continue
         if str(actor_id) not in latest:
             raise RuntimeError(f"SUMO loadState lost selected ACCVP actor {actor_id!r}")
     env._refresh_vehicle_subscriptions()

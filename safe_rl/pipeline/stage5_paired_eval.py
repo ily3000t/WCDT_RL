@@ -5,6 +5,19 @@ import re
 from pathlib import Path
 from typing import Any
 
+from safe_rl.analysis.paired_statistics import build_pair_statistics
+from safe_rl.accvp.artifacts import resolve_v2_bundle
+from safe_rl.accvp.observation import RiskGatedACCVPCandidateTableAugmentor
+from safe_rl.evaluation_protocol import (
+    EvidenceProtocolError,
+    audit_seed_cohorts,
+    assert_disjoint_seed_usage,
+    build_stage_lineage,
+    file_sha256,
+    seeds_for_role,
+    stable_hash,
+    validate_parent_lineage,
+)
 from safe_rl.pipeline.common import latest_stage_file, load_stage_config, parse_config_arg, write_report
 from safe_rl.pipeline.accvp_observation_preflight import _gate as _accvp_observation_runtime_gate
 from safe_rl.rl.evaluation import evaluate_policy
@@ -27,6 +40,52 @@ def _risk_path(cfg) -> Path:
     return latest_stage_file(cfg, "stage2", "risk_module.pt")
 
 
+def _accvp_bundle_lineage(cfg: Any) -> dict[str, Any]:
+    """Resolve the immutable VNext bundle identity used by one Stage5 group."""
+
+    if not RiskGatedACCVPCandidateTableAugmentor.enabled(cfg):
+        return {"required": False, "enabled": False}
+    source = cfg.accvp.get("artifact_manifest")
+    if not source:
+        raise EvidenceProtocolError(
+            "ACCVP-enabled Stage5 group requires accvp.artifact_manifest"
+        )
+    path = Path(str(source)).resolve()
+    try:
+        manifest, resolved = resolve_v2_bundle(path)
+    except (FileNotFoundError, ValueError) as exc:
+        raise EvidenceProtocolError(f"invalid Stage5 ACCVP bundle: {exc}") from exc
+    predictor = resolved.get("predictor")
+    if predictor is None:
+        raise EvidenceProtocolError("Stage5 ACCVP bundle is missing predictor")
+    payload = {
+        "required": True,
+        "enabled": True,
+        "manifest_path": str(path),
+        "manifest_sha256": file_sha256(path),
+        "artifact_fingerprint": str(manifest["artifact_fingerprint"]),
+        "artifact_variant": str(manifest["artifact_variant"]),
+        "artifact_generation": str(manifest["artifact_generation"]),
+        "bundle_schema_version": int(manifest["bundle_schema_version"]),
+        "formal_runtime_contract_sha256": str(
+            manifest["formal_runtime_contract_sha256"]
+        ),
+        "predictor_sha256": file_sha256(predictor),
+    }
+    payload["binding_fingerprint"] = stable_hash(payload)
+    return payload
+
+
+def _validate_lineage_fingerprint(lineage: dict[str, Any], *, name: str) -> None:
+    expected = str(lineage.get("lineage_fingerprint", ""))
+    if not expected:
+        raise EvidenceProtocolError(f"{name} is missing lineage_fingerprint")
+    content = dict(lineage)
+    content.pop("lineage_fingerprint", None)
+    if stable_hash(content) != expected:
+        raise EvidenceProtocolError(f"{name} lineage_fingerprint mismatch")
+
+
 def _select_eval_seeds(cfg) -> list[int]:
     requested = int(cfg.stage5.episodes_per_group)
     seed_file = cfg.stage5.get("seed_file")
@@ -37,6 +96,11 @@ def _select_eval_seeds(cfg) -> list[int]:
         seeds = [int(seed) for seed in source]
     else:
         seeds = [int(seed) for seed in cfg.stage5.seeds]
+    protocol_cfg = dict(cfg.get("evaluation_protocol", {}) or {})
+    stage5_role = str(protocol_cfg.get("stage5_role", "stage5_confirmatory"))
+    seeds = seeds_for_role(cfg, stage5_role, fallback=seeds)
+    if len(seeds) != len(set(seeds)):
+        raise EvidenceProtocolError("Stage5 evaluation seeds contain duplicates")
     if requested <= 0:
         if not seeds:
             raise ValueError("stage5.episodes_per_group<=0 requires at least one configured seed")
@@ -47,6 +111,218 @@ def _select_eval_seeds(cfg) -> list[int]:
             f"but {'stage5.seed_file' if seed_file else 'stage5.seeds'} has {len(seeds)}"
         )
     return seeds[:requested]
+
+
+def _stage3_training_report(model_path: Path) -> Path:
+    return model_path.parent / "stage3_training_report.json"
+
+
+def _validate_stage5_model_lineage(
+    *,
+    model_path: Path,
+    stage5_lineage: dict[str, Any],
+    stage5_seeds: list[int],
+) -> dict[str, Any]:
+    report_path = _stage3_training_report(model_path)
+    strict = bool(stage5_lineage.get("protocol_strict", False))
+    if not report_path.exists():
+        if strict:
+            raise EvidenceProtocolError(f"strict Stage5 requires Stage3 report for model: {model_path}")
+        return {"available": False, "stage3_report": str(report_path)}
+    with report_path.open("r", encoding="utf-8") as handle:
+        report = json.load(handle)
+    parent = dict(report.get("evidence_lineage", {}) or {})
+    if strict or parent.get("lineage_fingerprint"):
+        _validate_lineage_fingerprint(parent, name="Stage3 evidence lineage")
+    validate_parent_lineage(parent, stage5_lineage)
+    role_usage = dict(parent.get("role_usage", {}) or {})
+    training = [int(seed) for seed in role_usage.get("stage3_training", {}).get("seeds", [])]
+    selection = [int(seed) for seed in role_usage.get("stage3_selection", {}).get("seeds", [])]
+    if not training:
+        training = [
+            int(item["episode_seed"])
+            for item in report.get("training_episode_seed_records", [])
+            if "episode_seed" in item
+        ]
+    if not selection:
+        selection = [int(seed) for seed in report.get("checkpoint_selection_seeds", [])]
+    if bool(stage5_lineage.get("protocol_enabled", False)) or bool(
+        parent.get("protocol_enabled", False)
+    ):
+        seed_audit = assert_disjoint_seed_usage(
+            stage3_training=training,
+            stage3_selection=selection,
+            stage5_confirmatory=stage5_seeds,
+        )
+        seed_audit["enforced"] = True
+    else:
+        seed_audit = audit_seed_cohorts(
+            {
+                "stage3_training": training,
+                "stage3_selection": selection,
+                "stage5_confirmatory": stage5_seeds,
+            }
+        )
+        seed_audit["enforced"] = False
+    return {
+        "available": True,
+        "stage3_report": str(report_path.resolve()),
+        "stage3_lineage_fingerprint": parent.get("lineage_fingerprint"),
+        "training_seed_count": len(training),
+        "selection_seed_count": len(selection),
+        "overlap_count": int(seed_audit.get("overlap_count", 0)),
+        "seed_audit": seed_audit,
+    }
+
+
+def _validate_stage5_observation_contract(
+    *,
+    model_path: Path,
+    group_cfg: Any,
+    protocol_strict: bool,
+) -> dict[str, Any]:
+    if not RiskGatedACCVPCandidateTableAugmentor.enabled(group_cfg):
+        return {"required": False, "available": True}
+    report_path = _stage3_training_report(model_path)
+    if not report_path.exists():
+        if protocol_strict:
+            raise EvidenceProtocolError(
+                f"strict ACCVP Stage5 requires Stage3 observation contract: {report_path}"
+            )
+        return {"required": True, "available": False, "stage3_report": str(report_path)}
+    with report_path.open("r", encoding="utf-8") as handle:
+        report = json.load(handle)
+    expected_bundle = _accvp_bundle_lineage(group_cfg)
+    parent_lineage = dict(report.get("evidence_lineage", {}) or {})
+    if protocol_strict or parent_lineage.get("lineage_fingerprint"):
+        _validate_lineage_fingerprint(
+            parent_lineage,
+            name="Stage3 ACCVP evidence lineage",
+        )
+    recorded_bundle = report.get("accvp_bundle_lineage")
+    parent_bundle = parent_lineage.get("accvp_bundle")
+    if not isinstance(recorded_bundle, dict) or not isinstance(parent_bundle, dict):
+        if protocol_strict:
+            raise EvidenceProtocolError(
+                "strict ACCVP Stage5 requires Stage3 bundle lineage"
+            )
+        return {
+            "required": True,
+            "available": False,
+            "stage3_report": str(report_path.resolve()),
+            "reason": "missing_stage3_accvp_bundle_lineage",
+        }
+    if recorded_bundle != parent_bundle:
+        raise EvidenceProtocolError(
+            "Stage3 report ACCVP bundle lineage disagrees with its evidence lineage"
+        )
+    recorded_fingerprint = str(recorded_bundle.get("binding_fingerprint", ""))
+    recorded_content = dict(recorded_bundle)
+    recorded_content.pop("binding_fingerprint", None)
+    if not recorded_fingerprint or stable_hash(recorded_content) != recorded_fingerprint:
+        raise EvidenceProtocolError("Stage3 ACCVP bundle binding_fingerprint mismatch")
+    binding_fields = (
+        "manifest_sha256",
+        "artifact_fingerprint",
+        "artifact_variant",
+        "artifact_generation",
+        "bundle_schema_version",
+        "formal_runtime_contract_sha256",
+        "predictor_sha256",
+    )
+    differing = [
+        key
+        for key in binding_fields
+        if recorded_bundle.get(key) != expected_bundle.get(key)
+    ]
+    if differing:
+        raise EvidenceProtocolError(
+            "Stage3/Stage5 ACCVP bundle lineage mismatch: "
+            f"fields={differing}"
+        )
+    expected_names = RiskGatedACCVPCandidateTableAugmentor.feature_names(group_cfg)
+    expected_hash = stable_hash(list(expected_names))
+    recorded_hash = str(report.get("accvp_observation_feature_names_sha256", ""))
+    if not recorded_hash:
+        if protocol_strict:
+            raise EvidenceProtocolError("Stage3 report is missing ACCVP feature-name hash")
+        return {
+            "required": True,
+            "available": False,
+            "stage3_report": str(report_path.resolve()),
+            "expected_feature_names_sha256": expected_hash,
+        }
+    if recorded_hash != expected_hash:
+        raise EvidenceProtocolError(
+            "Stage3/Stage5 ACCVP observation feature contract mismatch: "
+            f"stage3={recorded_hash} stage5={expected_hash}"
+        )
+    return {
+        "required": True,
+        "available": True,
+        "stage3_report": str(report_path.resolve()),
+        "feature_count": len(expected_names),
+        "feature_names_sha256": expected_hash,
+        "accvp_bundle": expected_bundle,
+        "stage3_bundle_lineage_match": True,
+    }
+
+
+def _validate_frozen_runtime_preflight(
+    *,
+    cfg: Any,
+    group_model_paths: dict[str, Path],
+    protocol_strict: bool,
+) -> dict[str, Any]:
+    required = bool(cfg.stage5.get("require_accvp_observation_runtime_gate", False))
+    source = cfg.stage5.get("accvp_observation_preflight_report")
+    if not source:
+        if required and protocol_strict:
+            raise EvidenceProtocolError(
+                "strict Stage5 runtime gate requires stage5.accvp_observation_preflight_report"
+            )
+        return {"required": required, "available": False, "validated_before_stage5": False}
+    path = Path(str(source))
+    if not path.exists():
+        raise FileNotFoundError(f"ACCVP observation preflight report not found: {path}")
+    with path.open("r", encoding="utf-8") as handle:
+        report = json.load(handle)
+    gate = dict(report.get("gate", {}) or {})
+    if not bool(gate.get("pass", False)):
+        raise EvidenceProtocolError("frozen ACCVP observation preflight did not pass")
+    accvp_groups: list[tuple[str, Any, Path]] = []
+    for group in cfg.stage5.groups:
+        group_cfg = clone_with_overrides(cfg, _group_overrides(group))
+        model_path = group_model_paths.get(str(group.name))
+        if model_path is not None and RiskGatedACCVPCandidateTableAugmentor.enabled(group_cfg):
+            accvp_groups.append((str(group.name), group_cfg, model_path))
+    model_hashes = {file_sha256(model_path) for _name, _group_cfg, model_path in accvp_groups}
+    if len(model_hashes) > 1:
+        raise EvidenceProtocolError("one frozen preflight cannot validate multiple ACCVP PPO models")
+    if model_hashes and str(report.get("policy_model_sha256", "")) not in model_hashes:
+        raise EvidenceProtocolError("frozen preflight PPO model hash does not match Stage5 model")
+    feature_hashes = {
+        stable_hash(
+            {"feature_names": RiskGatedACCVPCandidateTableAugmentor.feature_names(group_cfg)}
+        )
+        for _name, group_cfg, _model_path in accvp_groups
+    }
+    if len(feature_hashes) > 1:
+        raise EvidenceProtocolError("ACCVP Stage5 groups do not share one observation feature contract")
+    if feature_hashes and str(report.get("accvp_observation_feature_names_sha256", "")) not in feature_hashes:
+        raise EvidenceProtocolError("frozen preflight observation feature hash does not match Stage5")
+    return {
+        "required": required,
+        "available": True,
+        "validated_before_stage5": True,
+        "report": str(path.resolve()),
+        "report_sha256": file_sha256(path),
+        "gate": gate,
+        "policy_model_sha256": report.get("policy_model_sha256"),
+        "accvp_observation_feature_contract_hash": report.get(
+            "accvp_observation_feature_contract_hash"
+        ),
+    }
 
 
 def _group_overrides(group) -> dict:
@@ -355,6 +631,66 @@ def _build_paired_delta(group_reports: dict, pairs: list[dict[str, Any]] | None 
     return paired_delta
 
 
+def _build_paired_statistics(
+    group_reports: dict[str, dict],
+    pairs: list[dict[str, Any]] | None = None,
+    *,
+    statistics_config: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    config = dict(statistics_config or {})
+    confidence = float(config.get("confidence", 0.95))
+    replicates = int(config.get("bootstrap_replicates", 10_000))
+    bootstrap_seed = int(config.get("bootstrap_seed", 0))
+    requested = list(pairs or [])
+    if not requested:
+        defaults = (
+            ("ppo_vs_ppo_shield", "ppo", "ppo_shield"),
+            ("ppo_cv_features_vs_ppo_wcdt_v3_features", "ppo_cv_features", "ppo_wcdt_v3_features"),
+            (
+                "ppo_wcdt_v3_features_vs_wcdt_v3_prediction_shield",
+                "ppo_wcdt_v3_features",
+                "wcdt_v3_prediction_shield",
+            ),
+        )
+        requested = [
+            {"name": name, "left": left, "right": right}
+            for name, left, right in defaults
+            if left in group_reports and right in group_reports
+        ]
+    reports: dict[str, Any] = {}
+    for index, pair in enumerate(requested):
+        left_name = str(pair["left"])
+        right_name = str(pair["right"])
+        left = group_reports.get(left_name)
+        right = group_reports.get(right_name)
+        if left is None or right is None:
+            reports[str(pair["name"])] = {
+                "available": False,
+                "left": left_name,
+                "right": right_name,
+                "reason": "missing_group_report",
+            }
+            continue
+        reports[str(pair["name"])] = {
+            "available": True,
+            "left": left_name,
+            "right": right_name,
+            "statistics": build_pair_statistics(
+                left,
+                right,
+                confidence=confidence,
+                replicates=replicates,
+                seed=bootstrap_seed + index * 100_000,
+            ),
+        }
+    return {
+        "confidence": confidence,
+        "bootstrap_replicates": replicates,
+        "bootstrap_seed": bootstrap_seed,
+        "pairs": reports,
+    }
+
+
 def _episode_records(report: dict) -> dict[int, dict]:
     return {int(item["seed"]): item for item in report.get("episodes", []) if "seed" in item}
 
@@ -618,6 +954,50 @@ def run(cfg) -> Path:
     seeds = _select_eval_seeds(cfg)
     risk_checkpoint = str(_risk_path(cfg))
     default_model = _default_model_path(cfg)
+    protocol_cfg = dict(cfg.get("evaluation_protocol", {}) or {})
+    stage5_role = str(protocol_cfg.get("stage5_role", "stage5_confirmatory"))
+    lineage_artifacts: dict[str, str | Path | None] = {"risk_checkpoint": risk_checkpoint}
+    group_model_paths: dict[str, Path] = {}
+    for group in cfg.stage5.groups:
+        model = _group_model_path(group, default_model)
+        if model is not None:
+            group_model_paths[str(group.name)] = model
+            lineage_artifacts[f"ppo_model:{group.name}"] = model
+            group_cfg = clone_with_overrides(cfg, _group_overrides(group))
+            if RiskGatedACCVPCandidateTableAugmentor.enabled(group_cfg):
+                manifest_source = group_cfg.accvp.get("artifact_manifest")
+                if not manifest_source:
+                    raise EvidenceProtocolError(
+                        f"ACCVP Stage5 group {group.name!r} requires artifact_manifest"
+                    )
+                lineage_artifacts[f"accvp_manifest:{group.name}"] = str(
+                    manifest_source
+                )
+        if group.get("forecast_checkpoint"):
+            lineage_artifacts[f"forecast_checkpoint:{group.name}"] = str(group.forecast_checkpoint)
+    if cfg.stage5.get("accvp_observation_preflight_report"):
+        lineage_artifacts["accvp_observation_preflight_report"] = str(
+            cfg.stage5.accvp_observation_preflight_report
+        )
+    frozen_runtime_preflight = _validate_frozen_runtime_preflight(
+        cfg=cfg,
+        group_model_paths=group_model_paths,
+        protocol_strict=bool(protocol_cfg.get("strict", False)),
+    )
+    evidence_lineage = build_stage_lineage(
+        cfg,
+        stage="stage5",
+        role_seeds={stage5_role: seeds},
+        artifact_paths=lineage_artifacts,
+    )
+    model_lineage = {
+        name: _validate_stage5_model_lineage(
+            model_path=path,
+            stage5_lineage=evidence_lineage,
+            stage5_seeds=seeds,
+        )
+        for name, path in group_model_paths.items()
+    }
     stage_log("stage5", f"run_id={cfg.run.run_id}")
     stage_log("stage5", f"seeds={seeds}")
     stage_log("stage5", f"default_model={default_model}")
@@ -626,6 +1006,7 @@ def run(cfg) -> Path:
     tb = TensorboardLogger(stage_dir / "tensorboard", enabled=bool(cfg.run.get("tensorboard", True)))
     replay_dir = stage_dir / "replay"
     group_reports = {}
+    accvp_group_bindings: dict[str, dict[str, Any]] = {}
     for group_idx, group in enumerate(cfg.stage5.groups):
         group_cfg = clone_with_overrides(cfg, _group_overrides(group))
         if str(group_cfg.rl.get("reward_profile", "default")) in {"shield_guided_forecast", "merge_timing_forecast"}:
@@ -642,7 +1023,16 @@ def run(cfg) -> Path:
             )
         if bool(group_cfg.accvp.get("enabled", False)) and not bool(group.shield):
             raise ValueError(f"stage5 group '{group.name}' enables ACCVP but disables Safety Shield")
-        model_path = _group_model_path(group, default_model)
+        model_path = group_model_paths.get(str(group.name))
+        observation_contract = (
+            _validate_stage5_observation_contract(
+                model_path=model_path,
+                group_cfg=group_cfg,
+                protocol_strict=bool(evidence_lineage.get("protocol_strict", False)),
+            )
+            if model_path is not None
+            else {"required": False, "available": True}
+        )
         stage_log(
             "stage5",
             f"group={group.name} policy_type={policy_type} forecast={bool(group.forecast_features)} shield={bool(group.shield)} model={model_path}",
@@ -659,6 +1049,11 @@ def run(cfg) -> Path:
             tensorboard_step_offset=group_idx * max(1, len(seeds)),
             policy_type=policy_type,
         )
+        group_reports[group.name]["stage3_observation_contract_validation"] = observation_contract
+        bundle_lineage = observation_contract.get("accvp_bundle")
+        if isinstance(bundle_lineage, dict):
+            accvp_group_bindings[str(group.name)] = dict(bundle_lineage)
+            group_reports[group.name]["accvp_bundle_lineage"] = dict(bundle_lineage)
         if bool(group_cfg.accvp.get("observation", {}).get("enabled", False)):
             runtime_gate = _accvp_observation_runtime_gate(dict(group_reports[group.name].get("metrics", {}) or {}))
             group_reports[group.name]["accvp_observation_preflight_pass"] = bool(runtime_gate.get("pass", False))
@@ -692,12 +1087,26 @@ def run(cfg) -> Path:
         comparative_metadata = dict(group.get("comparative", {}) or {})
         if comparative_metadata:
             group_reports[group.name]["comparative"] = comparative_metadata
+        if str(group.name) in model_lineage:
+            group_reports[group.name]["stage3_lineage_validation"] = model_lineage[str(group.name)]
+
+    evidence_lineage.pop("lineage_fingerprint", None)
+    evidence_lineage["accvp_group_bindings"] = {
+        name: accvp_group_bindings[name]
+        for name in sorted(accvp_group_bindings)
+    }
+    evidence_lineage["lineage_fingerprint"] = stable_hash(evidence_lineage)
 
     shield_off = {name: report for name, report in group_reports.items() if not bool(report.get("shield_enabled", False))}
     shield_on = {name: report for name, report in group_reports.items() if bool(report.get("shield_enabled", False))}
     forecast_baseline = _forecast_baseline_group(group_reports)
     configured_pairs = _normalised_pairs(cfg.stage5)
     paired_delta = _build_paired_delta(group_reports, configured_pairs)
+    paired_statistics = _build_paired_statistics(
+        group_reports,
+        configured_pairs,
+        statistics_config=dict(cfg.stage5.get("statistics", {}) or {}),
+    )
     acceptance = _build_acceptance(group_reports, cfg.stage5)
     write_report(stage_dir / "shield_off_metrics.json", shield_off)
     write_report(stage_dir / "shield_on_metrics.json", shield_on)
@@ -713,9 +1122,13 @@ def run(cfg) -> Path:
         "configured_pairs": configured_pairs,
         "forecast_baseline_group": forecast_baseline,
         "paired_delta": paired_delta,
+        "paired_statistics": paired_statistics,
         "acceptance": acceptance,
         "comparison_tables": _comparison_tables(group_reports),
         "training_seed_summary": _training_seed_summary(group_reports),
+        "evidence_lineage": evidence_lineage,
+        "stage3_lineage_validation": model_lineage,
+        "frozen_accvp_runtime_preflight": frozen_runtime_preflight,
     }
     write_report(stage_dir / "formal_paired_eval_report.json", report)
     tb.close()

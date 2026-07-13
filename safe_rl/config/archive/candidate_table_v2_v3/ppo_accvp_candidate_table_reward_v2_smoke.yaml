@@ -38,4 +38,3 @@ accvp:
     fail_closed_defaults: true
     include_risk_secondary: true
     allow_with_forecast_features: false
-

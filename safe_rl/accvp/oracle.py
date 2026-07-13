@@ -7,6 +7,7 @@ from typing import Any, Iterable
 
 from safe_rl.accvp.schema import file_sha256, read_json, write_json_atomic
 from safe_rl.accvp.protocol import effective_activation_distance
+from safe_rl.evaluation_protocol import seeds_for_role
 
 
 ORACLE_STATES = frozenset({"insufficient_coverage", "no_safe_viable_alternative", "go"})
@@ -29,6 +30,7 @@ def _dataset_provenance(dataset: Path) -> dict[str, Any]:
     manifest = read_json(dataset_manifest_path)
     return {
         "formal_dataset": str(manifest.get("artifact_kind", "")) == "counterfactual_dataset_v2",
+        "counterfactual_schema_version": int(manifest.get("counterfactual_schema_version", -1)),
         "collection_phase": str(manifest.get("collection_phase", "")),
         "dataset_manifest_sha256": file_sha256(dataset_manifest_path),
         "roots_manifest_sha256": file_sha256(roots_path),
@@ -36,6 +38,13 @@ def _dataset_provenance(dataset: Path) -> dict[str, Any]:
         "dataset_fingerprint": str(manifest.get("dataset_fingerprint", "")),
         "config_hash": str(manifest.get("config_hash", "")),
         "data_contract_hash": str(manifest.get("data_contract_hash", "")),
+        "data_contract_protocol_version": str(
+            dict(manifest.get("data_contract", {})).get("protocol_version", "")
+        ),
+        "scenario_route_hash": str(
+            manifest.get("scenario_route_hash")
+            or dict(manifest.get("data_contract", {})).get("scenario_route_hash", "")
+        ),
         "accvp_activation_distance_m": manifest.get("accvp_activation_distance_m"),
         "risk_model_fingerprint": str(manifest.get("risk_model_fingerprint", "")),
     }
@@ -78,6 +87,9 @@ def counterfactual_oracle_report(
     *,
     min_deadline_roots_per_seed: int = 1,
     root_policy: str | None = None,
+    cohort_role: str = "oracle_regression",
+    oracle_only: bool = True,
+    exclude_from_model_splits: bool = True,
 ) -> dict[str, Any]:
     """Pre-training ACCVP repairability oracle with explicit coverage semantics.
 
@@ -129,6 +141,9 @@ def counterfactual_oracle_report(
                 "safe_viable_alternative_action_ids": [int(row["action_id"]) for row in alternatives],
                 "repairable": repairable,
                 "candidate_count": len(candidates),
+                "oracle_only": bool(root.get("oracle_only", False)),
+                "cohort_role": str(root.get("cohort_role", "")),
+                "exclude_from_model_splits": bool(root.get("exclude_from_model_splits", False)),
             }
         )
     per_seed: dict[str, dict[str, Any]] = {}
@@ -168,6 +183,9 @@ def counterfactual_oracle_report(
         "required_seeds": seed_list,
         "required_min_deadline_roots_per_seed": int(min_deadline_roots_per_seed),
         "root_policy": root_policy,
+        "cohort_role": str(cohort_role),
+        "oracle_only": bool(oracle_only),
+        "exclude_from_model_splits": bool(exclude_from_model_splits),
         "dataset_provenance": _dataset_provenance(dataset),
         "root_count": len(root_rows),
         "required_failure_seed_results": per_seed,
@@ -182,19 +200,31 @@ def write_oracle_report(
     *,
     min_deadline_roots_per_seed: int = 1,
     root_policy: str | None = None,
+    cohort_role: str = "oracle_regression",
+    oracle_only: bool = True,
+    exclude_from_model_splits: bool = True,
 ) -> dict[str, Any]:
     report = counterfactual_oracle_report(
         dataset_dir,
         required_seeds,
         min_deadline_roots_per_seed=min_deadline_roots_per_seed,
         root_policy=root_policy,
+        cohort_role=cohort_role,
+        oracle_only=oracle_only,
+        exclude_from_model_splits=exclude_from_model_splits,
     )
     write_json_atomic(output_path, report)
     return report
 
 
 def validate_oracle_for_training(config: Any, dataset_dir: str | Path) -> dict[str, Any]:
-    """Enforce the non-bypassable ACCVP-v1 repairability gate."""
+    """Validate the independent oracle-regression premise for formal training.
+
+    The oracle cohort may live in a separate schema-v3 dataset.  Its report is
+    bound to that dataset, while compatibility-critical collection semantics
+    are compared with the formal model dataset.  Oracle seeds and explicitly
+    oracle-only roots are forbidden from every model split.
+    """
 
     report_path = config.accvp.get("oracle_report")
     if not report_path:
@@ -204,17 +234,48 @@ def validate_oracle_for_training(config: Any, dataset_dir: str | Path) -> dict[s
         raise ValueError(f"ACCVP training blocked by oracle_state={report.get('oracle_state')!r}")
     if str(report.get("root_policy", "")) != "merge_timing":
         raise ValueError("ACCVP training requires a merge_timing-PPO oracle report")
-    if [int(value) for value in report.get("required_seeds", [])] != [2, 5]:
-        raise ValueError("ACCVP training requires the pre-registered oracle seeds [2, 5]")
+
+    oracle_cfg = dict(config.accvp.get("oracle", {}) or {})
+    configured_seeds = oracle_cfg.get("required_seeds")
+    if configured_seeds is None:
+        configured_seeds = report.get("required_seeds", [])
+    required_seeds = [int(value) for value in configured_seeds]
+    if not required_seeds or len(required_seeds) != len(set(required_seeds)):
+        raise ValueError("accvp.oracle.required_seeds must be a non-empty unique seed list")
+    cohort_role = str(oracle_cfg.get("cohort_role", report.get("cohort_role", "")))
+    if not cohort_role:
+        raise ValueError("accvp.oracle.cohort_role is required")
+    exclude_from_splits = bool(
+        oracle_cfg.get(
+            "exclude_from_model_splits",
+            report.get("exclude_from_model_splits", False),
+        )
+    )
+    if not exclude_from_splits:
+        raise ValueError("formal ACCVP training requires oracle exclusion from model splits")
+    registered_seeds = seeds_for_role(config, cohort_role, fallback=required_seeds)
+    if registered_seeds != required_seeds:
+        raise ValueError(
+            "accvp.oracle.required_seeds do not match the registered oracle cohort: "
+            f"configured={required_seeds} registered={registered_seeds}"
+        )
+    if [int(value) for value in report.get("required_seeds", [])] != required_seeds:
+        raise ValueError("ACCVP oracle report seeds do not match accvp.oracle.required_seeds")
+    if str(report.get("cohort_role", "")) != cohort_role:
+        raise ValueError("ACCVP oracle report cohort_role does not match configuration")
+    if not bool(report.get("oracle_only", False)) or not bool(
+        report.get("exclude_from_model_splits", False)
+    ):
+        raise ValueError("ACCVP oracle report must declare oracle-only split exclusion")
+
     dataset = Path(dataset_dir).resolve()
-    if Path(str(report.get("dataset_dir", ""))).resolve() != dataset:
-        raise ValueError("ACCVP oracle report belongs to a different dataset directory")
-    current = _dataset_provenance(dataset)
+    oracle_dataset = Path(str(report.get("dataset_dir", ""))).resolve()
+    if not oracle_dataset.is_dir():
+        raise ValueError("ACCVP oracle report dataset directory does not exist")
+    current = _dataset_provenance(oracle_dataset)
     expected = dict(report.get("dataset_provenance", {}))
     if not bool(current.get("formal_dataset", False)):
-        raise ValueError("ACCVP training requires a merged formal counterfactual dataset")
-    if str(current.get("collection_phase", "")) != "formal":
-        raise ValueError("ACCVP training requires a dataset merged from formal collection shards")
+        raise ValueError("ACCVP oracle report requires a merged counterfactual dataset")
     for key in (
         "dataset_manifest_sha256",
         "roots_manifest_sha256",
@@ -224,7 +285,66 @@ def validate_oracle_for_training(config: Any, dataset_dir: str | Path) -> dict[s
     ):
         if not expected.get(key) or expected.get(key) != current.get(key):
             raise ValueError(f"ACCVP oracle report provenance mismatch for {key}")
-    risk_fingerprint = str(current.get("risk_model_fingerprint", ""))
+
+    oracle_roots = [
+        row
+        for row in _jsonl(oracle_dataset / "manifests" / "roots.jsonl")
+        if bool(row.get("complete", False))
+        and int(row.get("episode_seed", -1)) in set(required_seeds)
+        and str(row.get("root_policy", row.get("root_source", ""))) == "merge_timing"
+    ]
+    covered_seeds = {int(row.get("episode_seed", -1)) for row in oracle_roots}
+    if covered_seeds != set(required_seeds):
+        raise ValueError("ACCVP oracle dataset does not contain every required oracle seed")
+    incorrectly_scoped = [
+        str(row.get("root_id", ""))
+        for row in oracle_roots
+        if not bool(row.get("oracle_only", False))
+        or str(row.get("cohort_role", "")) != cohort_role
+        or not bool(row.get("exclude_from_model_splits", False))
+    ]
+    if incorrectly_scoped:
+        raise ValueError(
+            "ACCVP oracle roots lack oracle-only cohort metadata: "
+            f"{incorrectly_scoped[:10]}"
+        )
+
+    model_provenance = _dataset_provenance(dataset)
+    if not bool(model_provenance.get("formal_dataset", False)):
+        raise ValueError("ACCVP training requires a merged formal counterfactual dataset")
+    if str(model_provenance.get("collection_phase", "")) != "formal":
+        raise ValueError("ACCVP training requires a dataset merged from formal collection shards")
+    for key in (
+        "counterfactual_schema_version",
+        "data_contract_hash",
+        "data_contract_protocol_version",
+        "scenario_route_hash",
+        "risk_model_fingerprint",
+        "accvp_activation_distance_m",
+    ):
+        if current.get(key) != model_provenance.get(key):
+            raise ValueError(f"ACCVP oracle/model dataset compatibility mismatch for {key}")
+
+    model_roots = [
+        row
+        for row in _jsonl(dataset / "manifests" / "roots.jsonl")
+        if bool(row.get("complete", False))
+    ]
+    forbidden_model_roots = [
+        str(row.get("root_id", ""))
+        for row in model_roots
+        if int(row.get("episode_seed", -1)) in set(required_seeds)
+        or bool(row.get("oracle_only", False))
+        or bool(row.get("exclude_from_model_splits", False))
+        or str(row.get("cohort_role", "")) == cohort_role
+    ]
+    if forbidden_model_roots:
+        raise ValueError(
+            "formal ACCVP model dataset contains oracle-regression roots: "
+            f"{forbidden_model_roots[:10]}"
+        )
+
+    risk_fingerprint = str(model_provenance.get("risk_model_fingerprint", ""))
     if risk_fingerprint.startswith("heuristic:") or not risk_fingerprint:
         raise ValueError("ACCVP formal dataset is not bound to a frozen Risk Module checkpoint")
     configured_risk = config.accvp.get("risk_checkpoint")
@@ -232,7 +352,17 @@ def validate_oracle_for_training(config: Any, dataset_dir: str | Path) -> dict[s
         expected_fingerprint = f"risk_checkpoint:{file_sha256(configured_risk)}"
         if expected_fingerprint != risk_fingerprint:
             raise ValueError("ACCVP Risk Module checkpoint does not match the counterfactual dataset")
-    expected_activation = float(current.get("accvp_activation_distance_m", -1.0))
+    expected_activation = float(model_provenance.get("accvp_activation_distance_m", -1.0))
     if expected_activation <= 0.0 or abs(effective_activation_distance(config) - expected_activation) > 1.0e-9:
         raise ValueError("ACCVP activation window does not match the formal counterfactual dataset")
-    return report
+    validated = dict(report)
+    validated["training_exclusion_audit"] = {
+        "cohort_role": cohort_role,
+        "required_seeds": required_seeds,
+        "exclude_from_model_splits": True,
+        "oracle_dataset_dir": str(oracle_dataset),
+        "model_dataset_dir": str(dataset),
+        "model_root_count": len(model_roots),
+        "forbidden_model_root_count": 0,
+    }
+    return validated

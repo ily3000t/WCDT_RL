@@ -8,7 +8,13 @@ import numpy as np
 
 from safe_rl.accvp.schema import write_json_atomic
 from safe_rl.accvp.selection import LEFT_ACTION_IDS, lite_secondary_safety_pass, select_viability_lite_action
-from safe_rl.accvp.viability_lite import evaluate_lite_thresholds
+from safe_rl.accvp.viability_lite import (
+    conditional_merge_success_rate,
+    evaluate_lite_thresholds,
+    outcome_merge_observation_rate,
+    outcome_merge_success_rate,
+    outcome_safety_event_rate,
+)
 
 
 def _by_root(records: list[dict[str, Any]]) -> dict[str, list[dict[str, Any]]]:
@@ -27,15 +33,19 @@ def _risk_pass(row: dict[str, Any], thresholds: dict[str, Any]) -> bool:
 
 
 def _safe(row: dict[str, Any]) -> bool:
-    return float(row.get("proxy_collision", 0.0)) < 0.5 and float(row.get("safety_violation", 0.0)) < 0.5
+    return outcome_safety_event_rate(row) <= np.finfo(np.float64).eps
 
 
 def _success(row: dict[str, Any]) -> bool:
-    return bool(row.get("merge_observed", False)) and float(row.get("merge_before_taper", 0.0)) >= 0.5
+    tolerance = np.finfo(np.float64).eps
+    return (
+        outcome_merge_observation_rate(row) >= 1.0 - tolerance
+        and outcome_merge_success_rate(row) >= 1.0 - tolerance
+    )
 
 
-def _rate(values: list[bool]) -> float | None:
-    return float(np.mean([bool(value) for value in values])) if values else None
+def _rate(values: list[float | bool]) -> float | None:
+    return float(np.mean([float(value) for value in values])) if values else None
 
 
 def _action_summary(row: dict[str, Any] | None) -> dict[str, Any] | None:
@@ -59,6 +69,9 @@ def _action_summary(row: dict[str, Any] | None) -> dict[str, Any] | None:
         "secondary_veto_reason": str(row.get("secondary_veto_reason", "")),
         "merge_observed": bool(row.get("merge_observed", False)),
         "merge_success": _success(row),
+        "merge_observation_rate": outcome_merge_observation_rate(row),
+        "merge_success_rate": outcome_merge_success_rate(row),
+        "safety_event_rate": outcome_safety_event_rate(row),
         "proxy_collision": bool(float(row.get("proxy_collision", 0.0)) >= 0.5),
         "safety_violation": bool(float(row.get("safety_violation", 0.0)) >= 0.5),
         "safe": _safe(row),
@@ -112,6 +125,7 @@ def audit_lite_replacements(
     unnecessary_replacement_roots: list[dict[str, Any]] = []
     risk_failed_but_success_roots: list[dict[str, Any]] = []
     targeted_seed_candidates: list[tuple[str, int]] = []
+    unnecessary_replacement_mass = 0.0
     reason_counts: Counter[str] = Counter()
     replacement_action_counts: Counter[str] = Counter()
 
@@ -133,8 +147,9 @@ def audit_lite_replacements(
         if bool(decision.get("replacement", False)) and selected is not None:
             if not _safe(selected):
                 replacement_safety_event_roots.append(root_report)
-            if raw is not None and _success(raw):
+            if raw is not None and outcome_merge_success_rate(raw) > 0.0:
                 unnecessary_replacement_roots.append(root_report)
+                unnecessary_replacement_mass += outcome_merge_success_rate(raw)
             if raw is not None and not _success(raw) and _safe(selected) and _success(selected):
                 targeted_seed_candidates.append((root_id, int(candidates[0].get("episode_seed", -1))))
 
@@ -147,8 +162,16 @@ def audit_lite_replacements(
                     }
                 )
 
-    selected_observed = [row for row in selected_rows if bool(row.get("merge_observed", False))]
-    replacement_observed = [row for row in replacement_rows if bool(row.get("merge_observed", False))]
+    selected_observed = [
+        row
+        for row in selected_rows
+        if outcome_merge_observation_rate(row) > 0.0
+    ]
+    replacement_observed = [
+        row
+        for row in replacement_rows
+        if outcome_merge_observation_rate(row) > 0.0
+    ]
     targeted_seeds: list[int] = []
     seen: set[int] = set()
     for _root_id, seed in sorted(targeted_seed_candidates, key=lambda item: (item[0], item[1])):
@@ -174,15 +197,27 @@ def audit_lite_replacements(
         "reason_counts": dict(sorted(reason_counts.items())),
         "replacement_action_histogram": dict(sorted(replacement_action_counts.items(), key=lambda item: int(item[0]))),
         "all_selected_action_risk_pass_rate": _rate([_risk_pass(row, thresholds) for row in selected_rows]),
-        "all_selected_action_safety_event_rate": _rate([not _safe(row) for row in selected_rows]),
-        "all_selected_action_merge_success_rate": _rate([_success(row) for row in selected_observed]),
+        "all_selected_action_safety_event_rate": _rate(
+            [outcome_safety_event_rate(row) for row in selected_rows]
+        ),
+        "all_selected_action_merge_success_rate": conditional_merge_success_rate(
+            selected_observed
+        ),
         "replacement_action_risk_pass_rate": _rate([_risk_pass(row, thresholds) for row in replacement_rows]),
-        "replacement_action_safety_event_rate": _rate([not _safe(row) for row in replacement_rows]),
-        "replacement_action_merge_success_rate": _rate([_success(row) for row in replacement_observed]),
+        "replacement_action_safety_event_rate": _rate(
+            [outcome_safety_event_rate(row) for row in replacement_rows]
+        ),
+        "replacement_action_merge_success_rate": conditional_merge_success_rate(
+            replacement_observed
+        ),
         "replacement_safety_event_root_count": int(len(replacement_safety_event_roots)),
         "risk_failed_but_success_root_count": int(len(risk_failed_but_success_roots)),
         "unnecessary_replacement_root_count": int(unnecessary_count),
-        "replacement_unnecessary_rate": float(unnecessary_count / replacement_count) if replacement_count else None,
+        "replacement_unnecessary_rate": (
+            float(unnecessary_replacement_mass / replacement_count)
+            if replacement_count
+            else None
+        ),
         "replacement_safety_event_roots": replacement_safety_event_roots,
         "risk_failed_but_success_roots": risk_failed_but_success_roots,
         "unnecessary_replacement_roots": unnecessary_replacement_roots,

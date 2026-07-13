@@ -1,0 +1,74 @@
+# Schema-v3 reproduction of the historical seed-2/5 repairable-state premise.
+# Every root from this run is oracle-only and is forbidden from all model
+# train/validation/calibration/operating-point/test splits.
+run:
+  run_id: "accvp_vnext_oracle_regression"
+  output_root: "safe_rl_output/runs"
+  cache_root: "safe_rl_output/.cache/accvp_vnext_oracle_regression"
+  seed: 2
+  tensorboard: false
+
+evaluation_protocol:
+  strict: true
+  protocol_id: "accvp-vnext-correctness-v1"
+  seed_ledger: "safe_rl/config/accvp_vnext_seed_ledger.json"
+  revocation_manifest: "safe_rl/config/artifact_revocation_manifest_vnext.json"
+  cohort_roles:
+    oracle_regression: "oracle_regression"
+
+stage1:
+  episodes: 2
+
+accvp:
+  enabled: false
+  mode: "off"
+  artifact_generation: "vnext_schema3"
+  schema_version: 3
+  data_contract_version: "accvp_240_v2"
+  actor_row_mapping_version: "selected_indices_v2"
+  root_observation_fingerprint_version: "model_input_fingerprint_v3"
+  entry_time_label_version: "conditional_entry_time_v1"
+  loss_version: "accvp_loss_v2"
+  activation_distance: 240.0
+  candidate_plan_profile: "accvp_commitment_v1"
+  response_horizon_s: 3.0
+  response_horizon_steps: 30
+  viability_horizon_s: 8.0
+  candidate_plan_horizon_steps: 80
+  oracle:
+    required_seeds: [2, 5]
+    cohort_role: "oracle_regression"
+    exclude_from_model_splits: true
+  warm_start:
+    checkpoint: "safe_rl_output/runs/safe_rl_comparison_schema9_validation_001/stage2/wcdt_v3_predictor.pt"
+  counterfactual:
+    collection_phase: "ad_hoc"
+    root_budget: 0
+    roots_per_episode_limit: 0
+    output_name: "accvp_vnext_schema3_oracle_regression"
+    cache_root: "safe_rl_output/.cache/accvp_vnext_oracle_regression"
+    workers: 2
+    shard_roots: 0
+    risk_checkpoint: "safe_rl_output/runs/safe_rl_comparison_schema9_validation_001/stage2/risk_module.pt"
+    policy_checkpoints:
+      merge_timing: "safe_rl_output/runs/safe_rl_comparison_schema9_validation_001_forecast_wcdt_v3/stage3/ppo_model.zip"
+    collection_jobs:
+      - name: "merge_timing_seed2_5_vnext_oracle"
+        collection_source: "oracle_regression"
+        root_policy: "merge_timing"
+        root_filter: "activation_window"
+        episode_seeds: [2, 5]
+        root_budget: 0
+        roots_per_episode_limit: 0
+        oracle_only: true
+        cohort_role: "oracle_regression"
+        exclude_from_model_splits: true
+        root_policy_checkpoint: "safe_rl_output/runs/safe_rl_comparison_schema9_validation_001_forecast_wcdt_v3/stage3/ppo_model.zip"
+        config_overrides:
+          forecast_features:
+            enabled: true
+            use_for_ppo_observation: true
+            source: "wcdt_v3"
+            checkpoint: "safe_rl_output/runs/safe_rl_comparison_schema9_validation_001/stage2/wcdt_v3_predictor.pt"
+            allow_heuristic_fallback: false
+          rl: {use_wcdt_forecast_features: true, reward_profile: "merge_timing_forecast"}

@@ -437,6 +437,16 @@ def candidate_records_from_dataset(
                 records.append(
                     {
                         "root_id": str(row["root_id"]),
+                        "root_observation_fingerprint": str(
+                            dataset.observation_fingerprint_by_root.get(
+                                str(row["root_id"]), ""
+                            )
+                        ),
+                        "split_component_id": str(
+                            dataset.split_component_by_root.get(
+                                str(row["root_id"]), ""
+                            )
+                        ),
                         "episode_seed": int(root.get("episode_seed", row.get("episode_seed", -1))),
                         "action_id": int(row["action_id"]),
                         "raw_action_id": root.get("raw_action_id", row.get("raw_action_id")),

@@ -4,13 +4,21 @@ import argparse
 import json
 from pathlib import Path
 
+from safe_rl.accvp.artifacts import (
+    ACCVP_ARTIFACT_GENERATION,
+    apply_v2_bundle_paths,
+    artifact_filename,
+)
 from safe_rl.accvp.candidate_table_diagnostics import (
     candidate_records_from_dataset,
     load_calibration,
     load_models_from_checkpoint,
 )
 from safe_rl.accvp.dataset import ACCVPBranchDataset
-from safe_rl.accvp.viability_lite import lite_thresholds_from_config
+from safe_rl.accvp.viability_lite import (
+    collapse_vnext_lite_records,
+    lite_thresholds_from_config,
+)
 from safe_rl.accvp.viability_lite_audit import audit_lite_replacements, write_lite_replacement_audit
 from safe_rl.utils.config import REPO_ROOT, load_config
 
@@ -61,6 +69,7 @@ def main() -> None:
         raise ImportError("ACCVP-lite replacement audit requires torch.") from exc
 
     cfg = load_config(args.config)
+    apply_v2_bundle_paths(cfg)
     output_dir = _resolve(args.output_dir) if args.output_dir else _artifact_dir(cfg)
     dataset = _resolve(args.dataset or cfg.accvp.dataset_dir)
     checkpoint = (
@@ -68,14 +77,24 @@ def main() -> None:
         if args.checkpoint
         else _resolve(cfg.accvp.checkpoint)
         if cfg.accvp.get("checkpoint")
-        else output_dir / "accvp_v1_predictor.pt"
+        else output_dir
+        / (
+            artifact_filename("predictor")
+            if str(cfg.accvp.get("artifact_generation") or "") == ACCVP_ARTIFACT_GENERATION
+            else "accvp_v1_predictor.pt"
+        )
     )
     calibration_path = (
         _resolve(args.calibration)
         if args.calibration
         else _resolve(cfg.accvp.calibration_bundle)
         if cfg.accvp.get("calibration_bundle")
-        else output_dir / "accvp_v1_calibration.json"
+        else output_dir
+        / (
+            artifact_filename("calibration")
+            if str(cfg.accvp.get("artifact_generation") or "") == ACCVP_ARTIFACT_GENERATION
+            else "accvp_v1_calibration.json"
+        )
     )
     operating_point = (
         _resolve(args.operating_point)
@@ -97,12 +116,17 @@ def main() -> None:
     for split in args.splits:
         dataset_split = ACCVPBranchDataset(dataset, split)
         records = candidate_records_from_dataset(models, dataset_split, calibration, torch)
+        decision_weighting = None
+        if str(cfg.accvp.get("artifact_generation") or "") == ACCVP_ARTIFACT_GENERATION:
+            records, decision_weighting = collapse_vnext_lite_records(records)
         split_report = audit_lite_replacements(
             records,
             thresholds,
             split=split,
             max_targeted_seeds=int(args.max_targeted_seeds),
         )
+        if decision_weighting is not None:
+            split_report["decision_weighting"] = decision_weighting
         split_reports[split] = split_report
         targeted_by_split[split] = list(split_report["targeted_seeds"])
         for key in combined:

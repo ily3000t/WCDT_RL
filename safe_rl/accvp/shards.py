@@ -7,14 +7,23 @@ from collections import Counter
 from pathlib import Path
 from typing import Any, Iterable
 
+import numpy as np
+
 from safe_rl.accvp.schema import (
+    ACTOR_ROW_MAPPING_VERSION,
     COUNTERFACTUAL_DATASET_MANIFEST_VERSION,
     COUNTERFACTUAL_SCHEMA_VERSION,
+    ROOT_OBSERVATION_FINGERPRINT_VERSION,
+    SCENARIO_EPISODE_KEY_VERSION,
+    actor_row_mapping_hash,
     canonical_json,
     file_sha256,
     jsonl_sha256,
     read_json,
+    root_observation_fingerprint,
+    scenario_episode_key,
     stable_hash,
+    validate_branch_row,
     write_json_atomic,
 )
 
@@ -124,6 +133,7 @@ def merge_counterfactual_shards(
     # Only the formal counterfactual data contract is required to match.
     baseline = dict(manifests[0]["data_contract"])
     baseline_hash = str(manifests[0]["data_contract_hash"])
+    strict_actor_rows = str(baseline.get("protocol_version", "")) == "accvp_240_v2"
     if stable_hash(baseline) != baseline_hash:
         raise ValueError(f"invalid counterfactual data_contract hash in shard {shards[0]}")
     for shard, manifest in zip(shards[1:], manifests[1:]):
@@ -145,6 +155,8 @@ def merge_counterfactual_shards(
     branch_rows: list[dict[str, Any]] = []
     root_ids: set[str] = set()
     root_state_fingerprints: dict[str, dict[str, str]] = {}
+    root_mapping_hashes: dict[str, str] = {}
+    root_actor_row_ids: dict[str, list[str]] = {}
     duplicate_root_state_fingerprints: list[dict[str, str]] = []
     shard_records: list[dict[str, Any]] = []
     for shard, manifest in zip(shards, manifests):
@@ -178,7 +190,68 @@ def merge_counterfactual_shards(
                 continue
             if str(root.get("data_contract_hash", "")) != baseline_hash:
                 raise ValueError(f"root data-contract mismatch in shard {shard}: {root_id}")
-            root_state_fingerprint = str(root.get("root_state_fingerprint", ""))
+            actor_row_ids: list[str] = []
+            source_indices: list[int] = []
+            mapping_hash = ""
+            root_scenario_episode_key = ""
+            if strict_actor_rows:
+                root_scenario_episode_key = scenario_episode_key(
+                    scenario_route_hash=str(baseline.get("scenario_route_hash", "")),
+                    traffic_profile=str(root.get("traffic_profile", "")),
+                    episode_seed=int(root["episode_seed"]),
+                )
+                root_metadata = read_json(root["metadata_path"])
+                if str(root_metadata.get("traffic_profile", "")) != str(root.get("traffic_profile", "")):
+                    raise ValueError(f"root traffic-profile mismatch in shard {shard}: {root_id}")
+                if int(root_metadata.get("episode_seed", -1)) != int(root["episode_seed"]):
+                    raise ValueError(f"root episode-seed mismatch in shard {shard}: {root_id}")
+                for source_name, recorded_key in (
+                    ("root manifest", str(root.get("scenario_episode_key", ""))),
+                    ("root metadata", str(root_metadata.get("scenario_episode_key", ""))),
+                ):
+                    if recorded_key and recorded_key != root_scenario_episode_key:
+                        raise ValueError(f"{source_name} scenario-episode key mismatch in shard {shard}: {root_id}")
+                for source_name, recorded_route_hash in (
+                    ("root manifest", str(root.get("scenario_route_hash", ""))),
+                    ("root metadata", str(root_metadata.get("scenario_route_hash", ""))),
+                    (
+                        "root metadata data contract",
+                        str(dict(root_metadata.get("data_contract", {})).get("scenario_route_hash", "")),
+                    ),
+                ):
+                    if recorded_route_hash and recorded_route_hash != str(baseline["scenario_route_hash"]):
+                        raise ValueError(f"{source_name} scenario-route hash mismatch in shard {shard}: {root_id}")
+                actor_row_ids = [str(value) for value in root_metadata.get("actor_row_ids", [])]
+                source_indices = [int(value) for value in root_metadata.get("actor_row_source_indices", [])]
+                with np.load(root["tensor_path"], allow_pickle=False) as tensors:
+                    actor_mask = np.asarray(tensors["mask"], dtype=np.float32)[0].reshape(-1)
+                    tensor_indices = np.asarray(tensors["selected_indices"], dtype=np.int64)[0].reshape(-1).tolist()
+                    root_tensor_values = {name: np.asarray(tensors[name]) for name in tensors.files}
+                if tensor_indices != source_indices:
+                    raise ValueError(f"root selected_indices mismatch in shard {shard}: {root_id}")
+                mapping_hash = actor_row_mapping_hash(actor_row_ids, source_indices, actor_mask)
+                if mapping_hash != str(root_metadata.get("actor_row_mapping_hash", "")):
+                    raise ValueError(f"root actor-row mapping mismatch in shard {shard}: {root_id}")
+                if str(root_metadata.get("actor_row_mapping_version", "")) != ACTOR_ROW_MAPPING_VERSION:
+                    raise ValueError(f"root actor-row mapping version mismatch in shard {shard}: {root_id}")
+                observation_fingerprint = str(root_metadata.get("root_observation_fingerprint", ""))
+                if not observation_fingerprint:
+                    raise ValueError(f"root observation fingerprint missing in shard {shard}: {root_id}")
+                if str(root_metadata.get("root_observation_fingerprint_version", "")) != ROOT_OBSERVATION_FINGERPRINT_VERSION:
+                    raise ValueError(f"root observation fingerprint version mismatch in shard {shard}: {root_id}")
+                recomputed_fingerprint = root_observation_fingerprint(
+                    actor_row_ids=actor_row_ids,
+                    root_ego=dict(root_metadata.get("root_ego", {})),
+                    data_contract_hash=str(root_metadata.get("data_contract_hash", "")),
+                    tensors=root_tensor_values,
+                )
+                if recomputed_fingerprint != observation_fingerprint:
+                    raise ValueError(f"root observation fingerprint content mismatch in shard {shard}: {root_id}")
+                root_mapping_hashes[root_id] = mapping_hash
+                root_actor_row_ids[root_id] = actor_row_ids
+            else:
+                observation_fingerprint = str(root.get("root_state_fingerprint", ""))
+            root_state_fingerprint = observation_fingerprint
             if root_state_fingerprint:
                 current = {
                     "root_id": root_id,
@@ -204,6 +277,21 @@ def merge_counterfactual_shards(
                         }
                     )
             enriched = dict(root)
+            if strict_actor_rows:
+                enriched.update(
+                    {
+                        "actor_row_ids": actor_row_ids,
+                        "actor_row_source_indices": source_indices,
+                        "actor_row_mapping_version": ACTOR_ROW_MAPPING_VERSION,
+                        "actor_row_mapping_hash": mapping_hash,
+                        "root_observation_fingerprint_version": ROOT_OBSERVATION_FINGERPRINT_VERSION,
+                        "root_observation_fingerprint": observation_fingerprint,
+                        "root_state_fingerprint": observation_fingerprint,
+                        "scenario_episode_key_version": SCENARIO_EPISODE_KEY_VERSION,
+                        "scenario_episode_key": root_scenario_episode_key,
+                        "scenario_route_hash": str(baseline["scenario_route_hash"]),
+                    }
+                )
             enriched["source_shard_id"] = str(manifest["collection_id"])
             enriched["source_shard_path"] = str(shard)
             root_rows.append(enriched)
@@ -216,6 +304,24 @@ def merge_counterfactual_shards(
                 raise ValueError(f"branch data-contract mismatch in shard {shard}: {branch.get('branch_id')}")
             if "secondary_safety_pass" not in branch or not branch.get("risk_model_fingerprint"):
                 raise ValueError(f"counterfactual branch is missing frozen secondary-risk metadata: {branch.get('branch_id')}")
+            root_id = str(branch.get("root_id", ""))
+            if strict_actor_rows:
+                validate_branch_row(branch)
+                if str(branch.get("actor_row_mapping_hash", "")) != root_mapping_hashes.get(root_id, ""):
+                    raise ValueError(f"counterfactual branch actor-row mapping mismatch: {branch.get('branch_id')}")
+                expected_actor_ids = root_actor_row_ids.get(root_id, [])
+                if [str(value) for value in branch.get("actor_row_ids", [])] != expected_actor_ids:
+                    raise ValueError(f"counterfactual branch actor-row IDs mismatch: {branch.get('branch_id')}")
+                with np.load(branch["tensor_path"], allow_pickle=False) as tensors:
+                    tensor_ids = [str(value) for value in np.asarray(tensors["actor_row_ids"]).tolist()]
+                    response = np.asarray(tensors["actor_response"])
+                    response_mask = np.asarray(tensors["actor_valid_mask"])
+                if tensor_ids != expected_actor_ids:
+                    raise ValueError(f"counterfactual branch tensor actor-row IDs mismatch: {branch.get('branch_id')}")
+                if response.ndim != 3 or response.shape[-1] != 5 or response.shape[0] != len(tensor_ids):
+                    raise ValueError(f"counterfactual branch actor_response shape mismatch: {branch.get('branch_id')}")
+                if response_mask.shape != response.shape[:2]:
+                    raise ValueError(f"counterfactual branch actor_valid_mask shape mismatch: {branch.get('branch_id')}")
             enriched = dict(branch)
             enriched["source_shard_id"] = str(manifest["collection_id"])
             enriched["source_shard_path"] = str(shard)
@@ -244,8 +350,12 @@ def merge_counterfactual_shards(
         "data_contract_hash": baseline_hash,
         "scenario_config_hash": str(baseline["scenario_config_hash"]),
         "scenario_route_hash": str(baseline["scenario_route_hash"]),
+        "scenario_episode_key_version": SCENARIO_EPISODE_KEY_VERSION,
         "action_execution_profile": str(baseline["action_execution_profile"]),
         "candidate_plan_profile": str(baseline["candidate_plan_profile"]),
+        "actor_row_mapping_version": str(baseline.get("actor_row_mapping_version", "")),
+        "root_observation_fingerprint_version": str(baseline.get("root_observation_fingerprint_version", "")),
+        "entry_time_label_version": str(baseline.get("entry_time_label_version", "")),
         "risk_model_fingerprint": str(baseline["risk_model_fingerprint"]),
         "accvp_activation_distance_m": float(baseline["activation_distance_m"]),
         "source_config_hashes": source_config_hashes,

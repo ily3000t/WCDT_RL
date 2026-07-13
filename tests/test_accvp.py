@@ -23,20 +23,35 @@ from safe_rl.accvp.pilot import validate_pilot_dataset
 from safe_rl.accvp.protocol import counterfactual_data_contract, data_contract_hash, effective_activation_distance
 from safe_rl.accvp.root_context import RootContext
 from safe_rl.accvp.runtime import ACCVPRuntimePredictor
-from safe_rl.accvp.schema import COUNTERFACTUAL_SCHEMA_VERSION, stable_hash
+from safe_rl.accvp.schema import (
+    COUNTERFACTUAL_SCHEMA_VERSION,
+    ENTRY_TIME_LABEL_VERSION,
+    actor_row_mapping_hash,
+    stable_hash,
+)
 from safe_rl.accvp.risk_secondary_audit import audit_risk_secondary
 from safe_rl.accvp.online_trigger_audit import audit_online_triggers, write_online_trigger_audit
 from safe_rl.accvp.selection import select_viability_action, select_viability_lite_action
 from safe_rl.accvp.shards import merge_counterfactual_shards
 from safe_rl.accvp.snapshot_store import CounterfactualSnapshotStore
 from safe_rl.accvp.targeted_benchmark import build_replacement_case_table, build_targeted_benchmark_summary
-from safe_rl.accvp.viability_lite import evaluate_lite_thresholds, tune_viability_lite_operating_point
+from safe_rl.accvp.viability_lite import (
+    collapse_vnext_lite_records,
+    conditional_merge_success_rate,
+    evaluate_lite_thresholds,
+    tune_viability_lite_operating_point,
+)
 from safe_rl.accvp.viability_lite_audit import audit_lite_replacements
 from safe_rl.pipeline.accvp_tune_viability_lite import _lite_acceptance_failures
 from safe_rl.pipeline.accvp_observation_preflight import _gate as _accvp_observation_preflight_gate
 from safe_rl.pipeline.stage1_collect_accvp_jobs import materialise_collection_job, validate_required_pilot
 from safe_rl.risk.risk_aggregator import aggregate_episode_reports
-from safe_rl.stage1_counterfactual.collector import _cache_dir, _root_filter_matches, _seed_schedule
+from safe_rl.stage1_counterfactual.collector import (
+    _SecondaryRiskEvaluator,
+    _cache_dir,
+    _root_filter_matches,
+    _seed_schedule,
+)
 from safe_rl.sim.action_space import decode_action
 from safe_rl.sim.types import VehicleState
 from safe_rl.utils.config import clone_with_overrides, load_config
@@ -64,6 +79,47 @@ class _Shield:
             "risk_uncertainty": 0.0,
             "veto_reason": "risk_score" if not self.safe else "",
         }
+
+
+def test_counterfactual_secondary_risk_uses_one_ordered_shield_batch():
+    class BatchShield:
+        def __init__(self):
+            self.calls = []
+
+        def evaluate_candidates(self, actions, context):
+            self.calls.append(([int(action.index) for action in actions], context))
+            return [
+                {
+                    "candidate_legal": True,
+                    "safety_pass": index == 0,
+                    "risk_score": 0.1 + index,
+                    "risk_uncertainty": 0.01 * index,
+                    "veto_reason": "" if index == 0 else "risk_score",
+                }
+                for index, _action in enumerate(actions)
+            ]
+
+    evaluator = _SecondaryRiskEvaluator.__new__(_SecondaryRiskEvaluator)
+    evaluator.shield = BatchShield()
+    context = {"sentinel": object()}
+    result = evaluator.score(context, [7, 4])
+
+    assert evaluator.shield.calls == [([7, 4], context)]
+    assert list(result) == ["7", "4"]
+    assert result["7"] == {
+        "candidate_legal": True,
+        "risk_score": 0.1,
+        "risk_uncertainty": 0.0,
+        "secondary_safety_pass": True,
+        "veto_reason": "",
+    }
+    assert result["4"] == {
+        "candidate_legal": True,
+        "risk_score": 1.1,
+        "risk_uncertainty": 0.01,
+        "secondary_safety_pass": False,
+        "veto_reason": "risk_score",
+    }
 
 
 def _cfg(mode: str):
@@ -544,10 +600,17 @@ def test_snapshot_is_deleted_only_after_all_expected_branches_complete(tmp_path:
         "data_contract_hash": "contract",
         "risk_model_fingerprint": "risk_checkpoint:test",
         "secondary_safety_pass": True,
+        "actor_row_mapping_hash": actor_row_mapping_hash(["actor"], [1], [1.0]),
+        "actor_row_ids": ["actor"],
+        "actor_row_source_indices": [1],
         "event_observed": False,
         "censor_time": 8.0,
         "censor_reason": "horizon_elapsed",
         "viability_observation_status": "censored",
+        "entry_time_observed": False,
+        "entry_time_censor_time_s": 8.0,
+        "entry_time_censor_reason": "horizon_elapsed",
+        "entry_time_label_version": ENTRY_TIME_LABEL_VERSION,
         "branch_status": "completed",
     }
     store.write_branch({**base, "branch_id": "root_action0", "action_id": 0})
@@ -605,6 +668,22 @@ def test_empty_calibration_bin_is_conservative_and_selector_retains_raw():
     )
     assert decision["selected"]["action_id"] == 4
     assert decision["raw_feasible"] is True
+
+
+def test_clustered_calibrator_counts_components_not_correlated_rows():
+    calibrator = OneSidedBinnedCalibrator.fit_clustered_bounded_means(
+        [0.1, 0.1, 0.1],
+        [0.0, 1.0, 0.0],
+        ["component-a", "component-a", "component-b"],
+        bins=2,
+        nominal_alpha=0.05,
+        bonferroni_family_size=1,
+    )
+    assert calibrator.method == "one_sided_hoeffding_component_mean_v1"
+    np.testing.assert_allclose(calibrator.bin_effective_counts, [2.0, 0.0])
+    restored = OneSidedBinnedCalibrator.from_dict(calibrator.to_dict())
+    assert restored.method == calibrator.method
+    np.testing.assert_allclose(restored.bin_effective_counts, [2.0, 0.0])
 
 
 def test_selector_replacement_requires_merge_intent():
@@ -725,9 +804,12 @@ def test_viability_lite_does_not_replace_when_raw_is_illegal_or_missing():
 def _lite_record(root_id: str, seed: int, action_id: int, raw_id: int, *, p_merge: float, success: bool, safe: bool = True, risk_pass: bool = True, risk_score: float = 0.0):
     return {
         "root_id": root_id,
+        "root_observation_fingerprint": f"fingerprint:{root_id}",
+        "split_component_id": f"component:{root_id}",
         "episode_seed": seed,
         "action_id": action_id,
         "raw_action_id": raw_id,
+        "raw_action_legal": True,
         "root_policy": "merge_timing",
         "collection_source": "merge_timing",
         "traffic_profile": "hard",
@@ -740,12 +822,17 @@ def _lite_record(root_id: str, seed: int, action_id: int, raw_id: int, *, p_merg
         "p_merge_before_taper": p_merge,
         "p_proxy_collision": 0.1,
         "p_safety_violation": 0.1,
+        "p_taper_miss": 0.1,
+        "pU_proxy_collision": 0.1,
+        "pU_safety_violation": 0.1,
+        "pL_merge_before_taper": p_merge,
         "target_lane_entry_time_s": 2.0,
         "ensemble_disagreement": 0.0,
         "merge_observed": True,
         "merge_before_taper": 1.0 if success else 0.0,
         "proxy_collision": 0.0 if safe else 1.0,
         "safety_violation": 0.0 if safe else 1.0,
+        "taper_miss": 0.0,
         "oracle_min_obb_distance": 4.0 if safe else 0.1,
         "oracle_min_ttc": 10.0 if safe else 0.1,
         "oracle_max_drac": 1.0 if safe else 8.0,
@@ -807,6 +894,255 @@ def test_viability_lite_tuning_uses_replacement_only_metrics_and_secondary_risk_
     assert report["selected_metrics"]["replacement_repairable_capture_rate"] == 1.0
 
 
+def test_viability_lite_empty_replacement_rates_are_canonical_json_null():
+    report = evaluate_lite_thresholds(
+        [_lite_record("root", 250, 4, 4, p_merge=0.9, success=True)],
+        {
+            "min_p_merge_before_taper": 0.8,
+            "min_improvement_over_raw": 0.01,
+            "max_target_entry_time_s": 6.0,
+            "max_ensemble_disagreement": 0.1,
+            "max_secondary_risk_score": 0.2,
+            "secondary_safety_profile": "strict",
+        },
+    )
+    assert report["replacement_count"] == 0
+    assert report["replacement_action_risk_pass_rate"] is None
+    assert report["replacement_action_safety_event_rate"] is None
+    assert report["replacement_action_merge_success_rate"] is None
+    assert stable_hash(report)
+
+
+def test_vnext_lite_records_give_duplicate_fingerprint_decision_total_weight_one():
+    records = [
+        _lite_record("root-a", 251, 4, 4, p_merge=0.1, success=False),
+        _lite_record("root-a", 251, 8, 4, p_merge=0.9, success=True),
+        _lite_record("root-b", 251, 4, 4, p_merge=0.1, success=True),
+        _lite_record("root-b", 251, 8, 4, p_merge=0.9, success=False),
+    ]
+    for row in records:
+        row["root_observation_fingerprint"] = "shared-fingerprint"
+        row["split_component_id"] = "shared-component"
+    collapsed, provenance = collapse_vnext_lite_records(records)
+    assert len(collapsed) == 2
+    assert provenance["raw_candidate_row_count"] == 4
+    assert provenance["effective_candidate_row_count"] == 2
+    assert provenance["effective_decision_count"] == 1
+    assert provenance["statistical_independence_claim"] is False
+    by_action = {int(row["action_id"]): row for row in collapsed}
+    assert by_action[4]["replicate_count"] == 2
+    assert by_action[4]["expected_replicate_count"] == 2
+    assert by_action[4]["complete_decision_coverage"] is True
+    assert by_action[4]["merge_before_taper"] == 0.5
+    assert by_action[8]["merge_before_taper"] == 0.5
+
+
+def test_vnext_lite_evaluation_preserves_fractional_duplicate_outcomes():
+    records = [
+        _lite_record("root-a", 258, 4, 4, p_merge=0.1, success=False),
+        _lite_record("root-a", 258, 8, 4, p_merge=0.9, success=True),
+        _lite_record("root-b", 258, 4, 4, p_merge=0.1, success=True),
+        _lite_record("root-b", 258, 8, 4, p_merge=0.9, success=False),
+    ]
+    for row in records:
+        row["root_observation_fingerprint"] = "shared-fingerprint"
+        row["split_component_id"] = "shared-component"
+
+    collapsed, _provenance = collapse_vnext_lite_records(records)
+    report = evaluate_lite_thresholds(collapsed, _lite_thresholds(), split="test")
+
+    assert report["replacement_count"] == 1
+    assert report["replacement_action_merge_success_rate"] == __import__(
+        "pytest"
+    ).approx(0.5)
+    assert report["replacement_unnecessary_rate"] == __import__("pytest").approx(
+        0.5
+    )
+    assert report["repairable_decision_mass"] == __import__("pytest").approx(0.5)
+    assert report["repairable_captured_mass"] == __import__("pytest").approx(0.5)
+    assert report["replacement_repairable_capture_rate"] == 1.0
+
+
+def test_vnext_lite_fractional_safety_events_are_not_majority_voted_away():
+    records = []
+    for index, root_id in enumerate(("root-a", "root-b", "root-c")):
+        records.extend(
+            [
+                _lite_record(root_id, 259, 4, 4, p_merge=0.1, success=False),
+                _lite_record(
+                    root_id,
+                    259,
+                    8,
+                    4,
+                    p_merge=0.9,
+                    success=True,
+                    safe=index != 0,
+                ),
+            ]
+        )
+    for row in records:
+        row["root_observation_fingerprint"] = "shared-fingerprint"
+        row["split_component_id"] = "shared-component"
+
+    collapsed, _provenance = collapse_vnext_lite_records(records)
+    thresholds = _lite_thresholds()
+    report = evaluate_lite_thresholds(collapsed, thresholds, split="test")
+    audit = audit_lite_replacements(collapsed, thresholds, split="test")
+
+    expected = __import__("pytest").approx(1.0 / 3.0)
+    assert report["replacement_action_safety_event_rate"] == expected
+    assert audit["replacement_action_safety_event_rate"] == expected
+    assert report["replacement_action_merge_success_rate"] == 1.0
+
+
+def test_vnext_lite_merge_success_conditions_on_total_observed_mass():
+    rate = conditional_merge_success_rate(
+        [
+            {
+                "outcome_merge_observation_rate": 0.5,
+                "outcome_merge_success_rate": 1.0,
+                "outcome_merge_success_mass": 0.5,
+            },
+            {
+                "outcome_merge_observation_rate": 1.0,
+                "outcome_merge_success_rate": 0.0,
+                "outcome_merge_success_mass": 0.0,
+            },
+        ]
+    )
+
+    assert rate == __import__("pytest").approx(1.0 / 3.0)
+
+
+def test_vnext_lite_collapse_vetoes_action_missing_from_a_duplicate_root():
+    records = [
+        _lite_record("root-a", 252, 4, 4, p_merge=0.1, success=False),
+        _lite_record("root-a", 252, 8, 4, p_merge=0.9, success=True),
+        _lite_record("root-b", 252, 4, 4, p_merge=0.1, success=False),
+    ]
+    for row in records:
+        row["root_observation_fingerprint"] = "shared-fingerprint"
+        row["split_component_id"] = "shared-component"
+
+    collapsed, _provenance = collapse_vnext_lite_records(records)
+    by_action = {int(row["action_id"]): row for row in collapsed}
+
+    assert by_action[4]["complete_decision_coverage"] is True
+    assert by_action[4]["candidate_legal"] is True
+    assert by_action[8]["replicate_count"] == 1
+    assert by_action[8]["expected_replicate_count"] == 2
+    assert by_action[8]["complete_decision_coverage"] is False
+    assert by_action[8]["raw_action_complete_decision_coverage"] is True
+    assert by_action[8]["raw_action_legal"] is True
+    assert by_action[8]["candidate_legal"] is False
+    assert by_action[8]["secondary_safety_pass"] is False
+    thresholds = _lite_thresholds()
+    thresholds["secondary_safety_profile"] = "audited_merge_left_v1"
+    decision = select_viability_lite_action(
+        collapsed,
+        raw_action_id=4,
+        thresholds=thresholds,
+    )
+    assert decision["replacement"] is False
+
+
+def test_vnext_lite_collapse_copies_incomplete_raw_legality_to_all_actions():
+    records = [
+        _lite_record("root-a", 253, 4, 4, p_merge=0.1, success=False),
+        _lite_record("root-a", 253, 8, 4, p_merge=0.9, success=True),
+        _lite_record("root-b", 253, 8, 4, p_merge=0.9, success=True),
+    ]
+    for row in records:
+        row["root_observation_fingerprint"] = "shared-fingerprint"
+        row["split_component_id"] = "shared-component"
+
+    collapsed, provenance = collapse_vnext_lite_records(records)
+    by_action = {int(row["action_id"]): row for row in collapsed}
+
+    assert provenance["raw_incomplete_decision_count"] == 1
+    assert provenance["raw_illegal_decision_count"] == 1
+    assert all(
+        row["raw_action_complete_decision_coverage"] is False
+        for row in collapsed
+    )
+    assert all(row["raw_action_legal"] is False for row in collapsed)
+    assert by_action[4]["candidate_legal"] is False
+    assert by_action[8]["candidate_legal"] is True
+    decision = select_viability_lite_action(
+        collapsed,
+        raw_action_id=4,
+        thresholds=_lite_thresholds(),
+    )
+    assert decision["replacement"] is False
+
+
+def test_vnext_lite_collapse_keeps_complete_raw_legal_when_lower_action_is_missing():
+    records = [
+        _lite_record("root-a", 254, 0, 8, p_merge=0.2, success=False),
+        _lite_record("root-a", 254, 8, 8, p_merge=0.9, success=True),
+        _lite_record("root-b", 254, 8, 8, p_merge=0.9, success=True),
+    ]
+    for row in records:
+        row["root_observation_fingerprint"] = "shared-fingerprint"
+        row["split_component_id"] = "shared-component"
+
+    collapsed, provenance = collapse_vnext_lite_records(records)
+    by_action = {int(row["action_id"]): row for row in collapsed}
+
+    assert provenance["raw_incomplete_decision_count"] == 0
+    assert provenance["raw_illegal_decision_count"] == 0
+    assert all(row["raw_action_legal"] is True for row in collapsed)
+    assert by_action[0]["complete_decision_coverage"] is False
+    assert by_action[0]["candidate_legal"] is False
+    assert by_action[8]["complete_decision_coverage"] is True
+
+
+def test_vnext_lite_collapse_rejects_cross_action_component_mismatch():
+    records = [
+        _lite_record("root-a", 255, 4, 4, p_merge=0.1, success=False),
+        _lite_record("root-a", 255, 8, 4, p_merge=0.9, success=True),
+    ]
+    for row in records:
+        row["root_observation_fingerprint"] = "shared-fingerprint"
+    records[0]["split_component_id"] = "component-a"
+    records[1]["split_component_id"] = "component-b"
+
+    with __import__("pytest").raises(ValueError, match="multiple split components"):
+        collapse_vnext_lite_records(records)
+
+
+def test_vnext_lite_collapse_rejects_inconsistent_decision_raw_legality():
+    records = [
+        _lite_record("root-a", 256, 4, 4, p_merge=0.1, success=False),
+        _lite_record("root-b", 256, 4, 4, p_merge=0.1, success=False),
+    ]
+    for row in records:
+        row["root_observation_fingerprint"] = "shared-fingerprint"
+        row["split_component_id"] = "shared-component"
+    records[1]["raw_action_legal"] = False
+
+    with __import__("pytest").raises(ValueError, match="raw-action legality"):
+        collapse_vnext_lite_records(records)
+
+
+def test_vnext_lite_collapse_distinguishes_covered_but_illegal_raw_action():
+    records = [
+        _lite_record("root-a", 257, 4, 4, p_merge=0.1, success=False),
+        _lite_record("root-b", 257, 4, 4, p_merge=0.1, success=False),
+    ]
+    for row in records:
+        row["root_observation_fingerprint"] = "shared-fingerprint"
+        row["split_component_id"] = "shared-component"
+        row["raw_action_legal"] = False
+
+    collapsed, provenance = collapse_vnext_lite_records(records)
+
+    assert provenance["raw_incomplete_decision_count"] == 0
+    assert provenance["raw_illegal_decision_count"] == 1
+    assert collapsed[0]["raw_action_complete_decision_coverage"] is True
+    assert collapsed[0]["raw_action_legal"] is False
+
+
 def test_viability_lite_audited_profile_can_recover_risk_failed_left_only():
     thresholds = {
         "min_p_merge_before_taper": 0.8,
@@ -845,10 +1181,11 @@ def test_risk_secondary_audit_reports_false_negatives_and_safe_sweep():
     }
     report = audit_risk_secondary(records, base, split="test", risk_score_grid=[0.2, 0.9])
     assert report["confusion"]["risk_fail_clean_success"] == 1
-    assert report["selected_audited_profile"]["secondary_safety_profile"] == "audited_merge_left_v1"
-    assert report["selected_audited_profile"]["max_secondary_risk_score"] == 0.9
-    assert report["threshold_sweep"][1]["safe_success_recovered_count"] == 1
-    assert report["threshold_sweep"][1]["unsafe_pass_count"] == 0
+    assert report["selection_eligible"] is False
+    assert report["selected_audited_profile"] is None
+    assert report["diagnostic_best_profile"] is None
+    assert report["threshold_sweep_is_selection"] is False
+    assert len(report["threshold_sweep"]) == 1
 
 
 def test_viability_lite_acceptance_detects_failed_final_test():
@@ -883,6 +1220,50 @@ def test_viability_lite_acceptance_detects_failed_final_test():
     assert "replacement_action_merge_success_rate<0.9" in failures
     assert "replacement_unnecessary_rate>0.25" in failures
     assert "replacement_repairable_capture_rate<=0.05" in failures
+
+
+def test_vnext_lite_acceptance_requires_preregistered_evidence_minimums():
+    cfg = clone_with_overrides(
+        load_config(),
+        {
+            "accvp": {
+                "artifact_generation": "vnext_schema3",
+                "viability_lite": {
+                    "acceptance": {
+                        "require_replacement": True,
+                        "min_effective_decision_count": 1000,
+                        "min_unique_episode_seed_count": 30,
+                        "min_effective_split_component_count": 30,
+                        "min_replacement_count": 20,
+                        "min_replacement_unique_episode_seed_count": 10,
+                        "min_replacement_effective_split_component_count": 10,
+                        "min_replacement_observed_mass": 20.0,
+                        "min_repairable_decision_mass": 20.0,
+                    }
+                },
+            }
+        },
+    )
+    report = {
+        "replacement_count": 19,
+        "effective_decision_count": 1000,
+        "unique_episode_seed_count": 30,
+        "effective_split_component_count": 30,
+        "replacement_unique_episode_seed_count": 10,
+        "replacement_effective_split_component_count": 10,
+        "replacement_observed_mass": 20.0,
+        "repairable_decision_mass": 20.0,
+    }
+
+    failures = _lite_acceptance_failures(report, cfg)
+
+    assert "replacement_count<20" in failures
+    cfg.accvp.viability_lite.acceptance.pop("min_repairable_decision_mass")
+    failures = _lite_acceptance_failures(report, cfg)
+    assert any(
+        failure.startswith("formal_acceptance_minimums_missing:")
+        for failure in failures
+    )
 
 
 def test_online_trigger_audit_generates_deterministic_shadow_seed_file(tmp_path: Path):
@@ -1536,6 +1917,78 @@ def test_collection_job_can_override_policy_observation_config_without_mutating_
     assert job_cfg.accvp.counterfactual.policy_checkpoints.ppo == "baseline.zip"
     assert job_cfg.forecast_features.enabled is False
     assert cfg.accvp.counterfactual.root_budget != 100
+
+
+def test_vnext_collection_configs_are_schema3_budgeted_and_path_isolated():
+    pilot = load_config("safe_rl/config/active/accvp_vnext/pilot.yaml")
+    formal = load_config("safe_rl/config/active/accvp_vnext/formal.yaml")
+    oracle = load_config("safe_rl/config/active/accvp_vnext/oracle_regression.yaml")
+
+    assert pilot.run.run_id == "accvp_vnext_pilot"
+    assert formal.run.run_id == "accvp_vnext_formal"
+    assert pilot.run.run_id != formal.run.run_id
+    assert pilot.run.seed == 60001
+    assert formal.run.seed == 10001
+
+    for cfg, phase, budget, output_name in (
+        (pilot, "pilot", 500, "accvp_vnext_schema3_pilot"),
+        (formal, "formal", 5000, "accvp_vnext_schema3_formal"),
+    ):
+        assert cfg.accvp.artifact_generation == "vnext_schema3"
+        assert cfg.accvp.schema_version == 3
+        assert cfg.accvp.actor_row_mapping_version == "selected_indices_v2"
+        assert cfg.accvp.root_observation_fingerprint_version == "model_input_fingerprint_v3"
+        assert cfg.accvp.entry_time_label_version == "conditional_entry_time_v1"
+        assert cfg.accvp.loss_version == "accvp_loss_v2"
+        assert cfg.accvp.counterfactual.collection_phase == phase
+        assert cfg.accvp.counterfactual.root_budget == budget
+        assert cfg.accvp.counterfactual.output_name == output_name
+        assert sum(int(job.root_budget) for job in cfg.accvp.counterfactual.collection_jobs) == budget
+        assert {str(job.collection_source) for job in cfg.accvp.counterfactual.collection_jobs} == {
+            "mixed",
+            "ppo",
+            "merge_timing",
+            "rule",
+            "deadline_hard",
+        }
+        assert all(not job.get("episode_seeds") for job in cfg.accvp.counterfactual.collection_jobs)
+        assert "accvp_240" not in str(cfg.run.run_id)
+        assert "accvp_240" not in str(cfg.run.cache_root)
+        assert "accvp_240" not in str(cfg.accvp.counterfactual.output_name)
+
+    pilot_cache = _cache_dir(
+        pilot,
+        str(pilot.accvp.counterfactual.output_name),
+        pilot.accvp.counterfactual,
+    )
+    formal_cache = _cache_dir(
+        formal,
+        str(formal.accvp.counterfactual.output_name),
+        formal.accvp.counterfactual,
+    )
+    assert pilot_cache != formal_cache
+    assert "accvp_vnext_pilot" in pilot_cache.parts
+    assert "accvp_vnext_formal" in formal_cache.parts
+    assert formal.accvp.counterfactual.required_pilot_report == (
+        "safe_rl_output/runs/accvp_vnext_pilot/pilot_report.json"
+    )
+    oracle_job = oracle.accvp.counterfactual.collection_jobs[0]
+    assert oracle.run.run_id == "accvp_vnext_oracle_regression"
+    assert oracle.accvp.artifact_generation == "vnext_schema3"
+    assert oracle.accvp.schema_version == 3
+    assert list(oracle.accvp.oracle.required_seeds) == [2, 5]
+    assert oracle.accvp.oracle.cohort_role == "oracle_regression"
+    assert oracle.accvp.oracle.exclude_from_model_splits is True
+    assert list(oracle_job.episode_seeds) == [2, 5]
+    assert oracle_job.oracle_only is True
+    assert oracle_job.cohort_role == "oracle_regression"
+    assert oracle_job.exclude_from_model_splits is True
+    oracle_cache = _cache_dir(
+        oracle,
+        str(oracle.accvp.counterfactual.output_name),
+        oracle.accvp.counterfactual,
+    )
+    assert len({pilot_cache, formal_cache, oracle_cache}) == 3
 
 
 def test_formal_collection_requires_matching_pilot_report(tmp_path: Path):

@@ -13,6 +13,7 @@ from safe_rl.prediction.wcdt_v3_predictor import (
 
 
 ACCVP_ARCHITECTURE_VERSION = "accvp_v1_conditional_response_transformer"
+ACCVP_LOSS_VERSION = "accvp_loss_v2"
 EVENT_NAMES = (
     "proxy_collision",
     "safety_violation",
@@ -233,14 +234,74 @@ def set_scene_encoder_trainable(model: ACCVPPredictor, trainable: bool) -> None:
         parameter.requires_grad = bool(trainable)
 
 
-def accvp_loss(output: dict[str, Any], batch: dict[str, Any], weights: dict[str, float] | None = None):
-    """Masked v1 loss; viability is explicitly masked for censored examples."""
+def accvp_loss(output: dict[str, Any], batch: dict[str, Any], weights: dict[str, Any] | None = None):
+    """Masked v2 loss with per-scalar normalization and residual smoothness."""
 
     torch, _nn, functional = _require_torch()
     weights = weights or {}
+    response = output["actor_response"]
+    response_target = batch["actor_response"]
+    response_mask = batch["actor_response_mask"]
+    if response.shape != response_target.shape or response.ndim != 4 or response.shape[-1] != 5:
+        raise ValueError(
+            "actor_response prediction/target must have identical [batch,actor,time,5] shapes"
+        )
+    if response_mask.shape != response.shape[:-1]:
+        raise ValueError("actor_response_mask must match actor_response [batch,actor,time]")
+    if output["event_logits"].shape != batch["event_targets"].shape or output["event_logits"].shape[-1] != 4:
+        raise ValueError("event logits/targets must have identical [batch,4] shapes")
+    if batch["event_mask"].shape != output["event_logits"].shape:
+        raise ValueError("event_mask must match event logits")
+    if output["geometry"].shape != batch["geometry_targets"].shape or output["geometry"].shape[-1] != 5:
+        raise ValueError("geometry prediction/target must have identical [batch,5] shapes")
+    candidate_plan = batch["candidate_plan"]
+    if candidate_plan.ndim != 3 or candidate_plan.shape[0] != response.shape[0] or candidate_plan.shape[-1] != 5:
+        raise ValueError("candidate_plan must have shape [batch,time,5]")
+    if candidate_plan.shape[1] < response.shape[2]:
+        raise ValueError("candidate_plan horizon must cover the response horizon")
+    sample_weight = batch.get("sample_weight")
+    if sample_weight is None:
+        sample_weight = torch.ones((response.shape[0],), dtype=response.dtype, device=response.device)
+    sample_weight = sample_weight.reshape(-1).to(dtype=response.dtype, device=response.device)
+    if sample_weight.shape != (response.shape[0],):
+        raise ValueError("sample_weight must have shape [batch]")
+    if not bool(torch.isfinite(sample_weight).all()) or bool((sample_weight <= 0.0).any()):
+        raise ValueError("sample_weight must contain finite positive values")
+    response_sample_weight = sample_weight[:, None, None, None]
     actor_mask = batch["actor_response_mask"][:, :, :, None]
-    response_error = functional.smooth_l1_loss(output["actor_response"], batch["actor_response"], reduction="none")
-    trajectory = (response_error * actor_mask).sum() / actor_mask.sum().clamp_min(1.0)
+    response_delta = response - response_target
+    # Heading is circular; comparing raw radians creates an artificial jump at
+    # +/-pi. Remaining features retain their physical units unless an explicit
+    # train-only scale vector is supplied in the loss configuration.
+    response_delta = torch.stack(
+        [
+            response_delta[..., 0],
+            response_delta[..., 1],
+            torch.atan2(torch.sin(response_delta[..., 2]), torch.cos(response_delta[..., 2])),
+            response_delta[..., 3],
+            response_delta[..., 4],
+        ],
+        dim=-1,
+    )
+    feature_scales = torch.as_tensor(
+        weights.get("response_feature_scales", [1.0, 1.0, 1.0, 1.0, 1.0]),
+        dtype=response_delta.dtype,
+        device=response_delta.device,
+    )
+    if feature_scales.shape != (5,) or bool((feature_scales <= 0.0).any()):
+        raise ValueError("response_feature_scales must contain five positive values")
+    normalized_delta = response_delta / feature_scales
+    response_error = functional.smooth_l1_loss(
+        normalized_delta,
+        torch.zeros_like(normalized_delta),
+        reduction="none",
+    )
+    response_feature_mask = actor_mask.expand_as(response_error) * response_sample_weight
+    trajectory_numerator = (response_error * response_feature_mask).sum()
+    trajectory_denominator = response_feature_mask.sum()
+    trajectory = trajectory_numerator / trajectory_denominator.clamp_min(
+        torch.finfo(trajectory_denominator.dtype).eps
+    )
     event_logits = output["event_logits"]
     event_targets = batch["event_targets"]
     event_mask = batch["event_mask"]
@@ -248,15 +309,31 @@ def accvp_loss(output: dict[str, Any], batch: dict[str, Any], weights: dict[str,
     pos_weight = None
     if positive_weights is not None:
         pos_weight = torch.as_tensor(positive_weights, dtype=event_logits.dtype, device=event_logits.device)
+        if pos_weight.shape != (4,):
+            raise ValueError("event_positive_weights must contain four values")
+    event_loss_weights = torch.as_tensor(
+        weights.get("event_loss_weights", [1.0, 1.0, 1.0, 1.0]),
+        dtype=event_logits.dtype,
+        device=event_logits.device,
+    )
+    if event_loss_weights.shape != (4,) or bool((event_loss_weights < 0.0).any()):
+        raise ValueError("event_loss_weights must contain four non-negative values")
     event_loss = functional.binary_cross_entropy_with_logits(
         event_logits,
         event_targets,
         reduction="none",
         pos_weight=pos_weight,
     )
-    event_loss = (event_loss * event_mask).sum() / event_mask.sum().clamp_min(1.0)
+    weighted_event_mask = event_mask * event_loss_weights[None, :] * sample_weight[:, None]
+    event_numerator = (event_loss * weighted_event_mask).sum()
+    event_denominator = weighted_event_mask.sum()
+    event_loss = event_numerator / event_denominator.clamp_min(
+        torch.finfo(event_denominator.dtype).eps
+    )
     geometry_error = functional.smooth_l1_loss(output["geometry"], batch["geometry_targets"], reduction="none")
     geometry_mask = batch.get("geometry_mask", torch.ones_like(geometry_error))
+    if geometry_mask.shape != geometry_error.shape:
+        raise ValueError("geometry_mask must match geometry prediction/target [batch,5]")
     quantile_error = torch.maximum(
         0.10 * (batch["geometry_targets"][:, 0] - output["geometry"][:, 0]),
         (0.10 - 1.0) * (batch["geometry_targets"][:, 0] - output["geometry"][:, 0]),
@@ -264,18 +341,43 @@ def accvp_loss(output: dict[str, Any], batch: dict[str, Any], weights: dict[str,
         0.90 * (batch["geometry_targets"][:, 1] - output["geometry"][:, 1]),
         (0.90 - 1.0) * (batch["geometry_targets"][:, 1] - output["geometry"][:, 1]),
     )
-    geometry_loss = (
-        quantile_error.sum()
-        + (geometry_error[:, 2:] * geometry_mask[:, 2:]).sum()
-    ) / (2.0 * geometry_error.shape[0] + geometry_mask[:, 2:].sum()).clamp_min(1.0)
-    response_xy = output["actor_response"][..., :2]
-    response_delta = response_xy[:, :, 1:] - response_xy[:, :, :-1]
-    smooth_mask = actor_mask[:, :, 1:] * actor_mask[:, :, :-1]
-    smoothness = (response_delta.abs().sum(dim=-1) * smooth_mask[..., 0]).sum() / smooth_mask.sum().clamp_min(1.0)
+    geometry_numerator = (
+        (quantile_error * sample_weight).sum()
+        + (geometry_error[:, 2:] * geometry_mask[:, 2:] * sample_weight[:, None]).sum()
+    )
+    geometry_denominator = (
+        2.0 * sample_weight.sum()
+        + (geometry_mask[:, 2:] * sample_weight[:, None]).sum()
+    )
+    geometry_loss = geometry_numerator / geometry_denominator.clamp_min(
+        torch.finfo(geometry_denominator.dtype).eps
+    )
+    response_residual_xy = response[..., :2] - response_target[..., :2]
+    residual_second_difference = (
+        response_residual_xy[:, :, 2:]
+        - 2.0 * response_residual_xy[:, :, 1:-1]
+        + response_residual_xy[:, :, :-2]
+    )
+    smooth_mask = actor_mask[:, :, 2:] * actor_mask[:, :, 1:-1] * actor_mask[:, :, :-2]
+    smooth_feature_mask = (
+        smooth_mask.expand_as(residual_second_difference) * response_sample_weight
+    )
+    smoothness_numerator = (
+        residual_second_difference.abs() * smooth_feature_mask
+    ).sum()
+    smoothness_denominator = smooth_feature_mask.sum()
+    smoothness = smoothness_numerator / smoothness_denominator.clamp_min(
+        torch.finfo(smoothness_denominator.dtype).eps
+    )
     ego_x = batch["candidate_plan"][:, None, : output["actor_response"].shape[2], 0]
     target_sign = torch.sign(batch["actor_response"][..., 0] - ego_x)
     predicted_relative = output["actor_response"][..., 0] - ego_x
-    ordering = (torch.relu(-target_sign * predicted_relative) * actor_mask[..., 0]).sum() / actor_mask.sum().clamp_min(1.0)
+    ordering_weight = actor_mask[..., 0] * sample_weight[:, None, None]
+    ordering_numerator = (torch.relu(-target_sign * predicted_relative) * ordering_weight).sum()
+    ordering_denominator = ordering_weight.sum()
+    ordering = ordering_numerator / ordering_denominator.clamp_min(
+        torch.finfo(ordering_denominator.dtype).eps
+    )
     total = (
         float(weights.get("trajectory", 1.0)) * trajectory
         + float(weights.get("events", 1.0)) * event_loss
@@ -289,12 +391,35 @@ def accvp_loss(output: dict[str, Any], batch: dict[str, Any], weights: dict[str,
         "geometry": geometry_loss.detach(),
         "ordering": ordering.detach(),
         "smoothness": smoothness.detach(),
+        "statistics": {
+            "trajectory": {
+                "numerator": trajectory_numerator.detach(),
+                "denominator": trajectory_denominator.detach(),
+            },
+            "events": {
+                "numerator": event_numerator.detach(),
+                "denominator": event_denominator.detach(),
+            },
+            "geometry": {
+                "numerator": geometry_numerator.detach(),
+                "denominator": geometry_denominator.detach(),
+            },
+            "ordering": {
+                "numerator": ordering_numerator.detach(),
+                "denominator": ordering_denominator.detach(),
+            },
+            "smoothness": {
+                "numerator": smoothness_numerator.detach(),
+                "denominator": smoothness_denominator.detach(),
+            },
+        },
     }
 
 
 def checkpoint_metadata(config: Any, *, warm_start: dict[str, Any]) -> dict[str, Any]:
     return {
         "architecture_version": ACCVP_ARCHITECTURE_VERSION,
+        "loss_version": ACCVP_LOSS_VERSION,
         "counterfactual_schema_version": COUNTERFACTUAL_SCHEMA_VERSION,
         "wcdt_v3_architecture_version": WCDT_V3_ARCHITECTURE_VERSION,
         "model_kwargs": model_kwargs_from_config(config),

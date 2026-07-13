@@ -13,6 +13,11 @@ from safe_rl.prediction.forecast_feature_augmentor import ForecastFeatureAugment
 from safe_rl.prediction.wcdt_predictor import WcDTPredictor
 from safe_rl.risk.risk_module import RiskModuleWrapper
 from safe_rl.accvp.schema import file_sha256
+from safe_rl.accvp.artifacts import (
+    ACCVP_ARTIFACT_KIND,
+    apply_v2_bundle_paths,
+    validate_lifecycle_for_mode,
+)
 from safe_rl.accvp.observation import RiskGatedACCVPCandidateTableAugmentor
 from safe_rl.shield.safety_shield import SafetyShield
 from safe_rl.sim.sumo_highway_merge_env import SumoHighwayMergeEnv
@@ -126,6 +131,9 @@ def make_accvp_observation_augmentor(
 ) -> RiskGatedACCVPCandidateTableAugmentor | None:
     if not RiskGatedACCVPCandidateTableAugmentor.enabled(cfg):
         return None
+    manifest, _resolved_files = apply_v2_bundle_paths(cfg)
+    if manifest is not None and str(manifest.get("artifact_kind", "")) == ACCVP_ARTIFACT_KIND:
+        validate_lifecycle_for_mode(manifest, str(cfg.accvp.get("mode", "off")))
     configured_risk = cfg.accvp.get("risk_checkpoint") or risk_checkpoint or reward_risk_checkpoint
     if configured_risk:
         cfg.accvp["risk_checkpoint"] = str(configured_risk)

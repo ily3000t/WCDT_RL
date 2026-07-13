@@ -124,9 +124,9 @@ def _pipeline_profile_config_path(profile: str) -> Path | None:
     if profile == "default":
         return None
     if profile == "smoke":
-        return REPO_ROOT / "safe_rl" / "config" / "advanced" / "pipeline_smoke_fast.yaml"
+        return REPO_ROOT / "safe_rl" / "config" / "active" / "pipeline" / "pipeline_smoke_fast.yaml"
     if profile == "performance":
-        return REPO_ROOT / "safe_rl" / "config" / "advanced" / "pipeline_performance.yaml"
+        return REPO_ROOT / "safe_rl" / "config" / "active" / "pipeline" / "pipeline_performance.yaml"
     raise ValueError(f"pipeline profile must be one of {VALID_PIPELINE_PROFILES}; got {profile!r}")
 
 

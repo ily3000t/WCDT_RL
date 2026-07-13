@@ -49,6 +49,8 @@ class OneSidedBinnedCalibrator:
     nominal_alpha: float = 0.05
     effective_alpha: float = 0.05
     z_value: float = 1.6448536269514722
+    method: str = "one_sided_wilson_binomial_v1"
+    bin_effective_counts: np.ndarray | None = None
 
     @classmethod
     def fit(
@@ -59,7 +61,8 @@ class OneSidedBinnedCalibrator:
         nominal_alpha: float = 0.05,
         bonferroni_family_size: int = 3,
     ) -> "OneSidedBinnedCalibrator":
-        values = np.clip(np.asarray(list(scores), dtype=np.float64), 0.0, 1.0)
+        raw_values = np.asarray(list(scores), dtype=np.float64)
+        values = np.clip(raw_values, 0.0, 1.0)
         targets = np.asarray(list(labels), dtype=np.float64)
         if values.shape != targets.shape or not values.size:
             raise ValueError("calibration requires equally sized non-empty scores and labels")
@@ -81,6 +84,86 @@ class OneSidedBinnedCalibrator:
             nominal_alpha=float(nominal_alpha),
             effective_alpha=effective_alpha,
             z_value=float(z_value),
+            method="one_sided_wilson_binomial_v1",
+            bin_effective_counts=counts.astype(np.float64),
+        )
+
+    @classmethod
+    def fit_clustered_bounded_means(
+        cls,
+        scores: Iterable[float],
+        labels: Iterable[float],
+        cluster_ids: Iterable[str],
+        bins: int = 20,
+        nominal_alpha: float = 0.05,
+        bonferroni_family_size: int = 3,
+    ) -> "OneSidedBinnedCalibrator":
+        """Fit distribution-free one-sided bounds on independent clusters.
+
+        Rows within one split component are correlated. For each score bin we
+        therefore average all bounded labels contributed by a component first,
+        then apply Hoeffding's inequality across component means. A component
+        contributes at most one value to any bin, independent of how many
+        roots or actions it contains.
+        """
+
+        bin_count = int(bins)
+        family_size = int(bonferroni_family_size)
+        alpha = float(nominal_alpha)
+        if bin_count <= 0:
+            raise ValueError("calibration bins must be positive")
+        if family_size <= 0:
+            raise ValueError("bonferroni_family_size must be positive")
+        if not 0.0 < alpha < 1.0:
+            raise ValueError("nominal_alpha must be between zero and one")
+        raw_values = np.asarray(list(scores), dtype=np.float64)
+        values = np.clip(raw_values, 0.0, 1.0)
+        targets = np.asarray(list(labels), dtype=np.float64)
+        clusters = np.asarray([str(value) for value in cluster_ids], dtype=object)
+        if values.shape != targets.shape or values.shape != clusters.shape or not values.size:
+            raise ValueError(
+                "clustered calibration requires equally sized non-empty scores, labels, and cluster_ids"
+            )
+        if not np.isfinite(raw_values).all() or not np.isfinite(targets).all():
+            raise ValueError("clustered calibration scores and labels must be finite")
+        if np.any((targets < 0.0) | (targets > 1.0)):
+            raise ValueError("clustered calibration labels must lie in [0, 1]")
+        if any(not str(value).strip() for value in clusters.tolist()):
+            raise ValueError("clustered calibration requires non-empty cluster_ids")
+
+        edges = np.linspace(0.0, 1.0, bin_count + 1)
+        indices = np.clip(np.digitize(values, edges, right=False) - 1, 0, bin_count - 1)
+        grouped: dict[tuple[int, str], list[float]] = {}
+        for index, cluster, target in zip(indices.tolist(), clusters.tolist(), targets.tolist()):
+            grouped.setdefault((int(index), str(cluster)), []).append(float(target))
+        per_bin: list[list[float]] = [[] for _ in range(bin_count)]
+        for (index, _cluster), cluster_targets in grouped.items():
+            per_bin[index].append(float(np.mean(cluster_targets)))
+
+        effective_alpha = alpha / max(1, bin_count * family_size)
+        lower = np.zeros((bin_count,), dtype=np.float64)
+        upper = np.ones((bin_count,), dtype=np.float64)
+        counts = np.zeros((bin_count,), dtype=np.float64)
+        for index, observations in enumerate(per_bin):
+            count = len(observations)
+            counts[index] = float(count)
+            if count == 0:
+                continue
+            mean = float(np.mean(observations))
+            radius = float(
+                np.sqrt(np.log(1.0 / effective_alpha) / (2.0 * float(count)))
+            )
+            lower[index] = max(0.0, mean - radius)
+            upper[index] = min(1.0, mean + radius)
+        return cls(
+            edges=edges,
+            lower=lower,
+            upper=upper,
+            nominal_alpha=alpha,
+            effective_alpha=effective_alpha,
+            z_value=0.0,
+            method="one_sided_hoeffding_component_mean_v1",
+            bin_effective_counts=counts,
         )
 
     def transform_upper(self, scores: Iterable[float]) -> np.ndarray:
@@ -94,14 +177,20 @@ class OneSidedBinnedCalibrator:
         return self.lower[index]
 
     def to_dict(self) -> dict[str, Any]:
-        return {
+        payload = {
             "edges": self.edges.tolist(),
             "lower": self.lower.tolist(),
             "upper": self.upper.tolist(),
             "nominal_alpha": self.nominal_alpha,
             "effective_alpha": self.effective_alpha,
             "z_value": self.z_value,
+            "method": self.method,
         }
+        if self.bin_effective_counts is not None:
+            payload["bin_effective_counts"] = np.asarray(
+                self.bin_effective_counts, dtype=np.float64
+            ).tolist()
+        return payload
 
     @classmethod
     def from_dict(cls, value: dict[str, Any]) -> "OneSidedBinnedCalibrator":
@@ -112,6 +201,12 @@ class OneSidedBinnedCalibrator:
             nominal_alpha=float(value.get("nominal_alpha", 0.05)),
             effective_alpha=float(value.get("effective_alpha", 0.05)),
             z_value=float(value.get("z_value", 1.6448536269514722)),
+            method=str(value.get("method", "one_sided_wilson_binomial_v1")),
+            bin_effective_counts=(
+                None
+                if value.get("bin_effective_counts") is None
+                else np.asarray(value["bin_effective_counts"], dtype=np.float64)
+            ),
         )
 
 

@@ -201,6 +201,7 @@ rule_gap_acceptance:
 risk_module:
   enabled: true
   safety_metric_version: "oriented_box_v1"
+  candidate_geometry_backend: "vectorized"  # reference is audit-only
   use_wcdt_latent: true
   use_explicit_risk_features: true
   action_conditioned: true
@@ -239,7 +240,7 @@ rl:
   backend: "sb3"
   use_wcdt_forecast_features: false
   # Reward-v2 is the default mainline from codex/reward-v2-mainline-accvp-shadow.
-  # Use safe_rl/config/advanced/legacy_default_reward.yaml for historical default-reward runs.
+  # Use safe_rl/config/baselines/no_forecast/legacy_default_reward.yaml for historical default-reward runs.
   training_semantics_version: "reward_v2_mainline_001"
   reward_profile: "merge_timing_forecast"
   total_timesteps: 20000
@@ -353,6 +354,7 @@ shield:
 accvp:
   enabled: false
   mode: "off"                 # off | shadow | viability_branch | viability_lite_shadow | viability_lite
+  artifact_generation: null
   dataset_dir: null
   oracle_report: null
   checkpoint: null
@@ -360,7 +362,12 @@ accvp:
   operating_point: null
   artifact_manifest: null
   risk_checkpoint: null
-  schema_version: 2
+  schema_version: 3
+  data_contract_version: "accvp_240_v2"
+  actor_row_mapping_version: "accvp_actor_rows_v1"
+  root_observation_fingerprint_version: "accvp_root_observation_v1"
+  entry_time_label_version: "conditional_entry_time_v1"
+  loss_version: "accvp_loss_v2"
   candidate_plan_profile: "accvp_commitment_v1"
   response_horizon_s: 3.0
   viability_horizon_s: 8.0
@@ -379,12 +386,27 @@ accvp:
   lateral_commitment_s: 1.0
   observation:
     enabled: false
+    # Preserve the legacy disabled/default contract. VNext PPO configs opt in
+    # explicitly so an older overlay can never change from 99D/103D to 107D.
     feature_version: "risk_gated_candidate_table_v1"
     activation_distance: 240.0
     timeout_s: 0.45
+    timeout_contract: "soft_realtime_post_return_v1"
+    full_table_hard_deadline_worker: false
     use_inference_worker: false
     profile_latency: true
     fail_closed_defaults: true
+    invalid_table_strategy: "fail_closed_v1"
+    last_valid_max_decisions: 1
+    last_valid_ttl_s: 0.5
+    last_valid_max_merge_distance_delta_m: 15.0
+    last_valid_max_ego_speed_delta_mps: 3.0
+    last_valid_max_gap_delta_m: 8.0
+    # Keep warmup opt-in because legacy observation overlays inherit this
+    # block. VNext configs enable it explicitly after selecting the bounded-
+    # stale feature contract.
+    warmup_enabled: false
+    warmup_max_attempts: 3
     include_risk_secondary: true
     secondary_safety_profile: "risk_model_rollout_v1"
     risk_horizon_steps: 0
@@ -416,6 +438,8 @@ accvp:
     prewarm_on_init: true
     startup_timeout_s: 15.0
   training:
+    deterministic: false
+    deterministic_torch_threads: null
     epochs: 20
     batch_size: 32
     learning_rate: 0.0003
@@ -427,6 +451,7 @@ accvp:
       geometry: 0.25
       ordering: 0.10
       smoothness: 0.01
+      response_feature_scales: [1.0, 1.0, 1.0, 1.0, 1.0]
   tuning:
     required_availability: 0.95
     proxy_collision_upper_bounds: [0.05, 0.10, 0.15, 0.20, 0.30, 0.50, 0.75, 1.00]

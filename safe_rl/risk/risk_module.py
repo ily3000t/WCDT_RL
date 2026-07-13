@@ -191,19 +191,23 @@ class RiskModuleWrapper:
         cache = context.setdefault("_risk_prediction_cache", {})
         missing = [action for action in actions if (id(self), int(action.index)) not in cache]
         if missing:
-            tracker = context.get("performance_tracker")
-            started = None
-            if tracker is not None:
-                import time
+            import time
 
-                started = time.perf_counter()
+            tracker = context.get("performance_tracker")
+            started = time.perf_counter()
+            context["_risk_candidate_latency"] = {}
+            feature_started = time.perf_counter()
             candidates = evaluate_candidate_actions(missing, context)
+            feature_elapsed = time.perf_counter() - feature_started
+            forward_started = time.perf_counter()
             if self.model is None:
                 predictions = [self.estimator.predict_candidate(candidate) for candidate in candidates]  # type: ignore[union-attr]
             else:
                 features = np.stack([candidate.features for candidate in candidates], axis=0).astype(np.float32)
                 action_indices = np.asarray([action.index for action in missing], dtype=np.int64)
-                with torch.no_grad():
+                # inference_mode avoids autograd version-counter overhead while
+                # preserving the learned model's exact evaluation semantics.
+                with torch.inference_mode():
                     output = self.model(
                         torch.as_tensor(features, dtype=torch.float32),
                         torch.as_tensor(action_indices, dtype=torch.long),
@@ -224,12 +228,23 @@ class RiskModuleWrapper:
                     )
                     for index in range(len(missing))
                 ]
+            forward_elapsed = time.perf_counter() - forward_started
+            pack_started = time.perf_counter()
             for action, prediction in zip(missing, predictions):
                 cache[(id(self), int(action.index))] = prediction
-            if tracker is not None and started is not None:
-                import time
-
+            pack_elapsed = time.perf_counter() - pack_started
+            candidate_latency = dict(context.get("_risk_candidate_latency", {}) or {})
+            context["_risk_last_latency"] = {
+                "candidate_features": float(feature_elapsed),
+                "network_forward": float(forward_elapsed),
+                "result_pack": float(pack_elapsed),
+                **{str(name): float(value) for name, value in candidate_latency.items()},
+            }
+            if tracker is not None:
                 tracker.add_time("risk_forward_time", time.perf_counter() - started)
+                tracker.add_time("risk_candidate_features_time", feature_elapsed)
+                tracker.add_time("risk_network_forward_time", forward_elapsed)
+                tracker.add_time("risk_result_pack_time", pack_elapsed)
                 tracker.increment("risk_forwards")
                 tracker.increment("risk_candidates", len(missing))
         return [cache[(id(self), int(action.index))] for action in actions]

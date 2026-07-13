@@ -20,6 +20,7 @@ from safe_rl.accvp.root_context import capture_root_context, synchronise_root_st
 from safe_rl.accvp.schema import (
     COUNTERFACTUAL_SCHEMA_VERSION,
     COUNTERFACTUAL_SHARD_MANIFEST_VERSION,
+    SCENARIO_EPISODE_KEY_VERSION,
     canonical_json,
     file_sha256,
     stable_hash,
@@ -159,10 +160,13 @@ class _SecondaryRiskEvaluator:
 
     def score(self, context: dict[str, Any], legal_ids: list[int]) -> dict[str, dict[str, Any]]:
         by_index = {action.index: action for action in ACTIONS}
+        actions = [by_index[int(action_id)] for action_id in legal_ids]
+        checks = self.shield.evaluate_candidates(actions, context)
+        if len(checks) != len(actions):
+            raise ValueError("Shield candidate-check count does not match ACCVP legal-action batch")
         result: dict[str, dict[str, Any]] = {}
-        for action_id in legal_ids:
-            check = self.shield.evaluate_candidate(by_index[int(action_id)], context)
-            result[str(action_id)] = {
+        for action, check in zip(actions, checks):
+            result[str(int(action.index))] = {
                 "candidate_legal": bool(check["candidate_legal"]),
                 "risk_score": float(check["risk_score"]),
                 "risk_uncertainty": float(check["risk_uncertainty"]),
@@ -229,6 +233,15 @@ def collect(
     seed_schedule = _seed_schedule(cfg, episode_seeds, episodes)
     shard_id = _collection_id(counterfactual, policy_name, filter_name, seed_schedule, collection_id)
     source_name = str(collection_source or policy_name)
+    job_payload = dict(collection_job or {})
+    oracle_only = bool(job_payload.get("oracle_only", False))
+    cohort_role = str(job_payload.get("cohort_role", ""))
+    exclude_from_model_splits = bool(job_payload.get("exclude_from_model_splits", False))
+    if oracle_only and (not cohort_role or not exclude_from_model_splits):
+        raise ValueError(
+            "oracle-only collection jobs require cohort_role and "
+            "exclude_from_model_splits=true"
+        )
     shard_dir = assert_new_shard(immutable_shard_dir(stage_dir, output_name, shard_id))
     store = CounterfactualSnapshotStore(
         shard_dir,
@@ -307,16 +320,25 @@ def collect(
                             root.metadata["risk_model_fingerprint"] = secondary_risk.fingerprint
                             root.metadata["collection_id"] = shard_id
                             root.metadata["collection_source"] = source_name
+                            root.metadata["oracle_only"] = oracle_only
+                            root.metadata["cohort_role"] = cohort_role
+                            root.metadata["exclude_from_model_splits"] = exclude_from_model_splits
                             metadata_path, tensor_path = store.write_root(root, legal_ids)
                             root_rows.append(
                                 {
                                     "root_id": root_id,
                                     "root_episode_id": str(root.metadata["root_episode_id"]),
+                                    "scenario_episode_key_version": str(root.metadata["scenario_episode_key_version"]),
+                                    "scenario_episode_key": str(root.metadata["scenario_episode_key"]),
+                                    "scenario_route_hash": str(root.metadata["scenario_route_hash"]),
                                     "episode_seed": int(env.seed_value),
                                     "root_source": policy_name,
                                     "root_policy": policy_name,
                                     "root_filter": filter_name,
                                     "collection_source": source_name,
+                                    "oracle_only": oracle_only,
+                                    "cohort_role": cohort_role,
+                                    "exclude_from_model_splits": exclude_from_model_splits,
                                     "raw_action_id": int(raw_action),
                                     "raw_action_legal": bool(raw_action_legal),
                                     "traffic_profile": str(context.get("curriculum_profile", "unknown")),
@@ -381,10 +403,15 @@ def collect(
         "collected_roots": collected,
         "complete_roots": sum(1 for row in root_rows if row.get("complete")),
         "failed_branches": sum(1 for row in branch_rows if row.get("branch_status") != "completed"),
-        "collection_job": dict(collection_job or {}),
+        "collection_job": job_payload,
+        "oracle_only": oracle_only,
+        "cohort_role": cohort_role,
+        "exclude_from_model_splits": exclude_from_model_splits,
         "cache_dir": str(store.cache_dir),
         "config_hash": stable_hash(dict(cfg)),
         "scenario_config_hash": scenario_config_hash,
+        "scenario_route_hash": str(contract["scenario_route_hash"]),
+        "scenario_episode_key_version": SCENARIO_EPISODE_KEY_VERSION,
         "action_execution_profile": str(cfg.scenario.get("action_execution_profile", "current_v1")),
         "candidate_plan_profile": str(cfg.accvp.candidate_plan_profile),
         "risk_model_fingerprint": secondary_risk.fingerprint,

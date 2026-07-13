@@ -1,0 +1,50 @@
+run:
+  run_id: "ppo_wcdt_v3_reward_v2_template"
+  # Fixed simulator-training cohort seed. Replicates vary rl.optimizer_seed.
+  seed: 20001
+  output_root: "safe_rl_output/runs"
+  tensorboard: true
+  replay: false
+
+experiment:
+  method_id: "wcdt_reward_v2"
+  note: "Canonical WcDT-11D Reward-v2 baseline replicate template."
+
+evaluation_protocol:
+  strict: true
+  protocol_id: "accvp-vnext-correctness-v1"
+  seed_ledger: "safe_rl/config/accvp_vnext_seed_ledger.json"
+  revocation_manifest: "safe_rl/config/artifact_revocation_manifest_vnext.json"
+  cohort_roles:
+    stage3_training: "ppo_training"
+    stage3_selection: "ppo_selection"
+    ppo_optimizer_replicates: "ppo_optimizer_replicates"
+
+forecast_features:
+  enabled: true
+  use_for_ppo_observation: true
+  source: "wcdt_v3"
+  checkpoint: "safe_rl_output/runs/safe_rl_comparison_schema9_validation_001/stage2/wcdt_v3_predictor.pt"
+  allow_heuristic_fallback: false
+
+rl:
+  use_wcdt_forecast_features: true
+  reward_profile: "merge_timing_forecast"
+  training_semantics_version: "reward_v2_mainline_001"
+  optimizer_seed: 1001
+  total_timesteps: 100000
+  merge_timing_reward:
+    reward_version: "opportunity_window_v2"
+  shield_guided_reward:
+    risk_checkpoint: "safe_rl_output/runs/safe_rl_comparison_schema9_validation_001/stage2/risk_module.pt"
+  policy_lateral_commitment:
+    enabled: false
+    profile: "left_intent_1s_risk_gated_v2"
+    duration_s: 1.0
+    preserve_raw_accel: true
+
+accvp:
+  enabled: false
+  mode: "off"
+  observation:
+    enabled: false

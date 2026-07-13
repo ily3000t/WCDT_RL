@@ -1,0 +1,26 @@
+{
+  "schema_version": 1,
+  "artifact_kind": "safe_rl_artifact_revocation_manifest_v1",
+  "protocol_id": "accvp-vnext-correctness-v1",
+  "status": "superseded",
+  "deployable": false,
+  "allowed_usage": "diagnostic_only",
+  "reason": "Legacy ACCVP artifacts were produced before actor-row v3, fingerprint-component splits, untouched holdout evaluation, and bounded-stale runtime gates.",
+  "path_base": "../..",
+  "artifacts": [
+    {"path": "safe_rl_output/runs/accvp_240_formal_dataset", "match": "path_prefix", "status": "superseded", "deployable": false, "allowed_usage": "diagnostic_only"},
+    {"path": "safe_rl_output/runs/accvp_240_shadow_train", "match": "path_prefix", "status": "superseded", "deployable": false, "allowed_usage": "diagnostic_only"},
+    {"path": "safe_rl_output/runs/accvp_240_lite_risk_audit", "match": "path_prefix", "status": "superseded", "deployable": false, "allowed_usage": "diagnostic_only"},
+    {"path": "safe_rl_output/runs/accvp_240_lite_v2", "match": "path_prefix", "status": "superseded", "deployable": false, "allowed_usage": "diagnostic_only"},
+    {"path": "safe_rl_output/runs/accvp_240_lite_v3", "match": "path_prefix", "status": "superseded", "deployable": false, "allowed_usage": "diagnostic_only"},
+    {"path": "safe_rl_output/runs/ppo_accvp_candidate_table_reward_v2", "match": "path_prefix", "status": "superseded", "deployable": false, "allowed_usage": "diagnostic_only"},
+    {"path": "safe_rl_output/runs/ppo_accvp_candidate_table_reward_v3", "match": "path_prefix", "status": "superseded", "deployable": false, "allowed_usage": "diagnostic_only"},
+    {"path": "safe_rl_output/runs/stage5_accvp_assisted_ppo_candidate_table", "match": "path_prefix", "status": "superseded", "deployable": false, "allowed_usage": "diagnostic_only"},
+    {"path": "safe_rl_output/runs/stage5_reward_v2_accvp", "match": "path_prefix", "status": "superseded", "deployable": false, "allowed_usage": "diagnostic_only"}
+  ],
+  "metadata": {
+    "replacement_protocol": "accvp-vnext-correctness-v1",
+    "deletion_required": false,
+    "formal_lineage_loading_allowed": false
+  }
+}

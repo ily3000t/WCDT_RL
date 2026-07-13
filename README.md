@@ -62,7 +62,7 @@ rl:
 旧版默认 reward 对照必须显式加载：
 
 ```text
-safe_rl/config/advanced/legacy_default_reward.yaml
+safe_rl/config/baselines/no_forecast/legacy_default_reward.yaml
 ```
 
 Current 50-seed evidence on `stage5_merge_timing_reward_v2_eval`:
@@ -285,7 +285,7 @@ prediction:
 Stage4 采集完成后，如果要把 on-policy failure buffer 合并回 Risk Module 训练，使用：
 
 ```powershell
-python -m safe_rl.pipeline.stage2_train_prediction_risk --run-id $RUN_ID --config safe_rl\config\advanced\stage2_with_stage4.yaml
+python -m safe_rl.pipeline.stage2_train_prediction_risk --run-id $RUN_ID --config safe_rl\config\active\pipeline\stage2_with_stage4.yaml
 ```
 
 该配置会读取同一 run 下的 `stage1/risk_probe_buffer/manifest.json` 与 `arrays/*.npy`，并与 `stage4/on_policy_failure_buffer.npz` 的风险样本合并训练 Risk Module；WcDT predictor 仍优先使用 Stage1 的 trajectory windows。历史 run 的 `stage1/risk_probe_buffer.npz` 仅作为只读兼容输入。
@@ -311,21 +311,21 @@ Stage3 使用 Stable-Baselines3 的 TensorBoard 记录 PPO reward、episode leng
 如果要先训练不依赖 checkpoint 的 `PPO + constant-velocity forecast features`，使用覆盖配置：
 
 ```text
-safe_rl/config/advanced/ppo_constant_velocity_features.yaml
+safe_rl/config/baselines/cv/ppo_constant_velocity_features.yaml
 ```
 
 如果要训练旧版 `PPO + WcDT v1 forecast features`，使用历史兼容覆盖配置：
 
 ```text
-safe_rl/config/advanced/ppo_forecast_features.yaml
-safe_rl/config/advanced/ppo_wcdt_v1_features_legacy.yaml
+safe_rl/config/baselines/wcdt/ppo_forecast_features.yaml
+safe_rl/config/baselines/wcdt/ppo_wcdt_v1_features_legacy.yaml
 ```
 
 `ppo_forecast_features.yaml` 保留是为了旧命令不失效；新主线推荐通过 full runner 生成 CV + WcDT v3 的 forecast PPO 配置。注意：forecast-feature PPO 是 63 维 observation，不能复用 baseline 的 52 维 PPO；如果手动训练 WcDT v1，需要把配置中的 `forecast_features.checkpoint` 指向 baseline run 的 `stage2/wcdt_predictor.pt`。
 
 ```powershell
 $FORECAST_RUN_ID = "safe_rl_highway_merge_forecast_001"
-python -m safe_rl.pipeline.stage3_train_ppo --run-id $FORECAST_RUN_ID --config safe_rl\config\advanced\ppo_forecast_features.yaml
+python -m safe_rl.pipeline.stage3_train_ppo --run-id $FORECAST_RUN_ID --config safe_rl\config\baselines\wcdt\ppo_forecast_features.yaml
 ```
 
 ### Stage4：RL 过程危险片段采集与风险模型修正数据
@@ -346,12 +346,12 @@ safe_rl_output/runs/<run_id>/stage4/replay/episode_0000.json
 safe_rl_output/runs/<run_id>/stage4/tensorboard/
 ```
 
-如果要启用真实 intervention mode，使用覆盖配置 `safe_rl/config/advanced/stage4_intervention.yaml`。
+如果要启用真实 intervention mode，使用覆盖配置 `safe_rl/config/active/pipeline/stage4_intervention.yaml`。
 
 命令：
 
 ```powershell
-python -m safe_rl.pipeline.stage4_collect_failures --run-id $RUN_ID --config safe_rl\config\advanced\stage4_intervention.yaml
+python -m safe_rl.pipeline.stage4_collect_failures --run-id $RUN_ID --config safe_rl\config\active\pipeline\stage4_intervention.yaml
 ```
 
 Stage4 report 会额外记录 action histogram、shadow would-replace rate、fallback rate、raw risk 分布和 replacement risk delta，用于判断 Shield 是否仍在过度干预。
@@ -377,10 +377,10 @@ safe_rl_output/runs/<run_id>/stage5/tensorboard/
 如果要手动比较 baseline、CV forecast 和 WcDT v2 forecast，建议分别训练 baseline PPO、CV forecast PPO、WcDT v2 forecast PPO，然后复制并修改 ablation 模板中的 `model_path`：
 
 ```text
-safe_rl/config/advanced/stage5_six_groups_cv_wcdt_v2.example.yaml
+safe_rl/config/examples/vnext/stage5_six_groups_cv_wcdt_v2.example.yaml
 ```
 
-旧模板 `safe_rl/config/advanced/stage5_four_groups.example.yaml` 是 WcDT v1 legacy 示例，不作为新主实验模板。模板中的 forecast 组必须显式设置对应 63 维 forecast PPO 的 `model_path`。CV、WcDT v1 和 WcDT v2 虽然 observation 都是 63 维，但 forecast feature 分布不同，应分别训练 PPO。`forecast_source: "wcdt"` 还要设置 `forecast_checkpoint` 指向 Stage2 的 `wcdt_predictor.pt`；`forecast_source: "wcdt_v2"` 指向 `wcdt_v2_predictor.pt`；`forecast_source: "constant_velocity"` 不需要 checkpoint。Stage5 会在评估前校验 PPO model 和环境 observation shape，不匹配会直接失败。
+旧模板 `safe_rl/config/examples/legacy/stage5_four_groups.example.yaml` 是 WcDT v1 legacy 示例，不作为新主实验模板。模板中的 forecast 组必须显式设置对应 63 维 forecast PPO 的 `model_path`。CV、WcDT v1 和 WcDT v2 虽然 observation 都是 63 维，但 forecast feature 分布不同，应分别训练 PPO。`forecast_source: "wcdt"` 还要设置 `forecast_checkpoint` 指向 Stage2 的 `wcdt_predictor.pt`；`forecast_source: "wcdt_v2"` 指向 `wcdt_v2_predictor.pt`；`forecast_source: "constant_velocity"` 不需要 checkpoint。Stage5 会在评估前校验 PPO model 和环境 observation shape，不匹配会直接失败。
 
 命令：
 
@@ -733,7 +733,7 @@ python -m safe_rl.pipeline.stage1_risk_probe --run-id $RUN_ID
 python -m safe_rl.pipeline.stage2_train_prediction_risk --run-id $RUN_ID
 python -m safe_rl.pipeline.stage3_train_ppo --run-id $RUN_ID
 python -m safe_rl.pipeline.stage4_collect_failures --run-id $RUN_ID
-python -m safe_rl.pipeline.stage2_train_prediction_risk --run-id $RUN_ID --config safe_rl\config\advanced\stage2_with_stage4.yaml
+python -m safe_rl.pipeline.stage2_train_prediction_risk --run-id $RUN_ID --config safe_rl\config\active\pipeline\stage2_with_stage4.yaml
 python -m safe_rl.pipeline.stage5_paired_eval --run-id $RUN_ID
 ```
 

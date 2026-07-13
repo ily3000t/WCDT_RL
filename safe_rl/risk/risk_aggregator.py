@@ -51,16 +51,27 @@ def _quantile_summary(values: list[float]) -> dict[str, float | None]:
 
 def _latency_quantiles(values: list[float]) -> dict[str, float | None]:
     if not values:
-        return {"p50": None, "p95": None, "max": None}
+        return {"p50": None, "p95": None, "p99": None, "max": None}
     arr = np.asarray(values, dtype=np.float64)
     return {
         "p50": float(np.percentile(arr, 50)),
         "p95": float(np.percentile(arr, 95)),
+        "p99": float(np.percentile(arr, 99)),
         "max": float(np.max(arr)),
     }
 
 
 def _accvp_observation_metrics(reports: list[dict]) -> dict:
+    observed_episode_seeds: set[int] = set()
+    missing_episode_seed_count = 0
+    for report in reports:
+        raw_seed = report.get("seed", report.get("episode_seed"))
+        try:
+            if raw_seed is None or isinstance(raw_seed, bool):
+                raise ValueError
+            observed_episode_seeds.add(int(raw_seed))
+        except (TypeError, ValueError, OverflowError):
+            missing_episode_seed_count += 1
     decision_count = int(sum(int(report.get("accvp_table_decision_count", 0)) for report in reports))
     activation_count = int(sum(int(report.get("accvp_table_activation_window_decision_count", 0)) for report in reports))
     valid_count = int(sum(int(report.get("accvp_table_valid_decision_count", 0)) for report in reports))
@@ -71,24 +82,62 @@ def _accvp_observation_metrics(reports: list[dict]) -> dict:
     fail_closed_count = int(sum(int(report.get("accvp_table_fail_closed_count", 0)) for report in reports))
     hard_fail_closed_count = int(sum(int(report.get("accvp_table_hard_fail_closed_count", 0)) for report in reports))
     last_valid_fallback_count = int(sum(int(report.get("accvp_table_last_valid_fallback_count", 0)) for report in reports))
+    bounded_stale_reuse_count = int(
+        sum(int(report.get("accvp_table_bounded_stale_reuse_count", 0)) for report in reports)
+    )
+    stale_expired_count = int(sum(int(report.get("accvp_table_stale_expired_count", 0)) for report in reports))
+    stale_context_rejected_count = int(
+        sum(int(report.get("accvp_table_stale_context_rejected_count", 0)) for report in reports)
+    )
     no_prior_fallback_count = int(sum(int(report.get("accvp_table_no_prior_fallback_count", 0)) for report in reports))
     invalid_dropout_count = int(sum(int(report.get("accvp_table_invalid_dropout_count", 0)) for report in reports))
     warmup_count = int(sum(int(report.get("accvp_table_warmup_count", 0)) for report in reports))
     warmup_error_count = int(sum(int(report.get("accvp_table_warmup_error_count", 0)) for report in reports))
+    warmup_required_count = int(
+        sum(bool(report.get("accvp_observation_warmup_enabled", False)) for report in reports)
+    )
+    warmup_ready_count = int(
+        sum(
+            bool(report.get("accvp_observation_warmup_ready", False))
+            for report in reports
+            if bool(report.get("accvp_observation_warmup_enabled", False))
+        )
+    )
+    max_consecutive_timeout_count = int(
+        max((int(report.get("accvp_table_max_consecutive_timeout_count", 0)) for report in reports), default=0)
+    )
     model_error_count = int(sum(int(report.get("accvp_table_model_error_count", 0)) for report in reports))
     invalid_bundle_count = int(sum(int(report.get("accvp_table_invalid_bundle_count", 0)) for report in reports))
+    invalid_output_count = int(sum(int(report.get("accvp_table_invalid_output_count", 0)) for report in reports))
     latencies: list[float] = []
     warmup_latencies: list[float] = []
+    stale_ages: list[float] = []
+    stale_context_deltas: list[float] = []
+    stale_rejection_reasons: Counter[str] = Counter()
     stage_latencies: dict[str, list[float]] = {
         "context_legality": [],
         "accvp_prepare_candidates": [],
         "accvp_score": [],
         "risk_secondary": [],
+        "risk_context": [],
+        "risk_predict_many": [],
+        "risk_candidate_features": [],
+        "risk_other_rollout": [],
+        "risk_ego_rollout": [],
+        "risk_pairwise_geometry": [],
+        "risk_merge_local_reduction": [],
+        "risk_network_forward": [],
+        "risk_result_pack": [],
         "table_pack": [],
     }
     for report in reports:
         latencies.extend(float(value) for value in list(report.get("accvp_table_latency_total_s", []) or []))
         warmup_latencies.extend(float(value) for value in list(report.get("accvp_table_warmup_latency_s", []) or []))
+        stale_ages.extend(float(value) for value in list(report.get("accvp_table_stale_age_s", []) or []))
+        stale_context_deltas.extend(
+            float(value) for value in list(report.get("accvp_table_stale_context_delta_norm", []) or [])
+        )
+        stale_rejection_reasons.update(dict(report.get("accvp_table_stale_rejection_reasons", {}) or {}))
         stage_payload = dict(report.get("accvp_table_latency_stage_s", {}) or {})
         for stage_name in stage_latencies:
             stage_latencies[stage_name].extend(
@@ -96,15 +145,44 @@ def _accvp_observation_metrics(reports: list[dict]) -> dict:
             )
     latency_summary = _latency_quantiles(latencies)
     warmup_latency_summary = _latency_quantiles(warmup_latencies)
+    stale_age_summary = _latency_quantiles(stale_ages)
+    stale_context_delta_summary = _latency_quantiles(stale_context_deltas)
     valid_rate_activation = float(activation_valid_count / activation_count) if activation_count else 0.0
+    timeout_rate_activation = float(timeout_count / activation_count) if activation_count else 0.0
+    stale_rate_activation = float(last_valid_fallback_count / activation_count) if activation_count else 0.0
+    warmup_ready_rate = (
+        float(warmup_ready_count / warmup_required_count) if warmup_required_count else 1.0
+    )
     latency_p95 = latency_summary["p95"]
+    latency_p99 = latency_summary["p99"]
+    latency_max = latency_summary["max"]
+    risk_secondary_summary = _latency_quantiles(stage_latencies["risk_secondary"])
     runtime_gate_pass = bool(
-        valid_rate_activation >= 0.95
+        len(observed_episode_seeds) >= 30
+        and missing_episode_seed_count == 0
+        and activation_count >= 1000
+        and valid_rate_activation >= 0.995
+        and timeout_rate_activation <= 0.005
+        and stale_rate_activation <= 0.005
         and hard_fail_closed_count == 0
+        and max_consecutive_timeout_count <= 1
+        and model_error_count == 0
+        and invalid_bundle_count == 0
+        and invalid_output_count == 0
+        and warmup_error_count == 0
+        and warmup_ready_rate >= 1.0
         and latency_p95 is not None
-        and float(latency_p95) <= 0.5
+        and float(latency_p95) <= 0.30
+        and latency_p99 is not None
+        and float(latency_p99) <= 0.40
+        and latency_max is not None
+        and float(latency_max) <= 0.50
+        and risk_secondary_summary["p95"] is not None
+        and float(risk_secondary_summary["p95"]) <= 0.15
     )
     return {
+        "accvp_table_unique_episode_seed_count": int(len(observed_episode_seeds)),
+        "accvp_table_missing_episode_seed_count": int(missing_episode_seed_count),
         "accvp_table_decision_count": decision_count,
         "accvp_table_activation_window_decision_count": activation_count,
         "accvp_table_valid_decision_count": valid_count,
@@ -113,25 +191,40 @@ def _accvp_observation_metrics(reports: list[dict]) -> dict:
         "accvp_table_valid_rate_activation_window": valid_rate_activation,
         "accvp_table_timeout_count": timeout_count,
         "accvp_table_timeout_rate": float(timeout_count / decision_count) if decision_count else 0.0,
+        "accvp_table_timeout_rate_activation_window": timeout_rate_activation,
         "accvp_table_fail_closed_count": fail_closed_count,
         "accvp_table_fail_closed_rate": float(fail_closed_count / decision_count) if decision_count else 0.0,
         "accvp_table_hard_fail_closed_count": hard_fail_closed_count,
         "accvp_table_hard_fail_closed_rate": float(hard_fail_closed_count / decision_count) if decision_count else 0.0,
         "accvp_table_last_valid_fallback_count": last_valid_fallback_count,
         "accvp_table_last_valid_fallback_rate": float(last_valid_fallback_count / decision_count) if decision_count else 0.0,
+        "accvp_table_last_valid_fallback_rate_activation_window": stale_rate_activation,
+        "accvp_table_bounded_stale_reuse_count": bounded_stale_reuse_count,
+        "accvp_table_stale_expired_count": stale_expired_count,
+        "accvp_table_stale_context_rejected_count": stale_context_rejected_count,
+        "accvp_table_stale_rejection_reasons": dict(stale_rejection_reasons),
+        "accvp_table_stale_age_summary_s": stale_age_summary,
+        "accvp_table_stale_context_delta_summary": stale_context_delta_summary,
         "accvp_table_no_prior_fallback_count": no_prior_fallback_count,
         "accvp_table_invalid_dropout_count": invalid_dropout_count,
         "accvp_table_invalid_dropout_rate": float(invalid_dropout_count / decision_count) if decision_count else 0.0,
         "accvp_table_warmup_count": warmup_count,
         "accvp_table_warmup_error_count": warmup_error_count,
+        "accvp_table_warmup_required_count": warmup_required_count,
+        "accvp_table_warmup_ready_count": warmup_ready_count,
+        "accvp_table_warmup_ready_rate": warmup_ready_rate,
+        "accvp_table_max_consecutive_timeout_count": max_consecutive_timeout_count,
         "accvp_table_model_error_count": model_error_count,
         "accvp_table_invalid_bundle_count": invalid_bundle_count,
+        "accvp_table_invalid_output_count": invalid_output_count,
         "accvp_table_latency_count": int(len(latencies)),
         "accvp_table_latency_p50": latency_summary["p50"],
         "accvp_table_latency_p95": latency_summary["p95"],
+        "accvp_table_latency_p99": latency_summary["p99"],
         "accvp_table_latency_max": latency_summary["max"],
         "accvp_table_warmup_latency_p50": warmup_latency_summary["p50"],
         "accvp_table_warmup_latency_p95": warmup_latency_summary["p95"],
+        "accvp_table_warmup_latency_p99": warmup_latency_summary["p99"],
         "accvp_table_warmup_latency_max": warmup_latency_summary["max"],
         "accvp_table_runtime_gate_pass": runtime_gate_pass,
         "accvp_table_latency_per_stage": {

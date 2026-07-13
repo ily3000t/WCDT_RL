@@ -2240,7 +2240,7 @@ def test_default_reward_profile_is_reward_v2_and_legacy_overlay_restores_default
     assert cfg.rl.training_semantics_version == "reward_v2_mainline_001"
     assert cfg.rl.merge_timing_reward.reward_version == "opportunity_window_v2"
 
-    legacy = load_config("safe_rl/config/advanced/legacy_default_reward.yaml")
+    legacy = load_config("safe_rl/config/baselines/no_forecast/legacy_default_reward.yaml")
     assert legacy.rl.reward_profile == "default"
     assert legacy.rl.training_semantics_version == "legacy_default_reward_001"
 
@@ -3564,14 +3564,14 @@ def test_ppo_training_device_defaults_to_cpu_and_legacy_fallback_remains_availab
 
 
 def test_legacy_wcdt_v1_forecast_config_still_loads():
-    cfg = load_config("safe_rl/config/advanced/ppo_wcdt_v1_features_legacy.yaml")
+    cfg = load_config("safe_rl/config/baselines/wcdt/ppo_wcdt_v1_features_legacy.yaml")
     assert cfg.forecast_features.enabled is True
     assert cfg.forecast_features.source == "wcdt"
     assert cfg.forecast_features.allow_heuristic_fallback is False
 
 
 def test_stage5_six_group_cv_wcdt_v2_example_uses_current_mainline():
-    path = Path("safe_rl/config/advanced/stage5_six_groups_cv_wcdt_v2.example.yaml")
+    path = Path("safe_rl/config/examples/vnext/stage5_six_groups_cv_wcdt_v2.example.yaml")
     payload = yaml.safe_load(path.read_text(encoding="utf-8"))
     groups = {item["name"]: item for item in payload["stage5"]["groups"]}
     assert set(groups) == {

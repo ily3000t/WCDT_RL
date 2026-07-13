@@ -5,9 +5,9 @@ from __future__ import annotations
 import json
 from collections import Counter
 from pathlib import Path
-from typing import Any, Mapping
+from typing import Any, Iterable, Mapping
 
-from safe_rl.accvp.schema import read_json, write_json_atomic
+from safe_rl.accvp.schema import file_sha256, read_json, write_json_atomic
 
 
 def _jsonl(path: Path) -> list[dict[str, Any]]:
@@ -23,6 +23,9 @@ def validate_pilot_dataset(
     min_branch_success_rate: float = 0.99,
     min_observed_viability_fraction: float = 0.70,
     oracle_report_path: str | Path | None = None,
+    oracle_required_seeds: Iterable[int] | None = None,
+    oracle_cohort_role: str | None = None,
+    oracle_exclude_from_model_splits: bool | None = None,
 ) -> dict[str, Any]:
     """Validate fixed pilot criteria without treating model loss as a gate."""
 
@@ -79,14 +82,91 @@ def validate_pilot_dataset(
     oracle = None
     if oracle_report_path is not None:
         oracle = read_json(oracle_report_path)
-        oracle_matches_dataset = str(oracle.get("dataset_provenance", {}).get("dataset_fingerprint", "")) == str(
-            manifest.get("dataset_fingerprint", "")
+        expected_seeds = [
+            int(value)
+            for value in (
+                oracle_required_seeds
+                if oracle_required_seeds is not None
+                else oracle.get("required_seeds", [])
+            )
+        ]
+        report_dataset = str(oracle.get("dataset_dir", ""))
+        strict_oracle_contract = oracle_cohort_role is not None
+        oracle_dataset_path = Path(report_dataset).resolve() if report_dataset else None
+        oracle_dataset_exists = bool(
+            oracle_dataset_path is not None and oracle_dataset_path.is_dir()
+        ) if strict_oracle_contract else (
+            not report_dataset or bool(oracle_dataset_path and oracle_dataset_path.is_dir())
         )
-        conditions["seed2_5_oracle"] = bool(
-            oracle_matches_dataset
+        oracle_provenance_matches = not strict_oracle_contract
+        oracle_contract_matches = not strict_oracle_contract
+        oracle_scope_matches = not strict_oracle_contract
+        if strict_oracle_contract and oracle_dataset_path is not None and oracle_dataset_path.is_dir():
+            oracle_manifests = oracle_dataset_path / "manifests"
+            oracle_manifest = read_json(oracle_manifests / "dataset_manifest.json")
+            expected_provenance = dict(oracle.get("dataset_provenance", {}))
+            oracle_provenance_matches = all(
+                str(expected_provenance.get(key, "")) == actual
+                for key, actual in {
+                    "dataset_manifest_sha256": file_sha256(oracle_manifests / "dataset_manifest.json"),
+                    "roots_manifest_sha256": file_sha256(oracle_manifests / "roots.jsonl"),
+                    "branches_manifest_sha256": file_sha256(oracle_manifests / "branches.jsonl"),
+                }.items()
+            )
+            oracle_contract_matches = all(
+                oracle_manifest.get(key) == manifest.get(key)
+                for key in (
+                    "counterfactual_schema_version",
+                    "data_contract_hash",
+                    "accvp_activation_distance_m",
+                    "risk_model_fingerprint",
+                    "scenario_route_hash",
+                )
+            )
+            oracle_roots = [
+                row
+                for row in _jsonl(oracle_manifests / "roots.jsonl")
+                if bool(row.get("complete", False))
+                and int(row.get("episode_seed", -1)) in set(expected_seeds)
+                and str(row.get("root_policy", row.get("root_source", ""))) == "merge_timing"
+            ]
+            oracle_scope_matches = (
+                {int(row.get("episode_seed", -1)) for row in oracle_roots} == set(expected_seeds)
+                and all(
+                    bool(row.get("oracle_only", False))
+                    and str(row.get("cohort_role", "")) == str(oracle_cohort_role)
+                    and bool(row.get("exclude_from_model_splits", False))
+                    for row in oracle_roots
+                )
+            )
+        role_matches = oracle_cohort_role is None or (
+            str(oracle.get("cohort_role", "")) == str(oracle_cohort_role)
+            and bool(oracle.get("oracle_only", False))
+        )
+        exclusion_matches = oracle_exclude_from_model_splits is None or (
+            bool(oracle.get("exclude_from_model_splits", False))
+            == bool(oracle_exclude_from_model_splits)
+        )
+        if strict_oracle_contract:
+            forbidden_pilot_roots = [
+                str(row.get("root_id", ""))
+                for row in roots
+                if int(row.get("episode_seed", -1)) in set(expected_seeds)
+                or bool(row.get("oracle_only", False))
+                or bool(row.get("exclude_from_model_splits", False))
+                or str(row.get("cohort_role", "")) == str(oracle_cohort_role)
+            ]
+            conditions["oracle_excluded_from_pilot_dataset"] = not forbidden_pilot_roots
+        conditions["oracle_regression"] = bool(
+            oracle_dataset_exists
+            and oracle_provenance_matches
+            and oracle_contract_matches
+            and oracle_scope_matches
             and str(oracle.get("oracle_state", "")) == "go"
-            and [int(value) for value in oracle.get("required_seeds", [])] == [2, 5]
+            and [int(value) for value in oracle.get("required_seeds", [])] == expected_seeds
             and str(oracle.get("root_policy", "")) == "merge_timing"
+            and role_matches
+            and exclusion_matches
         )
     return {
         "dataset_dir": str(dataset),

@@ -3,6 +3,11 @@ from __future__ import annotations
 import argparse
 from pathlib import Path
 
+from safe_rl.accvp.artifacts import (
+    ACCVP_ARTIFACT_GENERATION,
+    apply_v2_bundle_paths,
+    artifact_filename,
+)
 from safe_rl.accvp.candidate_table_diagnostics import candidate_table_diagnostics
 from safe_rl.pipeline.common import write_report
 from safe_rl.utils.config import REPO_ROOT, load_config
@@ -34,9 +39,27 @@ def main() -> None:
     args = parser.parse_args()
 
     cfg = load_config(args.config)
+    apply_v2_bundle_paths(cfg)
     dataset = _resolve(args.dataset or cfg.accvp.dataset_dir)
-    checkpoint = _resolve(args.checkpoint) if args.checkpoint else _default_artifact_path(cfg, "accvp_v1_predictor.pt")
-    calibration = _resolve(args.calibration) if args.calibration else _default_artifact_path(cfg, "accvp_v1_calibration.json")
+    vnext = str(cfg.accvp.get("artifact_generation") or "") == ACCVP_ARTIFACT_GENERATION
+    checkpoint = (
+        _resolve(args.checkpoint)
+        if args.checkpoint
+        else _resolve(cfg.accvp.checkpoint)
+        if cfg.accvp.get("checkpoint")
+        else _default_artifact_path(
+            cfg, artifact_filename("predictor") if vnext else "accvp_v1_predictor.pt"
+        )
+    )
+    calibration = (
+        _resolve(args.calibration)
+        if args.calibration
+        else _resolve(cfg.accvp.calibration_bundle)
+        if cfg.accvp.get("calibration_bundle")
+        else _default_artifact_path(
+            cfg, artifact_filename("calibration") if vnext else "accvp_v1_calibration.json"
+        )
+    )
     output = _resolve(args.output) if args.output else _default_artifact_path(cfg, "accvp_candidate_table_diagnostics.json")
     report = candidate_table_diagnostics(
         config=cfg,

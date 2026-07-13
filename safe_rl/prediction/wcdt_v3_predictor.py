@@ -208,6 +208,54 @@ def build_v3_numpy_batch(
     }
 
 
+def selected_vehicle_ids_from_indices(
+    runtime_agent_ids: list[str] | np.ndarray,
+    selected_indices: np.ndarray,
+    actor_mask: np.ndarray,
+) -> list[str]:
+    """Resolve model-row vehicle IDs from the authoritative row permutation.
+
+    ``build_v3_numpy_batch`` may reorder non-ego actors for merge relevance.
+    Consequently, slicing ``runtime_agent_ids[1:]`` is not a valid row mapping.
+    Invalid/padded model rows are represented by an empty ID and every valid
+    row must resolve to one unique, non-ego vehicle.
+    """
+
+    ids = [str(value) for value in list(runtime_agent_ids)]
+    indices = np.asarray(selected_indices, dtype=np.int64).reshape(-1)
+    mask = np.asarray(actor_mask, dtype=np.float32).reshape(-1)
+    if indices.shape != mask.shape:
+        raise ValueError(
+            "WcDT v3 selected-index and actor-mask shapes differ: "
+            f"indices={indices.shape}, mask={mask.shape}"
+        )
+    resolved: list[str] = []
+    seen: set[str] = set()
+    for row, (index, valid) in enumerate(zip(indices.tolist(), mask.tolist())):
+        if float(valid) <= 0.0:
+            if int(index) > 0:
+                raise ValueError(
+                    f"WcDT v3 padded actor row {row} references live selected index {index}"
+                )
+            resolved.append("")
+            continue
+        if int(index) <= 0 or int(index) >= len(ids):
+            raise ValueError(
+                f"WcDT v3 actor row {row} has invalid selected index {index}; "
+                f"runtime_agent_count={len(ids)}"
+            )
+        vehicle_id = ids[int(index)]
+        if not vehicle_id:
+            raise ValueError(f"WcDT v3 actor row {row} resolved to an empty vehicle ID")
+        if ids and vehicle_id == ids[0]:
+            raise ValueError(f"WcDT v3 actor row {row} resolved to the ego vehicle")
+        if vehicle_id in seen:
+            raise ValueError(f"WcDT v3 actor row mapping contains duplicate vehicle ID {vehicle_id!r}")
+        seen.add(vehicle_id)
+        resolved.append(vehicle_id)
+    return resolved
+
+
 def build_v3_runtime_batch(cfg: Any, history: HistoryBuffer, ego_id: str) -> dict[str, Any]:
     latest = history.latest()
     ego = latest.get(ego_id)
@@ -255,6 +303,11 @@ def build_v3_runtime_batch(cfg: Any, history: HistoryBuffer, ego_id: str) -> dic
         for key, value in batch.items()
     }
     output["runtime_agent_ids"] = ids
+    output["actor_row_ids"] = selected_vehicle_ids_from_indices(
+        ids,
+        output["selected_indices"],
+        output["mask"][0],
+    )
     output["actor_selection"] = selection
     return output
 
@@ -538,11 +591,7 @@ class WcDTV3Predictor:
         batch = build_v3_runtime_batch(self.config, history, str(ego.vehicle_id))
         tensor_batch = tensorize_v3_batch(batch, self._torch, self.device)
         mean, uncertainty = ensemble_predict_v3(self.models, tensor_batch)
-        agent_ids = list(batch["runtime_agent_ids"])
-        selected_vehicle_ids = [
-            str(agent_ids[int(index)]) if 0 < int(index) < len(agent_ids) else ""
-            for index in batch["selected_indices"].tolist()
-        ]
+        selected_vehicle_ids = list(batch["actor_row_ids"])
         selection = batch["actor_selection"]
         return {
             "future_trajectories": mean.detach().cpu().numpy()[0],

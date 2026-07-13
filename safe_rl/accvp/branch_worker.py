@@ -8,7 +8,12 @@ import numpy as np
 
 from safe_rl.accvp.candidate_plan import ACCVP_COMMITMENT_PROFILE, apply_branch_command
 from safe_rl.accvp.root_context import load_root_context, restore_root_context
-from safe_rl.accvp.schema import COUNTERFACTUAL_SCHEMA_VERSION, file_sha256
+from safe_rl.accvp.schema import (
+    COUNTERFACTUAL_SCHEMA_VERSION,
+    ENTRY_TIME_LABEL_VERSION,
+    actor_row_mapping_hash,
+    file_sha256,
+)
 from safe_rl.risk.merge_local import merge_local_stats
 from safe_rl.sim.action_space import decode_action
 from safe_rl.sim.metrics import compute_step_metrics
@@ -62,8 +67,18 @@ def _branch_outcome(job: dict[str, Any]) -> dict[str, Any]:
         env._accvp_branch_target_speed = max(0.0, float(ego.speed) + float(action.accel_cmd) * 1.5 * 0.5)
         response_steps = max(1, int(config.accvp.response_horizon_steps))
         horizon_steps = max(1, int(config.accvp.candidate_plan_horizon_steps))
-        actor_ids = [str(value) for value in root.metadata.get("selected_actor_ids", [])]
         actor_count = int(config.accvp.actor_count)
+        actor_ids = [str(value) for value in root.metadata.get("actor_row_ids", [])]
+        source_indices = [int(value) for value in root.metadata.get("actor_row_source_indices", [])]
+        root_actor_mask = np.asarray(root.tensors["mask"], dtype=np.float32)[0].reshape(-1)
+        if len(actor_ids) != actor_count or len(source_indices) != actor_count:
+            raise ValueError(
+                "schema-v3 ACCVP root has incomplete actor row mapping: "
+                f"actor_ids={len(actor_ids)}, source_indices={len(source_indices)}, expected={actor_count}"
+            )
+        mapping_hash = actor_row_mapping_hash(actor_ids, source_indices, root_actor_mask)
+        if mapping_hash != str(root.metadata.get("actor_row_mapping_hash", "")):
+            raise ValueError("schema-v3 ACCVP root actor_row_mapping_hash mismatch")
         actor_response = np.zeros((actor_count, response_steps, 5), dtype=np.float32)
         actor_valid = np.zeros((actor_count, response_steps), dtype=np.float32)
         min_distance = float("inf")
@@ -136,7 +151,12 @@ def _branch_outcome(job: dict[str, Any]) -> dict[str, Any]:
             censor_reason = "horizon_elapsed"
             censor_time = float(horizon_steps) * float(env.step_length)
         tensor_path = output_dir / f"{branch_id}.npz"
-        _write_npz_atomic(tensor_path, actor_response=actor_response, actor_valid_mask=actor_valid)
+        _write_npz_atomic(
+            tensor_path,
+            actor_response=actor_response,
+            actor_valid_mask=actor_valid,
+            actor_row_ids=np.asarray(actor_ids, dtype=np.str_),
+        )
         secondary_risk = dict(root.metadata.get("secondary_risk", {}).get(str(action.index), {}))
         return {
             "counterfactual_schema_version": COUNTERFACTUAL_SCHEMA_VERSION,
@@ -162,12 +182,18 @@ def _branch_outcome(job: dict[str, Any]) -> dict[str, Any]:
             "root_policy": str(root.metadata.get("root_policy", root.metadata["root_source"])),
             "root_filter": str(root.metadata.get("root_filter", "all")),
             "collection_source": str(root.metadata.get("collection_source", root.metadata["root_source"])),
+            "oracle_only": bool(root.metadata.get("oracle_only", False)),
+            "cohort_role": str(root.metadata.get("cohort_role", "")),
+            "exclude_from_model_splits": bool(root.metadata.get("exclude_from_model_splits", False)),
             "raw_action_id": int(root.metadata.get("raw_action_id", -1)),
             "raw_action_legal": bool(root.metadata.get("raw_action_legal", False)),
             "risk_model_fingerprint": str(root.metadata.get("risk_model_fingerprint", "")),
             "secondary_risk": secondary_risk,
             "secondary_safety_pass": bool(secondary_risk.get("secondary_safety_pass", False)),
-            "selected_actor_ids": actor_ids,
+            "selected_actor_ids": [value for value in actor_ids if value],
+            "actor_row_ids": actor_ids,
+            "actor_row_source_indices": source_indices,
+            "actor_row_mapping_hash": mapping_hash,
             "selected_actor_coverage_complete": bool(root.metadata.get("selected_actor_coverage_complete", False)),
             "safety_actor_coverage_complete": bool(root.metadata.get("safety_actor_coverage_complete", False)),
             "event_observed": viability_status != "censored",
@@ -181,6 +207,13 @@ def _branch_outcome(job: dict[str, Any]) -> dict[str, Any]:
             "taper_miss_observed": bool(taper_miss_time is not None),
             "merge_before_taper_observed": bool(viability_status == "observed_success"),
             "target_lane_entry_time_s": target_lane_entry_time,
+            "entry_time_observed": bool(target_lane_entry_time is not None),
+            "entry_time_censor_time_s": float(censor_time),
+            "entry_time_censor_reason": (
+                "" if target_lane_entry_time is not None else
+                ("taper_miss" if viability_status == "observed_failure" else "horizon_elapsed")
+            ),
+            "entry_time_label_version": ENTRY_TIME_LABEL_VERSION,
             "min_obb_distance": float(min_distance),
             "min_ttc": float(min_ttc),
             "max_drac": float(max_drac),

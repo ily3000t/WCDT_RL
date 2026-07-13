@@ -8,9 +8,13 @@ from safe_rl.accvp.candidate_table_diagnostics import (
     load_calibration,
     load_models_from_checkpoint,
 )
+from safe_rl.accvp.artifacts import (
+    ACCVP_ARTIFACT_GENERATION,
+    apply_v2_bundle_paths,
+    artifact_filename,
+)
 from safe_rl.accvp.dataset import ACCVPBranchDataset
 from safe_rl.accvp.viability_lite import (
-    evaluate_lite_thresholds,
     tune_viability_lite_operating_point,
     write_lite_artifacts,
 )
@@ -42,6 +46,37 @@ def _lite_acceptance_failures(final_test: dict, cfg) -> list[str]:
     if not acceptance:
         return []
     failures: list[str] = []
+    evidence_minimums = (
+        ("min_effective_decision_count", "effective_decision_count"),
+        ("min_unique_episode_seed_count", "unique_episode_seed_count"),
+        ("min_effective_split_component_count", "effective_split_component_count"),
+        ("min_replacement_count", "replacement_count"),
+        (
+            "min_replacement_unique_episode_seed_count",
+            "replacement_unique_episode_seed_count",
+        ),
+        (
+            "min_replacement_effective_split_component_count",
+            "replacement_effective_split_component_count",
+        ),
+        ("min_replacement_observed_mass", "replacement_observed_mass"),
+        ("min_repairable_decision_mass", "repairable_decision_mass"),
+    )
+    if str(cfg.accvp.get("artifact_generation") or "").strip() == ACCVP_ARTIFACT_GENERATION:
+        missing = [
+            config_key
+            for config_key, _metric_key in evidence_minimums
+            if acceptance.get(config_key) is None
+        ]
+        if missing:
+            failures.append(f"formal_acceptance_minimums_missing:{','.join(missing)}")
+    for config_key, metric_key in evidence_minimums:
+        limit = acceptance.get(config_key)
+        if limit is None:
+            continue
+        value = _finite_float(final_test.get(metric_key))
+        if value < float(limit):
+            failures.append(f"{metric_key}<{limit}")
     replacement_count = int(final_test.get("replacement_count", 0))
     if bool(acceptance.get("require_replacement", False)) and replacement_count <= 0:
         failures.append("replacement_count<=0")
@@ -80,6 +115,7 @@ def main() -> None:
         raise ImportError("ACCVP-lite tuning requires torch.") from exc
 
     cfg = load_config(args.config)
+    apply_v2_bundle_paths(cfg)
     output_dir = _resolve(args.output_dir) if args.output_dir else _artifact_dir(cfg)
     dataset = _resolve(args.dataset or cfg.accvp.dataset_dir)
     checkpoint = (
@@ -87,39 +123,32 @@ def main() -> None:
         if args.checkpoint
         else _resolve(cfg.accvp.checkpoint)
         if cfg.accvp.get("checkpoint")
-        else output_dir / "accvp_v1_predictor.pt"
+        else output_dir
+        / (
+            artifact_filename("predictor")
+            if str(cfg.accvp.get("artifact_generation") or "") == ACCVP_ARTIFACT_GENERATION
+            else "accvp_v1_predictor.pt"
+        )
     )
     calibration_path = (
         _resolve(args.calibration)
         if args.calibration
         else _resolve(cfg.accvp.calibration_bundle)
         if cfg.accvp.get("calibration_bundle")
-        else output_dir / "accvp_v1_calibration.json"
+        else output_dir
+        / (
+            artifact_filename("calibration")
+            if str(cfg.accvp.get("artifact_generation") or "") == ACCVP_ARTIFACT_GENERATION
+            else "accvp_v1_calibration.json"
+        )
     )
     lite_cfg = cfg.accvp.get("viability_lite", {}) or {}
     artifact_prefix = str(lite_cfg.get("artifact_prefix", "accvp_v1_lite"))
     models = load_models_from_checkpoint(cfg, checkpoint, torch)
     calibration = load_calibration(calibration_path)
     operating_set = ACCVPBranchDataset(dataset, "operating_point")
-    test_set = ACCVPBranchDataset(dataset, "test")
     operating_records = candidate_records_from_dataset(models, operating_set, calibration, torch)
-    test_records = candidate_records_from_dataset(models, test_set, calibration, torch)
     operating_point = tune_viability_lite_operating_point(operating_records, cfg, split="operating_point")
-    final_test = evaluate_lite_thresholds(test_records, operating_point["selected"], split="test")
-    acceptance_failures = _lite_acceptance_failures(final_test, cfg)
-    if acceptance_failures:
-        failure = {
-            "artifact_kind": "accvp_viability_lite_tuning_failure",
-            "deployable_artifact": False,
-            "failures": acceptance_failures,
-            "operating_point": operating_point,
-            "final_test": final_test,
-        }
-        write_report(output_dir / f"{artifact_prefix}_tuning_failure_diagnostics.json", failure)
-        raise SystemExit(
-            "ACCVP-lite operating point failed acceptance; "
-            f"wrote {output_dir / f'{artifact_prefix}_tuning_failure_diagnostics.json'}"
-        )
     artifacts = write_lite_artifacts(
         output_dir=output_dir,
         config=cfg,
@@ -127,23 +156,31 @@ def main() -> None:
         checkpoint=checkpoint,
         calibration=calibration_path,
         operating_point=operating_point,
-        final_test=final_test,
         artifact_prefix=artifact_prefix,
     )
     summary = {
         "artifact_kind": "accvp_viability_lite_tuning_summary",
+        "artifact_generation": cfg.accvp.get("artifact_generation"),
         "controller": "acv_shield_lite",
         "deployable_claim": "task_viability_only",
+        "deployable_artifact": False,
+        "holdout_state": "sealed",
+        "threshold_selection_split": "operating_point",
+        "test_used_for_threshold_selection": False,
         "operating_point": operating_point,
-        "final_test": final_test,
         "artifacts": {key: str(value.resolve()) for key, value in artifacts.items()},
     }
-    write_report(output_dir / f"{artifact_prefix}_tuning_summary.json", summary)
+    summary_path = (
+        output_dir / artifact_filename("lite_tuning_summary")
+        if str(cfg.accvp.get("artifact_generation") or "") == ACCVP_ARTIFACT_GENERATION
+        else output_dir / f"{artifact_prefix}_tuning_summary.json"
+    )
+    write_report(summary_path, summary)
     print(
         "accvp_viability_lite_tuning "
         f"repair_capture={operating_point['selected_metrics']['repairable_root_capture_rate']:.6f} "
         f"replacement_rate={operating_point['selected_metrics']['replacement_rate']:.6f} "
-        f"test_repair_capture={final_test['repairable_root_capture_rate']:.6f} "
+        "holdout_state=sealed "
         f"manifest={artifacts['artifact_manifest']}"
     )
 

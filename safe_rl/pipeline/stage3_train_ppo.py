@@ -3,16 +3,50 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
+from safe_rl.accvp.artifacts import resolve_v2_bundle
 from safe_rl.accvp.observation import RiskGatedACCVPCandidateTableAugmentor
+from safe_rl.evaluation_protocol import build_stage_lineage, file_sha256, stable_hash
 from safe_rl.prediction.forecast_feature_augmentor import ForecastFeatureAugmentor
 from safe_rl.prediction.actor_selector import actor_selection_config_hash
 from safe_rl.prediction.forecast_rollout_bundle import FORECAST_ROLLOUT_BUNDLE_VERSION
 from safe_rl.prediction.trajectory_postprocess import TRAJECTORY_POSTPROCESS_VERSION
 from safe_rl.pipeline.common import latest_stage_file, load_stage_config, make_env, parse_config_arg, write_report
+from safe_rl.ppo_replicates import observation_contract, optimizer_seed, validate_reward_semantics
 from safe_rl.rl.ppo import train_ppo
 from safe_rl.sim.metrics import SAFETY_METRIC_VERSION
 from safe_rl.utils.config import prepare_run_dir
 from safe_rl.utils.progress import stage_log
+
+
+def _accvp_bundle_lineage(cfg) -> dict:
+    """Resolve the exact VNext bundle consumed by an ACCVP-enabled policy."""
+
+    if not RiskGatedACCVPCandidateTableAugmentor.enabled(cfg):
+        return {"required": False, "enabled": False}
+    source = cfg.accvp.get("artifact_manifest")
+    if not source:
+        raise ValueError("ACCVP-enabled Stage3 requires accvp.artifact_manifest")
+    path = Path(str(source)).resolve()
+    manifest, resolved = resolve_v2_bundle(path)
+    predictor = resolved.get("predictor")
+    if predictor is None:
+        raise ValueError("ACCVP-enabled Stage3 bundle is missing predictor")
+    payload = {
+        "required": True,
+        "enabled": True,
+        "manifest_path": str(path),
+        "manifest_sha256": file_sha256(path),
+        "artifact_fingerprint": str(manifest["artifact_fingerprint"]),
+        "artifact_variant": str(manifest["artifact_variant"]),
+        "artifact_generation": str(manifest["artifact_generation"]),
+        "bundle_schema_version": int(manifest["bundle_schema_version"]),
+        "formal_runtime_contract_sha256": str(
+            manifest["formal_runtime_contract_sha256"]
+        ),
+        "predictor_sha256": file_sha256(predictor),
+    }
+    payload["binding_fingerprint"] = stable_hash(payload)
+    return payload
 
 
 def _prediction_loss_summary(checkpoint: str | None, forecast_source: str | None = None) -> dict | None:
@@ -112,6 +146,10 @@ def _append_semantics_token(base_semantics: str, token: str, *, enabled: bool) -
 
 
 def run(cfg):
+    # Fail before SUMO/model construction when a human-readable semantics label
+    # disagrees with the reward and policy behavior that will actually execute.
+    reward_semantics = validate_reward_semantics(cfg)
+    observation_semantics = observation_contract(cfg, require_artifacts=False)
     cfg.shield["forecast_task_shadow_enabled"] = False
     cfg.shield["task_backstop_enabled"] = False
     cfg.shield["forecast_aware_candidate_ranking_mode"] = "off"
@@ -202,6 +240,12 @@ def run(cfg):
         enabled=RiskGatedACCVPCandidateTableAugmentor.enabled(cfg),
     )
     report["reward_profile"] = reward_profile
+    report["optimizer_seed"] = optimizer_seed(cfg)
+    report["simulator_training_start_seed"] = int(cfg.run.seed)
+    report["reward_semantics"] = reward_semantics["payload"]
+    report["reward_semantics_hash"] = reward_semantics["sha256"]
+    report["observation_contract"] = observation_semantics["payload"]
+    report["observation_contract_hash"] = observation_semantics["sha256"]
     report["merge_timing_reward_version"] = (
         str(merge_timing_cfg.get("reward_version", ""))
         if reward_profile == "merge_timing_forecast"
@@ -239,6 +283,16 @@ def run(cfg):
     report["observation_shape"] = observation_shape
     report["accvp_observation_summary"] = accvp_observation_summary
     report.update(accvp_observation_summary)
+    ordered_accvp_feature_names = list(
+        accvp_observation_summary.get(
+            "accvp_observation_feature_names",
+            RiskGatedACCVPCandidateTableAugmentor.feature_names(cfg)
+            if RiskGatedACCVPCandidateTableAugmentor.enabled(cfg)
+            else [],
+        )
+    )
+    report["accvp_observation_feature_names"] = ordered_accvp_feature_names
+    report["accvp_observation_feature_names_sha256"] = stable_hash(ordered_accvp_feature_names)
     report["accvp_observation_runtime_summary_semantics"] = (
         "last_env_episode_only" if RiskGatedACCVPCandidateTableAugmentor.enabled(cfg) else ""
     )
@@ -264,6 +318,32 @@ def run(cfg):
     report["sumo_installation"] = dict(
         cfg.scenario.get("sumo_installation_fingerprint", {}) or {}
     )
+    accvp_bundle_lineage = _accvp_bundle_lineage(cfg)
+    report["accvp_bundle_lineage"] = accvp_bundle_lineage
+    lineage_artifacts = {
+        "selected_ppo_model": report.get("model_path"),
+        "prediction_checkpoint": prediction_checkpoint,
+        "reward_risk_checkpoint": reward_risk_checkpoint,
+    }
+    if bool(accvp_bundle_lineage.get("required", False)):
+        lineage_artifacts["accvp_manifest"] = accvp_bundle_lineage["manifest_path"]
+    evidence_lineage = build_stage_lineage(
+        cfg,
+        stage="stage3",
+        role_seeds={
+            "stage3_training": [
+                int(item["episode_seed"])
+                for item in report.get("training_episode_seed_records", [])
+                if "episode_seed" in item
+            ],
+            "stage3_selection": [int(seed) for seed in report.get("checkpoint_selection_seeds", [])],
+        },
+        artifact_paths=lineage_artifacts,
+    )
+    evidence_lineage.pop("lineage_fingerprint", None)
+    evidence_lineage["accvp_bundle"] = accvp_bundle_lineage
+    evidence_lineage["lineage_fingerprint"] = stable_hash(evidence_lineage)
+    report["evidence_lineage"] = evidence_lineage
     write_report(stage_dir / "stage3_training_report.json", report)
     stage_log("stage3", f"tensorboard={stage_dir / 'tensorboard'}")
     stage_log("stage3", f"report={stage_dir / 'stage3_training_report.json'}")

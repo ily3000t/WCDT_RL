@@ -1,0 +1,155 @@
+schema_version: 1
+artifact_kind: safe_rl_config_registry_v1
+
+# Status is authoritative. Only `canonical` entries may define the ACCVP VNext
+# formal path. Baselines are valid comparison arms, supported configs are
+# operational utilities, templates require user substitution, and
+# diagnostic_only entries cannot contribute formal evidence.
+statuses:
+  canonical: "Current pre-registered ACCVP VNext workflow."
+  supported: "Maintained operational, smoke, or performance configuration."
+  baseline: "Maintained comparison baseline; not an ACCVP candidate artifact."
+  template: "Example only; placeholders must be resolved before execution."
+  diagnostic_only: "Historical reproduction/failure analysis only; no formal lineage."
+
+configs:
+  accvp_vnext_pilot:
+    path: active/accvp_vnext/pilot.yaml
+    status: canonical
+    protocol: accvp-vnext-correctness-v1
+    entrypoint: safe_rl.pipeline.stage1_collect_accvp_jobs
+  accvp_vnext_oracle_regression:
+    path: active/accvp_vnext/oracle_regression.yaml
+    status: canonical
+    protocol: accvp-vnext-correctness-v1
+    entrypoint: safe_rl.pipeline.stage1_collect_accvp_jobs
+  accvp_vnext_formal:
+    path: active/accvp_vnext/formal.yaml
+    status: canonical
+    protocol: accvp-vnext-correctness-v1
+    entrypoint: safe_rl.pipeline.stage1_collect_accvp_jobs
+  accvp_vnext_train:
+    path: active/accvp_vnext/train.yaml
+    status: canonical
+    protocol: accvp-vnext-correctness-v1
+    entrypoint: safe_rl.pipeline.stage2_train_accvp
+  ppo_accvp_candidate_table_vnext_dev:
+    path: active/accvp_vnext/ppo_candidate_table_dev.yaml
+    status: canonical
+    protocol: accvp-vnext-correctness-v1
+    entrypoint: safe_rl.pipeline.stage3_train_ppo
+    usage: canonical_replicate_template
+    minimum_optimizer_replicates: 5
+    generated_config_location: safe_rl_output/runs/<run>/generated_configs
+  ppo_accvp_candidate_table_vnext_full:
+    path: active/accvp_vnext/ppo_candidate_table_full.yaml
+    status: canonical
+    protocol: accvp-vnext-correctness-v1
+    entrypoint: safe_rl.pipeline.stage3_train_ppo
+    usage: canonical_replicate_template
+    minimum_optimizer_replicates: 5
+    generated_config_location: safe_rl_output/runs/<run>/generated_configs
+  accvp_vnext_ppo_ablation_matrix:
+    path: active/accvp_vnext/ppo_ablation_matrix.yaml
+    status: supported
+    protocol: accvp-vnext-correctness-v1
+    usage: method_definition_only
+
+  accvp_snapshot_smoke:
+    path: active/smoke/accvp_snapshot_smoke.yaml
+    status: supported
+    usage: smoke_only
+  pipeline_smoke_fast:
+    path: active/pipeline/pipeline_smoke_fast.yaml
+    status: supported
+    usage: smoke_only
+  pipeline_performance:
+    path: active/pipeline/pipeline_performance.yaml
+    status: supported
+    usage: performance_diagnostic
+  stage2_with_stage4:
+    path: active/pipeline/stage2_with_stage4.yaml
+    status: supported
+    usage: pipeline_overlay
+  stage4_intervention:
+    path: active/pipeline/stage4_intervention.yaml
+    status: supported
+    usage: pipeline_overlay
+
+  ppo_reward_v2_no_forecast:
+    path: baselines/no_forecast/ppo_reward_v2_no_forecast.yaml
+    status: baseline
+    baseline_family: no_forecast
+  legacy_default_reward:
+    path: baselines/no_forecast/legacy_default_reward.yaml
+    status: baseline
+    baseline_family: no_forecast_legacy_reward
+  ppo_constant_velocity_features:
+    path: baselines/cv/ppo_constant_velocity_features.yaml
+    status: baseline
+    baseline_family: constant_velocity
+  ppo_forecast_features:
+    path: baselines/wcdt/ppo_forecast_features.yaml
+    status: baseline
+    baseline_family: wcdt_v1_compatibility
+  ppo_forecast_shield_guided:
+    path: baselines/wcdt/ppo_forecast_shield_guided.yaml
+    status: baseline
+    baseline_family: wcdt_shield_guided
+  ppo_wcdt_v1_features_legacy:
+    path: baselines/wcdt/ppo_wcdt_v1_features_legacy.yaml
+    status: baseline
+    baseline_family: wcdt_v1_legacy
+  wcdt_v3_6actors:
+    path: baselines/wcdt/wcdt_v3_6actors.yaml
+    status: baseline
+    baseline_family: wcdt_v3
+  ppo_wcdt_v3_reward_v2:
+    path: baselines/wcdt/ppo_wcdt_v3_reward_v2.yaml
+    status: baseline
+    baseline_family: wcdt_v3
+    protocol: accvp-vnext-correctness-v1
+    entrypoint: safe_rl.pipeline.stage3_train_ppo_replicates
+    usage: canonical_replicate_template
+    minimum_optimizer_replicates: 5
+    generated_config_location: safe_rl_output/runs/<run>/generated_configs
+
+  evaluation_protocol_vnext_example:
+    path: examples/vnext/evaluation_protocol_vnext.example.yaml
+    status: template
+    protocol: accvp-vnext-correctness-v1
+  stage5_replicated_aggregate_vnext_example:
+    path: examples/vnext/stage5_replicated_aggregate_vnext.example.json
+    status: template
+    protocol: accvp-vnext-correctness-v1
+  stage5_six_groups_cv_wcdt_v2_example:
+    path: examples/vnext/stage5_six_groups_cv_wcdt_v2.example.yaml
+    status: template
+
+# Archive families preserve filenames, so an old basename maps directly to the
+# corresponding directory below. These entries are intentionally broader than
+# individual files and are verified by tests.
+families:
+  accvp_schema2:
+    path_glob: archive/accvp_schema2/*.yaml
+    status: diagnostic_only
+    replaced_by: accvp_vnext_pilot, accvp_vnext_formal, accvp_vnext_train
+  candidate_table_v2_v3:
+    path_glob: archive/candidate_table_v2_v3/*.yaml
+    status: diagnostic_only
+    replaced_by: ppo_accvp_candidate_table_vnext_dev, ppo_accvp_candidate_table_vnext_full
+  stage5_legacy:
+    path_glob: archive/stage5_legacy/*.yaml
+    status: diagnostic_only
+    replaced_by: stage5_replicated_aggregate_vnext_example
+  diagnostics:
+    path_glob: archive/diagnostics/*.yaml
+    status: diagnostic_only
+  legacy_examples:
+    path_glob: examples/legacy/*.yaml
+    status: diagnostic_only
+
+local:
+  directory: local
+  tracked: false
+  policy: "Copy a template here for machine-specific paths; never use local files as formal evidence."

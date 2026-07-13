@@ -5,8 +5,15 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Any
 
-from safe_rl.accvp.schema import file_sha256, stable_hash
-from safe_rl.prediction.actor_selector import actor_selection_config_hash
+from safe_rl.accvp.schema import (
+    ACTOR_ROW_MAPPING_VERSION,
+    ENTRY_TIME_LABEL_VERSION,
+    ROOT_OBSERVATION_FINGERPRINT_VERSION,
+    file_sha256,
+    stable_hash,
+)
+from safe_rl.prediction.actor_selector import ACTOR_SELECTION_VERSION, actor_selection_config_hash
+from safe_rl.prediction.wcdt_v3_predictor import TRAJECTORY_SCHEMA_VERSION
 from safe_rl.sim.metrics import SAFETY_METRIC_VERSION
 
 
@@ -70,7 +77,7 @@ def counterfactual_data_contract(config: Any, risk_model_fingerprint: str) -> di
     """Fields that must match before ACCVP shards may be merged or deployed."""
 
     return {
-        "protocol_version": "accvp_240_v1",
+        "protocol_version": "accvp_240_v2",
         "scenario_config_hash": stable_hash(dict(config.scenario)),
         "scenario_route_hash": scenario_route_fingerprint(config),
         "action_execution_profile": str(config.scenario.get("action_execution_profile", "current_v1")),
@@ -81,7 +88,16 @@ def counterfactual_data_contract(config: Any, risk_model_fingerprint: str) -> di
         "viability_horizon_s": float(config.accvp.viability_horizon_s),
         "candidate_plan_horizon_steps": int(config.accvp.candidate_plan_horizon_steps),
         "actor_count": int(config.accvp.actor_count),
+        "actor_row_mapping_version": ACTOR_ROW_MAPPING_VERSION,
+        "root_observation_fingerprint_version": ROOT_OBSERVATION_FINGERPRINT_VERSION,
+        "entry_time_label_version": ENTRY_TIME_LABEL_VERSION,
+        "response_feature_order": ["x", "y", "heading", "speed", "accel"],
+        "wcdt_trajectory_schema_version": int(TRAJECTORY_SCHEMA_VERSION),
+        "actor_selection_version": ACTOR_SELECTION_VERSION,
         "actor_selection_config_hash": actor_selection_config_hash(config),
+        "vehicle_state_ordering_version": str(
+            config.scenario.get("vehicle_state_ordering_version", "unspecified_legacy")
+        ),
         "safety_metric_version": str(config.risk_module.get("safety_metric_version", SAFETY_METRIC_VERSION)),
         "event_definition_version": ACCVP_EVENT_DEFINITION_VERSION,
         "risk_model_fingerprint": str(risk_model_fingerprint),

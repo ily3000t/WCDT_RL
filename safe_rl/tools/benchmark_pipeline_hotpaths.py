@@ -14,7 +14,7 @@ from safe_rl.utils.sumo_installation import resolve_sumo_installation
 def _profile_config(profile: str):
     path = None
     if profile == "performance":
-        path = REPO_ROOT / "safe_rl" / "config" / "advanced" / "pipeline_performance.yaml"
+        path = REPO_ROOT / "safe_rl" / "config" / "active" / "pipeline" / "pipeline_performance.yaml"
     cfg = load_config(path)
     installation = resolve_sumo_installation(cfg.scenario)
     cfg.scenario.update(

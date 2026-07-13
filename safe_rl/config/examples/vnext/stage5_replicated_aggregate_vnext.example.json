@@ -1,0 +1,73 @@
+{
+  "artifact_kind": "stage5_replicated_aggregate_request_v1",
+  "comparison_id": "baseline_vs_accvp_vnext",
+  "formal_aggregation": true,
+  "minimum_training_seed_count": 5,
+  "require_strict_lineage": true,
+  "candidate_manifest": {
+    "path": "safe_rl_output/runs/accvp_vnext_train/accvp/accvp_vnext_schema3_candidate_manifest.json",
+    "sha256": "<candidate-manifest-sha256>",
+    "artifact_fingerprint": "<candidate-artifact-fingerprint>",
+    "artifact_variant": "full_candidate_gate_v1"
+  },
+  "candidate_side": "right",
+  "source_acceptance_key": "baseline_vs_accvp_vnext",
+  "formal_runtime_contract_sha256": "<formal-runtime-contract-sha256>",
+  "statistics": {
+    "continuous_metrics": [
+      "episode_reward"
+    ],
+    "binary_metrics": [
+      "proxy_collision",
+      "safety_violation",
+      "taper_miss",
+      "merge_success"
+    ],
+    "confidence": 0.95,
+    "bootstrap_replicates": 10000,
+    "bootstrap_seed": 42001,
+    "require_distinct_checkpoints": true
+  },
+  "replicates": [
+    {
+      "training_seed": 1001,
+      "stage5_report": "<seed-1001-formal-paired-eval-report.json>",
+      "left_group": "baseline_seed_1001",
+      "right_group": "candidate_seed_1001",
+      "left_checkpoint_sha256": "<baseline-seed-1001-checkpoint-sha256>",
+      "right_checkpoint_sha256": "<candidate-seed-1001-checkpoint-sha256>"
+    },
+    {
+      "training_seed": 1002,
+      "stage5_report": "<seed-1002-formal-paired-eval-report.json>",
+      "left_group": "baseline_seed_1002",
+      "right_group": "candidate_seed_1002",
+      "left_checkpoint_sha256": "<baseline-seed-1002-checkpoint-sha256>",
+      "right_checkpoint_sha256": "<candidate-seed-1002-checkpoint-sha256>"
+    },
+    {
+      "training_seed": 1003,
+      "stage5_report": "<seed-1003-formal-paired-eval-report.json>",
+      "left_group": "baseline_seed_1003",
+      "right_group": "candidate_seed_1003",
+      "left_checkpoint_sha256": "<baseline-seed-1003-checkpoint-sha256>",
+      "right_checkpoint_sha256": "<candidate-seed-1003-checkpoint-sha256>"
+    },
+    {
+      "training_seed": 1004,
+      "stage5_report": "<seed-1004-formal-paired-eval-report.json>",
+      "left_group": "baseline_seed_1004",
+      "right_group": "candidate_seed_1004",
+      "left_checkpoint_sha256": "<baseline-seed-1004-checkpoint-sha256>",
+      "right_checkpoint_sha256": "<candidate-seed-1004-checkpoint-sha256>"
+    },
+    {
+      "training_seed": 1005,
+      "stage5_report": "<seed-1005-formal-paired-eval-report.json>",
+      "left_group": "baseline_seed_1005",
+      "right_group": "candidate_seed_1005",
+      "left_checkpoint_sha256": "<baseline-seed-1005-checkpoint-sha256>",
+      "right_checkpoint_sha256": "<candidate-seed-1005-checkpoint-sha256>"
+    }
+  ]
+}

@@ -37,10 +37,19 @@ def tune_operating_point(models: list[Any], dataset: ACCVPBranchDataset, calibra
             bounds = calibration.score(raw)
             manifest = dataset.rows[index]
             root = dataset.roots[str(manifest["root_id"])]
+            root_id = str(manifest["root_id"])
+            fingerprint = dataset.observation_fingerprint_by_root.get(root_id, "")
+            decision_unit_id = (
+                f"{fingerprint}|raw:{int(root['raw_action_id'])}"
+                if fingerprint
+                else root_id
+            )
             secondary = dict(manifest.get("secondary_risk", {}))
             rows.append(
                 {
-                    "root_id": str(manifest["root_id"]),
+                    "root_id": root_id,
+                    "decision_unit_id": decision_unit_id,
+                    "root_observation_fingerprint": fingerprint,
                     "pU_proxy_collision": float(bounds["pU_proxy_collision"][0]),
                     "pU_safety_violation": float(bounds["pU_safety_violation"][0]),
                     "pL_merge_before_taper": float(bounds["pL_merge_before_taper"][0]),
@@ -56,6 +65,34 @@ def tune_operating_point(models: list[Any], dataset: ACCVPBranchDataset, calibra
             )
     if not rows:
         raise ValueError("operating-point split has no observed deadline viability rows")
+    raw_row_count = len(rows)
+    grouped_rows: dict[tuple[str, int], list[dict[str, Any]]] = defaultdict(list)
+    for row in rows:
+        grouped_rows[(str(row["decision_unit_id"]), int(row["action_id"]))].append(row)
+    collapsed_rows: list[dict[str, Any]] = []
+    for (decision_unit_id, action_id), members in sorted(grouped_rows.items()):
+        raw_actions = {int(row["raw_action_id"]) for row in members}
+        if len(raw_actions) != 1:
+            raise ValueError("duplicate operating-point decision unit has inconsistent raw actions")
+        collapsed_rows.append(
+            {
+                **members[0],
+                "root_id": decision_unit_id,
+                "decision_unit_id": decision_unit_id,
+                "action_id": action_id,
+                "pU_proxy_collision": max(float(row["pU_proxy_collision"]) for row in members),
+                "pU_safety_violation": max(float(row["pU_safety_violation"]) for row in members),
+                "pL_merge_before_taper": min(float(row["pL_merge_before_taper"]) for row in members),
+                "proxy_collision": float(np.mean([float(row["proxy_collision"]) for row in members])),
+                "safety_violation": float(np.mean([float(row["safety_violation"]) for row in members])),
+                "merge_before_taper": float(np.mean([float(row["merge_before_taper"]) for row in members])),
+                "merge_observed": bool(all(bool(row["merge_observed"]) for row in members)),
+                "candidate_legal": bool(all(bool(row["candidate_legal"]) for row in members)),
+                "secondary_safety_pass": bool(all(bool(row["secondary_safety_pass"]) for row in members)),
+                "replicate_count": len(members),
+            }
+        )
+    rows = collapsed_rows
     required = float(tuning.required_availability)
     candidates: list[dict[str, Any]] = []
     evaluated_points: list[dict[str, Any]] = []
@@ -132,4 +169,13 @@ def tune_operating_point(models: list[Any], dataset: ACCVPBranchDataset, calibra
             -row["candidate_set_availability"],
         ),
     )
-    return {"split": "operating_point", "required_availability": required, "selected": selected, "evaluated_points": candidates}
+    return {
+        "split": "operating_point",
+        "required_availability": required,
+        "selected": selected,
+        "evaluated_points": candidates,
+        "decision_weighting_version": "fingerprint_raw_action_total_weight_one_v1",
+        "raw_candidate_row_count": raw_row_count,
+        "effective_candidate_row_count": len(rows),
+        "effective_decision_count": len({str(row["decision_unit_id"]) for row in rows}),
+    }

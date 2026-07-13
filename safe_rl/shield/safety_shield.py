@@ -22,25 +22,60 @@ class SafetyShield:
 
     def evaluate_candidate(self, action: CandidateAction, context: dict[str, Any]) -> dict[str, Any]:
         """Evaluate one candidate without mutating Shield episode state."""
-        candidate_legal = bool(is_candidate_legal(action, context))
-        prediction = self.ranker.risk_model.predict(action, context)
+        return self.evaluate_candidates([action], context)[0]
+
+    def evaluate_candidates(
+        self,
+        actions: list[CandidateAction] | tuple[CandidateAction, ...],
+        context: dict[str, Any],
+        *,
+        candidate_legality: dict[int, bool] | None = None,
+    ) -> list[dict[str, Any]]:
+        """Batch-evaluate candidates without mutating Shield episode state.
+
+        The method deliberately evaluates every supplied action, including an
+        illegal one, so ``evaluate_candidate`` retains its historical score and
+        cache semantics. Callers that want to skip illegal work should pass only
+        their precomputed legal-action subset and conservatively fill the rest.
+        """
+
+        requested = list(actions)
+        if not requested:
+            return []
+        risk_model = self.ranker.risk_model
+        if hasattr(risk_model, "predict_many"):
+            predictions = list(risk_model.predict_many(requested, context))
+        else:  # pragma: no cover - compatibility with external estimators
+            predictions = [risk_model.predict(action, context) for action in requested]
+        if len(predictions) != len(requested):
+            raise ValueError("Risk Module prediction count does not match candidate batch")
         risk_threshold = float(self.config.shield.risk_threshold)
         uncertainty_threshold = float(self.config.shield.uncertainty_threshold)
-        if not candidate_legal:
-            veto_reason = "candidate_illegal"
-        elif float(prediction.risk_score) >= risk_threshold:
-            veto_reason = "risk_score"
-        elif float(prediction.risk_uncertainty) >= uncertainty_threshold:
-            veto_reason = "risk_uncertainty"
-        else:
-            veto_reason = ""
-        return {
-            "candidate_legal": candidate_legal,
-            "risk_score": float(prediction.risk_score),
-            "risk_uncertainty": float(prediction.risk_uncertainty),
-            "safety_pass": not veto_reason,
-            "veto_reason": veto_reason,
-        }
+        result: list[dict[str, Any]] = []
+        for action, prediction in zip(requested, predictions):
+            candidate_legal = bool(
+                candidate_legality.get(int(action.index), False)
+                if candidate_legality is not None
+                else is_candidate_legal(action, context)
+            )
+            if not candidate_legal:
+                veto_reason = "candidate_illegal"
+            elif float(prediction.risk_score) >= risk_threshold:
+                veto_reason = "risk_score"
+            elif float(prediction.risk_uncertainty) >= uncertainty_threshold:
+                veto_reason = "risk_uncertainty"
+            else:
+                veto_reason = ""
+            result.append(
+                {
+                    "candidate_legal": candidate_legal,
+                    "risk_score": float(prediction.risk_score),
+                    "risk_uncertainty": float(prediction.risk_uncertainty),
+                    "safety_pass": not veto_reason,
+                    "veto_reason": veto_reason,
+                }
+            )
+        return result
 
     def select_action(self, raw_action: CandidateAction, context: dict[str, Any]) -> tuple[CandidateAction, dict[str, Any]]:
         raw_legal = is_candidate_legal(raw_action, context)

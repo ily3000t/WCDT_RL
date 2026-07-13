@@ -1,7 +1,8 @@
 from __future__ import annotations
 
 import math
-from typing import Iterable
+from dataclasses import dataclass
+from typing import Iterable, Sequence
 
 import numpy as np
 
@@ -11,6 +12,194 @@ from safe_rl.sim.types import StepMetrics, VehicleState
 INF_TTC = 1.0e6
 SAFETY_METRIC_VERSION = "oriented_box_v1"
 _EPS = 1.0e-9
+
+
+@dataclass(frozen=True)
+class PairwiseBatchMetrics:
+    """Exact oriented-box metrics for an ``action x time x actor`` batch."""
+
+    gap: np.ndarray
+    ttc: np.ndarray
+    drac: np.ndarray
+    overlap: np.ndarray
+
+
+def _state_batch(states: Sequence[Sequence[VehicleState]]) -> dict[str, np.ndarray]:
+    rows = [list(row) for row in states]
+    if not rows:
+        return {
+            name: np.zeros((0, 0), dtype=np.float64)
+            for name in ("x", "y", "heading", "speed", "length", "width")
+        }
+    horizon = len(rows[0])
+    if any(len(row) != horizon for row in rows):
+        raise ValueError("vehicle-state batches must have a rectangular time dimension")
+    return {
+        name: np.asarray(
+            [[float(getattr(state, name)) for state in row] for row in rows],
+            dtype=np.float64,
+        )
+        for name in ("x", "y", "heading", "speed", "length", "width")
+    }
+
+
+def _batch_box_geometry(values: dict[str, np.ndarray]) -> tuple[np.ndarray, np.ndarray]:
+    heading = values["heading"]
+    cos_h = np.cos(heading)
+    sin_h = np.sin(heading)
+    half_length = 0.5 * np.maximum(values["length"], 0.1)
+    half_width = 0.5 * np.maximum(values["width"], 0.1)
+    center_x = values["x"] - half_length * cos_h
+    center_y = values["y"] - half_length * sin_h
+    forward = np.stack([cos_h, sin_h], axis=-1)
+    lateral = np.stack([-sin_h, cos_h], axis=-1)
+    axes = np.stack([forward, lateral], axis=-2)
+    signs = np.asarray(
+        ((1.0, 1.0), (1.0, -1.0), (-1.0, -1.0), (-1.0, 1.0)),
+        dtype=np.float64,
+    )
+    offsets = (
+        signs[:, 0] * half_length[..., None]
+    )[..., None] * forward[..., None, :] + (
+        signs[:, 1] * half_width[..., None]
+    )[..., None] * lateral[..., None, :]
+    centers = np.stack([center_x, center_y], axis=-1)
+    return centers[..., None, :] + offsets, axes
+
+
+def _batch_point_segment_minimum(
+    points: np.ndarray,
+    segment_points: np.ndarray,
+) -> np.ndarray:
+    starts = segment_points
+    ends = np.roll(segment_points, shift=-1, axis=-2)
+    point = points[..., :, None, :]
+    start = starts[..., None, :, :]
+    delta = (ends - starts)[..., None, :, :]
+    length_sq = np.sum(delta * delta, axis=-1)
+    numerator = np.sum((point - start) * delta, axis=-1)
+    ratio = np.divide(
+        numerator,
+        length_sq,
+        out=np.zeros_like(numerator),
+        where=length_sq > _EPS,
+    )
+    ratio = np.clip(ratio, 0.0, 1.0)
+    closest = start + ratio[..., None] * delta
+    distances = np.linalg.norm(point - closest, axis=-1)
+    return np.min(distances, axis=(-2, -1))
+
+
+def batch_pairwise_obb_metrics(
+    ego_rollouts: Sequence[Sequence[VehicleState]],
+    other_rollouts: Sequence[Sequence[VehicleState]],
+) -> PairwiseBatchMetrics:
+    """Vectorise the scalar OBB gap/TTC/DRAC contract without changing it.
+
+    ``ego_rollouts`` is action-major and ``other_rollouts`` is actor-major.
+    Returned arrays have shape ``[action, time, actor]``. The function uses
+    float64 because the scalar reference implementation operates on Python
+    floats and downstream thresholds must retain the same boolean decisions.
+    """
+
+    ego_values = _state_batch(ego_rollouts)
+    other_values = _state_batch(other_rollouts)
+    action_count, horizon = ego_values["x"].shape
+    actor_count = int(other_values["x"].shape[0])
+    if actor_count and int(other_values["x"].shape[1]) != horizon:
+        raise ValueError("ego and surrounding rollout horizons must match")
+    shape = (action_count, horizon, actor_count)
+    if actor_count == 0:
+        return PairwiseBatchMetrics(
+            gap=np.full(shape, INF_TTC, dtype=np.float64),
+            ttc=np.full(shape, INF_TTC, dtype=np.float64),
+            drac=np.zeros(shape, dtype=np.float64),
+            overlap=np.zeros(shape, dtype=np.bool_),
+        )
+
+    ego_points, ego_axes = _batch_box_geometry(ego_values)
+    other_points, other_axes = _batch_box_geometry(other_values)
+    ego_points = np.broadcast_to(
+        ego_points[:, :, None, :, :],
+        (action_count, horizon, actor_count, 4, 2),
+    )
+    other_points = np.broadcast_to(
+        other_points[None, :, :, :, :].transpose(0, 2, 1, 3, 4),
+        (action_count, horizon, actor_count, 4, 2),
+    )
+    ego_axes = np.broadcast_to(
+        ego_axes[:, :, None, :, :],
+        (action_count, horizon, actor_count, 2, 2),
+    )
+    other_axes = np.broadcast_to(
+        other_axes[None, :, :, :, :].transpose(0, 2, 1, 3, 4),
+        (action_count, horizon, actor_count, 2, 2),
+    )
+    axes = np.concatenate([ego_axes, other_axes], axis=-2)
+
+    ego_projection = np.einsum("...pi,...ki->...pk", ego_points, axes)
+    other_projection = np.einsum("...pi,...ki->...pk", other_points, axes)
+    ego_min = np.min(ego_projection, axis=-2)
+    ego_max = np.max(ego_projection, axis=-2)
+    other_min = np.min(other_projection, axis=-2)
+    other_max = np.max(other_projection, axis=-2)
+    separated = (ego_max < other_min - _EPS) | (other_max < ego_min - _EPS)
+    overlap = ~np.any(separated, axis=-1)
+
+    ego_to_other = _batch_point_segment_minimum(ego_points, other_points)
+    other_to_ego = _batch_point_segment_minimum(other_points, ego_points)
+    gap = np.where(overlap, 0.0, np.minimum(ego_to_other, other_to_ego))
+
+    ego_heading = ego_values["heading"][:, :, None]
+    other_heading = other_values["heading"].T[None, :, :]
+    ego_vx = ego_values["speed"][:, :, None] * np.cos(ego_heading)
+    ego_vy = ego_values["speed"][:, :, None] * np.sin(ego_heading)
+    other_speed = other_values["speed"].T[None, :, :]
+    rel_vx = other_speed * np.cos(other_heading) - ego_vx
+    rel_vy = other_speed * np.sin(other_heading) - ego_vy
+    projected_velocity = rel_vx[..., None] * axes[..., 0] + rel_vy[..., None] * axes[..., 1]
+    moving = np.abs(projected_velocity) > _EPS
+    static_separated = (~moving) & separated
+    t1 = np.divide(
+        ego_min - other_max,
+        projected_velocity,
+        out=np.zeros_like(projected_velocity),
+        where=moving,
+    )
+    t2 = np.divide(
+        ego_max - other_min,
+        projected_velocity,
+        out=np.zeros_like(projected_velocity),
+        where=moving,
+    )
+    axis_entry = np.where(moving, np.minimum(t1, t2), -INF_TTC)
+    axis_exit = np.where(moving, np.maximum(t1, t2), INF_TTC)
+    entry_time = np.max(axis_entry, axis=-1)
+    exit_time = np.min(axis_exit, axis=-1)
+    no_intersection = (
+        np.any(static_separated, axis=-1)
+        | ((entry_time - exit_time) > _EPS)
+        | (exit_time < np.maximum(0.0, entry_time) - _EPS)
+    )
+    ttc = np.where(no_intersection, INF_TTC, np.maximum(0.0, entry_time))
+    ttc = np.where(overlap, 0.0, ttc)
+
+    finite_ttc = ttc < INF_TTC
+    positive_gap = gap > _EPS
+    closing_speed = np.divide(
+        gap,
+        np.maximum(ttc, 1.0e-6),
+        out=np.zeros_like(gap),
+        where=finite_ttc & positive_gap,
+    )
+    drac_values = np.divide(
+        closing_speed * closing_speed,
+        2.0 * gap,
+        out=np.zeros_like(gap),
+        where=finite_ttc & positive_gap,
+    )
+    drac_values = np.where(positive_gap, drac_values, INF_TTC)
+    return PairwiseBatchMetrics(gap=gap, ttc=ttc, drac=drac_values, overlap=overlap)
 
 
 def bbox_radius(state: VehicleState) -> float:

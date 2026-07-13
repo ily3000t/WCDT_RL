@@ -8,6 +8,15 @@ from typing import Any
 
 import numpy as np
 
+from safe_rl.evaluation_protocol import (
+    EvidenceProtocolError,
+    audit_seed_cohorts,
+    assert_disjoint_seed_usage,
+    build_stage_lineage,
+    protocol_snapshot,
+    seeds_for_role,
+    stable_hash,
+)
 from safe_rl.sim.sumo_highway_merge_env import SumoHighwayMergeEnv
 from safe_rl.utils.io import write_json
 
@@ -97,6 +106,46 @@ def _checkpoint_paths(output_path: Path) -> tuple[Path, Path, Path]:
     )
 
 
+def _checkpoint_selection_seeds(config: Any) -> list[int]:
+    configured = [int(seed) for seed in config.stage3.get("eval_seeds", [])]
+    if not bool(config.stage3.get("eval_enabled", bool(configured))):
+        return []
+    seeds = seeds_for_role(config, "stage3_selection", fallback=configured)
+    if len(seeds) != len(set(seeds)):
+        raise EvidenceProtocolError("Stage3 checkpoint-selection seeds contain duplicates")
+    return seeds
+
+
+def _validate_stage3_seed_preflight(config: Any) -> dict[str, Any]:
+    selection = _checkpoint_selection_seeds(config)
+    training_start = [int(config.run.seed)]
+    snapshot = protocol_snapshot(config)
+    if bool(snapshot.get("enabled", False)):
+        audit = assert_disjoint_seed_usage(
+            stage3_training_start=training_start,
+            stage3_selection=selection,
+        )
+        expected_training = seeds_for_role(config, "stage3_training", fallback=training_start)
+        if expected_training and int(config.run.seed) not in set(expected_training):
+            raise EvidenceProtocolError(
+                f"Stage3 run.seed={int(config.run.seed)} is outside the registered training cohort"
+            )
+        enforced = True
+    else:
+        audit = audit_seed_cohorts(
+            {"stage3_training_start": training_start, "stage3_selection": selection}
+        )
+        enforced = False
+    return {
+        "training_start_seed": int(config.run.seed),
+        "selection_seeds": selection,
+        "selection_seed_sha256": stable_hash(sorted(selection)),
+        "seed_audit": audit,
+        "protocol_enabled": bool(snapshot.get("enabled", False)),
+        "disjointness_enforced": enforced,
+    }
+
+
 def _evaluate_model_for_safety(model: Any, config: Any, seeds: list[int]) -> dict[str, Any]:
     from safe_rl.pipeline.common import make_env
     from safe_rl.risk.risk_aggregator import aggregate_episode_reports
@@ -139,7 +188,7 @@ class _SafetyEvalCallback:
                 self.cfg = cfg
                 self.model_output = model_output
                 self.eval_freq = int(cfg.stage3.get("eval_freq", 10000))
-                self.eval_seeds = [int(seed) for seed in cfg.stage3.get("eval_seeds", [])]
+                self.eval_seeds = _checkpoint_selection_seeds(cfg)
                 self.checkpoint_dir = model_output.parent / "checkpoints"
                 self.checkpoint_dir.mkdir(parents=True, exist_ok=True)
                 _final_path, self.best_path, _selection_report_path = _checkpoint_paths(model_output)
@@ -248,6 +297,12 @@ def _configure_torch_threads(thread_count: int) -> None:
         pass
 
 
+def _ppo_optimizer_seed(config: Any) -> int:
+    """Return the model RNG seed without changing simulator scheduling."""
+
+    return int(config.rl.get("optimizer_seed", config.run.seed))
+
+
 def _build_ppo_worker_env(config: Any, rank: int, num_envs: int):
     from safe_rl.pipeline.common import make_env
 
@@ -316,6 +371,7 @@ def train_ppo(
     output_path: str | Path,
     tensorboard_dir: str | Path | None = None,
 ) -> dict:
+    protocol_preflight = _validate_stage3_seed_preflight(config)
     PPO = _require_sb3()
     from stable_baselines3.common.callbacks import BaseCallback, CallbackList
     num_envs = max(1, int(config.get("training", {}).get("ppo_num_envs", 1)))
@@ -348,7 +404,9 @@ def train_ppo(
         vf_coef=float(config.rl.vf_coef),
         tensorboard_log=str(tensorboard_dir) if tensorboard_dir else None,
         device=_training_device(config),
-        seed=int(config.run.seed),
+        # ``run.seed`` controls simulator episode scheduling.  Optimizer
+        # replicates must not silently change the traffic realization cohort.
+        seed=_ppo_optimizer_seed(config),
         verbose=1,
     )
     output_path = Path(output_path)
@@ -389,6 +447,12 @@ def train_ppo(
             "PPO training produced duplicate episode seeds under incrementing_v1: "
             f"duplicate_count={duplicate_seed_count}"
         )
+    selection_seeds = list(protocol_preflight["selection_seeds"])
+    if bool(protocol_preflight.get("disjointness_enforced", False)):
+        assert_disjoint_seed_usage(
+            stage3_training=training_episode_seeds,
+            stage3_selection=selection_seeds,
+        )
     model.save(str(final_path))
     checkpoint_selection: dict[str, Any]
     if safety_callback is not None and getattr(safety_callback, "best_record", None) is not None and best_path.exists():
@@ -422,6 +486,18 @@ def train_ppo(
     requested_total_timesteps = int(config.rl.total_timesteps)
     actual_total_timesteps = int(model.num_timesteps)
     rollout_quantum = int(num_envs * int(config.rl.n_steps))
+    evidence_lineage = build_stage_lineage(
+        config,
+        stage="stage3",
+        role_seeds={
+            "stage3_training": training_episode_seeds,
+            "stage3_selection": selection_seeds,
+        },
+        artifact_paths={
+            "final_model": final_path,
+            "best_model": best_path if best_path.exists() else None,
+        },
+    )
     report = {
         "model_path": str(output_path),
         "final_model_path": str(final_path),
@@ -434,9 +510,13 @@ def train_ppo(
         "rollout_quantum": rollout_quantum,
         "timesteps_rounded_up": bool(actual_total_timesteps > requested_total_timesteps),
         "reward_profile": str(config.rl.get("reward_profile", "default")),
+        "optimizer_seed": _ppo_optimizer_seed(config),
+        "simulator_training_start_seed": int(config.run.seed),
         "checkpoint_selection_profile": selection_profile,
         "checkpoint_selection_weights": selection_weights,
         "checkpoint_selection_metric": selection_metric,
+        "checkpoint_selection_seeds": selection_seeds,
+        "checkpoint_selection_seed_sha256": stable_hash(sorted(selection_seeds)),
         "tensorboard": str(tensorboard_dir) if tensorboard_dir else None,
         "device": str(model.device),
         "ppo_num_envs": int(num_envs),
@@ -454,6 +534,8 @@ def train_ppo(
         "training_episode_seed_unique_count": int(len(set(training_episode_seeds))),
         "training_episode_seed_duplicate_count": int(duplicate_seed_count),
         "training_episode_seed_records": seed_trace_records,
+        "evidence_protocol_preflight": protocol_preflight,
+        "evidence_lineage": evidence_lineage,
         "vehicle_state_ordering_version": str(
             config.get("scenario", {}).get(
                 "vehicle_state_ordering_version",

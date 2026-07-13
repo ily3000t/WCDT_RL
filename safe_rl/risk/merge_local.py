@@ -3,6 +3,7 @@ from __future__ import annotations
 import math
 import hashlib
 import json
+import time
 from contextlib import nullcontext
 from dataclasses import dataclass
 from typing import Any
@@ -10,7 +11,15 @@ from typing import Any
 import numpy as np
 
 from safe_rl.sim.action_space import ACTIONS, CandidateAction
-from safe_rl.sim.metrics import INF_TTC, bbox_gap, compute_step_metrics, drac, explicit_risk_features, relative_ttc
+from safe_rl.sim.metrics import (
+    INF_TTC,
+    batch_pairwise_obb_metrics,
+    bbox_gap,
+    compute_step_metrics,
+    drac,
+    explicit_risk_features,
+    relative_ttc,
+)
 from safe_rl.sim.scenario_semantics import (
     advance_route_state,
     auxiliary_lane_index,
@@ -105,6 +114,14 @@ class RiskCandidateRolloutContext:
     risk_surrounding_cv_rollouts: list[list[VehicleState]]
     legality: dict[int, bool]
     samples: dict[int, CandidateRiskSample]
+    ego_rollouts: dict[int, tuple[list[VehicleState], bool]]
+    merge_ego_edges: Any
+    merge_target_edges: Any
+    configured_merge_target_lane: Any
+    configured_target_lane_mapping: Any
+    near_miss_threshold: float
+    ttc_threshold: float
+    drac_threshold: float
 
     @property
     def other_rollouts(self) -> list[list[VehicleState]]:
@@ -114,6 +131,11 @@ class RiskCandidateRolloutContext:
 # Compatibility alias for external imports. The semantic name above makes the
 # CV-only Risk path explicit.
 CandidateRolloutContext = RiskCandidateRolloutContext
+
+
+def _record_candidate_latency(context: dict[str, Any], name: str, seconds: float) -> None:
+    payload = context.setdefault("_risk_candidate_latency", {})
+    payload[str(name)] = float(payload.get(str(name), 0.0)) + max(0.0, float(seconds))
 
 
 def merge_x(config: Any) -> float:
@@ -510,11 +532,21 @@ def get_cached_ego_rollout(
     if not isinstance(cache, EgoRolloutCache):
         cache = EgoRolloutCache(entries={})
         context["_ego_rollout_cache"] = cache
+    config = context["config"]
+    cached_config_hash = context.get("_ego_rollout_config_hash_cache")
+    if (
+        not isinstance(cached_config_hash, tuple)
+        or len(cached_config_hash) != 2
+        or int(cached_config_hash[0]) != id(config)
+    ):
+        cached_config_hash = (id(config), _ego_rollout_config_hash(config))
+        context["_ego_rollout_config_hash_cache"] = cached_config_hash
+    config_hash = str(cached_config_hash[1])
     key = (
         int(action.index),
         int(horizon_steps),
         round(float(dt), 9),
-        _ego_rollout_config_hash(context["config"]),
+        config_hash,
     )
     if key not in cache.entries:
         cache.entries[key] = rollout_ego(
@@ -538,7 +570,9 @@ def prepare_candidate_rollout_context(context: dict[str, Any]) -> RiskCandidateR
     dt = _rollout_dt(config)
     tracker = context.get("performance_tracker")
     timer = tracker.measure("candidate_rollout_time") if tracker is not None else nullcontext()
-    with timer:
+    detail_timer = tracker.measure("risk_other_rollout_time") if tracker is not None else nullcontext()
+    detail_started = time.perf_counter()
+    with timer, detail_timer:
         other_rollouts = (
             [
                 route_aware_constant_velocity_rollout(vehicle, horizon_steps, dt, config)[0]
@@ -548,6 +582,11 @@ def prepare_candidate_rollout_context(context: dict[str, Any]) -> RiskCandidateR
             if ego is not None
             else []
         )
+    _record_candidate_latency(
+        context,
+        "other_rollout",
+        time.perf_counter() - detail_started,
+    )
     prepared = RiskCandidateRolloutContext(
         ego=ego,
         vehicles=vehicles,
@@ -558,6 +597,14 @@ def prepare_candidate_rollout_context(context: dict[str, Any]) -> RiskCandidateR
         risk_surrounding_cv_rollouts=other_rollouts,
         legality={action.index: is_candidate_legal(action, context, missing_ego_is_legal=False) for action in ACTIONS},
         samples={},
+        ego_rollouts={},
+        merge_ego_edges=merge_zone_edges(config),
+        merge_target_edges=target_lane_edges(config),
+        configured_merge_target_lane=merge_target_lane(config),
+        configured_target_lane_mapping=target_lane_mapping(config),
+        near_miss_threshold=float(config.risk_module.near_miss_distance_threshold),
+        ttc_threshold=float(config.risk_module.ttc_threshold),
+        drac_threshold=float(config.risk_module.drac_threshold),
     )
     context["_candidate_rollout_context"] = prepared
     return prepared
@@ -593,13 +640,18 @@ def evaluate_candidate_action_risk(action: CandidateAction, context: dict[str, A
     lane_oob = not candidate_legal
     tracker = context.get("performance_tracker")
     timer = tracker.measure("candidate_rollout_time") if tracker is not None else nullcontext()
-    with timer:
-        ego_rollout, ego_taper_miss = get_cached_ego_rollout(
-            context,
-            action,
-            horizon_steps=prepared.horizon_steps,
-            dt=prepared.dt,
-        )
+    detail_timer = tracker.measure("risk_ego_rollout_time") if tracker is not None else nullcontext()
+    with timer, detail_timer:
+        cached_ego_rollout = prepared.ego_rollouts.get(int(action.index))
+        if cached_ego_rollout is None:
+            cached_ego_rollout = get_cached_ego_rollout(
+                context,
+                action,
+                horizon_steps=prepared.horizon_steps,
+                dt=prepared.dt,
+            )
+            prepared.ego_rollouts[int(action.index)] = cached_ego_rollout
+        ego_rollout, ego_taper_miss = cached_ego_rollout
     other_rollouts = prepared.risk_surrounding_cv_rollouts
 
     min_distance = INF_TTC
@@ -620,14 +672,14 @@ def evaluate_candidate_action_risk(action: CandidateAction, context: dict[str, A
             ego_state,
             [ego_state, *step_vehicles],
             collision=False,
-            near_miss_threshold=float(config.risk_module.near_miss_distance_threshold),
-            ttc_threshold=float(config.risk_module.ttc_threshold),
-            drac_threshold=float(config.risk_module.drac_threshold),
+            near_miss_threshold=prepared.near_miss_threshold,
+            ttc_threshold=prepared.ttc_threshold,
+            drac_threshold=prepared.drac_threshold,
             lane_oob=lane_oob,
-            merge_ego_edges=merge_zone_edges(config),
-            merge_target_edges=target_lane_edges(config),
-            merge_target_lane=merge_target_lane(config),
-            merge_target_lanes=target_lane_mapping(config),
+            merge_ego_edges=prepared.merge_ego_edges,
+            merge_target_edges=prepared.merge_target_edges,
+            merge_target_lane=prepared.configured_merge_target_lane,
+            merge_target_lanes=prepared.configured_target_lane_mapping,
         )
         stats = merge_local_stats(ego_state, step_vehicles, config)
         if stats.target_lane_gap < best_gap:
@@ -692,12 +744,202 @@ def evaluate_candidate_action_risk(action: CandidateAction, context: dict[str, A
     return sample
 
 
+def evaluate_candidate_actions_reference(
+    actions: list[CandidateAction] | tuple[CandidateAction, ...],
+    context: dict[str, Any],
+) -> list[CandidateRiskSample]:
+    """Scalar reference backend retained for parity audits and diagnostics."""
+
+    prepared = prepare_candidate_rollout_context(context)
+    # Build the complete requested ego-rollout batch up front. This shares the
+    # config fingerprint and rollout cache across candidates while retaining
+    # the exact reference rollout and metric computations below.
+    if prepared.ego is not None:
+        for action in actions:
+            if int(action.index) not in prepared.samples and int(action.index) not in prepared.ego_rollouts:
+                prepared.ego_rollouts[int(action.index)] = get_cached_ego_rollout(
+                    context,
+                    action,
+                    horizon_steps=prepared.horizon_steps,
+                    dt=prepared.dt,
+                )
+    return [evaluate_candidate_action_risk(action, context) for action in actions]
+
+
+def _evaluate_candidate_actions_vectorized(
+    actions: list[CandidateAction],
+    context: dict[str, Any],
+    prepared: RiskCandidateRolloutContext,
+) -> None:
+    if not actions:
+        return
+    if prepared.ego is None:
+        for action in actions:
+            evaluate_candidate_action_risk(action, context)
+        return
+
+    tracker = context.get("performance_tracker")
+    rollout_timer = tracker.measure("candidate_rollout_time") if tracker is not None else nullcontext()
+    ego_timer = tracker.measure("risk_ego_rollout_time") if tracker is not None else nullcontext()
+    ego_started = time.perf_counter()
+    with rollout_timer, ego_timer:
+        for action in actions:
+            action_id = int(action.index)
+            if action_id not in prepared.ego_rollouts:
+                prepared.ego_rollouts[action_id] = get_cached_ego_rollout(
+                    context,
+                    action,
+                    horizon_steps=prepared.horizon_steps,
+                    dt=prepared.dt,
+                )
+    _record_candidate_latency(context, "ego_rollout", time.perf_counter() - ego_started)
+
+    ego_rollouts = [prepared.ego_rollouts[int(action.index)][0] for action in actions]
+    geometry_timer = (
+        tracker.measure("risk_pairwise_geometry_time") if tracker is not None else nullcontext()
+    )
+    geometry_started = time.perf_counter()
+    with geometry_timer:
+        pairwise = batch_pairwise_obb_metrics(
+            ego_rollouts,
+            prepared.risk_surrounding_cv_rollouts,
+        )
+    _record_candidate_latency(
+        context,
+        "pairwise_geometry",
+        time.perf_counter() - geometry_started,
+    )
+
+    reduction_timer = (
+        tracker.measure("risk_merge_local_reduction_time") if tracker is not None else nullcontext()
+    )
+    reduction_started = time.perf_counter()
+    with reduction_timer:
+        actor_count = int(pairwise.gap.shape[-1])
+        config = prepared.config
+        for action_idx, action in enumerate(actions):
+            action_id = int(action.index)
+            candidate_legal = bool(prepared.legality[action_id])
+            lane_oob = not candidate_legal
+            ego_rollout, ego_taper_miss = prepared.ego_rollouts[action_id]
+            if actor_count:
+                min_distance = float(np.min(pairwise.gap[action_idx]))
+                min_ttc = float(np.min(pairwise.ttc[action_idx]))
+                max_drac = float(np.max(pairwise.drac[action_idx]))
+            else:
+                min_distance = INF_TTC
+                min_ttc = INF_TTC
+                max_drac = 0.0
+
+            collision = False
+            near_miss = bool(min_distance < prepared.near_miss_threshold)
+            low_ttc = bool(min_ttc < prepared.ttc_threshold)
+            high_drac = bool(max_drac > prepared.drac_threshold)
+            merge_conflict = False
+            taper_miss = bool(ego_taper_miss)
+            best_stats = prepared.current_stats
+            best_gap = best_stats.target_lane_gap
+            for step_idx, ego_state in enumerate(ego_rollout):
+                step_vehicles = [
+                    rollout[step_idx]
+                    for rollout in prepared.risk_surrounding_cv_rollouts
+                ]
+                stats = merge_local_stats(ego_state, step_vehicles, config)
+                if stats.target_lane_gap < best_gap:
+                    best_gap = stats.target_lane_gap
+                    best_stats = stats
+                merge_conflict = merge_conflict or stats.merge_zone_risk
+                taper_miss = taper_miss or stats.taper_miss
+
+            worst = StepMetrics(
+                min_distance=float(min_distance),
+                min_ttc=float(min_ttc),
+                max_drac=float(max_drac),
+                collision=bool(collision),
+                near_miss=bool(near_miss),
+                low_ttc=bool(low_ttc),
+                high_drac=bool(high_drac),
+                merge_gap=float(best_gap),
+                lane_oob=bool(lane_oob),
+                hard_brake=bool(action.accel_cmd < 0),
+            )
+            features = explicit_risk_features(worst)
+            if features.shape[0] != int(config.risk_module.explicit_feature_dim):
+                padded = np.zeros(
+                    (int(config.risk_module.explicit_feature_dim),),
+                    dtype=np.float32,
+                )
+                limit = min(padded.shape[0], features.shape[0])
+                padded[:limit] = features[:limit]
+                features = padded
+            risk_types = np.asarray(
+                [
+                    float(collision),
+                    float(near_miss),
+                    float(low_ttc),
+                    float(high_drac),
+                    float(merge_conflict),
+                    float(taper_miss),
+                ],
+                dtype=np.float32,
+            )
+            traffic_risk = float(np.max(risk_types))
+            continuous_target = continuous_risk_target(
+                worst,
+                best_stats,
+                taper_miss=taper_miss,
+            )
+            prepared.samples[action_id] = CandidateRiskSample(
+                action=action_id,
+                features=features.astype(np.float32),
+                overall_risk=traffic_risk,
+                risk_types=risk_types,
+                local_stats=best_stats,
+                lane_oob=float(lane_oob),
+                candidate_legal=candidate_legal,
+                traffic_risk=traffic_risk,
+                continuous_risk_target=continuous_target,
+                boundary_sample=bool(0.20 <= continuous_target < 0.80),
+                distance_to_taper=float(best_stats.merge_distance),
+                ego_on_auxiliary=bool(best_stats.ego_on_auxiliary),
+            )
+    _record_candidate_latency(
+        context,
+        "merge_local_reduction",
+        time.perf_counter() - reduction_started,
+    )
+
+
 def evaluate_candidate_actions(
     actions: list[CandidateAction] | tuple[CandidateAction, ...],
     context: dict[str, Any],
 ) -> list[CandidateRiskSample]:
-    prepare_candidate_rollout_context(context)
-    return [evaluate_candidate_action_risk(action, context) for action in actions]
+    """Evaluate candidates with batched pairwise geometry and scalar route semantics."""
+
+    requested = list(actions)
+    config = context.get("config")
+    risk_config = getattr(config, "risk_module", {}) if config is not None else {}
+    backend = str(
+        risk_config.get("candidate_geometry_backend", "vectorized")
+        if hasattr(risk_config, "get")
+        else "vectorized"
+    ).strip().lower()
+    if backend == "reference":
+        return evaluate_candidate_actions_reference(requested, context)
+    if backend != "vectorized":
+        raise ValueError(f"unsupported candidate_geometry_backend={backend!r}")
+    prepared = prepare_candidate_rollout_context(context)
+    missing_by_id: dict[int, CandidateAction] = {}
+    for action in requested:
+        action_id = int(action.index)
+        if action_id not in prepared.samples:
+            missing_by_id.setdefault(action_id, action)
+    _evaluate_candidate_actions_vectorized(
+        list(missing_by_id.values()),
+        context,
+        prepared,
+    )
+    return [prepared.samples[int(action.index)] for action in requested]
 
 
 def candidate_action_risk_samples(context: dict[str, Any]) -> list[CandidateRiskSample]:

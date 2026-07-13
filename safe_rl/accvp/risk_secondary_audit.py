@@ -8,7 +8,12 @@ import numpy as np
 
 from safe_rl.accvp.schema import write_json_atomic
 from safe_rl.accvp.selection import LEFT_ACTION_IDS, lite_secondary_safety_pass
-from safe_rl.accvp.viability_lite import evaluate_lite_thresholds
+from safe_rl.accvp.viability_lite import (
+    evaluate_lite_thresholds,
+    outcome_merge_observation_rate,
+    outcome_merge_success_rate,
+    outcome_safety_event_rate,
+)
 
 
 def _rate(values: list[bool]) -> float | None:
@@ -44,13 +49,16 @@ def _strict_pass(row: dict[str, Any]) -> bool:
 
 
 def _success(row: dict[str, Any]) -> bool:
-    return bool(row.get("merge_observed", False)) and float(row.get("merge_before_taper", 0.0)) >= 0.5
+    tolerance = np.finfo(np.float64).eps
+    return (
+        outcome_merge_observation_rate(row) >= 1.0 - tolerance
+        and outcome_merge_success_rate(row) >= 1.0 - tolerance
+    )
 
 
 def _safety_event(row: dict[str, Any]) -> bool:
     return (
-        float(row.get("proxy_collision", 0.0)) >= 0.5
-        or float(row.get("safety_violation", 0.0)) >= 0.5
+        outcome_safety_event_rate(row) > np.finfo(np.float64).eps
         or bool(row.get("oracle_geometric_overlap", False))
     )
 
@@ -76,6 +84,9 @@ def _row_summary(row: dict[str, Any]) -> dict[str, Any]:
         "secondary_veto_reason": str(row.get("secondary_veto_reason", "")),
         "merge_observed": bool(row.get("merge_observed", False)),
         "merge_success": _success(row),
+        "merge_observation_rate": outcome_merge_observation_rate(row),
+        "merge_success_rate": outcome_merge_success_rate(row),
+        "safety_event_rate": outcome_safety_event_rate(row),
         "clean_success": _clean_success(row),
         "safety_event": _safety_event(row),
         "proxy_collision": float(row.get("proxy_collision", 0.0)) >= 0.5,
@@ -109,6 +120,7 @@ def audit_risk_secondary(
     split: str,
     risk_score_grid: list[float],
 ) -> dict[str, Any]:
+    selection_eligible = str(split) == "operating_point"
     rows = [{**row, "split": split} for row in records if int(row.get("action_id", -1)) in LEFT_ACTION_IDS]
     strict_pass_rows = [row for row in rows if _strict_pass(row)]
     strict_fail_rows = [row for row in rows if not _strict_pass(row)]
@@ -127,7 +139,15 @@ def audit_risk_secondary(
     clean_success_failed_total = max(1, len(clean_success_failed))
     unsafe_total = max(1, len(unsafe_rows))
     sweep = []
-    for threshold in risk_score_grid:
+    # A non-selection split may only evaluate the already frozen threshold.
+    # In particular, test must never expose a threshold grid or a "best"
+    # profile that could feed a subsequent tuning decision.
+    effective_grid = (
+        list(risk_score_grid)
+        if selection_eligible
+        else [float(base_thresholds.get("max_secondary_risk_score", 1.0))]
+    )
+    for threshold in effective_grid:
         thresholds = {
             **base_thresholds,
             "max_secondary_risk_score": float(threshold),
@@ -165,17 +185,28 @@ def audit_risk_secondary(
         and float(row["replacement_unnecessary_rate"]) <= 0.25
         and float(row["replacement_rate"]) <= float(base_thresholds.get("max_replacement_rate", 0.10))
     ]
-    selected = max(
-        safe_sweep,
-        key=lambda row: (
-            float(row["replacement_repairable_capture_rate"]),
-            float(row["safe_success_recovery_rate"]),
-            -float(row["max_secondary_risk_score"]),
-        ),
-        default=None,
+    diagnostic_best = (
+        max(
+            safe_sweep,
+            key=lambda row: (
+                float(row["replacement_repairable_capture_rate"]),
+                float(row["safe_success_recovery_rate"]),
+                -float(row["max_secondary_risk_score"]),
+            ),
+            default=None,
+        )
+        if selection_eligible
+        else None
     )
+    selected = diagnostic_best if selection_eligible else None
     return {
         "split": split,
+        "selection_eligible": selection_eligible,
+        "selection_note": (
+            "threshold selection is permitted only on the operating_point split"
+            if not selection_eligible
+            else "operating_point is the sole threshold-selection split"
+        ),
         "left_action_count": int(len(rows)),
         "strict_pass_count": int(len(strict_pass_rows)),
         "strict_fail_count": int(len(strict_fail_rows)),
@@ -202,6 +233,7 @@ def audit_risk_secondary(
         "by_source": _group_counts(clean_success_failed, "collection_source"),
         "by_root_policy": _group_counts(clean_success_failed, "root_policy"),
         "threshold_sweep": sweep,
+        "threshold_sweep_is_selection": selection_eligible,
         "selected_audited_profile": None
         if selected is None
         else {
@@ -210,29 +242,35 @@ def audit_risk_secondary(
             "source": "accvp_risk_secondary_audit",
             "split": split,
         },
+        "diagnostic_best_profile": None
+        if diagnostic_best is None
+        else {
+            "secondary_safety_profile": "audited_merge_left_v1",
+            "max_secondary_risk_score": float(diagnostic_best["max_secondary_risk_score"]),
+            "source": "accvp_risk_secondary_audit",
+            "split": split,
+            "selection_eligible": selection_eligible,
+        },
         "clean_success_but_risk_failed_roots": [_row_summary(row) for row in clean_success_failed],
         "unsafe_but_risk_passed_roots": [_row_summary(row) for row in unsafe_passed],
     }
 
 
 def combine_audit_reports(split_reports: dict[str, dict[str, Any]]) -> dict[str, Any]:
-    selected = None
-    test = split_reports.get("test")
-    if test is not None:
-        selected = test.get("selected_audited_profile")
-    if selected is None:
-        for report in split_reports.values():
-            selected = report.get("selected_audited_profile")
-            if selected is not None:
-                break
+    operating_point = split_reports.get("operating_point")
+    selected = None if operating_point is None else operating_point.get("selected_audited_profile")
+    if selected is not None and str(selected.get("split", "")) != "operating_point":
+        raise ValueError("Risk-secondary threshold provenance must be operating_point")
     return {
         "artifact_kind": "accvp_risk_secondary_audit_v1",
         "controller": "acv_shield_lite",
         "safety_authority": "risk_module_safety_shield",
         "accvp_safety_head_hard_gate": False,
         "splits": split_reports,
+        "selection_split": "operating_point",
+        "test_used_for_selection": False,
         "selected_audited_profile": selected,
-        "audit_state": "go" if selected is not None else "no_safe_threshold",
+        "audit_state": "go" if selected is not None else "no_safe_operating_point_threshold",
     }
 
 
