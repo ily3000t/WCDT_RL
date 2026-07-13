@@ -36,6 +36,44 @@ def _write_npz_atomic(path: Path, **arrays: np.ndarray) -> None:
     temporary.replace(path)
 
 
+def _conditional_entry_time_fields(
+    viability_status: str,
+    target_lane_entry_time: float | None,
+    censor_time: float,
+) -> dict[str, Any]:
+    """Build the conditional entry-time label required by schema-v3.
+
+    A lane entry after the first taper miss is useful diagnostic information,
+    but it is not a successful entry-time regression target.  Preserve that
+    raw timestamp separately while censoring the supervised label at failure.
+    """
+
+    status = str(viability_status)
+    if status == "observed_success":
+        if target_lane_entry_time is None:
+            raise ValueError("observed-success branch is missing target lane entry time")
+        return {
+            "target_lane_entry_time_s": float(target_lane_entry_time),
+            "target_lane_entry_time_raw_s": float(target_lane_entry_time),
+            "entry_time_observed": True,
+            "entry_time_censor_time_s": float(censor_time),
+            "entry_time_censor_reason": "",
+        }
+    if status not in {"observed_failure", "censored"}:
+        raise ValueError(f"unsupported viability status for entry time: {status!r}")
+    return {
+        "target_lane_entry_time_s": None,
+        "target_lane_entry_time_raw_s": (
+            None if target_lane_entry_time is None else float(target_lane_entry_time)
+        ),
+        "entry_time_observed": False,
+        "entry_time_censor_time_s": float(censor_time),
+        "entry_time_censor_reason": (
+            "taper_miss" if status == "observed_failure" else "horizon_elapsed"
+        ),
+    }
+
+
 def _branch_outcome(job: dict[str, Any]) -> dict[str, Any]:
     """Run exactly one branch in a worker-owned SUMO process.
 
@@ -150,6 +188,11 @@ def _branch_outcome(job: dict[str, Any]) -> dict[str, Any]:
             viability_status = "censored"
             censor_reason = "horizon_elapsed"
             censor_time = float(horizon_steps) * float(env.step_length)
+        entry_time_fields = _conditional_entry_time_fields(
+            viability_status,
+            target_lane_entry_time,
+            float(censor_time),
+        )
         tensor_path = output_dir / f"{branch_id}.npz"
         _write_npz_atomic(
             tensor_path,
@@ -206,13 +249,7 @@ def _branch_outcome(job: dict[str, Any]) -> dict[str, Any]:
             "geometric_overlap_within_horizon": bool(geometric_overlap),
             "taper_miss_observed": bool(taper_miss_time is not None),
             "merge_before_taper_observed": bool(viability_status == "observed_success"),
-            "target_lane_entry_time_s": target_lane_entry_time,
-            "entry_time_observed": bool(target_lane_entry_time is not None),
-            "entry_time_censor_time_s": float(censor_time),
-            "entry_time_censor_reason": (
-                "" if target_lane_entry_time is not None else
-                ("taper_miss" if viability_status == "observed_failure" else "horizon_elapsed")
-            ),
+            **entry_time_fields,
             "entry_time_label_version": ENTRY_TIME_LABEL_VERSION,
             "min_obb_distance": float(min_distance),
             "min_ttc": float(min_ttc),

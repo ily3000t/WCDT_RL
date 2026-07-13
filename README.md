@@ -1,933 +1,195 @@
-# WcDT_RL / SAFE_RL：Reward-v2 主线与 ACCVP 反事实可行性规划
+# WCDT_ACCVP / SAFE_RL
 
-本仓库在原始 WcDT 交通场景生成代码基础上，新增了 `safe_rl/` 包，用于构建 SUMO `highway_merge` 场景中的分层安全强化学习框架。
+本仓库研究 SUMO `highway_merge` 场景中的安全强化学习。当前正式实验主线是
+**ACCVP VNext**：用 action-conditioned Candidate Table 估计候选动作的合流可行性，
+由独立 Risk/Safety Shield 保持局部安全权威，再通过成对、多训练副本的闭环评估检验收益。
 
-当前主线是：
+旧 WcDT、schema-v2 ACCVP、Reward-v2/v3 开发实验仍可用于复现和故障诊断，但不能直接
+支持 VNext calibration、operating point、confirmatory evaluation 或部署结论。
 
-```text
-Reward-v2 PPO learns proactive merge timing.
-Risk/Safety Shield provides local safety fallback.
-ACCVP provides action-conditioned counterfactual viability estimation.
-```
+## 当前方法边界
 
-也就是说，当前方法不再把“更大的 WcDT 预测器”作为最终创新点。WcDT v3 仍然保留，但主要定位为：
-
-```text
-1. action-independent forecast baseline
-2. ACCVP scene encoder warm-start
-3. prediction interface ablation
-```
-
-ACCVP 的角色是 action-conditioned counterfactual viability estimator：给定同一状态和 9 个候选 ego action，估计每个动作的 taper 前合流可行性、目标车道进入时间和不确定性。当前主线采用职责分离：
+VNext 将职责明确拆开：
 
 ```text
-Risk Module / Safety Shield = safety authority
-ACCVP / ACV-Shield-lite    = merge-before-taper task viability authority
+Risk Module / Safety Shield  -> 局部安全否决与 fallback
+ACCVP Candidate Table       -> 每个候选动作的任务可行性与进入时间
+PPO                          -> 在固定 observation/reward 契约下学习动作策略
+Stage5 + final holdout       -> 独立确认与一次性最终评估
 ```
 
-因此 ACCVP safety head 目前只用于 logging / diagnostics，不作为硬安全门控；真正的安全否决仍由 Risk Module 与 Safety Shield 执行。
+ACCVP safety head 只用于诊断，不能替代 Risk Module 的硬安全门控。完整方法也不等于
+“Candidate Table + Reward-v2”：正式 Reward 因子角色为：
 
-运行时主线：
+| 方法 | 角色 |
+| --- | --- |
+| WcDT + Reward-v2 | action-independent forecast baseline |
+| Candidate Table + Reward-v2 | Candidate Table 单因素消融 |
+| Candidate Table + Reward-v2 + commitment | commitment 因素对照 |
+| Candidate Table + Reward-v3.1 | persistence reward 因素对照 |
+| Candidate Table + Reward-v3.1 + risk-gated commitment | 最终完整方法候选 |
+
+历史实验只支持将 Reward-v3.1 与 commitment **预注册为候选**；它们仍须在 schema3、
+无泄漏 split、五个 optimizer seeds 和独立 confirmatory cohorts 下重新验证。
+
+## 正式 VNext 入口
+
+正式状态由
+[`safe_rl/config/active/accvp_vnext/workflow.yaml`](safe_rl/config/active/accvp_vnext/workflow.yaml)
+和产物报告共同决定。先查看状态，不会启动任务：
+
+```powershell
+python -m safe_rl.pipeline.run_accvp_vnext_pipeline
+```
+
+只执行当前一个阶段：
+
+```powershell
+python -m safe_rl.pipeline.run_accvp_vnext_pipeline --execute-next
+```
+
+连续执行到指定阶段：
+
+```powershell
+python -m safe_rl.pipeline.run_accvp_vnext_pipeline --run-until pilot_validation
+```
+
+`--run-until` 不是无条件一键跑完。它会在以下任一情况立即停止：
+
+- 子进程失败；
+- 阶段返回后 artifact gate 仍关闭；
+- workflow 将下一阶段标为 blocked；
+- 到达指定阶段；
+- sealed final holdout 未得到显式授权。
+
+最终 holdout 只有在全部上游门槛通过并冻结后才能显式打开：
+
+```powershell
+python -m safe_rl.pipeline.run_accvp_vnext_pipeline `
+  --execute-next `
+  --allow-final-holdout
+```
+
+当前 workflow 会在 `candidate_ppo_replicates` 前 fail closed，直到 factorial PPO/Stage5
+协调器能够把 Reward-v2 固定为消融、把 Reward-v3.1 + commitment 固定为最终候选。
+这避免现有单一 Reward-v2 命令被误当作完整方法。通用
+`safe_rl.pipeline.run_full_pipeline` 仍可用于旧版/一般比较实验，但不是 VNext 正式证据入口。
+
+## 正式阶段顺序
 
 ```text
-SUMO highway_merge 场景
-  -> Reward-v2 PPO 输出 raw action
-  -> Risk/Safety Shield 检查局部硬安全
-  -> ACCVP candidate table 记录每个候选动作的反事实可行性
-  -> ACV-Shield-lite 仅在 targeted task-infeasible 状态中低频修正
-  -> paired evaluation 验证动作序列、任务质量和安全收益
+pilot collection / merge
+  -> seed 2/5 oracle-only regression
+  -> pilot validation
+  -> formal schema3 collection / merge
+  -> ACCVP ensemble training, calibration, operating point
+  -> scorer runtime preflight
+  -> factorial PPO, five optimizer seeds per method
+  -> policy runtime benchmark (worst replicate gate)
+  -> paired Stage5 reports and hierarchical aggregation
+  -> sealed one-shot final holdout
 ```
 
-完整 ACV-Shield 仍保留为后续版本；当前已验证的是更窄的 ACV-Shield-lite：
+每次推进前建议重新运行状态命令，确认 `next_phase`、`next_command`、`blocked` 和对应
+artifact。不要因为 report 为 `fail` 就删除数据、放宽阈值或跳过阶段；应读取报告的
+`conditions`/`gate` 定位唯一关闭项。
+
+## 不可绕过的数据契约
+
+- 正式反事实数据必须是 schema3；旧 schema2 数据只能用于 diagnostic。
+- actor rows 只能由 `selected_indices` 生成，并由 mapping hash 约束。
+- split component 联合绑定 model-input fingerprint 与 scenario/traffic/episode seed。
+- ensemble bootstrap 以 fingerprint component 为单位，重复样本组总权重为 1。
+- target-lane entry time 只监督 `observed_success`；失败或 censored 分支不得伪造进入时间。
+- seed 2/5 是 `oracle_regression` cohort，必须 `oracle_only=true` 且排除全部模型 split。
+- calibration、operating-point selection 和 test/holdout cohorts 必须隔离。
+- final holdout 不能生成阈值、改配置或触发重训。
+
+完整契约与故障恢复说明见
+[`safe_rl/accvp/README.md`](safe_rl/accvp/README.md)。
+
+## 配置与产物
+
+配置状态以 [`safe_rl/config/registry.yaml`](safe_rl/config/registry.yaml) 为准：
 
 ```text
-PPO raw action
-  -> Safety Shield
-  -> ACV-Shield-lite:
-       if shield action task-feasible: keep
-       else choose Risk-audited left action with higher merge-before-taper viability
-  -> final action
+safe_rl/config/
+  active/accvp_vnext/  # canonical VNext configs and workflow
+  baselines/           # maintained comparison arms
+  examples/            # templates, not frozen experiments
+  archive/             # diagnostic_only historical configs
+  local/               # gitignored machine-specific copies
 ```
 
-从 `codex/reward-v2-mainline-accvp-shadow` 起，默认训练 reward 语义切换为：
+不要根据文件名、能否被 YAML loader 读取或是否位于仓库中推断正式地位。生成的 PPO
+replicate 和 Stage5 配置写入 `safe_rl_output/runs/.../generated_configs`，不回写 canonical
+配置目录。既有 run 目录包含路径和 hash lineage，不应为了配合新目录结构而移动。
 
-```yaml
-rl:
-  training_semantics_version: "reward_v2_mainline_001"
-  reward_profile: "merge_timing_forecast"
-  merge_timing_reward:
-    reward_version: "opportunity_window_v2"
-```
-
-旧版默认 reward 对照必须显式加载：
+VNext 产物使用 generation-aware 名称：
 
 ```text
-safe_rl/config/baselines/no_forecast/legacy_default_reward.yaml
+accvp_vnext_schema3_predictor.pt
+accvp_vnext_schema3_calibration.json
+accvp_vnext_schema3_candidate_manifest.json
 ```
 
-Current 50-seed evidence on `stage5_merge_timing_reward_v2_eval`:
+配置分类细节见 [`safe_rl/config/README.md`](safe_rl/config/README.md)。
 
-```text
-wcdt_v3_prediction_shield_baseline:
-  taper_miss = 7 / 50
-  merge_success = 43 / 50
-  first_merge_request_distance_to_taper_mean ≈ 95.9 m
+## 环境
 
-ppo_wcdt_v3_merge_timing_reward_v2:
-  taper_miss = 0 / 50
-  merge_success = 50 / 50
-  first_merge_request_distance_to_taper_mean ≈ 162.4 m
-
-wcdt_v3_merge_timing_reward_v2_prediction_shield:
-  taper_miss = 0 / 50
-  merge_success = 50 / 50
-  safety violation / proxy collision / fallback = 0
-```
-
-这些数值是当前 run 和 seed 集上的 evidence，不是跨场景、跨交通密度或跨版本的永久结论。
-
-Current targeted benchmark evidence on `stage5_reward_v2_accvp_lite_targeted_benchmark_v3`:
-
-```text
-Seeds:
-  [2, 3, 4, 7, 9, 13, 17, 19]
-
-wcdt_v3_merge_timing_reward_v2_prediction_shield:
-  terminal_success_rate = 1.0
-  timely_merge_success_rate = 1.0
-  first_target_lane_entry_distance_to_taper_p50 ≈ 146.55 m
-  deadline_opportunity_capture_rate ≈ 0.3077
-  taper_miss / proxy_collision / safety_violation / fallback = 0
-
-wcdt_v3_merge_timing_reward_v2_prediction_shield_accvp_lite_v3:
-  terminal_success_rate = 1.0
-  timely_merge_success_rate = 1.0
-  first_target_lane_entry_distance_to_taper_p50 ≈ 162.17 m
-  deadline_opportunity_capture_rate ≈ 0.3696
-  true ACCVP action-change = 8
-  same-action confirm = 4
-  taper_miss / proxy_collision / safety_violation / fallback = 0
-  ACCVP p95 latency ≈ 0.026 s
-```
-
-该 targeted benchmark 只主张：在 shadow-v3 标记出的 task-infeasible targeted states 中，ACV-Shield-lite v3 能低频执行 Risk-audited left action change，并在不引入 safety regression 的情况下改善合流时机与 deadline opportunity capture。它不是自然分布统计显著性结论。
-
-## 目录结构
-
-```text
-safe_rl/
-  config/default_safe_rl.yaml
-  sim/                 # SUMO 环境、动作空间、风险指标、场景校验
-  prediction/          # SUMO -> WcDT 适配、预测特征增强
-  risk/                # 显式风险特征、学习型 Risk Module、候选动作排序
-  shield/              # Shield 动作替换与 fallback policy
-  rl/                  # SB3 PPO 训练与评估封装
-  pipeline/            # Stage1-Stage5 命令入口
-
-scenarios/highway_merge/
-  highway_merge.sumocfg
-  highway_merge.rou.xml
-  highway_merge.net.xml
-```
-
-原始 WcDT 模型代码仍保留在 `net_works/` 下；`BackBone` 额外新增了 `predict()` 推理接口，原训练 `forward()` 未改变。
-
-## 环境准备
-
-推荐使用 `environment.yml` 创建环境：
+推荐从仓库环境创建 Python 环境，并使用同一个解释器执行所有阶段：
 
 ```powershell
 conda env create -f environment.yml
 conda activate WcDT
-```
-
-需要安装 SUMO。Full runner 会在启动任何 Stage 前选择一个安装根目录，并只从该根目录解析 `bin/sumo`、`bin/sumo-gui`、`bin/netconvert` 和 `tools/traci`，不会把不同安装的二进制或 Python TraCI 混用。安装选择优先级为：配置中的绝对 `scenario.sumo_binary`、`SUMO_HOME/bin`、系统 `PATH`、Windows 常见安装目录。显式绝对路径一旦不存在会立即报错，不会静默回退到另一套 SUMO。解析后的 tools 会插入 `sys.path` 首位，并统一注入所有 worker。路径、版本、TraCI 来源和二进制 SHA256 会写入 `pipeline_state.json`、场景 snapshot 和各阶段报告；`resume` 对安装路径、SUMO major/minor、TraCI 来源和实验语义版本漂移会拒绝继续，路径与版本不变但二进制 hash 变化时只记录诊断警告。
-
-Windows PowerShell 示例：
-
-```powershell
-$env:SUMO_HOME = "E:\Program Files\sumo-1.22.0"
+$env:SUMO_HOME = "<SUMO installation>"
 sumo --version
-netconvert --version
+python -m pytest -q
 ```
 
-如果只验证场景是否能加载：
+Windows 正式 CUDA 训练应在新的 Python 进程启动前设置：
 
 ```powershell
-python scenarios\highway_merge\build_network.py
-sumo -c scenarios\highway_merge\highway_merge.sumocfg --end 1 --no-step-log true --duration-log.disable true --seed 1
+$env:CUBLAS_WORKSPACE_CONFIG = ":4096:8"
 ```
 
-## 配置文件
+不要在一次流程中混用不同 Conda 环境、SUMO binary 或 TraCI 来源。当前 active 配置仍
+包含项目本机既有 checkpoint 路径；换机器时应先完成 lineage 审计，而不是静默替换模型。
 
-默认配置：
+## 代码结构
 
 ```text
-safe_rl/config/default_safe_rl.yaml
+safe_rl/accvp/                 # schema3、dataset、split、模型、训练与 artifact lifecycle
+safe_rl/stage1_counterfactual/ # snapshot/branch collection
+safe_rl/risk/                  # Risk Module 与 Candidate Risk backend
+safe_rl/shield/                # Safety Shield 与 bounded-stale 行为
+safe_rl/rl/                    # PPO 训练和 observation/reward integration
+safe_rl/analysis/              # paired/hierarchical statistics
+safe_rl/pipeline/              # 可执行阶段入口与 VNext coordinator
+safe_rl/config/                # registry、active、baseline、example、archive
+scenarios/highway_merge/       # SUMO network、routes、scenario config
+tests/                         # 数据、模型、runtime、统计和协调器回归测试
 ```
 
-所有 Stage 默认都会加载该配置；如需覆盖配置，传入：
+## 测试
 
-```powershell
---config path\to\your_config.yaml
-```
-
-最重要的实验开关：
-
-```yaml
-forecast_features:
-  enabled: false
-
-rl:
-  use_wcdt_forecast_features: false
-
-shield:
-  enabled: false
-```
-
-含义：
-
-```text
-forecast_features=false, shield=false  -> 原始 PPO
-forecast_features=true,  shield=false  -> PPO + forecast 预测特征（constant_velocity 或 WcDT）
-forecast_features=false, shield=true   -> PPO + Shield
-forecast_features=true,  shield=true   -> PPO + forecast 预测特征 + Shield
-```
-
-## 五阶段命令
-
-建议显式指定同一个 `RUN_ID`，这样 Stage2-Stage5 会使用同一轮实验输出。
-
-PowerShell：
+代码修改后至少执行：
 
 ```powershell
-$RUN_ID = "safe_rl_highway_merge_001"
+python -m compileall -q safe_rl tests
+python -m pytest tests/test_accvp_vnext_pipeline.py tests/test_accvp.py -q
+python -m pytest -q
 ```
 
-### Stage1：SUMO 危险先验采集
+测试通过只证明代码级契约；它不能替代真实 SUMO runtime benchmark、五副本 Stage5 或
+sealed holdout。synthetic fault audit 也只验证 bounded-stale 状态机，不构成 hard
+real-time deployment claim。
 
-采集 highway_merge 场景中的仿真危险先验、显式风险指标、历史/未来轨迹窗口。
+## 历史结果与原始 WcDT
 
-```powershell
-python -m safe_rl.pipeline.stage1_risk_probe --run-id $RUN_ID
-```
-
-主要输出：
-
-```text
-safe_rl_output/runs/<run_id>/stage1/risk_probe_buffer/manifest.json
-safe_rl_output/runs/<run_id>/stage1/risk_probe_buffer/arrays/*.npy
-safe_rl_output/runs/<run_id>/stage1/risk_events.jsonl
-safe_rl_output/runs/<run_id>/stage1/stage1_report.json
-safe_rl_output/runs/<run_id>/stage1/audit/stage1_data_audit.json
-safe_rl_output/runs/<run_id>/stage1/audit/stage1_action_histogram.csv
-safe_rl_output/runs/<run_id>/stage1/audit/stage1_action_histogram.png
-safe_rl_output/runs/<run_id>/stage1/audit/stage1_reward_distribution.png
-safe_rl_output/runs/<run_id>/stage1/audit/stage1_risk_distribution.png
-safe_rl_output/runs/<run_id>/stage1/replay/episode_0000.json
-safe_rl_output/runs/<run_id>/stage1/tensorboard/
-```
-
-命令行会显示：
-
-```text
-[stage1] run_id=...
-[stage1] SUMO config=...
-[stage1] SUMO binary=sumo, episodes=...
-Stage1 episodes:  50%|...
-[stage1] episode=0 replay=...
-[stage1] audit=...
-[stage1] buffer=...
-```
-
-Stage1 默认使用 mixed sampler：少量随机动作、主要 merge heuristic、部分 risk-seek 动作。当前活动场景是右侧单车道匝道进入 `main_aux lane 0`，再在 taper 前汇入相邻主路 `lane 1`。风险 buffer 会对每个状态展开 9 个候选动作样本，风险标签重点关注目标主路 front/rear gap、辅助车道局部 gap、距离 taper deadline 和 `taper_miss`。审计会统计执行动作分布、候选动作连续风险分布、boundary coverage、per-action risk rate、target-lane gap 分位数、risk type rate、curriculum profile 数量、reward 分布和 trajectory sample 数量。
-
-### Stage2：WcDT-style Prediction + Risk Module 训练
-
-使用 Stage1 buffer 训练风险模块；如果 buffer 中有轨迹窗口，也会训练 WcDT-style predictor。
-
-```powershell
-python -m safe_rl.pipeline.stage2_train_prediction_risk --run-id $RUN_ID
-```
-
-主要输出：
-
-```text
-safe_rl_output/runs/<run_id>/stage2/wcdt_predictor.pt
-safe_rl_output/runs/<run_id>/stage2/wcdt_predictor_best.pt
-safe_rl_output/runs/<run_id>/stage2/wcdt_v2_predictor.pt
-safe_rl_output/runs/<run_id>/stage2/wcdt_v2_predictor_best.pt
-safe_rl_output/runs/<run_id>/stage2/wcdt_v3_predictor.pt
-safe_rl_output/runs/<run_id>/stage2/wcdt_v3_predictor_best.pt
-safe_rl_output/runs/<run_id>/stage2/risk_module.pt
-safe_rl_output/runs/<run_id>/stage2/stage2_initial_prediction_report.json
-safe_rl_output/runs/<run_id>/stage2/stage2_training_report.json
-safe_rl_output/runs/<run_id>/stage2/tensorboard/
-```
-
-Stage2 会根据 full runner 的 forecast sources 选择 predictor。当前默认只训练 WcDT v3；旧 WcDT v1 仅在显式包含 `wcdt` 时训练，WcDT v2 仅在显式包含 `wcdt_v2` 时作为 ablation 训练。WcDT v1 会从 Stage1 trajectory windows 中划分 train/validation，按 validation `FDE + 0.5 * target_lane_gap_abs_error + 0.5 * future_min_distance_abs_error` 选择 best checkpoint。`wcdt_predictor_best.pt` 保存最佳权重；兼容路径 `wcdt_predictor.pt` 也写入同一 best 权重，避免后续 Stage3/Stage5 加载最后一个退化 epoch。
-
-Stage2 还会训练独立的 `wcdt_v2` residual-over-CV predictor。它不覆盖旧 WcDT，输入更偏 merge-centric：目标主路 front/rear、`main_aux lane 0` local、ramp local 和 nearest conflict vehicle。默认保存 3-model ensemble，`uncertainty` 来自 ensemble 方差。当前 `merge_safety_v3_masked` loss 会分别监督 `ADE / FDE / future minD / target front gap / target rear gap / front-rear ordering / smoothness`，其中 future minD 使用完整有效预测时域内的最小净距离误差。离场车辆的 future 不再复制末帧；训练与 diagnostics 通过 timestep mask 忽略缺失 future。每个 ensemble member 会在终端和 TensorBoard 输出每轮训练 loss 与 validation 指标；默认最多训练 30 epochs，并在 validation score 连续 10 轮无明显改善时 early stop。Risk Module 使用连续风险目标训练 risk head，并保留 6 类硬标签：`collision / near_miss / low_ttc / high_drac / merge_conflict / taper_miss`。validation 报告会输出 legal candidate 上的 boundary `ECE / Brier / NLL / reliability_bins`、中间分数区间占比和 ranking 诊断；默认不把 calibration 写入 runtime，只有显式开启配置后 Shield 才使用 calibrated score。
-
-`wcdt_v3` 是当前默认预测主线。它继续使用 route-aware CV residual 和 3-model ensemble，但加入历史轨迹 Transformer、逐时刻 lane/edge-role embedding、车辆角色 embedding 和 actor self-attention。Transformer 使用 history timestep mask，历史缺失填充值不会参与 attention。WcDT v2 保留为显式 ablation，并与 v3 共用 `merge_safety_v3_masked` loss，保证结构消融口径一致。
-
-新的 Stage1 主存储格式是 `manifest_npy_v1`：`stage1_buffer_schema_version=5`、`trajectory_schema_version=4`。每个数组单独保存为可 mmap 的 `.npy`，manifest 记录 dtype、shape、SHA256、seed schedule、车辆排序版本和 SUMO 安装指纹。`resume` 会重新检查每个 NPY 的存在性、dtype、shape 和 SHA256，而不只比较 manifest。`stage1.output_format` 目前只接受 `manifest_npy_v1`，其他值会在采集前明确失败。trajectory 数据保存 history/future timestep mask、逐时刻 lane/edge-role metadata、真实 window end step、decision index 和 episode seed。正式 v2/v3 训练只接受新 schema；旧 `risk_probe_buffer.npz` 继续只读兼容，但不参与严格并行复现结论。
-
-WcDT v1、v2 和 v3 使用独立 batch size：默认分别为 `16`、`32` 和 `16`。初始 Stage2 会额外保留 `risk_module_initial.pt` 与 `stage2_initial_training_report.json`；Stage4 后重训 Risk Module 时继续更新最终 `risk_module.pt`，不会覆盖初始快照。
-
-说明：当前仓库没有预训练 WcDT checkpoint，因此默认从 SUMO 采集数据训练；如有外部权重，可在配置中设置：
-
-```yaml
-prediction:
-  checkpoint: "path/to/wcdt_checkpoint.pt"
-```
-
-Stage4 采集完成后，如果要把 on-policy failure buffer 合并回 Risk Module 训练，使用：
-
-```powershell
-python -m safe_rl.pipeline.stage2_train_prediction_risk --run-id $RUN_ID --config safe_rl\config\active\pipeline\stage2_with_stage4.yaml
-```
-
-该配置会读取同一 run 下的 `stage1/risk_probe_buffer/manifest.json` 与 `arrays/*.npy`，并与 `stage4/on_policy_failure_buffer.npz` 的风险样本合并训练 Risk Module；WcDT predictor 仍优先使用 Stage1 的 trajectory windows。历史 run 的 `stage1/risk_probe_buffer.npz` 仅作为只读兼容输入。
-
-### Stage3：PPO 强化学习训练
-
-训练 highway_merge ego agent。默认是不带 WcDT forecast features 的 PPO。
-
-```powershell
-python -m safe_rl.pipeline.stage3_train_ppo --run-id $RUN_ID
-```
-
-主要输出：
-
-```text
-safe_rl_output/runs/<run_id>/stage3/ppo_model.zip
-safe_rl_output/runs/<run_id>/stage3/stage3_training_report.json
-safe_rl_output/runs/<run_id>/stage3/tensorboard/
-```
-
-Stage3 使用 Stable-Baselines3 的 TensorBoard 记录 PPO reward、episode length、policy loss、value loss、entropy 等训练指标。
-
-如果要先训练不依赖 checkpoint 的 `PPO + constant-velocity forecast features`，使用覆盖配置：
-
-```text
-safe_rl/config/baselines/cv/ppo_constant_velocity_features.yaml
-```
-
-如果要训练旧版 `PPO + WcDT v1 forecast features`，使用历史兼容覆盖配置：
-
-```text
-safe_rl/config/baselines/wcdt/ppo_forecast_features.yaml
-safe_rl/config/baselines/wcdt/ppo_wcdt_v1_features_legacy.yaml
-```
-
-`ppo_forecast_features.yaml` 保留是为了旧命令不失效；新主线推荐通过 full runner 生成 CV + WcDT v3 的 forecast PPO 配置。注意：forecast-feature PPO 是 63 维 observation，不能复用 baseline 的 52 维 PPO；如果手动训练 WcDT v1，需要把配置中的 `forecast_features.checkpoint` 指向 baseline run 的 `stage2/wcdt_predictor.pt`。
-
-```powershell
-$FORECAST_RUN_ID = "safe_rl_highway_merge_forecast_001"
-python -m safe_rl.pipeline.stage3_train_ppo --run-id $FORECAST_RUN_ID --config safe_rl\config\baselines\wcdt\ppo_forecast_features.yaml
-```
-
-### Stage4：RL 过程危险片段采集与风险模型修正数据
-
-默认使用 shadow mode：不真正替换 PPO 动作，只记录 Shield 会如何干预。
-
-```powershell
-python -m safe_rl.pipeline.stage4_collect_failures --run-id $RUN_ID
-```
-
-主要输出：
-
-```text
-safe_rl_output/runs/<run_id>/stage4/on_policy_failure_buffer.npz
-safe_rl_output/runs/<run_id>/stage4/intervention_buffer.jsonl
-safe_rl_output/runs/<run_id>/stage4/stage4_report.json
-safe_rl_output/runs/<run_id>/stage4/replay/episode_0000.json
-safe_rl_output/runs/<run_id>/stage4/tensorboard/
-```
-
-如果要启用真实 intervention mode，使用覆盖配置 `safe_rl/config/active/pipeline/stage4_intervention.yaml`。
-
-命令：
-
-```powershell
-python -m safe_rl.pipeline.stage4_collect_failures --run-id $RUN_ID --config safe_rl\config\active\pipeline\stage4_intervention.yaml
-```
-
-Stage4 report 会额外记录 action histogram、shadow would-replace rate、fallback rate、raw risk 分布和 replacement risk delta，用于判断 Shield 是否仍在过度干预。
-
-### Stage5：Shield on/off 成对闭环安全评估
-
-默认命令只比较 baseline 52 维 PPO 的 `ppo` 和 `ppo_shield` 两组，使用相同 SUMO seed、相同 PPO checkpoint、相同初始交通状态，只改变 Shield 开关做 paired evaluation。
-
-```powershell
-python -m safe_rl.pipeline.stage5_paired_eval --run-id $RUN_ID
-```
-
-主要输出：
-
-```text
-safe_rl_output/runs/<run_id>/stage5/formal_paired_eval_report.json
-safe_rl_output/runs/<run_id>/stage5/shield_off_metrics.json
-safe_rl_output/runs/<run_id>/stage5/shield_on_metrics.json
-safe_rl_output/runs/<run_id>/stage5/replay/<group>_seed_<seed>.json
-safe_rl_output/runs/<run_id>/stage5/tensorboard/
-```
-
-如果要手动比较 baseline、CV forecast 和 WcDT v2 forecast，建议分别训练 baseline PPO、CV forecast PPO、WcDT v2 forecast PPO，然后复制并修改 ablation 模板中的 `model_path`：
-
-```text
-safe_rl/config/examples/vnext/stage5_six_groups_cv_wcdt_v2.example.yaml
-```
-
-旧模板 `safe_rl/config/examples/legacy/stage5_four_groups.example.yaml` 是 WcDT v1 legacy 示例，不作为新主实验模板。模板中的 forecast 组必须显式设置对应 63 维 forecast PPO 的 `model_path`。CV、WcDT v1 和 WcDT v2 虽然 observation 都是 63 维，但 forecast feature 分布不同，应分别训练 PPO。`forecast_source: "wcdt"` 还要设置 `forecast_checkpoint` 指向 Stage2 的 `wcdt_predictor.pt`；`forecast_source: "wcdt_v2"` 指向 `wcdt_v2_predictor.pt`；`forecast_source: "constant_velocity"` 不需要 checkpoint。Stage5 会在评估前校验 PPO model 和环境 observation shape，不匹配会直接失败。
-
-命令：
-
-```powershell
-python -m safe_rl.pipeline.stage5_paired_eval --run-id $RUN_ID --config path\to\your_stage5_six_groups.yaml
-```
-
-### Stage5 Shield 阈值扫描
-
-当已有完整 run 输出后，可以不重训 Stage1-Stage4，直接复用当前 PPO、forecast PPO 和 `stage2/risk_module.pt` 扫描 Shield 阈值：
-
-```powershell
-python -m safe_rl.pipeline.stage5_shield_sweep --run-id $RUN_ID
-```
-
-默认扫描 `activation_risk_threshold/replacement_margin` 的四组组合：`0.90/0.15`、`0.85/0.15`、`0.85/0.10`、`0.80/0.10`。输出写入：
-
-```text
-safe_rl_output/runs/<run_id>/stage5_sweep/shield_sweep_report.json
-safe_rl_output/runs/<run_id>/stage5_sweep/generated_configs/
-```
-
-报告会按 variant 汇总 reward、min distance、TTC、DRAC、真实 replacement、fallback 和 regression 检查，并给出 `recommended_variant`。同时会输出 Shield score 饱和诊断，包括 raw risk score、best candidate risk score、replacement risk delta、reason ratio 和 raw risk 到 activation threshold 的 margin 分布，用来判断为什么不同阈值组合可能产生完全相同的动作。
-
-默认阈值仍保持保守设置：
-
-```yaml
-shield:
-  activation_risk_threshold: 0.90
-  replacement_margin: 0.15
-  allow_fallback: false
-  emergency_fallback_enabled: true
-  emergency_saturated_consecutive_enabled: false
-  emergency_saturated_consecutive_steps: 2
-```
-
-`emergency_fallback` 是独立的极端物理风险兜底，只在 `min_ttc <= 0.30`、`min_distance <= 1.0`，或 raw/best candidate 风险都饱和且进入物理 watch 区时触发。它优先选择合法的 `keep_decelerate` / `keep_hold`，并单独记录为 `emergency_fallback_count`，不会混入普通 `fallback_count`。连续风险饱和提前触发逻辑仍保留为实验开关，但默认关闭，因为旧简化场景中它会破坏正常策略。
-
-如果只想做诊断，可以额外扫描更激进阈值：
-
-```powershell
-python -m safe_rl.pipeline.stage5_shield_sweep --run-id $RUN_ID --include-aggressive
-```
-
-如需对比 raw risk score 与 temperature-scaled score 对 Shield 行为的影响，增加：
-
-```powershell
-python -m safe_rl.pipeline.stage5_shield_sweep --run-id $RUN_ID --include-calibrated
-```
-
-`--include-aggressive` 和 `--include-calibrated` 只用于解释风险分数饱和、校准效果和阈值敏感性，不会自动改写默认 Shield 配置。sweep report 会输出 `calibration_effect_summary` 和 `threshold_sensitivity_summary`，用于判断 calibrated score 是否真正改变替换率、是否造成 regression、不同阈值下替换率是否可解释变化。当前默认 Shield 仍保持 `0.90/0.15`。
-
-## 一键顺序运行示例
-
-当前活动 benchmark 已升级为常规右侧匝道辅助车道场景：`main_in(3 lanes) -> main_aux(4 lanes) -> main_out(3 lanes)`。匝道车辆从右侧进入 `main_aux lane 0`，必须在 taper 前向左汇入相邻主路 `lane 1`。因此旧 zipper、旧左侧 add/drop 地图以及修正前的 run、checkpoint 和 replay 只能作为历史参考，不能与新结果直接横向比较，也不能复用。
-
-当前推荐实验顺序只包含三步：full pipeline、50-seed confirmatory、calibrated sweep。full runner 会在网络构建后把场景 XML、net 和 SUMO 配置复制到 `safe_rl_output/runs/<run_id>/scenario_snapshot/`，replay 同时记录 snapshot manifest 与 hash，保证后续能够定位具体地图版本。
-
-推荐直接使用全流程 runner。它会重建网络、做 SUMO smoke check、依次运行 Stage1/2/3/4、用 Stage4 buffer 重训 Risk Module，然后在同一份 Stage1/Stage4 数据、同一个 Risk Module、同一个 baseline PPO 上分别训练 CV forecast PPO 和 WcDT v3 forecast PPO，并完成多组 Stage5 paired evaluation。默认 `--run-mode new` 会拒绝覆盖已有 run：
-
-```powershell
-python -m safe_rl.pipeline.run_full_pipeline --run-id safe_rl_right_onramp_v3_001 --run-mode new --forecast-sources constant_velocity,wcdt_v3
-python -m safe_rl.pipeline.stage5_confirmatory_eval --run-id safe_rl_right_onramp_v3_001 --episodes 50
-python -m safe_rl.pipeline.stage5_shield_sweep --run-id safe_rl_right_onramp_v3_001 --include-calibrated
-```
-
-新辅助车道 benchmark 的正式训练建议使用独立 run id，并提高 Stage1 边界样本覆盖。需要同时验证 masked v2 基线和 v3 主分支时，显式启用三种 forecast source：
-
-```powershell
-python -m safe_rl.pipeline.run_full_pipeline --run-id safe_rl_right_onramp_maskfix_v3_001 --run-mode new --stage1-episodes 1000 --ppo-timesteps 100000 --forecast-ppo-timesteps 100000 --forecast-sources constant_velocity,wcdt_v2,wcdt_v3 --forecast-ppo-profile shield_guided
-python -m safe_rl.pipeline.stage5_confirmatory_eval --run-id safe_rl_right_onramp_maskfix_v3_001 --episodes 50
-python -m safe_rl.pipeline.forecast_diagnostics --run-id safe_rl_right_onramp_maskfix_v3_001 --max-samples 512 --low-seed-count 5
-python -m safe_rl.pipeline.stage5_shield_sweep --run-id safe_rl_right_onramp_maskfix_v3_001 --include-calibrated
-```
-
-### Full runner 运行模式
-
-Full runner 会在 `<run_id>/pipeline_state.json` 中记录任务状态、调用参数、场景 hash 和关键产物 hash。中断后使用相同 run id 续跑，不需要重新输入首次运行的训练参数：
-
-```powershell
-python -m safe_rl.pipeline.run_full_pipeline --run-id safe_rl_right_onramp_maskfix_v3_001 --run-mode resume
-```
-
-如需明确删除 base run 和对应 forecast 子 run 并从头运行，必须显式使用 `overwrite`：
-
-```powershell
-python -m safe_rl.pipeline.run_full_pipeline --run-id safe_rl_right_onramp_maskfix_v3_001 --run-mode overwrite --stage1-episodes 1000 --ppo-timesteps 100000 --forecast-ppo-timesteps 100000 --forecast-sources constant_velocity,wcdt_v2,wcdt_v3 --forecast-ppo-profile shield_guided
-```
-
-`resume` 会校验默认配置、pipeline profile、场景 snapshot/source、已完成任务产物、SUMO/TraCI 安装路径，以及 `episode_seed_schedule`、车辆排序版本和 Stage1 存储格式。场景 source hash 只覆盖手写 `.nod/.edg/.con/.rou/.sumocfg`，排除含生成时间戳的 `.net.xml`；snapshot 仍保存并哈希 `.net.xml`。语义或路径漂移会拒绝静默续跑；相同路径与版本下的二进制 hash 变化会写入 `resume_diagnostics`，提示使用新 run id。各 Stage 的独立命令仍保留，仅建议用于调试和定向重跑。
-
-### 轻量 smoke profile
-
-需要验证全链路接口时，使用 `--pipeline-profile smoke`。该 profile 会把单 episode 仿真时长压到 `6s`，把 Stage1/4/5 episode 数降到 `2/1/1`，禁用 Stage1 正式 audit gate 和 Stage3 checkpoint eval，并把 Risk、WcDT v2、WcDT v3 训练压缩到单 epoch、单 member。CLI 显式参数仍优先于 profile：
-
-```powershell
-E:\Programs\EnvAnaconda3\envs\pytorch\python.exe -m safe_rl.pipeline.run_full_pipeline `
-  --run-id safe_rl_maskfix_smoke `
-  --run-mode new `
-  --pipeline-profile smoke `
-  --forecast-sources constant_velocity,wcdt_v2,wcdt_v3 `
-  --forecast-ppo-profile shield_guided
-```
-
-profile 名称和配置 hash 会写入 `pipeline_state.json`，`resume` 时必须一致。smoke 仅用于接口验证，不允许将 v3 标记为可晋级。
-
-### 并行 performance profile
-
-默认配置继续使用单个 Stage1 worker 和单个 PPO environment，保证旧实验不会静默改变。需要加速正式实验时，显式使用 `--pipeline-profile performance`：
-
-```powershell
-E:\Programs\EnvAnaconda3\envs\pytorch\python.exe -m safe_rl.pipeline.run_full_pipeline `
-  --run-id safe_rl_right_onramp_perf_v3_001 `
-  --run-mode new `
-  --pipeline-profile performance `
-  --stage1-episodes 1000 `
-  --ppo-timesteps 100000 `
-  --forecast-ppo-timesteps 100000 `
-  --forecast-sources constant_velocity,wcdt_v3 `
-  --forecast-ppo-profile merge_timing
-```
-
-该 profile 默认启用：
-
-```text
-Stage1 workers: 6
-Stage1 shard size: 25 episodes
-PPO environments: 4 (SubprocVecEnv, Windows spawn)
-PPO n_steps: 256 per environment
-PPO rollout size: 4 x 256 = 1024
-Persistent SUMO reload: enabled
-TraCI vehicle subscriptions: enabled
-```
-
-`total_timesteps` 仍表示所有 PPO environment 合计的 transition 请求数，不会再乘以 environment 数。SB3 会按 `num_envs * n_steps` 的 rollout quantum 向上取整，Stage3 report 同时记录 `requested_total_timesteps`、`actual_total_timesteps`、`rollout_quantum` 和 `timesteps_rounded_up`，吞吐率使用实际步数计算。每个 worker 将 PyTorch/OMP/MKL 限制为单线程，主 PPO 进程默认使用 4 个线程。forecast predictor 和 reward Risk Module 会在每个 PPO worker 中独立加载；Stage3 report 会给出基于 checkpoint 文件大小的内存下界估算。内存不足时可显式降为 2 个环境：
-
-Stage3 report 还会记录每个已完成训练 episode 的 `env_rank / episode_index / episode_seed / completed_at_timestep`，并给出唯一 seed 数和重复 seed 数；`incrementing_v1` 下检测到重复 seed 会拒绝产出该次训练结果。
-
-```powershell
---ppo-num-envs 2
-```
-
-Stage1 worker 数也可独立覆盖：
-
-```powershell
---stage1-workers 4
-```
-
-CLI 参数优先于 profile。Stage1 与 PPO 使用版本化 `incrementing_v1` seed schedule：
-
-```text
-episode_seed = base_seed + worker_rank + episode_index * num_envs
-```
-
-Stage5 的显式 `reset(seed=X)` 始终精确使用 `X`。并行 Stage1 使用 episode 独立 seed/RNG、长驻 worker 和未压缩 NPY shard；parent 通过两遍扫描和 `open_memmap()` 流式合并到最终 Manifest + NPY dataset，不执行全 shard `np.concatenate()` 或 `np.savez_compressed()`。PPO 并行会改变 transition 到达顺序，因此 performance run 属于新的训练配置，不能与旧单环境 checkpoint 视为位级等价。训练期会关闭 forecast-aware task shadow/backstop，Stage5 和 failure audit 仍会开启 shadow 诊断。
-
-运行正式实验前，可比较串行与并行热点：
-
-```powershell
-E:\Programs\EnvAnaconda3\envs\pytorch\python.exe -m safe_rl.tools.benchmark_pipeline_hotpaths `
-  --stage1-episodes 50 `
-  --ppo-timesteps 4096 `
-  --profiles default,performance
-```
-
-报告区分 parent `wall_time`、`worker_time_sum`、`worker_max_time`、aggregate/per-worker control decisions per second、simulation steps per second、episodes per hour 和 merge I/O time。热点占比只相对于 `worker_time_sum` 计算，不用 worker 时间总和冒充 wall time。报告还包含 PPO fps、TraCI fallback、Risk/forecast forward 次数和 SUMO restart/reload。当前优化不改变 `step_length`、control interval、预测 horizon 或候选动作数量。Libsumo 和并行 checkpoint evaluation 暂未启用。
-
-### Predictor 分支与 legacy 兼容
-
-默认 `--forecast-sources` 是 `constant_velocity,wcdt_v3`。初始 Stage2 只训练 WcDT v3 predictor，不再训练旧 WcDT v1 或 v2；v1 仅在显式包含 `wcdt` 时启用，v2 仅在显式包含 `wcdt_v2` 时作为 ablation 启用。如果要保留 v1/v2 对照，需要显式运行 `constant_velocity,wcdt`、`constant_velocity,wcdt_v2` 或 `constant_velocity,wcdt_v2,wcdt_v3`。如果只想跑其中一个 forecast 分支：
-
-```powershell
-python -m safe_rl.pipeline.run_full_pipeline --run-id safe_rl_merge_local_cv_001 --run-mode new --forecast-sources constant_velocity
-python -m safe_rl.pipeline.run_full_pipeline --run-id safe_rl_merge_local_wcdt_001 --run-mode new --forecast-sources wcdt
-python -m safe_rl.pipeline.run_full_pipeline --run-id safe_rl_merge_local_wcdt_v2_001 --run-mode new --forecast-sources wcdt_v2
-python -m safe_rl.pipeline.run_full_pipeline --run-id safe_rl_merge_local_wcdt_v3_001 --run-mode new --forecast-sources wcdt_v3
-```
-
-旧参数 `--forecast-source wcdt` 仍可用于单分支兼容，但不要和 `--forecast-sources` 同时使用。
-
-### WcDT v2 显式消融与 WcDT v3 主线
+旧 run 可以用于方法演进、failure-case regression 和论文结果溯源，但必须标为
+`diagnostic_only`。特别是受 schema2 actor-row 不确定性、fingerprint split 泄漏、test
+参与阈值选择或单 member uncertainty 影响的结果，不能升级为 VNext 正式结论。
 
-WcDT v3 是当前主实验预测分支。需要一次性比较 CV、v2-fixed 和 v3 时，显式启用三个 source。Stage1、Risk Module、baseline PPO、Stage4 数据和 Stage5 seeds 仍只生成一次：
-
-```powershell
-E:\Programs\EnvAnaconda3\envs\pytorch\python.exe -m safe_rl.pipeline.run_full_pipeline `
-  --run-id safe_rl_right_onramp_maskfix_v3_001 `
-  --run-mode new `
-  --stage1-episodes 1000 `
-  --ppo-timesteps 100000 `
-  --forecast-ppo-timesteps 100000 `
-  --forecast-sources constant_velocity,wcdt_v2,wcdt_v3 `
-  --forecast-ppo-profile shield_guided
-
-E:\Programs\EnvAnaconda3\envs\pytorch\python.exe -m safe_rl.pipeline.stage5_confirmatory_eval `
-  --run-id safe_rl_right_onramp_maskfix_v3_001 `
-  --episodes 50
-
-E:\Programs\EnvAnaconda3\envs\pytorch\python.exe -m safe_rl.pipeline.forecast_diagnostics `
-  --run-id safe_rl_right_onramp_maskfix_v3_001 `
-  --max-samples 512 `
-  --low-seed-count 5
-```
-
-显式启用 v2 后，Stage5 会额外增加 `ppo_wcdt_v2_features` 和 `wcdt_v2_prediction_shield`，形成八组消融。diagnostics 会输出 CV vs v3、v2 vs v3 的预测误差、feature distribution、policy sensitivity 和低 minD 回放命令。v3 虽然是当前主线，但仍必须通过正式安全 gate：至少 50 episodes 的 Stage5 同时满足无 proxy collision、安全率与成功率不退化、耗时不明显增加、Shield replacement 和 emergency fallback 不增加。smoke 或缺少 diagnostics 时固定输出 `promotion_reason=insufficient_formal_evidence`。
-
-如果 Stage5 出现 `minD=0` 或 proxy collision，先运行 failure audit，不要直接继续扩 seed 或调阈值：
-
-```powershell
-python -m safe_rl.pipeline.stage5_failure_audit --run-id safe_rl_right_onramp_maskfix_v3_001 --groups cv_prediction_shield,wcdt_v3_prediction_shield
-```
-
-该报告会写入 `stage5/failure_audit/failure_audit_report.json` 和 `failure_replay_commands.ps1`，用于检查失败 seed 的 replay、Shield raw/final action、risk 分数、replacement reason 和 emergency fallback 是否触发太晚。
-
-如需覆盖采样轮数和 PPO 训练步数：
-
-```powershell
-python -m safe_rl.pipeline.run_full_pipeline --run-id safe_rl_merge_local_001 --run-mode new --stage1-episodes 500 --ppo-timesteps 20000 --forecast-sources constant_velocity,wcdt_v3
-```
-
-生成的临时配置会写入：
-
-```text
-safe_rl_output/runs/<run_id>/generated_configs/
-safe_rl_output/runs/<run_id>/generated_configs/forecast_cv_ppo.yaml
-safe_rl_output/runs/<run_id>/generated_configs/forecast_wcdt_v3_ppo.yaml
-safe_rl_output/runs/<run_id>/generated_configs/stage5_multi_groups.yaml
-safe_rl_output/runs/<run_id>/stage5/diagnostics/forecast_diagnostics.json
-```
-
-只有显式包含 `wcdt` 或 `wcdt_v2` 时才会生成 `forecast_wcdt_ppo.yaml` 或 `forecast_wcdt_v2_ppo.yaml`。当前主线实验可以按三条轴线理解，避免把名字混在一起：
-
-```text
-PPO training reward: default / safety_forecast / shield_guided_forecast
-PPO observation: 52D baseline / 63D CV / 63D WcDT v1 legacy / 63D WcDT v2 / 63D WcDT v3 ablation
-Eval-time Shield: off / on
-```
-
-`safety_forecast` 和 `shield_guided_forecast` 都只是普通 PPO 的 reward profile；`ppo_shield` 是同一个 PPO 在评估时套 eval-time Shield，不是重新训练的模型。
-
-### 训练与推理设备
-
-设备已按负载拆分：
-
-```yaml
-training:
-  device: "auto"                  # legacy fallback
-  stage2_device: "auto"           # predictor / Risk Module 批训练
-  ppo_device: "cpu"               # SB3 MLP PPO
-  forecast_runtime_device: "cpu"  # SUMO 在线小 batch 推理
-  diagnostics_device: "auto"      # 批量 diagnostics
-```
-
-`auto` 在 CUDA 可用时会自动选择 GPU。在线 forecast 推理是否适合 GPU 取决于本机小 batch 延迟，使用以下命令测量后再覆盖 `forecast_runtime_device`：
-
-```powershell
-python -m safe_rl.tools.benchmark_forecast_runtime --run-id <run_id> --sources wcdt_v2,wcdt_v3 --devices cpu,cuda --steps 500
-```
-
-完成 full pipeline 后，推荐用 50 seeds 做最终复验。该命令只复用已有 Stage1/2/3/4 输出，不重训模型：
-
-```powershell
-python -m safe_rl.pipeline.stage5_confirmatory_eval --run-id safe_rl_merge_local_001
-```
-
-短流程 smoke 可以先跑：
-
-```powershell
-python -m safe_rl.pipeline.stage5_confirmatory_eval --run-id safe_rl_merge_local_001 --episodes 5
-```
-
-confirmatory 输出：
-
-```text
-safe_rl_output/runs/<run_id>/stage5_confirmatory/formal_paired_eval_report.json
-safe_rl_output/runs/<run_id>/stage5_confirmatory/confirmatory_summary.json
-safe_rl_output/runs/<run_id>/stage5_confirmatory/generated_configs/stage5_confirmatory.yaml
-```
-
-`confirmatory_summary.json` 会把主结果明确分成：可信 Shield 主线 `ppo/ppo_shield`、forecast 对照 `ppo_cv_features`、当前推荐预测分支 `ppo_wcdt_v3_features`、当前最强安全组合 `wcdt_v3_prediction_shield`。报告还会写入 `model_role_explanations` 和 `reporting_recommendation`，方便直接整理结果表。旧 WcDT v1 的 `ppo_wcdt_features` / `wcdt_prediction_shield` 不删除，但只作为 diagnostic；WcDT v2 的 `ppo_wcdt_v2_features` / `wcdt_v2_prediction_shield` 仅作为显式 ablation，不作为默认主表。
-
-如果 `wcdt_v2_prediction_shield` 没有实际替换但不退化，会标记 `shield_not_needed_on_wcdt_v2_policy=true`；如果只发生少量替换但安全指标不退化，会标记 `low_frequency_safety_backstop=true`，表示 Shield 在 WcDT v2 policy 上作为低频补强，而不是失败。
-
-主结果表建议同时报告四类指标：
-
-```text
-Safety: collision_rate, near_miss_rate, proxy_collision_rate, safety_violation_rate, taper_miss_rate, proxy_collision_count, safety_violation_count, taper_miss_count, min_distance_le_collision_threshold_count, min_distance_p1, ttc_p1, drac_p99_capped
-Task/Efficiency: merge_success_rate, completion_time_mean, completion_time_p95
-Driving Behavior: ego_speed_mean, ego_speed_p10, hard_brake_rate
-Shield: mean_actual_replacements, actual_replacement_rate, fallback_rate, emergency_fallback_count, emergency_fallback_rate
-```
-
-报告仍保留 `drac_p99_raw` 和兼容字段 `drac_p99`，用于 debug `minD=0 / DRAC=1e6` 这类极端异常；主表优先使用 capped 后的 `drac_p99_capped`。
-
-补充效率和舒适性指标后，不需要重跑 Stage1/2/3/4；只需要重跑 Stage5 confirmatory 和 calibrated sweep 即可刷新报告。
-
-Forecast feature 利用率诊断建议按以下顺序运行。该流程不改变 63 维 observation，只修正 `forecast_merge_gap` 的语义并检查 PPO 是否真的使用 forecast 维度：
-
-```powershell
-python -m safe_rl.pipeline.run_full_pipeline --run-id safe_rl_wcdt_v2_featurefix_001 --run-mode new --forecast-sources constant_velocity,wcdt_v2
-python -m safe_rl.pipeline.stage5_confirmatory_eval --run-id safe_rl_wcdt_v2_featurefix_001 --episodes 50
-python -m safe_rl.pipeline.forecast_diagnostics --run-id safe_rl_wcdt_v2_featurefix_001 --max-samples 512 --low-seed-count 5
-```
-
-`forecast_diagnostics.json` 会写入 `forecast_feature_summary`、`forecast_merge_gap_equals_min_distance_rate` 和 `policy_feature_sensitivity`。其中 `forecast_merge_gap` 统一表示未来目标合流车道可用 gap，不再复用 `forecast_min_distance`。如果 WcDT v2 预测质量通过但 zero/shuffle forecast dims 后动作几乎不变，报告会标记 `forecast_policy_underutilized=true`。
-
-如果 20k PPO 下 WcDT v2 policy 收益仍有限，再跑长训练对照：
-
-```powershell
-python -m safe_rl.pipeline.run_full_pipeline --run-id safe_rl_wcdt_v2_longppo_001 --run-mode new --forecast-sources constant_velocity,wcdt_v2 --ppo-timesteps 100000
-python -m safe_rl.pipeline.stage5_confirmatory_eval --run-id safe_rl_wcdt_v2_longppo_001 --episodes 50
-```
-
-如果长训练后 forecast PPO 变激进、尾部安全不稳定，使用 safety-aware forecast PPO。该配置只作用于 forecast PPO，baseline PPO 仍使用默认 reward：
-
-```powershell
-python -m safe_rl.pipeline.run_full_pipeline --run-id safe_rl_wcdt_v2_safetyppo_001 --run-mode new --forecast-sources constant_velocity,wcdt_v2 --forecast-ppo-profile safety --forecast-ppo-timesteps 100000
-python -m safe_rl.pipeline.stage5_confirmatory_eval --run-id safe_rl_wcdt_v2_safetyppo_001 --episodes 50
-python -m safe_rl.pipeline.forecast_diagnostics --run-id safe_rl_wcdt_v2_safetyppo_001 --max-samples 512 --low-seed-count 5
-```
-
-如果 safety-aware PPO 仍没有充分利用 WcDT v2 预测特征，下一步使用 Shield-guided forecast PPO。该 profile 仍不替换训练动作，只把 Risk Module / Shield shadow 判断写入 reward shaping，让 forecast PPO 学会避开会被 Shield 替换的 raw action：
-
-```powershell
-python -m safe_rl.pipeline.run_full_pipeline --run-id safe_rl_wcdt_v2_shieldguided_001 --run-mode new --forecast-sources constant_velocity,wcdt_v2 --forecast-ppo-profile shield_guided --forecast-ppo-timesteps 100000
-python -m safe_rl.pipeline.stage5_confirmatory_eval --run-id safe_rl_wcdt_v2_shieldguided_001 --episodes 50
-python -m safe_rl.pipeline.forecast_diagnostics --run-id safe_rl_wcdt_v2_shieldguided_001 --max-samples 512 --low-seed-count 5
-```
-
-`shield_guided_forecast` 会在 forecast PPO 生成配置中绑定 base run 的 `stage2/risk_module.pt`。baseline PPO 不加载该 Risk Module，仍保持默认 reward。
-
-Stage3 默认启用 safety checkpoint selection。这里的 `safety_score` / `checkpoint_selection_score` 只用于在多个 checkpoint 中选择下游使用的 `ppo_model.zip`，不是 PPO 训练 reward。训练 reward 由 `rl.reward_profile` 决定。训练结束后会同时输出：
-
-```text
-safe_rl_output/runs/<run_id>/stage3/ppo_model_final.zip
-safe_rl_output/runs/<run_id>/stage3/ppo_model_best_safety.zip
-safe_rl_output/runs/<run_id>/stage3/ppo_model.zip
-safe_rl_output/runs/<run_id>/stage3/stage3_checkpoint_selection_report.json
-```
-
-下游 Stage5 仍读取 `ppo_model.zip`，该路径会保存/复制为 `checkpoint_selection_score` 最好的 checkpoint，避免最后一个 checkpoint 过于激进。默认 `stage3.checkpoint_selection_profile: "safety"` 保持安全优先；如果后续发现 WcDT v3 policy 过度保守，可以显式改为 `"safety_efficiency"`，在安全项基础上轻量加入 `completion_time_mean` 和 `ego_speed_mean`，但它不是当前默认主线。
-
-如果需要手动逐阶段运行，命令如下：
-
-```powershell
-$RUN_ID = "safe_rl_highway_merge_001"
-
-python scenarios\highway_merge\build_network.py
-python -m safe_rl.pipeline.stage1_risk_probe --run-id $RUN_ID
-python -m safe_rl.pipeline.stage2_train_prediction_risk --run-id $RUN_ID
-python -m safe_rl.pipeline.stage3_train_ppo --run-id $RUN_ID
-python -m safe_rl.pipeline.stage4_collect_failures --run-id $RUN_ID
-python -m safe_rl.pipeline.stage2_train_prediction_risk --run-id $RUN_ID --config safe_rl\config\active\pipeline\stage2_with_stage4.yaml
-python -m safe_rl.pipeline.stage5_paired_eval --run-id $RUN_ID
-```
-
-## 命令行进度输出
-
-五个 Stage 都会在命令行输出关键运行信息，包括：
-
-```text
-run_id
-SUMO config / SUMO binary
-输入 checkpoint 或 buffer 路径
-输出目录
-episode / epoch / seed 进度
-关键输出文件路径
-```
-
-典型示例：
-
-```text
-[stage2] run_id=safe_rl_highway_merge_001
-[stage2] input_stage1=...\stage1\risk_probe_buffer\manifest.json
-[stage2] transition_count=12345
-Stage2 risk epochs:  30%|...
-[stage2] risk epoch=3/10 loss=0.421337
-[stage2] report=...\stage2\stage2_training_report.json
-```
-
-## TensorBoard 查看训练效果
-
-默认配置中 `run.tensorboard=true`，各阶段会写入：
-
-```text
-stage1/tensorboard/  # episode reward, collision, near-miss, min distance
-stage2/tensorboard/  # risk loss, prediction loss
-stage3/tensorboard/  # SB3 PPO reward/loss/value/entropy 等
-stage4/tensorboard/  # on-policy reward, intervention/fallback/collision
-stage5/tensorboard/  # 各实验组 reward/safety/task/intervention 指标
-```
-
-启动 TensorBoard：
-
-```powershell
-tensorboard --logdir safe_rl_output\runs\$RUN_ID
-```
-
-如果要关闭 TensorBoard：
-
-```yaml
-run:
-  tensorboard: false
-```
-
-## SUMO 回放与可视化
-
-Stage1、Stage4、Stage5 会默认写 replay JSON。它记录 seed、PPO raw action 序列、Stage5 实际执行的 `executed_actions`、shield 是否启用、risk checkpoint、模型路径和场景 snapshot hash，用于重新启动 SUMO 回放同一段闭环过程。回放仍使用 raw actions 并重新运行 Shield；forecast behavior diagnostics 优先比较 `executed_actions`，避免把 Shield replacement 误报为动作一致。
-
-无 GUI 回放：
-
-```powershell
-python -m safe_rl.tools.replay_episode --replay safe_rl_output\runs\$RUN_ID\stage1\replay\episode_0000.json
-```
-
-使用 SUMO-GUI 可视化回放：
-
-```powershell
-python -m safe_rl.tools.replay_episode --replay safe_rl_output\runs\safe_rl_right_onramp_maskfix_v3_001\stage1\replay\episode_0000.json --gui --delay-ms 200
-```
-
-Stage5 实验结果回放示例：
-
-```powershell
-python -m safe_rl.tools.replay_episode --replay safe_rl_output\runs\$RUN_ID\stage5\replay\ppo_shield_seed_1.json --gui --delay-ms 200
-```
-
-Forecast diagnostics 会自动挑出 `ppo_cv_features` 中 min distance 最低的 seeds，并生成可直接运行的回放脚本：
-
-```text
-safe_rl_output/runs/<run_id>/stage5/diagnostics/replay_low_min_distance_ppo_cv_features.ps1
-safe_rl_output/runs/<run_id>/stage5/diagnostics/replay_low_min_distance_ppo_wcdt_v2_features.ps1
-```
-
-也可以对已有 run 手动补生成 forecast diagnostics：
-
-```powershell
-python -m safe_rl.pipeline.forecast_diagnostics --run-id $RUN_ID --max-samples 512 --low-seed-count 5
-```
-
-如果之后重新运行 confirmatory，`confirmatory_summary.json` 会读取已有 `forecast_diagnostics.json` 并补充 `forecast_policy_utilization_summary`；如果 diagnostics 尚未生成，该字段会以 `available=false` 保留。
-
-如果机器上 `sumo-gui` 不在 `PATH` 中：
-
-```powershell
-python -m safe_rl.tools.replay_episode --replay safe_rl_output\runs\$RUN_ID\stage5\replay\ppo_shield_seed_1.json --sumo-binary "E:\Program Files\sumo-1.22.0\bin\sumo-gui.exe" --delay-ms 200
-```
-
-关闭 replay 输出：
-
-```yaml
-run:
-  replay: false
-```
-
-## Stage1 数据分布审计
-
-Stage1 完成后会自动生成：
-
-```text
-safe_rl_output/runs/<run_id>/stage1/audit/stage1_data_audit.json
-safe_rl_output/runs/<run_id>/stage1/audit/stage1_action_histogram.csv
-safe_rl_output/runs/<run_id>/stage1/audit/stage1_action_histogram.png
-safe_rl_output/runs/<run_id>/stage1/audit/stage1_reward_distribution.png
-safe_rl_output/runs/<run_id>/stage1/audit/stage1_risk_distribution.png
-```
-
-审计内容包括：
-
-```text
-action histogram
-continuous risk mean / p05 / p50 / p95
-easy-safe / boundary / extreme-risk coverage
-legal boundary sample count
-collision / near-miss / low-TTC / high-DRAC / merge-conflict / taper-miss rate
-distance-to-taper summary
-safe / boundary / hard curriculum profile count
-reward 分位数
-risk feature 分位数
-每个 episode 的 transition 数
-trajectory sample 数
-```
-
-正式 Stage1 在进入 Stage2 前会执行 audit gate：候选样本数不少于 `100000`、合法 boundary 样本不少于 `10000`、boundary rate 不低于 `0.15`，并且 safe / boundary / extreme 三类都非空。`stage1.episodes <= 20` 的短 smoke 流程会跳过该 gate，仅用于检查链路。
-
-如果只想跳过审计：
-
-```yaml
-stage1:
-  audit_enabled: false
-```
-
-## 快速自检命令
-
-不依赖完整训练的基础测试：
-
-```powershell
-python -m pytest tests\test_safe_rl_core.py
-```
-
-Python 语法编译检查：
-
-```powershell
-python -m compileall safe_rl tests
-```
-
-最小 SUMO 环境 smoke test：
-
-```powershell
-python -c "from safe_rl.utils.config import load_config; from safe_rl.sim.sumo_highway_merge_env import SumoHighwayMergeEnv; cfg=load_config(); cfg.scenario['episode_seconds']=1.0; env=SumoHighwayMergeEnv(cfg, seed=1); obs,_=env.reset(seed=1); obs,r,t,tr,info=env.step(4); env.close(); print(obs.shape, r, t, tr)"
-```
-
-辅助车道场景的短链路 full runner smoke：
-
-```powershell
-python -m safe_rl.pipeline.run_full_pipeline --run-id safe_rl_maskfix_smoke --run-mode new --pipeline-profile smoke --forecast-sources constant_velocity,wcdt_v2,wcdt_v3 --forecast-ppo-profile shield_guided
-```
-
-该命令会使用真正轻量的 smoke profile，跳过正式 Stage1 audit gate 与 Stage3 checkpoint eval。正式实验必须使用新的 run id、足够多的 Stage1 episodes，并检查 audit gate 通过。
-
-## 关键实现说明
-
-- 当前地图为 `main_in(3 lanes) -> main_aux(4 lanes) -> main_out(3 lanes)`；右侧 `ramp_in(1 lane)` 平滑接入 `main_aux lane 0`，该辅助车道在 taper 后消失。
-- `ego` 从匝道出发，merge success 定义为进入 `main_out` 并超过配置中的 `success_min_lane_position=40m`。如果 ego 接近 `main_aux` 末端仍停留在辅助 `lane 0`，episode 以 `taper_miss` 失败结束。
-- ego 使用 `ego_lane_change_mode=512` 禁用 SUMO 自主战略换道，仅保留 TraCI 动作请求与安全约束，避免仿真器绕过 PPO 横向决策完成合流。
-- 当前 `highway_merge.rou.xml` 使用较高流量：上游合流目标车道 `main_in lane 0` 为 `1350 veh/h`，lane 1 为 `1150 veh/h`，lane 2 为 `900 veh/h`，匝道为 `650 veh/h`。每个 episode 还会按 SUMO seed 选择 `safe / boundary / hard` curriculum，对 ego、目标 gap seeds 和辅助车道周车做可复现的位置与速度扰动。
-- 离散动作空间共 9 个动作：`lateral_cmd {-1,0,+1} x accel_cmd {-1,0,+1}`。
-- PPO observation 默认包含 ego 状态、top-k 周车相对状态、merge 几何；启用 forecast features 后拼接低维预测风险特征。
-- Risk Module 同时使用显式物理风险特征和学习型 MLP 风险头；risk head 学习连续风险目标，type head 保留 6 类硬事件。`lane_oob` 仍作为 legality hard filter，不混入交通风险。
-- Shield V2 默认只在 raw action 风险高于 `activation_risk_threshold=0.90`、候选动作风险至少降低 `replacement_margin=0.15` 且 uncertainty 低于阈值时替换；`allow_fallback=false`，没有明显更安全候选动作时继续执行 raw action。
-- `emergency_fallback` 不是普通 fallback 的恢复，而是极端物理危险下的低频 backstop；连续风险饱和提前触发默认关闭。报告中应同时看 `fallback_rate == 0` 和 `emergency_fallback_rate` 是否低频。
-
-## 原始 WcDT 说明
-
-本仓库原始部分来自 WcDT：World-centric Diffusion Transformer for Traffic Scene Generation。原 Waymo 数据预处理与训练入口仍保留：
-
-```powershell
-bash run_main.sh
-```
-
-原始 WcDT 论文引用：
-
-```bibtex
-@article{yang2024wcdt,
-  title={Wcdt: World-centric diffusion transformer for traffic scene generation},
-  author={Yang, Chen and He, Yangfan and Tian, Aaron Xuxiang and Chen, Dong and Wang, Jianhui and Shi, Tianyu and Heydarian, Arsalan and Liu, Pei},
-  journal={arXiv preprint arXiv:2404.02082},
-  year={2024}
-}
-```
+仓库保留原始 WcDT 网络和数据生成代码作为上游研究基础。使用上游工作或本仓库实验时，
+请分别遵循相应许可证与引用要求；VNext 报告必须同时保存配置、checkpoint、数据与报告 hash。

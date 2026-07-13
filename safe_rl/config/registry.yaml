@@ -54,6 +54,12 @@ configs:
     status: supported
     protocol: accvp-vnext-correctness-v1
     usage: method_definition_only
+  accvp_vnext_workflow:
+    path: active/accvp_vnext/workflow.yaml
+    status: canonical
+    protocol: accvp-vnext-correctness-v1
+    entrypoint: safe_rl.pipeline.run_accvp_vnext_pipeline
+    usage: workflow_contract
 
   accvp_snapshot_smoke:
     path: active/smoke/accvp_snapshot_smoke.yaml

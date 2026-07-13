@@ -1,0 +1,66 @@
+schema_version: 1
+artifact_kind: accvp_vnext_workflow_contract_v1
+protocol_id: accvp-vnext-correctness-v1
+
+# The coordinator may execute several phases, but it must stop when the next
+# artifact gate remains closed. Numeric scientific thresholds remain in their
+# owning pilot/runtime/Stage5 configs and are not duplicated here.
+automation:
+  default_run_until: pilot_validation
+  stop_on_closed_gate: true
+  execute_at_most_one_phase_without_run_until: true
+  final_holdout_requires_explicit_flag: true
+  blocked_phases:
+    candidate_ppo_replicates: >-
+      Formal factorial PPO orchestration must bind Reward-v2 as an ablation
+      and candidate_table_reward_v3_1_commitment as the final method before
+      this phase may execute.
+
+phase_order:
+  - pilot_collection
+  - pilot_merge
+  - oracle_collection
+  - oracle_merge
+  - oracle_regression
+  - pilot_validation
+  - formal_collection
+  - formal_merge
+  - accvp_training
+  - scorer_runtime_preflight
+  - candidate_ppo_replicates
+  - baseline_ppo_replicates
+  - policy_runtime_replicates
+  - stage5_generate
+  - stage5_replicates_and_aggregate
+  - one_shot_final_holdout
+
+phase_gates:
+  oracle_regression:
+    report_field: oracle_state
+    accepted_values: [go]
+  pilot_validation:
+    report_field: pilot_state
+    accepted_values: [pass]
+  scorer_runtime_preflight:
+    report_field: gate.pass
+    accepted_values: [true]
+  policy_runtime_replicates:
+    report_field: gate.pass
+    accepted_values: [true]
+  stage5_replicates_and_aggregate:
+    report_field: gate.pass
+    accepted_values: [true]
+  one_shot_final_holdout:
+    sealed_one_shot: true
+
+# Reward-v2 is an attribution arm, not the final method. This declaration is
+# consumed as the preregistered method intent while downstream factorial
+# Stage5 orchestration is completed.
+method_roles:
+  candidate_table_reward_v2: candidate_table_single_factor_ablation
+  candidate_table_reward_v2_commitment: commitment_factor_at_reward_v2
+  candidate_table_reward_v3_1: persistence_factor_without_commitment
+  candidate_table_reward_v3_1_commitment: final_complete_method_candidate
+  wcdt_reward_v2: action_independent_forecast_baseline
+
+final_method_id: candidate_table_reward_v3_1_commitment

@@ -30,6 +30,7 @@ def test_config_registry_resolves_every_explicit_entry_and_canonical_vnext_set()
         "accvp_vnext_oracle_regression",
         "accvp_vnext_formal",
         "accvp_vnext_train",
+        "accvp_vnext_workflow",
         "ppo_accvp_candidate_table_vnext_dev",
         "ppo_accvp_candidate_table_vnext_full",
     }
@@ -61,7 +62,7 @@ def test_all_public_yaml_configs_parse_and_supported_overlays_load():
         CONFIG_ROOT / "archive",
     )
     yaml_paths = sorted(path for root in public_roots for path in root.rglob("*.yaml"))
-    assert len(yaml_paths) == 63
+    assert len(yaml_paths) == 64
     for path in yaml_paths:
         payload = yaml.safe_load(path.read_text(encoding="utf-8"))
         assert isinstance(payload, dict), path

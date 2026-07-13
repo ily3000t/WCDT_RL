@@ -43,6 +43,7 @@ accvp:
     checkpoint: "safe_rl_output/runs/safe_rl_comparison_schema9_validation_001/stage2/wcdt_v3_predictor.pt"
   counterfactual:
     collection_phase: "pilot"
+    incomplete_shard_policy: "quarantine"
     root_budget: 500
     output_name: "accvp_vnext_schema3_pilot"
     cache_root: "safe_rl_output/.cache/accvp_vnext_pilot"

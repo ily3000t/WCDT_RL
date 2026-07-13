@@ -1,241 +1,249 @@
-# ACCVP VNext / ACV-Shield-240 execution order
+# ACCVP VNext protocol and execution guide
 
-## Compatibility boundary
+本文档是 ACCVP VNext 的详细执行契约。日常入口见仓库根 `README.md`；配置状态以
+`safe_rl/config/registry.yaml` 为准；机器生成的 artifact/report 才决定阶段 gate 是否打开。
 
-VNext requires counterfactual schema `3`, data contract `accvp_240_v2`,
-`selected_indices_v2`, `model_input_fingerprint_v3`, conditional entry-time
-labels, and `accvp_loss_v2`. All schema-2 datasets, calibrations, operating
-points, Risk-secondary profiles, checkpoints, and final-test reports are
-`diagnostic_only`: they may be inspected for regression history but may not be
-merged into VNext data, used for calibration, selected as an operating point,
-or loaded as a deployable artifact. VNext collection must write new immutable
-shards; do not overwrite or relabel old output directories.
+## 1. Compatibility boundary
 
-The default configuration keeps both `accvp.enabled` and
-`accvp.observation.enabled` false. Enabling Candidate Table observation is an
-explicit experiment decision and does not make ACCVP a safety authority.
+VNext 正式数据和模型必须同时满足：
 
-## Non-bypassable VNext gates
+- `artifact_generation: vnext_schema3`
+- `schema_version: 3`
+- `data_contract_version: accvp_240_v2`
+- `actor_row_mapping_version: selected_indices_v2`
+- `root_observation_fingerprint_version: model_input_fingerprint_v3`
+- `entry_time_label_version: conditional_entry_time_v1`
+- `loss_version: accvp_loss_v2`
 
-1. Every model row must have one authoritative `actor_row_id` resolved through
-   WcDT `selected_indices`. Root metadata, root tensor, every branch manifest,
-   and every branch tensor must share the same mapping hash.
-2. Splits are connected components over `root_episode_id`, the model-visible
-   observation fingerprint, and the versioned
-   `(scenario_route_hash, traffic_profile, episode_seed)` key. All three
-   cross-split overlap counters in `split_provenance.json` must be zero.
-3. Entry time is conditional on observed successful entry. Failure and
-   horizon-censored branches never receive a synthetic entry-time regression
-   target.
-4. Deployable training requires at least three unique, explicitly seeded
-   ensemble members. Each member draws one fixed bootstrap multiset of split
-   components; epochs only reshuffle that fixed replicate. Repeated
-   `(model_input_fingerprint, action)` rows retain all outcomes but contribute
-   total training weight one. A one-member checkpoint is shadow-only.
-5. Threshold selection uses development/calibration/operating-point data only.
-   Formal calibration first collapses duplicate fingerprint-action outcomes,
-   then forms one bounded mean per split component and score bin; one-sided
-   Hoeffding bounds therefore do not count correlated episode rows as
-   independent Wilson trials. Final test is diagnostic evaluation of a frozen
-   profile, never a selector.
-6. Candidate Table PPO may start only after the schema-3 artifact passes the
-   policy-free scorer preflight with `risk_gated_candidate_table_v3_bounded_stale`,
-   `bounded_last_valid_v2`, at least 1,000 activation-window decisions and at
-   least 30 distinct episode seeds. A stale table is reusable for at most one
-   decision, 0.5 seconds, and the configured context-delta bounds; otherwise
-   fail closed. Risk-secondary must use the audited vectorized geometry
-   backend.
-7. VNext files use the `accvp_vnext_schema3_*` prefix and are joined by a
-   bundle-v2 manifest. A sealed candidate is shadow-only. Formal
-   `viability_branch`/`viability_lite` runtime is permitted only after one-shot
-   holdout promotion to `holdout_evaluated_go`; NO-GO and revoked bundles are
-   rejected before model deserialization.
+旧 schema2 数据没有足够证据证明 `selected_actor_ids`、branch response rows 与 WcDT token
+rows 的唯一映射，因此不能迁移为完整 VNext actor-response supervision。它只允许在明确
+标注的 diagnostic/migration audit 中使用。
 
-Canonical overlays are:
+## 2. Data semantics
+
+### Actor mapping
+
+`selected_indices` 是 actor row 的唯一权威来源。root tensor、selected actor IDs、branch
+response rows 和 token rows 必须共享 mapping hash。缺失或不一致时应立即拒绝样本。
+
+### Entry-time labels
+
+目标车道进入时间是 conditional label：
+
+- `observed_success`：允许 `target_lane_entry_time_observed=true` 并监督进入时间；
+- `observed_failure`：进入时间监督必须关闭，即使仿真在 taper miss 后又进入目标车道；
+- `censored`：进入时间监督必须关闭并记录 censor reason。
+
+诊断可以保存 `target_lane_entry_time_raw_s`，但不能把 failure/censored 的 raw late entry
+重新解释为训练标签。
+
+### Split and bootstrap
+
+split component 至少连接以下关系：
+
+```text
+model_input_fingerprint
+OR (scenario_route_hash, traffic_profile, episode_seed)
+```
+
+同 component 不得跨 train/validation/calibration/operating/test。ensemble bootstrap 按
+component 抽样；同 fingerprint 的重复 root 作为一个等权组处理。
+
+### Oracle cohort
+
+seed 2/5 只验证历史 repairable premise：
+
+```text
+cohort_role = oracle_regression
+root_policy = merge_timing
+oracle_only = true
+exclude_from_model_splits = true
+required_seeds = [2, 5]
+```
+
+oracle 报告只有在 `oracle_state=go`、两个 seed 均有足够 deadline coverage、且完整 cohort
+契约匹配时才有效。报告为 GO 但缺 `root_policy` 也必须视为不完整 artifact。
+
+## 3. Canonical workflow
+
+状态查询：
+
+```powershell
+python -m safe_rl.pipeline.run_accvp_vnext_pipeline
+```
+
+单阶段执行：
+
+```powershell
+python -m safe_rl.pipeline.run_accvp_vnext_pipeline --execute-next
+```
+
+门槛内连续执行：
+
+```powershell
+python -m safe_rl.pipeline.run_accvp_vnext_pipeline `
+  --workflow-config safe_rl/config/active/accvp_vnext/workflow.yaml `
+  --run-until pilot_validation
+```
+
+没有 `--run-until` 时，`--execute-next` 最多执行一个阶段。`--run-until` 只有在每个阶段
+产物均通过 gate 后才继续；它不会忽略 fail report，也不会自动打开 final holdout。
+
+阶段顺序为：
+
+1. `pilot_collection`
+2. `pilot_merge`
+3. `oracle_collection`
+4. `oracle_merge`
+5. `oracle_regression`
+6. `pilot_validation`
+7. `formal_collection`
+8. `formal_merge`
+9. `accvp_training`
+10. `scorer_runtime_preflight`
+11. `candidate_ppo_replicates`
+12. `baseline_ppo_replicates`
+13. `policy_runtime_replicates`
+14. `stage5_generate`
+15. `stage5_replicates_and_aggregate`
+16. `one_shot_final_holdout`
+
+当前 workflow 故意将 `candidate_ppo_replicates` 标记为 blocked。解锁条件不是“某个 PPO 能
+运行”，而是 factorial orchestration 已能分别生成、审计和评估所有预注册 Reward/commitment
+方法，并将最终方法绑定到 Reward-v3.1 + risk-gated commitment。
+
+`safe_rl.pipeline.run_full_pipeline` 是通用/历史 pipeline，不能替代以上 VNext 证据链。
+
+## 4. Pilot gate
+
+canonical 配置：
 
 - `safe_rl/config/active/accvp_vnext/pilot.yaml`
-- `safe_rl/config/active/accvp_vnext/formal.yaml`
 - `safe_rl/config/active/accvp_vnext/oracle_regression.yaml`
-- `safe_rl/config/active/accvp_vnext/train.yaml`
-- `safe_rl/config/active/accvp_vnext/ppo_candidate_table_dev.yaml`
-- `safe_rl/config/active/accvp_vnext/ppo_candidate_table_full.yaml`
+- `safe_rl/config/active/accvp_vnext/formal.yaml`
 
-Run the development PPO overlay before the full overlay. Neither overlay is a
-formal comparison result by itself; the frozen evaluation protocol supplies
-the confirmatory seed ledger and report gates.
+pilot validation 同时检查：
 
-## Collection and training sequence
+- 每个预注册 collection source 的 root coverage；
+- branch completion/success；
+- observed viability fraction；
+- schema/data contract 与 provenance；
+- oracle dataset/report 的 seed、policy、cohort 和 split exclusion；
+- pilot 数据本身没有混入 oracle seeds/rows。
 
-1. Run the bounded mechanics smoke:
+当 `pilot_report.json` 为 `pilot_state=fail` 时，读取 `conditions`。如果仅
+`oracle_regression=false`，应核对 oracle 报告的 `root_policy`、`cohort_role`、split exclusion
+和 dataset provenance；不要重新采 pilot 或放宽 pilot threshold。
 
-   ```powershell
-   python -m safe_rl.pipeline.stage1_counterfactual --config safe_rl/config/active/smoke/accvp_snapshot_smoke.yaml --root-source mixed
-   ```
+## 5. Interrupted collection recovery
 
-   The collector never calls `loadState()` on its root TraCI connection. Each
-   branch is a separate process and SUMO connection. Completed roots delete
-   their snapshot only after every legal-action branch has passed schema and
-   checksum validation.
+schema3 collection shard 是不可变 artifact。配置使用：
 
-2. Run the schema-3 240 m pilot collection. `accvp.activation_distance` is the
-   ACV-Shield window only; it does not modify the physical taper, PPO reward,
-   Task Backstop, or `current_v1` action execution. The VNext overlay has a new
-   run ID, output name and transient cache root. Do not substitute the legacy
-   `accvp_240_pilot.yaml`: it is schema 2 and its completed shards are eligible
-   for resume under the old directory.
+```yaml
+accvp:
+  counterfactual:
+    incomplete_shard_policy: quarantine
+```
 
-   ```powershell
-   python -m safe_rl.pipeline.stage1_collect_accvp_jobs --config safe_rl/config/active/accvp_vnext/pilot.yaml
-   ```
+若同名 shard 只有部分文件或 manifest 不完整，collector 不覆盖原目录，而是移动到：
 
-   Merge the five model-eligible pilot sources into a new schema-3 pilot
-   dataset. Seed 2/5 is collected separately under the oracle-regression
-   overlay with `oracle_only=true`; never merge those roots into the pilot or
-   any model split. Validate the pilot against the separately generated oracle
-   report:
+```text
+shards/_failed_attempts/<utc-stamp>/
+  quarantine_record.json
+  ...original partial files...
+```
 
-   ```powershell
-   python -m safe_rl.pipeline.stage1_merge_counterfactual --config safe_rl/config/active/accvp_vnext/pilot.yaml --shard <pilot-shard-a> --shard <pilot-shard-b> --output safe_rl_output/runs/accvp_vnext_pilot_dataset
-   python -m safe_rl.pipeline.stage1_collect_accvp_jobs --config safe_rl/config/active/accvp_vnext/oracle_regression.yaml
-   python -m safe_rl.pipeline.stage1_merge_counterfactual --config safe_rl/config/active/accvp_vnext/oracle_regression.yaml --shard <oracle-shard> --output safe_rl_output/runs/accvp_vnext_oracle_regression_dataset
-   python -m safe_rl.pipeline.accvp_oracle_smoke --dataset safe_rl_output/runs/accvp_vnext_oracle_regression_dataset --seeds 2 5 --root-policy merge_timing --output safe_rl_output/runs/accvp_vnext_oracle_regression/oracle_report.json
-   python -m safe_rl.pipeline.stage1_validate_accvp_pilot --config safe_rl/config/active/accvp_vnext/pilot.yaml --dataset safe_rl_output/runs/accvp_vnext_pilot_dataset --oracle-report safe_rl_output/runs/accvp_vnext_oracle_regression/oracle_report.json --output safe_rl_output/runs/accvp_vnext_pilot/pilot_report.json
-   ```
+随后才在原 shard path 进行干净重试。不要手工删除 `_failed_attempts`，除非完成独立 retention
+审计并确认不再需要追溯故障。
 
-   A pass requires 90% source coverage, 99% branch success, 70% observed
-   viability labels in the activation window, and a `go` seed-2/5 oracle. The
-   merger allows source-specific PPO observation configs, but rejects data
-   contract mismatches (scenario/route, profiles, actor layout, horizons,
-   events, activation distance, and frozen Risk Module). Temporary SUMO states
-   remain below the overlay's dedicated
-   `safe_rl_output/.cache/accvp_vnext_pilot/` root.
+## 6. ACCVP training and artifact lifecycle
 
-3. Only after the pilot passes, collect the new 5,000-root schema-3 frozen
-   formal pool. The formal overlay refuses to start without the matching
-   `accvp_vnext_pilot/pilot_report.json`; its run, output and cache paths are
-   distinct from both the pilot and all legacy `accvp_240_*` artifacts.
+formal training 的前置顺序是：配置 generation 校验、oracle 校验、dataset/schema/split
+校验、formal runtime contract 校验，然后才初始化 Torch/CUDA 并构建模型。
 
-   ```powershell
-   python -m safe_rl.pipeline.stage1_collect_accvp_jobs --config safe_rl/config/active/accvp_vnext/formal.yaml
-   python -m safe_rl.pipeline.stage1_merge_counterfactual --config safe_rl/config/active/accvp_vnext/formal.yaml --shard <formal-shard-a> --shard <formal-shard-b> --output safe_rl_output/runs/accvp_vnext_formal_dataset
-   ```
+正式 ensemble 至少三个 members。artifact bundle 使用：
 
-   Before training, run actor-mapping and fingerprint/scenario-seed leakage
-   audits on the merged formal pool and bind the independent seed-2/5 oracle
-   regression report to its provenance. The training report and formal dataset
-   must have identical manifest, root, branch, contract, Risk Module, and
-   activation-window provenance. Oracle state is one of
-   `insufficient_coverage`, `no_safe_viable_alternative` or `go`; do not train
-   on either non-go state.
+```text
+accvp_vnext_schema3_predictor.pt
+accvp_vnext_schema3_calibration.json
+accvp_vnext_schema3_candidate_manifest.json
+```
 
-4. Set `accvp.dataset_dir`, `accvp.oracle_report`, `accvp.activation_distance: 240.0`,
-   `accvp.risk_checkpoint` and `accvp.warm_start.checkpoint` to the frozen
-   artifacts, then train:
+manifest 应绑定 dataset/split/component、member seed、bootstrap hash、warm-start hash、最终
+state-dict hash、calibration、operating point、runtime contract 和 observation feature hash。
+candidate artifact 在 holdout promotion 前只允许 observation/shadow；active controller 必须有
+相应 holdout GO。
 
-   ```powershell
-   python -m safe_rl.pipeline.stage2_train_accvp --config safe_rl/config/active/accvp_vnext/train.yaml
-   ```
+## 7. Reward factorial and PPO replication
 
-   The trainer rejects non-`go` or provenance-mismatched oracle reports and
-   writes a generation-aware checkpoint, calibration bundle, held-out
-   operating point, exact per-member/per-epoch training history and a sealed
-   candidate bundle. It does **not** open the final-test split. Runtime resolves
-   predictor, calibration, operating point and training history from the
-   manifest-relative bundle entries and rechecks both entry and top-level
-   hashes.
+`ppo_candidate_table_full.yaml` 是 replicate template，不是“唯一正式方法”。方法差异由
+`ppo_ablation_matrix.yaml` 显式绑定：
 
-5. Before training the first 159D PPO, run a policy-free scorer preflight with
-   the rule controller. It executes the real SUMO state path and Candidate
-   Table/Risk scorer, but deliberately skips PPO observation-shape validation.
-   After Candidate Table PPO training, run the separate policy runtime
-   preflight and benchmark with the frozen 159D checkpoint. All formal runs
-   reject a duplicate or shorter-than-30 seed schedule and refuse to overwrite
-   an existing report.
+```text
+wcdt_reward_v2
+candidate_table_reward_v2
+candidate_table_reward_v2_commitment
+candidate_table_reward_v3_1
+candidate_table_reward_v3_1_commitment  <- final method candidate
+```
 
-   ```powershell
-   python -m safe_rl.pipeline.accvp_runtime_benchmark --config <vnext-config> --policy-type rule_gap_acceptance --seeds <30-or-more-distinct-seeds> --backend vectorized --output <scorer-preflight.json>
+Reward-v2 Candidate 回答 Candidate Table 本身是否有增益；Reward-v3.1 persistence 与
+risk-gated commitment 回答识别机会后能否持续完成合流。每个正式方法至少五个独立 PPO
+optimizer seeds；optimizer seed 与 simulator seed cohort 不得混用。
 
-   # Run these only after the 159D PPO checkpoint exists.
-   python -m safe_rl.pipeline.accvp_observation_preflight --config <vnext-config> --policy-model <ppo.zip> --seeds <30-or-more-distinct-seeds> --output <preflight.json>
-   python -m safe_rl.pipeline.accvp_runtime_benchmark --config <vnext-config> --policy-type sb3_ppo --policy-model <ppo.zip> --seeds <30-or-more-distinct-seeds> --backend vectorized --output <runtime-benchmark.json>
-   python -m safe_rl.pipeline.accvp_runtime_fault_audit --output <fault-audit.json>
-   ```
+生成配置和 checkpoints 只能写入 `safe_rl_output/runs`，manifest 至少记录 resolved config、
+checkpoint、reward semantics、observation contract 和 ACCVP artifact fingerprint 的 hash。
 
-   A scorer-preflight report can authorize PPO training, but it cannot promote
-   a controller. Final holdout accepts only the post-training
-   `benchmark_scope=policy_runtime`, `policy_type=sb3_ppo` report whose policy
-   checkpoint is on the Stage5 candidate side.
+## 8. Runtime claims
 
-   `accvp_runtime_fault_audit` deterministically exercises timeout, exception,
-   NaN, wrong/missing/duplicate/unexpected rows and worker-crash API semantics
-   through fresh, bounded-stale, hard-default, recovery and cross-episode
-   states. Its current scope is explicitly synthetic and soft-deadline: it does
-   not claim OS-process preemption or hard real-time fault tolerance. The full
-   table runtime likewise declares `soft_realtime_post_return_v1` until a
-   separately parity- and latency-audited process supervisor is implemented.
+runtime 分两层：
 
-6. Run paired Stage5 comparisons for at least five frozen PPO optimizer seeds.
-   Each optimizer replicate must use the identical simulator-seed ledger and
-   carry explicit left/right checkpoint SHA-256 lineage. Formal aggregation
-   defaults to a non-lowerable five-training-seed minimum. Aggregate the
-   complete balanced optimizer-seed by simulator-seed matrix with the crossed
-   bootstrap entry point; it rejects duplicate training seeds, missing cells,
-   unequal simulator schedules, reused checkpoints and non-strict lineage.
+1. scorer preflight：rule/base-state policy 访问真实 SUMO state，只测 ACCVP/Risk Candidate
+   Table，不要求尚不存在的 159D Candidate PPO checkpoint；
+2. policy runtime benchmark：五个 Candidate PPO 训练后测试完整 observation/policy 路径，
+   聚合采用最差 replicate，而非平均值。
 
-   ```powershell
-   python -m safe_rl.pipeline.stage5_replicated_aggregate --manifest <replicated-request.json> --output <replicated-report.json>
-   ```
+synthetic fault audit 只证明 bounded-stale 状态机在 timeout、NaN、连续故障与恢复输入下的
+行为。若报告声明 `synthetic_context=true`、`real_sumo_executed=false` 或
+`hard_real_time_claim=false`，就不能据此声称 OS worker 可抢占或 hard real-time deployment。
 
-   Start from
-   `safe_rl/config/examples/vnext/stage5_replicated_aggregate_vnext.example.json`.
-   A formal request must bind the candidate bundle, candidate side, runtime
-   contract and one source acceptance key. Every source report must pass that
-   acceptance profile; empty metric output is rejected.
+bounded stale 状态不得通过 Risk gate；连续故障、恢复和 stale age 必须进入 observation 与
+审计报告。
 
-   Binary replicated inference reports a crossed-bootstrap risk-difference
-   interval and deliberately does not pool correlated cells into an exact
-   McNemar test. Shadow must retain the exact raw/Shield action sequence before
-   viability mode is enabled.
+## 9. Stage5 and holdout
 
-7. The training bundle carries the full safety/viability gate operating-point
-   schema and is not interchangeable with the task-only lite controller. If a
-   lite confirmatory evaluation is planned, derive a separate sealed VNext
-   lite bundle on the operating-point split. The derivation reuses and hashes
-   the source predictor, calibration and training history, replaces only the
-   operating point, records the source candidate fingerprint, and writes
-   `artifact_variant=viability_lite_task_v1`; it never creates a legacy-v1
-   alias.
-   Duplicate model-equivalent decisions use outcome-mass aggregation v2:
-   safety events remain fractional, merge success is conditioned on total
-   observed mass, and repairable capture is paired by source root rather than
-   majority-voted after collapse.
+同一 training seed 的 baseline/candidate 必须使用完全相同的 simulator seed ledger。每个
+replicate 先生成 paired report，再跨 optimizer seeds 做 hierarchical aggregation。正式统计
+至少包含 paired BCa、McNemar、多重比较校正和完整 lineage。
 
-   ```powershell
-   python -m safe_rl.pipeline.accvp_tune_viability_lite --config safe_rl/config/active/accvp_vnext/train.yaml --output-dir safe_rl_output/runs/accvp_vnext_lite/accvp
-   ```
+冻结顺序：
 
-8. Open the sealed test cohort exactly once per evaluation protocol only after the runtime gate and PPO
-   ablation are frozen. The holdout claim freezes the bundle manifest, split
-   manifest, predictor, calibration, operating point, dataset manifest and
-   training history. Lite mode requires the derived lite manifest and rejects
-   a full-gate manifest before model loading. The resulting validated bundle
-   is promoted to GO or NO-GO; test data never feeds threshold selection.
+```text
+formal dataset
+-> ACCVP bundle
+-> scorer runtime
+-> factorial method definitions
+-> five PPO replicates per method
+-> policy runtime
+-> development and targeted development
+-> code/config/threshold freeze
+-> confirmatory cohorts
+-> replicated aggregation
+-> one-shot final holdout
+```
 
-   ```powershell
-   python -m safe_rl.pipeline.accvp_final_holdout_eval --config safe_rl/config/active/accvp_vnext/train.yaml --artifact-manifest safe_rl_output/runs/accvp_vnext_lite/accvp/accvp_vnext_schema3_lite_candidate_manifest.json --runtime-benchmark <passed-vectorized-runtime-report.json> --stage5-replicated-report <formal-five-seed-stage5-report.json> --output-dir safe_rl_output/runs/accvp_vnext_lite/holdout --mode lite
-   ```
+final holdout 不允许生成阈值、选择 checkpoint、修改配置或重试以改善结论。完整 full artifact
+仍是研究诊断路径；部署还需要 Lite artifact 的独立 promotion 和满足相应 hard-runtime 契约。
 
-   VNext holdout refuses to open unless both reports have valid internal
-   fingerprints, the runtime report passes the strict 30-seed/1,000-decision
-   vectorized gate and binds this bundle (or its source full bundle), and the
-   Stage5 report is a balanced formal crossed-bootstrap matrix with at least
-   five distinct optimizer seeds under the same protocol ID. Stage5 must pass
-   its candidate-promotion gate, bind this bundle (or its full source bundle),
-   and prove the runtime-benchmarked policy is on the declared candidate side.
-   Lite GO also requires the preregistered minimum decision, seed, component,
-   replacement, observed and repairable masses in the VNext config. Both
-   reports are frozen into the atomic holdout claim and the promoted manifest.
+## 10. Failure triage
 
-   Running `--mode full` against the original
-   `artifact_variant=full_candidate_gate_v1` bundle remains diagnostic and
-   returns NO-GO for controller deployment by construction.
+遇到 coordinator 停止时按以下顺序处理：
+
+1. 运行无参数状态命令，确认第一个 incomplete phase；
+2. 打开该 phase 的 artifact/report；
+3. 找到唯一关闭的 `conditions`、`gate.pass` 或 lineage 字段；
+4. 修复产生该字段的上游契约；
+5. 重新运行同一个 `--run-until` 或 `--execute-next`；
+6. 确认 `next_phase` 前移后再继续。
+
+不要手工把 `fail` 改成 `pass`，不要复制其他 run 的报告，不要在 confirmatory/holdout 后调阈值。

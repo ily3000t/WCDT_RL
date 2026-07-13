@@ -11,6 +11,7 @@ from safe_rl.accvp.dataset import (
     entry_time_supervision,
     event_supervision_mask,
 )
+from safe_rl.accvp.branch_worker import _conditional_entry_time_fields
 from safe_rl.accvp.migration import audit_legacy_dataset_migration
 from safe_rl.accvp.model import ACCVP_LOSS_VERSION, accvp_loss
 from safe_rl.accvp.schema import (
@@ -296,6 +297,21 @@ def test_entry_time_regression_is_conditional_on_observed_entry():
         censor_time_s=8.0,
         viability_status="censored",
     ) == (0.0, 0.0, False, 8.0, "horizon_elapsed")
+
+
+def test_lane_entry_after_taper_miss_is_diagnostic_not_supervised():
+    fields = _conditional_entry_time_fields(
+        "observed_failure",
+        target_lane_entry_time=4.0,
+        censor_time=2.0,
+    )
+    assert fields == {
+        "target_lane_entry_time_s": None,
+        "target_lane_entry_time_raw_s": 4.0,
+        "entry_time_observed": False,
+        "entry_time_censor_time_s": 2.0,
+        "entry_time_censor_reason": "taper_miss",
+    }
 
 
 def test_censored_taper_outcome_is_not_supervised_as_a_negative():

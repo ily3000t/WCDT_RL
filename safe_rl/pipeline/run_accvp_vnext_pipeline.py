@@ -7,7 +7,9 @@ import sys
 from pathlib import Path
 from typing import Any
 
-from safe_rl.accvp.schema import read_json
+import yaml
+
+from safe_rl.accvp.schema import file_sha256, read_json
 from safe_rl.utils.config import REPO_ROOT
 from safe_rl.utils.io import write_json
 
@@ -20,6 +22,7 @@ PPO_CONFIG = "safe_rl/config/active/accvp_vnext/ppo_candidate_table_full.yaml"
 BASELINE_PPO_CONFIG = "safe_rl/config/baselines/wcdt/ppo_wcdt_v3_reward_v2.yaml"
 MATRIX_CONFIG = "safe_rl/config/active/accvp_vnext/ppo_ablation_matrix.yaml"
 PROTOCOL_CONFIG = "safe_rl/config/examples/vnext/evaluation_protocol_vnext.example.yaml"
+WORKFLOW_CONFIG = "safe_rl/config/active/accvp_vnext/workflow.yaml"
 OPTIMIZER_SEEDS = [1001, 1002, 1003, 1004, 1005]
 RUNTIME_SEEDS = list(range(50001, 50031))
 
@@ -37,7 +40,8 @@ def _complete_shards(root: Path) -> list[Path]:
         except (OSError, ValueError, json.JSONDecodeError):
             continue
         if (
-            int(manifest.get("complete_roots", -1)) == int(manifest.get("root_budget", -2))
+            int(manifest.get("complete_roots", -1))
+            == int(manifest.get("collected_roots", -2))
             and int(manifest.get("failed_branches", 1)) == 0
             and int(manifest.get("counterfactual_schema_version", -1)) == 3
         ):
@@ -74,14 +78,49 @@ def _artifact_ok(
     return True
 
 
+def _oracle_report_ok(path: Path) -> bool:
+    """Accept only the scoped oracle artifact required by pilot/training gates."""
+
+    if not _artifact_ok(path, state_field="oracle_state"):
+        return False
+    try:
+        payload = read_json(path)
+    except (OSError, ValueError, json.JSONDecodeError):
+        return False
+    return (
+        bool(payload.get("go_for_training", False))
+        and str(payload.get("root_policy", "")) == "merge_timing"
+        and str(payload.get("cohort_role", "")) == "oracle_regression"
+        and bool(payload.get("oracle_only", False))
+        and bool(payload.get("exclude_from_model_splits", False))
+        and [int(value) for value in payload.get("required_seeds", [])] == [2, 5]
+    )
+
+
 def _module_command(module: str, *args: Any) -> list[str]:
     return [sys.executable, "-m", module, *(str(value) for value in args)]
+
+
+def _load_workflow_contract(path: str | Path) -> tuple[Path, dict[str, Any]]:
+    source = _resolve(path)
+    with source.open("r", encoding="utf-8") as handle:
+        payload = yaml.safe_load(handle) or {}
+    if str(payload.get("artifact_kind", "")) != "accvp_vnext_workflow_contract_v1":
+        raise ValueError(f"unsupported ACCVP VNext workflow contract: {source}")
+    if int(payload.get("schema_version", 0)) != 1:
+        raise ValueError("unsupported ACCVP VNext workflow schema version")
+    phase_order = list(payload.get("phase_order", []) or [])
+    if not phase_order or len(phase_order) != len(set(phase_order)):
+        raise ValueError("workflow phase_order must be a non-empty unique list")
+    return source, payload
 
 
 def workflow_status(
     *,
     baseline_manifest: str | Path = "safe_rl_output/runs/wcdt_vnext_replicates/ppo_replicate_manifest.json",
+    workflow_config: str | Path = WORKFLOW_CONFIG,
 ) -> dict[str, Any]:
+    workflow_path, workflow = _load_workflow_contract(workflow_config)
     pilot_shard_root = _resolve(
         "safe_rl_output/runs/accvp_vnext_pilot/stage1_counterfactual/accvp_vnext_schema3_pilot/shards"
     )
@@ -175,7 +214,7 @@ def workflow_status(
     )
     add(
         "oracle_regression",
-        _artifact_ok(oracle_report, state_field="oracle_state"),
+        _oracle_report_ok(oracle_report),
         _module_command(
             "safe_rl.pipeline.accvp_oracle_smoke",
             "--dataset",
@@ -185,6 +224,8 @@ def workflow_status(
             "--seeds",
             2,
             5,
+            "--root-policy",
+            "merge_timing",
             "--cohort-role",
             "oracle_regression",
         ),
@@ -383,15 +424,65 @@ def workflow_status(
         ),
         holdout_report,
     )
+    declared_order = [str(value) for value in workflow["phase_order"]]
+    by_name = {str(phase["name"]): phase for phase in phases}
+    if set(declared_order) != set(by_name):
+        raise ValueError(
+            "workflow contract phase_order disagrees with implemented phases: "
+            f"missing={sorted(set(by_name).difference(declared_order))} "
+            f"unknown={sorted(set(declared_order).difference(by_name))}"
+        )
+    phases = [by_name[name] for name in declared_order]
     first_incomplete = next((phase for phase in phases if not phase["complete"]), None)
+    blocked_phases = dict(workflow.get("automation", {}).get("blocked_phases", {}) or {})
+    blocked_reason = (
+        None
+        if first_incomplete is None
+        else blocked_phases.get(str(first_incomplete["name"]))
+    )
     return {
         "artifact_kind": "accvp_vnext_pipeline_status_v1",
         "schema_version": 1,
         "complete": first_incomplete is None,
         "next_phase": None if first_incomplete is None else first_incomplete["name"],
-        "next_command": None if first_incomplete is None else first_incomplete["command"],
+        "next_command": (
+            None
+            if first_incomplete is None or blocked_reason is not None
+            else first_incomplete["command"]
+        ),
+        "blocked": blocked_reason is not None,
+        "blocked_reason": blocked_reason,
+        "workflow_contract": {
+            "path": str(workflow_path),
+            "sha256": file_sha256(workflow_path),
+            "protocol_id": str(workflow.get("protocol_id", "")),
+            "final_method_id": str(workflow.get("final_method_id", "")),
+        },
         "phases": phases,
     }
+
+
+def _execute_current_phase(
+    status: dict[str, Any],
+    *,
+    allow_final_holdout: bool,
+) -> None:
+    if bool(status.get("blocked", False)):
+        raise RuntimeError(
+            f"phase {status.get('next_phase')!r} is blocked by the workflow contract: "
+            f"{status.get('blocked_reason')}"
+        )
+    if status["next_phase"] == "one_shot_final_holdout" and not allow_final_holdout:
+        raise RuntimeError(
+            "final holdout is sealed and cannot be opened without --allow-final-holdout"
+        )
+    command = status.get("next_command")
+    if not command:
+        raise RuntimeError(
+            f"phase {status['next_phase']!r} requires explicit manual input"
+        )
+    print(f"[accvp_vnext_pipeline] executing phase={status['next_phase']}")
+    subprocess.run(command, cwd=REPO_ROOT, check=True)
 
 
 def main() -> None:
@@ -399,26 +490,64 @@ def main() -> None:
         description="Fail-closed ACCVP VNext workflow coordinator; executes at most one gated phase per invocation"
     )
     parser.add_argument("--baseline-manifest", default="safe_rl_output/runs/wcdt_vnext_replicates/ppo_replicate_manifest.json")
+    parser.add_argument("--workflow-config", default=WORKFLOW_CONFIG)
     parser.add_argument("--status-output")
-    parser.add_argument("--execute-next", action="store_true")
+    mode = parser.add_mutually_exclusive_group()
+    mode.add_argument("--execute-next", action="store_true")
+    mode.add_argument(
+        "--run-until",
+        help="Continuously execute gated phases through and including this phase.",
+    )
     parser.add_argument("--allow-final-holdout", action="store_true")
     args = parser.parse_args()
-    status = workflow_status(baseline_manifest=args.baseline_manifest)
+    status = workflow_status(
+        baseline_manifest=args.baseline_manifest,
+        workflow_config=args.workflow_config,
+    )
     if args.status_output:
         write_json(_resolve(args.status_output), status)
     print(json.dumps(status, indent=2, ensure_ascii=False))
-    if not args.execute_next or status["complete"]:
+    if not args.execute_next and not args.run_until:
         return
-    if status["next_phase"] == "one_shot_final_holdout" and not args.allow_final_holdout:
-        raise RuntimeError(
-            "final holdout is sealed and cannot be opened without --allow-final-holdout"
+    if status["complete"]:
+        return
+    if args.execute_next:
+        _execute_current_phase(status, allow_final_holdout=args.allow_final_holdout)
+        return
+
+    _workflow_path, workflow = _load_workflow_contract(args.workflow_config)
+    phase_order = [str(value) for value in workflow["phase_order"]]
+    target = str(args.run_until)
+    if target not in phase_order:
+        raise ValueError(
+            f"unknown --run-until phase={target!r}; available={phase_order}"
         )
-    command = status.get("next_command")
-    if not command:
-        raise RuntimeError(
-            f"phase {status['next_phase']!r} requires an external baseline manifest or explicit manual input"
+    target_index = phase_order.index(target)
+    while True:
+        status = workflow_status(
+            baseline_manifest=args.baseline_manifest,
+            workflow_config=args.workflow_config,
         )
-    subprocess.run(command, cwd=REPO_ROOT, check=True)
+        if status["complete"]:
+            return
+        next_phase = str(status["next_phase"])
+        next_index = phase_order.index(next_phase)
+        if next_index > target_index:
+            print(f"[accvp_vnext_pipeline] reached target phase={target}")
+            return
+        previous_phase = next_phase
+        _execute_current_phase(status, allow_final_holdout=args.allow_final_holdout)
+        updated = workflow_status(
+            baseline_manifest=args.baseline_manifest,
+            workflow_config=args.workflow_config,
+        )
+        if str(updated.get("next_phase")) == previous_phase:
+            raise RuntimeError(
+                f"phase {previous_phase!r} command returned but its artifact gate remains closed"
+            )
+        if previous_phase == target:
+            print(f"[accvp_vnext_pipeline] reached target phase={target}")
+            return
 
 
 if __name__ == "__main__":

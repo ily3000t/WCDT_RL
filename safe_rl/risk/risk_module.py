@@ -117,7 +117,15 @@ class RiskModuleWrapper:
     def load(self, checkpoint: str | Path) -> None:
         if torch is None:
             raise ImportError("Loading learned risk checkpoints requires torch.")
-        payload = torch.load(checkpoint, map_location="cpu")
+        # Risk checkpoints contain tensors plus primitive metadata only.  Use
+        # PyTorch's restricted unpickler so loading a trusted historical
+        # checkpoint does not execute arbitrary pickle payloads and does not
+        # emit the weights_only=False deprecation warning.
+        payload = torch.load(
+            checkpoint,
+            map_location="cpu",
+            weights_only=True,
+        )
         if isinstance(payload, dict):
             metric_version = str(payload.get("safety_metric_version", ""))
             expected = str(self.config.risk_module.get("safety_metric_version", SAFETY_METRIC_VERSION))

@@ -43,6 +43,7 @@ accvp:
     checkpoint: "safe_rl_output/runs/safe_rl_comparison_schema9_validation_001/stage2/wcdt_v3_predictor.pt"
   counterfactual:
     collection_phase: "ad_hoc"
+    incomplete_shard_policy: "quarantine"
     root_budget: 0
     roots_per_episode_limit: 0
     output_name: "accvp_vnext_schema3_oracle_regression"

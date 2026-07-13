@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -44,7 +45,11 @@ from safe_rl.accvp.viability_lite import (
 from safe_rl.accvp.viability_lite_audit import audit_lite_replacements
 from safe_rl.pipeline.accvp_tune_viability_lite import _lite_acceptance_failures
 from safe_rl.pipeline.accvp_observation_preflight import _gate as _accvp_observation_preflight_gate
-from safe_rl.pipeline.stage1_collect_accvp_jobs import materialise_collection_job, validate_required_pilot
+from safe_rl.pipeline.stage1_collect_accvp_jobs import (
+    existing_complete_shard,
+    materialise_collection_job,
+    validate_required_pilot,
+)
 from safe_rl.risk.risk_aggregator import aggregate_episode_reports
 from safe_rl.stage1_counterfactual.collector import (
     _SecondaryRiskEvaluator,
@@ -1989,6 +1994,31 @@ def test_vnext_collection_configs_are_schema3_budgeted_and_path_isolated():
         oracle.accvp.counterfactual,
     )
     assert len({pilot_cache, formal_cache, oracle_cache}) == 3
+
+
+def test_incomplete_vnext_shard_is_quarantined_before_retry(tmp_path: Path):
+    cfg = load_config("safe_rl/config/active/accvp_vnext/oracle_regression.yaml")
+    cfg.run["output_root"] = str(tmp_path)
+    collection_id = "merge_timing_seed2_5_vnext_oracle"
+    shard = (
+        tmp_path
+        / str(cfg.run.run_id)
+        / "stage1_counterfactual"
+        / str(cfg.accvp.counterfactual.output_name)
+        / "shards"
+        / collection_id
+    )
+    shard.mkdir(parents=True)
+    (shard / "partial.txt").write_text("failed attempt", encoding="utf-8")
+
+    assert existing_complete_shard(cfg, collection_id) is None
+    assert not shard.exists()
+    attempts = list((shard.parent / "_failed_attempts").iterdir())
+    assert len(attempts) == 1
+    record = json.loads((attempts[0] / "quarantine_record.json").read_text(encoding="utf-8"))
+    assert record["collection_id"] == collection_id
+    assert record["reason"] == "incomplete_or_invalid_dataset_manifest"
+    assert (attempts[0] / "partial.txt").read_text(encoding="utf-8") == "failed attempt"
 
 
 def test_formal_collection_requires_matching_pilot_report(tmp_path: Path):

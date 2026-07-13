@@ -1,13 +1,17 @@
 from __future__ import annotations
 
 import math
+import shutil
+from datetime import datetime, timezone
 from pathlib import Path
+from time import perf_counter
 
 from safe_rl.pipeline.common import load_stage_config, parse_config_arg
 from safe_rl.accvp.protocol import counterfactual_data_contract, data_contract_hash, effective_activation_distance
-from safe_rl.accvp.schema import file_sha256, read_json
+from safe_rl.accvp.schema import file_sha256, read_json, write_json_atomic
 from safe_rl.stage1_counterfactual.collector import collect
 from safe_rl.utils.config import REPO_ROOT, clone_with_overrides
+from safe_rl.utils.progress import stage_log
 from safe_rl.utils.sumo_installation import resolve_sumo_installation, sumo_installation_from_config
 
 
@@ -118,16 +122,14 @@ def split_collection_job(cfg, payload: dict) -> list[dict]:
     return subjobs
 
 
-def existing_complete_shard(cfg, collection_id: str, *, fail_on_incomplete: bool = True) -> Path | None:
-    """Return a completed immutable shard path so failed job batches can resume."""
-
+def _shard_dir(cfg, collection_id: str) -> Path:
     run_id = cfg.run.get("run_id")
     if not run_id:
-        return None
+        raise ValueError("immutable ACCVP collection requires run.run_id")
     output_root = Path(cfg.run.output_root)
     if not output_root.is_absolute():
         output_root = REPO_ROOT / output_root
-    shard = (
+    return (
         output_root
         / str(run_id)
         / "stage1_counterfactual"
@@ -135,16 +137,133 @@ def existing_complete_shard(cfg, collection_id: str, *, fail_on_incomplete: bool
         / "shards"
         / str(collection_id)
     )
-    if (shard / "manifests" / "dataset_manifest.json").exists():
-        return shard
+
+
+def existing_complete_shard(cfg, collection_id: str, *, fail_on_incomplete: bool = True) -> Path | None:
+    """Return a completed immutable shard path so failed job batches can resume."""
+
+    if not cfg.run.get("run_id"):
+        return None
+    shard = _shard_dir(cfg, collection_id)
+    dataset_manifest = shard / "manifests" / "dataset_manifest.json"
+    if dataset_manifest.exists():
+        manifest = read_json(dataset_manifest)
+        expected_schema = int(
+            cfg.accvp.get(
+                "schema_version",
+                manifest.get("counterfactual_schema_version", -1),
+            )
+        )
+        complete = (
+            int(manifest.get("counterfactual_schema_version", -1)) == expected_schema
+            and int(manifest.get("failed_branches", 1)) == 0
+            and int(manifest.get("complete_roots", -1))
+            == int(manifest.get("collected_roots", -2))
+        )
+        if complete:
+            return shard
     if shard.exists():
         if not fail_on_incomplete:
+            return None
+        policy = str(
+            cfg.accvp.counterfactual.get("incomplete_shard_policy", "error")
+        ).strip().lower()
+        if policy not in {"error", "quarantine"}:
+            raise ValueError(
+                "accvp.counterfactual.incomplete_shard_policy must be error or quarantine"
+            )
+        if policy == "quarantine":
+            quarantine_root = shard.parent / "_failed_attempts"
+            quarantine_root.mkdir(parents=True, exist_ok=True)
+            stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%fZ")
+            # Keep the quarantine leaf short enough for Windows path limits;
+            # collection_id remains recorded in the audit JSON.
+            target = quarantine_root / stamp
+            target = Path(shutil.move(str(shard), str(target)))
+            write_json_atomic(
+                target / "quarantine_record.json",
+                {
+                    "artifact_kind": "counterfactual_incomplete_shard_quarantine_v1",
+                    "schema_version": 1,
+                    "collection_id": str(collection_id),
+                    "original_path": str(shard.resolve()),
+                    "quarantined_path": str(target.resolve()),
+                    "quarantined_at_utc": datetime.now(timezone.utc).isoformat(),
+                    "reason": "incomplete_or_invalid_dataset_manifest",
+                },
+            )
+            print(
+                "[stage1_counterfactual] quarantined incomplete shard "
+                f"collection_id={collection_id} from={shard} to={target}"
+            )
             return None
         raise FileExistsError(
             f"counterfactual shard directory exists but is incomplete: {shard}; "
             "delete or move it before resuming collection"
         )
     return None
+
+
+def _run_collection_shard(
+    job_cfg,
+    payload: dict,
+    *,
+    shard_index: int,
+    shard_total: int,
+) -> Path:
+    """Run one immutable shard with flushed, machine-readable lifecycle logs."""
+
+    name = str(payload["name"])
+    seeds = [int(value) for value in payload.get("episode_seeds", []) or []]
+    root_budget = int(
+        payload.get("root_budget", job_cfg.accvp.counterfactual.get("root_budget", 0)) or 0
+    )
+    workers = int(payload.get("workers", job_cfg.accvp.counterfactual.get("workers", 1)) or 1)
+    output = _shard_dir(job_cfg, name)
+    source = str(payload.get("collection_source", name))
+    policy = str(payload["root_policy"])
+    root_filter = str(payload["root_filter"])
+    seed_range = "none" if not seeds else f"{seeds[0]}..{seeds[-1]}"
+    started_at = datetime.now(timezone.utc).isoformat()
+    stage_log(
+        "stage1_counterfactual",
+        "SHARD_START "
+        f"index={shard_index}/{shard_total} collection_id={name} source={source} "
+        f"root_policy={policy} root_filter={root_filter} root_budget={root_budget or 'unbounded'} "
+        f"workers={workers} seed_count={len(seeds)} seed_range={seed_range} "
+        f"started_at_utc={started_at} output={output}",
+    )
+    started = perf_counter()
+    try:
+        dataset = collect(
+            job_cfg,
+            root_policy=policy,
+            root_filter=root_filter,
+            episode_seeds=payload.get("episode_seeds"),
+            episodes=payload.get("episodes"),
+            collection_id=name,
+            collection_source=source,
+            collection_job=payload,
+        )
+    except BaseException as exc:
+        stage_log(
+            "stage1_counterfactual",
+            "SHARD_FAILED "
+            f"index={shard_index}/{shard_total} collection_id={name} "
+            f"elapsed_s={perf_counter() - started:.3f} error_type={type(exc).__name__} "
+            f"error={str(exc)!r} output={output}",
+        )
+        raise
+    manifest = read_json(Path(dataset) / "manifests" / "dataset_manifest.json")
+    stage_log(
+        "stage1_counterfactual",
+        "SHARD_END "
+        f"index={shard_index}/{shard_total} collection_id={name} "
+        f"elapsed_s={perf_counter() - started:.3f} collected_roots={manifest.get('collected_roots')} "
+        f"complete_roots={manifest.get('complete_roots')} failed_branches={manifest.get('failed_branches')} "
+        f"output={dataset}",
+    )
+    return Path(dataset)
 
 
 def validate_required_pilot(cfg) -> None:
@@ -188,31 +307,58 @@ def main() -> None:
     if not jobs:
         raise ValueError("accvp.counterfactual.collection_jobs must not be empty")
     validate_required_pilot(cfg)
+    expanded_jobs: list[tuple[object, dict, list[dict]]] = []
+    shard_total = 0
     for job in jobs:
         base_cfg, base_payload = materialise_collection_job(cfg, job)
-        base_name = str(base_payload["name"])
         subjobs = split_collection_job(cfg, base_payload)
+        expanded_jobs.append((base_cfg, base_payload, subjobs))
+        shard_total += len(subjobs)
+    stage_log(
+        "stage1_counterfactual",
+        f"BATCH_START run_id={cfg.run.run_id} jobs={len(jobs)} shards={shard_total} "
+        f"collection_phase={cfg.accvp.counterfactual.get('collection_phase', 'ad_hoc')}",
+    )
+    shard_index = 0
+    executed = 0
+    skipped = 0
+    for base_cfg, base_payload, subjobs in expanded_jobs:
+        base_name = str(base_payload["name"])
         existing = existing_complete_shard(base_cfg, base_name, fail_on_incomplete=(len(subjobs) == 1))
         if existing is not None:
-            print(f"[stage1_counterfactual] skip existing complete shard collection_id={base_name} dataset={existing}")
+            first_index = shard_index + 1
+            shard_index += len(subjobs)
+            skipped += len(subjobs)
+            stage_log(
+                "stage1_counterfactual",
+                f"SHARD_SKIP index={first_index}-{shard_index}/{shard_total} "
+                f"collection_id={base_name} reason=existing_complete dataset={existing}",
+            )
             continue
         for subjob in subjobs:
+            shard_index += 1
             job_cfg, payload = materialise_collection_job(cfg, subjob)
             name = str(payload["name"])
             existing = existing_complete_shard(job_cfg, name)
             if existing is not None:
-                print(f"[stage1_counterfactual] skip existing complete shard collection_id={name} dataset={existing}")
+                skipped += 1
+                stage_log(
+                    "stage1_counterfactual",
+                    f"SHARD_SKIP index={shard_index}/{shard_total} collection_id={name} "
+                    f"reason=existing_complete dataset={existing}",
+                )
                 continue
-            collect(
+            _run_collection_shard(
                 job_cfg,
-                root_policy=str(payload["root_policy"]),
-                root_filter=str(payload["root_filter"]),
-                episode_seeds=payload.get("episode_seeds"),
-                episodes=payload.get("episodes"),
-                collection_id=name,
-                collection_source=str(payload.get("collection_source", name)),
-                collection_job=payload,
+                payload,
+                shard_index=shard_index,
+                shard_total=shard_total,
             )
+            executed += 1
+    stage_log(
+        "stage1_counterfactual",
+        f"BATCH_END run_id={cfg.run.run_id} shards={shard_total} executed={executed} skipped={skipped}",
+    )
 
 
 if __name__ == "__main__":
