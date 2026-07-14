@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 from collections import Counter
 from pathlib import Path
+from time import perf_counter
 from typing import Any
 
 import numpy as np
@@ -44,6 +45,7 @@ from safe_rl.accvp.runtime_contract import (
 )
 from safe_rl.evaluation_protocol import protocol_snapshot
 from safe_rl.utils.config import prepare_run_dir
+from safe_rl.utils.progress import stage_log
 
 
 def _torch():
@@ -860,6 +862,7 @@ def _write_predictor_and_calibration(
 
 
 def train_accvp(config: Any, dataset_dir: str | Path, *, mode: str = "deployable") -> Path:
+    training_started = perf_counter()
     mode = str(mode).strip().lower()
     if mode not in {"shadow", "deployable"}:
         raise ValueError("ACCVP training mode must be 'shadow' or 'deployable'")
@@ -939,6 +942,15 @@ def train_accvp(config: Any, dataset_dir: str | Path, *, mode: str = "deployable
             f"incomplete={incomplete_components}"
         )
     duplicate_weighting = _duplicate_weighting_provenance(required_splits)
+    stage_log(
+        "accvp_training",
+        "TRAIN_START "
+        f"mode={mode} dataset={dataset_dir.resolve()} ensemble_size={ensemble_size} "
+        f"epochs={int(training.epochs)} batch_size={int(training.batch_size)} "
+        + " ".join(
+            f"{name}_rows={len(split)}" for name, split in required_splits.items()
+        ),
+    )
     # Keep every fail-closed provenance check ahead of Torch import and global
     # deterministic-state mutation.  Besides producing the most relevant
     # validation error, this lets callers reject bad inputs in a long-lived
@@ -995,14 +1007,23 @@ def train_accvp(config: Any, dataset_dir: str | Path, *, mode: str = "deployable
     if bool(warm.enabled):
         if warm_source is None or not warm_source.exists():
             raise FileNotFoundError("accvp.warm_start.enabled requires an existing WcDT v3 checkpoint")
-        source_payload = torch.load(warm_source, map_location="cpu")
+        source_payload = torch.load(
+            warm_source,
+            map_location="cpu",
+            weights_only=True,
+        )
         if not source_payload.get("model_state_dicts"):
             raise ValueError("WcDT v3 warm-start checkpoint has no model_state_dicts")
+        stage_log(
+            "accvp_training",
+            f"WARM_START_LOADED checkpoint={warm_source.resolve()} members={len(source_payload['model_state_dicts'])}",
+        )
     models: list[Any] = []
     warm_records: list[dict[str, Any]] = []
     best_losses: list[float] = []
     member_histories: list[dict[str, Any]] = []
     for member in range(ensemble_size):
+        member_started = perf_counter()
         member_seed = int(config.run.seed) + int(training.ensemble_seed_offset) * member
         rng = np.random.default_rng(member_seed)
         torch.manual_seed(member_seed)
@@ -1015,6 +1036,13 @@ def train_accvp(config: Any, dataset_dir: str | Path, *, mode: str = "deployable
             "member_seed": member_seed,
         }
         bootstrap_plan = build_component_bootstrap_plan(train_set, rng)
+        stage_log(
+            "accvp_training",
+            "MEMBER_START "
+            f"index={member + 1}/{ensemble_size} member_seed={member_seed} "
+            f"bootstrap_components={bootstrap_plan['population_component_count']} "
+            f"sampled_unique_components={bootstrap_plan['unique_sampled_component_count']}",
+        )
         warm_record.update(
             {
                 "bootstrap_sampling_version": str(bootstrap_plan["version"]),
@@ -1111,10 +1139,18 @@ def train_accvp(config: Any, dataset_dir: str | Path, *, mode: str = "deployable
                 "validation": validation_statistics,
             }
             epoch_history.append(epoch_record)
+            selected_best = validation_loss < best_loss
             if validation_loss < best_loss:
                 best_loss = validation_loss
                 best_epoch = int(epoch)
                 best_state = {key: value.detach().cpu().clone() for key, value in model.state_dict().items()}
+            stage_log(
+                "accvp_training",
+                "EPOCH_END "
+                f"member={member + 1}/{ensemble_size} epoch={epoch + 1}/{int(training.epochs)} "
+                f"train_total={float(train_statistics['total']):.8f} "
+                f"validation_total={validation_loss:.8f} selected_best={selected_best}",
+            )
         if best_state is not None:
             model.load_state_dict(best_state)
         if best_epoch < 0:
@@ -1166,10 +1202,18 @@ def train_accvp(config: Any, dataset_dir: str | Path, *, mode: str = "deployable
                 "epochs": epoch_history,
             }
         )
+        stage_log(
+            "accvp_training",
+            "MEMBER_END "
+            f"index={member + 1}/{ensemble_size} best_epoch={best_epoch + 1} "
+            f"best_validation_loss={best_loss:.8f} elapsed_s={perf_counter() - member_started:.3f}",
+        )
     member_hashes = [str(record["state_dict_sha256"]) for record in warm_records]
     if mode == "deployable" and len(set(member_hashes)) != len(member_hashes):
         raise ValueError("formal ACCVP candidate ensemble contains duplicate trained member state dicts")
+    stage_log("accvp_training", "CALIBRATION_START")
     calibration = _calibrate(models, calibration_set, torch, config.accvp.calibration)
+    stage_log("accvp_training", "CALIBRATION_END")
     training_history: dict[str, Any] = {
         "artifact_kind": "accvp_training_history_v2",
         "schema_version": TRAINING_HISTORY_SCHEMA_VERSION,
@@ -1232,11 +1276,24 @@ def train_accvp(config: Any, dataset_dir: str | Path, *, mode: str = "deployable
     from safe_rl.accvp.tuning import tune_operating_point
 
     try:
+        stage_log("accvp_training", "OPERATING_POINT_START split=operating_point")
         operating_point = tune_operating_point(models, operating_set, calibration, torch, config.accvp.tuning)
     except OperatingPointAvailabilityError as exc:
         _clear_generation_artifacts(output_dir)
-        _write_tuning_failure_diagnostics(output_dir, exc)
+        diagnostic_path = _write_tuning_failure_diagnostics(output_dir, exc)
+        stage_log(
+            "accvp_training",
+            f"OPERATING_POINT_FAILED diagnostics={diagnostic_path} error={str(exc)!r}",
+        )
         raise
+    stage_log(
+        "accvp_training",
+        "OPERATING_POINT_END "
+        f"conditional_availability={operating_point['selected']['model_conditional_availability']:.6f} "
+        f"unconditional_coverage={operating_point['selected']['unconditional_candidate_set_availability']:.6f} "
+        f"risk_eligible={operating_point['risk_eligible_decision_count']}/"
+        f"{operating_point['effective_decision_count']}",
+    )
     operating_point = dict(operating_point)
     operating_point_duplicate_provenance = {
         "split": "operating_point",
@@ -1267,7 +1324,7 @@ def train_accvp(config: Any, dataset_dir: str | Path, *, mode: str = "deployable
     training_history["operating_point_independence_provenance"] = (
         operating_point_duplicate_provenance
     )
-    return _write_predictor_and_calibration(
+    checkpoint = _write_predictor_and_calibration(
         output_dir=output_dir,
         config=config,
         dataset_dir=dataset_dir,
@@ -1285,3 +1342,8 @@ def train_accvp(config: Any, dataset_dir: str | Path, *, mode: str = "deployable
         mode="deployable",
         operating_point=operating_point,
     )
+    stage_log(
+        "accvp_training",
+        f"TRAIN_END checkpoint={checkpoint} elapsed_s={perf_counter() - training_started:.3f}",
+    )
+    return checkpoint

@@ -12,6 +12,7 @@ from safe_rl.sim.action_space import decode_action
 
 
 LEFT_ACTION_IDS = (6, 7, 8)
+AVAILABILITY_DENOMINATOR_VERSION = "risk_eligible_raw_or_merge_left_v1"
 
 NO_LEGAL_LEFT = "no legal merge-left candidate"
 RISK_LEFT_FAILED = "merge-left candidate Risk secondary failed"
@@ -303,6 +304,26 @@ def _gate_pass(row: dict[str, Any], thresholds: dict[str, float]) -> bool:
     )
 
 
+def _risk_eligible_for_model_gate(candidates: list[dict[str, Any]]) -> bool:
+    if not candidates:
+        return False
+
+    def risk_pass(row: dict[str, Any]) -> bool:
+        return bool(row.get("candidate_legal", True)) and bool(
+            row.get("secondary_safety_pass", False)
+        )
+
+    raw_action_id = int(candidates[0]["raw_action_id"])
+    raw = next(
+        (row for row in candidates if int(row["action_id"]) == raw_action_id),
+        None,
+    )
+    return bool(raw is not None and risk_pass(raw)) or any(
+        int(row["action_id"]) in LEFT_ACTION_IDS and risk_pass(row)
+        for row in candidates
+    )
+
+
 def _model_failure_reason(candidates: list[dict[str, Any]], thresholds: dict[str, float]) -> str:
     raw_action_id = int(candidates[0]["raw_action_id"])
     raw = next((row for row in candidates if int(row["action_id"]) == raw_action_id), None)
@@ -348,6 +369,11 @@ def model_gate_failure_diagnostics(
         for candidates in by_root.values()
     ]
     selected_count = sum(int(decision["selected"] is not None) for decision in decisions)
+    risk_eligible_decision_count = sum(
+        _risk_eligible_for_model_gate(candidates)
+        for candidates in by_root.values()
+    )
+    decision_count = len(by_root)
     root_records: list[dict[str, Any]] = []
     for root_id, candidates in sorted(by_root.items()):
         decision = select_viability_action(candidates, raw_action_id=int(candidates[0]["raw_action_id"]), thresholds=thresholds)
@@ -381,9 +407,25 @@ def model_gate_failure_diagnostics(
         "split": split,
         "required_availability": float(required_availability),
         "best_thresholds": dict(thresholds),
-        "model_gate_best_availability": float(selected_count / max(1, len(by_root))),
+        "availability_denominator_version": AVAILABILITY_DENOMINATOR_VERSION,
+        "model_gate_best_availability": float(
+            selected_count / max(1, risk_eligible_decision_count)
+        ),
+        "model_conditional_availability": float(
+            selected_count / max(1, risk_eligible_decision_count)
+        ),
+        "unconditional_candidate_set_availability": float(
+            selected_count / max(1, decision_count)
+        ),
+        "risk_eligible_decision_fraction": float(
+            risk_eligible_decision_count / max(1, decision_count)
+        ),
+        "risk_eligible_decision_count": int(risk_eligible_decision_count),
+        "risk_ineligible_decision_count": int(
+            decision_count - risk_eligible_decision_count
+        ),
         "selected_count": int(selected_count),
-        "decision_count": int(len(by_root)),
+        "decision_count": int(decision_count),
         "reason_counts": dict(Counter(str(row["reason"]) for row in root_records)),
         "per_root_gate_failure_reason": root_records,
         "per_action_gate_pass_rate": {

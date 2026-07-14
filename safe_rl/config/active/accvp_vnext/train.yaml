@@ -136,3 +136,9 @@ accvp:
       smoothness: 0.01
       response_feature_scales: "auto_train"
     response_feature_scale_minimums: [1.0, 1.0, 0.1, 1.0, 0.5]
+  tuning:
+    # The 0.95 gate measures model availability only where the frozen Risk
+    # authority permits raw retention or at least one merge-left rescue.
+    # Unconditional runtime coverage is reported separately and Risk-
+    # ineligible states always remain fail closed.
+    availability_denominator: "risk_eligible_raw_or_merge_left_v1"

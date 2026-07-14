@@ -103,6 +103,8 @@ artifact。不要因为 report 为 `fail` 就删除数据、放宽阈值或跳�
 - target-lane entry time 只监督 `observed_success`；失败或 censored 分支不得伪造进入时间。
 - seed 2/5 是 `oracle_regression` cohort，必须 `oracle_only=true` 且排除全部模型 split。
 - calibration、operating-point selection 和 test/holdout cohorts 必须隔离。
+- operating-point 的 0.95 model-availability gate 以 Risk-eligible decision 为分母；完整运行
+  覆盖率与 Risk-ineligible 比例必须另行报告，后者继续 fail closed。
 - final holdout 不能生成阈值、改配置或触发重训。
 
 完整契约与故障恢复说明见

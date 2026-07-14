@@ -9,8 +9,33 @@ import numpy as np
 from safe_rl.accvp.calibration import CalibrationBundle
 from safe_rl.accvp.availability import OperatingPointAvailabilityError, model_gate_failure_diagnostics
 from safe_rl.accvp.dataset import ACCVPBranchDataset, collate_numpy
-from safe_rl.accvp.selection import select_viability_action
+from safe_rl.accvp.selection import LEFT_ACTION_IDS, select_viability_action
 from safe_rl.accvp.train import _model_output, _tensor_batch
+
+
+AVAILABILITY_DENOMINATOR_VERSION = "risk_eligible_raw_or_merge_left_v1"
+
+
+def _risk_eligible_for_viability_selection(candidates: list[dict[str, Any]]) -> bool:
+    """Return whether Risk permits raw retention or a merge-left rescue."""
+
+    if not candidates:
+        return False
+
+    def risk_pass(row: dict[str, Any]) -> bool:
+        return bool(row.get("candidate_legal", True)) and bool(
+            row.get("secondary_safety_pass", False)
+        )
+
+    raw_action_id = int(candidates[0]["raw_action_id"])
+    raw = next(
+        (row for row in candidates if int(row["action_id"]) == raw_action_id),
+        None,
+    )
+    return bool(raw is not None and risk_pass(raw)) or any(
+        int(row["action_id"]) in LEFT_ACTION_IDS and risk_pass(row)
+        for row in candidates
+    )
 
 
 def tune_operating_point(models: list[Any], dataset: ACCVPBranchDataset, calibration: CalibrationBundle, torch: Any, tuning: Any) -> dict[str, Any]:
@@ -94,6 +119,22 @@ def tune_operating_point(models: list[Any], dataset: ACCVPBranchDataset, calibra
         )
     rows = collapsed_rows
     required = float(tuning.required_availability)
+    denominator_version = str(
+        tuning.get("availability_denominator", AVAILABILITY_DENOMINATOR_VERSION)
+    )
+    if denominator_version != AVAILABILITY_DENOMINATOR_VERSION:
+        raise ValueError(
+            "unsupported ACCVP tuning availability denominator: "
+            f"{denominator_version!r}"
+        )
+    by_root: dict[str, list[dict[str, Any]]] = defaultdict(list)
+    for row in rows:
+        by_root[row["root_id"]].append(row)
+    risk_eligible_decision_count = sum(
+        _risk_eligible_for_viability_selection(root_rows)
+        for root_rows in by_root.values()
+    )
+    decision_count = len(by_root)
     candidates: list[dict[str, Any]] = []
     evaluated_points: list[dict[str, Any]] = []
     for collision_bound, safety_bound, viability_bound in product(
@@ -101,9 +142,6 @@ def tune_operating_point(models: list[Any], dataset: ACCVPBranchDataset, calibra
         tuning.safety_violation_upper_bounds,
         tuning.merge_viability_lower_bounds,
     ):
-        by_root: dict[str, list[dict[str, Any]]] = defaultdict(list)
-        for row in rows:
-            by_root[row["root_id"]].append(row)
         thresholds = {
             "proxy_collision_upper_bound": float(collision_bound),
             "safety_violation_upper_bound": float(safety_bound),
@@ -114,15 +152,27 @@ def tune_operating_point(models: list[Any], dataset: ACCVPBranchDataset, calibra
             for candidates in by_root.values()
         ]
         selected = [decision["selected"] for decision in decisions if decision["selected"] is not None]
-        availability = float(len(selected) / max(1, len(by_root)))
+        availability = float(len(selected) / max(1, risk_eligible_decision_count))
+        unconditional_availability = float(len(selected) / max(1, decision_count))
+        risk_eligible_fraction = float(
+            risk_eligible_decision_count / max(1, decision_count)
+        )
         observed = [row for row in selected if row["merge_observed"]]
         point = {
             "proxy_collision_upper_bound": float(collision_bound),
             "safety_violation_upper_bound": float(safety_bound),
             "merge_viability_lower_bound": float(viability_bound),
             "candidate_set_availability": availability,
+            "model_conditional_availability": availability,
+            "unconditional_candidate_set_availability": unconditional_availability,
+            "risk_eligible_decision_fraction": risk_eligible_fraction,
+            "availability_denominator_version": denominator_version,
+            "risk_eligible_decision_count": int(risk_eligible_decision_count),
+            "risk_ineligible_decision_count": int(
+                decision_count - risk_eligible_decision_count
+            ),
             "selected_count": int(len(selected)),
-            "decision_count": int(len(by_root)),
+            "decision_count": int(decision_count),
             "selected_safety_ucb": float(np.mean([row["pU_safety_violation"] for row in selected])) if selected else float("inf"),
             "selected_viability_lcb": float(np.mean([row["pL_merge_before_taper"] for row in selected])) if selected else float("-inf"),
             "selected_observed_safety_rate": float(np.mean([row["safety_violation"] for row in selected])) if selected else float("nan"),
@@ -153,8 +203,9 @@ def tune_operating_point(models: list[Any], dataset: ACCVPBranchDataset, calibra
             evaluated_points=evaluated_points,
         )
         raise OperatingPointAvailabilityError(
-            "no operating point satisfies required ACCVP candidate-set availability; "
-            f"required={required:.6f} best_availability={best['candidate_set_availability']:.6f} "
+            "no operating point satisfies required ACCVP risk-conditional model availability; "
+            f"required={required:.6f} best_conditional_availability={best['candidate_set_availability']:.6f} "
+            f"unconditional_coverage={best['unconditional_candidate_set_availability']:.6f} "
             f"selected={best['selected_count']}/{best['decision_count']} "
             f"best_thresholds={{'proxy_collision_upper_bound': {best['proxy_collision_upper_bound']}, "
             f"'safety_violation_upper_bound': {best['safety_violation_upper_bound']}, "
@@ -172,10 +223,18 @@ def tune_operating_point(models: list[Any], dataset: ACCVPBranchDataset, calibra
     return {
         "split": "operating_point",
         "required_availability": required,
+        "availability_denominator_version": denominator_version,
+        "risk_eligible_decision_count": int(risk_eligible_decision_count),
+        "risk_ineligible_decision_count": int(
+            decision_count - risk_eligible_decision_count
+        ),
+        "risk_eligible_decision_fraction": float(
+            risk_eligible_decision_count / max(1, decision_count)
+        ),
         "selected": selected,
         "evaluated_points": candidates,
-        "decision_weighting_version": "fingerprint_raw_action_total_weight_one_v1",
+        "decision_weighting_version": "fingerprint_raw_action_risk_eligible_total_weight_one_v2",
         "raw_candidate_row_count": raw_row_count,
         "effective_candidate_row_count": len(rows),
-        "effective_decision_count": len({str(row["decision_unit_id"]) for row in rows}),
+        "effective_decision_count": int(decision_count),
     }

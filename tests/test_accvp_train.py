@@ -552,6 +552,11 @@ def test_formal_training_writes_sealed_candidate_without_opening_final_test(tmp_
         (output / artifact_filename("operating_point")).read_text(encoding="utf-8")
     )
     assert operating_point["decision_weighting_version"]
+    assert operating_point["availability_denominator_version"] == (
+        "risk_eligible_raw_or_merge_left_v1"
+    )
+    assert operating_point["selected"]["model_conditional_availability"] == 1.0
+    assert operating_point["selected"]["unconditional_candidate_set_availability"] == 1.0
     assert operating_point["duplicate_weighting_provenance"][
         "duplicate_weighting_applied_to_threshold_selection"
     ] is True

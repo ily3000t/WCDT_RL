@@ -1620,8 +1620,73 @@ def test_model_gate_diagnostic_identifies_viability_gate_failure():
     )
     assert report["deployable_artifact"] is False
     assert report["model_gate_best_availability"] == 0.0
+    assert report["risk_eligible_decision_count"] == 1
+    assert report["risk_ineligible_decision_count"] == 0
     assert report["reason_counts"]["model pL_viability gate failed"] == 1
     assert report["per_action_gate_pass_rate"]["7"]["viability_gate_pass_count"] == 0
+
+
+def test_model_availability_conditions_on_risk_eligible_decisions():
+    thresholds = {
+        "proxy_collision_upper_bound": 1.0,
+        "safety_violation_upper_bound": 1.0,
+        "merge_viability_lower_bound": 0.0,
+    }
+    rows = [
+        {
+            "root_id": "eligible",
+            "raw_action_id": 4,
+            "action_id": 4,
+            "candidate_legal": True,
+            "secondary_safety_pass": True,
+            "pU_proxy_collision": 0.1,
+            "pU_safety_violation": 0.1,
+            "pL_merge_before_taper": 0.9,
+            "proxy_collision": 0.0,
+            "safety_violation": 0.0,
+            "merge_before_taper": 1.0,
+            "merge_observed": True,
+        },
+        {
+            "root_id": "risk_blocked",
+            "raw_action_id": 4,
+            "action_id": 4,
+            "candidate_legal": True,
+            "secondary_safety_pass": False,
+            "pU_proxy_collision": 0.1,
+            "pU_safety_violation": 0.1,
+            "pL_merge_before_taper": 0.9,
+            "proxy_collision": 0.0,
+            "safety_violation": 0.0,
+            "merge_before_taper": 0.0,
+            "merge_observed": True,
+        },
+        {
+            "root_id": "risk_blocked",
+            "raw_action_id": 4,
+            "action_id": 7,
+            "candidate_legal": True,
+            "secondary_safety_pass": False,
+            "pU_proxy_collision": 0.1,
+            "pU_safety_violation": 0.1,
+            "pL_merge_before_taper": 0.9,
+            "proxy_collision": 0.0,
+            "safety_violation": 0.0,
+            "merge_before_taper": 1.0,
+            "merge_observed": True,
+        },
+    ]
+    report = model_gate_failure_diagnostics(
+        rows,
+        thresholds,
+        required_availability=0.95,
+    )
+    assert report["model_conditional_availability"] == 1.0
+    assert report["unconditional_candidate_set_availability"] == 0.5
+    assert report["risk_eligible_decision_fraction"] == 0.5
+    assert report["risk_eligible_decision_count"] == 1
+    assert report["risk_ineligible_decision_count"] == 1
+    assert report["reason_counts"]["merge-left candidate Risk secondary failed"] == 1
 
 
 def test_candidate_table_diagnostic_reports_viability_only_pass():

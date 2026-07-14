@@ -454,6 +454,7 @@ accvp:
       response_feature_scales: [1.0, 1.0, 1.0, 1.0, 1.0]
   tuning:
     required_availability: 0.95
+    availability_denominator: "risk_eligible_raw_or_merge_left_v1"
     proxy_collision_upper_bounds: [0.05, 0.10, 0.15, 0.20, 0.30, 0.50, 0.75, 1.00]
     safety_violation_upper_bounds: [0.05, 0.10, 0.15, 0.20, 0.30, 0.50, 0.75, 1.00]
     merge_viability_lower_bounds: [0.00, 0.10, 0.20, 0.30, 0.40, 0.50, 0.60, 0.70]

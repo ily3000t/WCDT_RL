@@ -174,6 +174,12 @@ state-dict hash、calibration、operating point、runtime contract 和 observati
 candidate artifact 在 holdout promotion 前只允许 observation/shadow；active controller 必须有
 相应 holdout GO。
 
+Operating-point 的 `required_availability` 使用版本化分母
+`risk_eligible_raw_or_merge_left_v1`：只在冻结 Risk authority 允许保留 raw action 或至少一个
+merge-left rescue 的 decision 上衡量 ACCVP 模型 availability。报告必须同时保留 unconditional
+candidate-set coverage 和 Risk-ineligible fraction；Risk-ineligible 状态始终 fail closed，不能因
+提高 Risk threshold 或放宽 ACCVP gate 获得动作。
+
 ## 7. Reward factorial and PPO replication
 
 `ppo_candidate_table_full.yaml` 是 replicate template，不是“唯一正式方法”。方法差异由
