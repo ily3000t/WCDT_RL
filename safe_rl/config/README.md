@@ -102,8 +102,8 @@ active/accvp_vnext/ppo_candidate_table_full.yaml
 active/accvp_vnext/ppo_ablation_matrix.yaml
 ```
 
-`workflow.yaml` 描述阶段顺序、artifact gate、blocked phase 和最终方法角色；数值科学阈值仍
-保留在各自 pilot/runtime/Stage5 配置中，避免重复声明和漂移。
+`workflow.yaml` 描述阶段顺序、artifact gate、最终方法角色和六个 factorial 比较；数值科学
+阈值仍保留在各自 pilot/runtime/Stage5 配置中，避免重复声明和漂移。
 
 ## Reward and method binding
 
@@ -119,8 +119,13 @@ Candidate PPO template 本身不定义“最终方法”。正式方法必须通
 | `candidate_table_reward_v3_1_commitment` | 最终完整方法候选 |
 
 Reward-v2 Candidate 必须保留以完成因果归因，但不能沿 pipeline 被当作唯一主方法送入
-Stage5/holdout。当前 workflow 因此在 factorial PPO orchestration 完成前阻塞
-`candidate_ppo_replicates`。
+Stage5/holdout。factorial 协调器现在固定生成四个 Candidate 方法 × 五个 optimizer seeds，
+总 manifest 只有在 20 个 checkpoints、四组语义和最终方法角色全部验证后才会标记 complete。
+`ppo_ablation_matrix.yaml` 因此属于 canonical 冻结协议，而不是可随意修改的辅助模板。
+
+正式 runtime 同样覆盖四个 Candidate 方法，而不是用最终方法的一份 preflight 代替其他
+checkpoint。Stage5 配置按 group 绑定 policy-runtime report；跨 Reward 版本只比较共同任务与
+安全指标，不比较各自训练时定义不同的 `episode_reward`。
 
 ## Running the registry workflow
 
@@ -144,16 +149,27 @@ python -m safe_rl.pipeline.run_accvp_vnext_pipeline `
   --run-until pilot_validation
 ```
 
+例如 scorer preflight 已完成后，可以只推进 factorial PPO：
+
+```powershell
+python -m safe_rl.pipeline.run_accvp_vnext_pipeline `
+  --run-until candidate_ppo_replicates
+```
+
+该阶段默认可恢复。已完整且 hash 匹配的 replicate 会跳过；不完整 run 目录不会被自动覆盖。
+
 命令会在子进程失败、产物 gate 关闭、workflow blocked 或目标阶段完成时停止。final holdout
 还要求独立的 `--allow-final-holdout`。`safe_rl.pipeline.run_full_pipeline` 是通用/历史比较
 协调器，不是 VNext 正式入口。
 
 ## Generated configs and local paths
 
-PPO replicate、Stage5 paired config 和 resolved config 写入：
+PPO factorial、runtime、Stage5 paired config 和 resolved config 写入：
 
 ```text
-safe_rl_output/runs/<run>/generated_configs/
+safe_rl_output/runs/accvp_vnext_factorial/
+safe_rl_output/runs/accvp_vnext_runtime/
+safe_rl_output/runs/accvp_vnext_stage5/generated/
 ```
 
 不要把每个 optimizer seed 的生成配置加入 `active/`，否则会重新造成配置膨胀。机器专用路径

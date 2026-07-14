@@ -428,6 +428,89 @@ def test_vnext_promotion_requires_bound_runtime_and_formal_five_seed_stage5(tmp_
     assert evidence["runtime_benchmark"]["report_fingerprint"]
     assert evidence["stage5_replicated_report"]["training_seed_count"] == 5
 
+    runtime_rows = []
+    for seed in [1, 2, 3, 4, 5]:
+        individual = json.loads(json.dumps(runtime))
+        checkpoint_sha = f"{seed:064x}"
+        individual["policy_model_sha256"] = checkpoint_sha
+        individual["artifact_lineage"]["policy_model_sha256"] = checkpoint_sha
+        individual["report_fingerprint"] = stable_hash(
+            {
+                key: value
+                for key, value in individual.items()
+                if key != "report_fingerprint"
+            }
+        )
+        individual_path = tmp_path / f"runtime_{seed}.json"
+        individual_path.write_text(json.dumps(individual), encoding="utf-8")
+        runtime_rows.append(
+            {
+                "optimizer_seed": seed,
+                "checkpoint_sha256": checkpoint_sha,
+                "report": str(individual_path),
+                "report_sha256": file_sha256(individual_path),
+            }
+        )
+    replicated_runtime = {
+        "artifact_kind": "accvp_runtime_benchmark_replicates_v1",
+        "schema_version": 1,
+        "replicates": runtime_rows,
+        "gate": {"pass": True},
+    }
+    replicated_runtime["report_fingerprint"] = stable_hash(replicated_runtime)
+    replicated_runtime_path = tmp_path / "runtime_replicated.json"
+    replicated_runtime_path.write_text(
+        json.dumps(replicated_runtime),
+        encoding="utf-8",
+    )
+    replicated_evidence = _validate_vnext_promotion_evidence(
+        manifest=manifest,
+        manifest_path=manifest_path,
+        runtime_benchmark_path=replicated_runtime_path,
+        stage5_replicated_report_path=stage5_path,
+        final_runtime_contract=runtime_contract,
+    )
+    assert replicated_evidence["runtime_benchmark"]["optimizer_replicate_count"] == 5
+
+    wrong_checkpoint = f"{99:064x}"
+    wrong_individual = json.loads((tmp_path / "runtime_5.json").read_text(encoding="utf-8"))
+    wrong_individual["policy_model_sha256"] = wrong_checkpoint
+    wrong_individual["artifact_lineage"]["policy_model_sha256"] = wrong_checkpoint
+    wrong_individual["report_fingerprint"] = stable_hash(
+        {
+            key: value
+            for key, value in wrong_individual.items()
+            if key != "report_fingerprint"
+        }
+    )
+    wrong_path = tmp_path / "runtime_wrong.json"
+    wrong_path.write_text(json.dumps(wrong_individual), encoding="utf-8")
+    replicated_runtime["replicates"][-1] = {
+        "optimizer_seed": 5,
+        "checkpoint_sha256": wrong_checkpoint,
+        "report": str(wrong_path),
+        "report_sha256": file_sha256(wrong_path),
+    }
+    replicated_runtime["report_fingerprint"] = stable_hash(
+        {
+            key: value
+            for key, value in replicated_runtime.items()
+            if key != "report_fingerprint"
+        }
+    )
+    replicated_runtime_path.write_text(
+        json.dumps(replicated_runtime),
+        encoding="utf-8",
+    )
+    with pytest.raises(EvidenceProtocolError, match="does not exactly match"):
+        _validate_vnext_promotion_evidence(
+            manifest=manifest,
+            manifest_path=manifest_path,
+            runtime_benchmark_path=replicated_runtime_path,
+            stage5_replicated_report_path=stage5_path,
+            final_runtime_contract=runtime_contract,
+        )
+
     invalid_stage5 = json.loads(json.dumps(stage5))
     invalid_stage5["gate"]["pass"] = False
     invalid_stage5["report_fingerprint"] = stable_hash(

@@ -276,10 +276,99 @@ def _validate_frozen_runtime_preflight(
 ) -> dict[str, Any]:
     required = bool(cfg.stage5.get("require_accvp_observation_runtime_gate", False))
     source = cfg.stage5.get("accvp_observation_preflight_report")
+    group_sources = dict(
+        cfg.stage5.get("accvp_observation_preflight_reports", {}) or {}
+    )
+    group_source_hashes = dict(
+        cfg.stage5.get("accvp_observation_preflight_report_sha256s", {}) or {}
+    )
+    if source and group_sources:
+        raise EvidenceProtocolError(
+            "Stage5 must use either one legacy ACCVP preflight report or "
+            "per-group ACCVP preflight reports, not both"
+        )
+
+    accvp_groups: list[tuple[str, Any, Path]] = []
+    for group in cfg.stage5.groups:
+        group_cfg = clone_with_overrides(cfg, _group_overrides(group))
+        model_path = group_model_paths.get(str(group.name))
+        if model_path is not None and RiskGatedACCVPCandidateTableAugmentor.enabled(group_cfg):
+            accvp_groups.append((str(group.name), group_cfg, model_path))
+
+    if group_sources:
+        expected_groups = {name for name, _group_cfg, _model_path in accvp_groups}
+        provided_groups = {str(name) for name in group_sources}
+        provided_hash_groups = {str(name) for name in group_source_hashes}
+        if provided_groups != expected_groups or provided_hash_groups != expected_groups:
+            raise EvidenceProtocolError(
+                "per-group ACCVP preflight reports and hashes must exactly cover the "
+                "ACCVP Stage5 groups: "
+                f"reports={sorted(provided_groups)} hashes={sorted(provided_hash_groups)} "
+                f"expected={sorted(expected_groups)}"
+            )
+        records: dict[str, dict[str, Any]] = {}
+        for name, group_cfg, model_path in accvp_groups:
+            path = Path(str(group_sources[name]))
+            if not path.exists():
+                raise FileNotFoundError(
+                    f"ACCVP observation preflight report not found for group {name!r}: {path}"
+                )
+            actual_report_sha256 = file_sha256(path)
+            if actual_report_sha256 != str(group_source_hashes[name]):
+                raise EvidenceProtocolError(
+                    f"ACCVP preflight report hash changed for Stage5 group {name!r}"
+                )
+            with path.open("r", encoding="utf-8") as handle:
+                report = json.load(handle)
+            gate = dict(report.get("gate", {}) or {})
+            if not bool(gate.get("pass", False)):
+                raise EvidenceProtocolError(
+                    f"frozen ACCVP observation preflight did not pass for group {name!r}"
+                )
+            expected_model_hash = file_sha256(model_path)
+            if str(report.get("policy_model_sha256", "")) != expected_model_hash:
+                raise EvidenceProtocolError(
+                    f"frozen preflight PPO model hash does not match Stage5 group {name!r}"
+                )
+            expected_feature_hash = stable_hash(
+                {
+                    "feature_names": RiskGatedACCVPCandidateTableAugmentor.feature_names(
+                        group_cfg
+                    )
+                }
+            )
+            if (
+                str(report.get("accvp_observation_feature_names_sha256", ""))
+                != expected_feature_hash
+            ):
+                raise EvidenceProtocolError(
+                    "frozen preflight observation feature hash does not match "
+                    f"Stage5 group {name!r}"
+                )
+            records[name] = {
+                "report": str(path.resolve()),
+                "report_sha256": actual_report_sha256,
+                "gate": gate,
+                "policy_model_sha256": expected_model_hash,
+                "accvp_observation_feature_names_sha256": expected_feature_hash,
+                "accvp_observation_feature_contract_hash": report.get(
+                    "accvp_observation_feature_contract_hash"
+                ),
+            }
+        return {
+            "required": required,
+            "available": True,
+            "validated_before_stage5": True,
+            "mode": "per_group_v1",
+            "reports": records,
+            "report_matrix_sha256": stable_hash(records),
+        }
+
     if not source:
         if required and protocol_strict:
             raise EvidenceProtocolError(
-                "strict Stage5 runtime gate requires stage5.accvp_observation_preflight_report"
+                "strict Stage5 runtime gate requires a legacy or per-group ACCVP "
+                "observation preflight report"
             )
         return {"required": required, "available": False, "validated_before_stage5": False}
     path = Path(str(source))
@@ -290,12 +379,6 @@ def _validate_frozen_runtime_preflight(
     gate = dict(report.get("gate", {}) or {})
     if not bool(gate.get("pass", False)):
         raise EvidenceProtocolError("frozen ACCVP observation preflight did not pass")
-    accvp_groups: list[tuple[str, Any, Path]] = []
-    for group in cfg.stage5.groups:
-        group_cfg = clone_with_overrides(cfg, _group_overrides(group))
-        model_path = group_model_paths.get(str(group.name))
-        if model_path is not None and RiskGatedACCVPCandidateTableAugmentor.enabled(group_cfg):
-            accvp_groups.append((str(group.name), group_cfg, model_path))
     model_hashes = {file_sha256(model_path) for _name, _group_cfg, model_path in accvp_groups}
     if len(model_hashes) > 1:
         raise EvidenceProtocolError("one frozen preflight cannot validate multiple ACCVP PPO models")
@@ -315,6 +398,7 @@ def _validate_frozen_runtime_preflight(
         "required": required,
         "available": True,
         "validated_before_stage5": True,
+        "mode": "single_report_v1",
         "report": str(path.resolve()),
         "report_sha256": file_sha256(path),
         "gate": gate,
@@ -735,6 +819,24 @@ def _mainline_reward_v2_acceptance(
     }
 
 
+def _paired_policy_non_regression_acceptance(
+    left: dict | None,
+    right: dict | None,
+    *,
+    profile_config: dict[str, Any] | None = None,
+) -> dict:
+    """Reward-version-neutral safety/task acceptance for factorial policy pairs."""
+
+    result = _mainline_reward_v2_acceptance(
+        left,
+        right,
+        profile_config=profile_config,
+    )
+    if result.get("available"):
+        result["profile"] = "paired_policy_non_regression_v1"
+    return result
+
+
 def _shadow_noop_acceptance(
     baseline: dict | None,
     shadow: dict | None,
@@ -828,6 +930,12 @@ def _configured_pair_acceptance(group_reports: dict, cfg_stage5: Any) -> dict:
         profile_config = dict(profile_configs.get(profile, {}) or {})
         if profile == "mainline_reward_v2":
             acceptance[name] = _mainline_reward_v2_acceptance(left, right, profile_config=profile_config)
+        elif profile == "paired_policy_non_regression_v1":
+            acceptance[name] = _paired_policy_non_regression_acceptance(
+                left,
+                right,
+                profile_config=profile_config,
+            )
         elif profile == "shadow_noop":
             acceptance[name] = _shadow_noop_acceptance(left, right, profile_config=profile_config)
         else:
@@ -975,7 +1083,15 @@ def run(cfg) -> Path:
                 )
         if group.get("forecast_checkpoint"):
             lineage_artifacts[f"forecast_checkpoint:{group.name}"] = str(group.forecast_checkpoint)
-    if cfg.stage5.get("accvp_observation_preflight_report"):
+    group_preflight_reports = dict(
+        cfg.stage5.get("accvp_observation_preflight_reports", {}) or {}
+    )
+    if group_preflight_reports:
+        for group_name, report_path in sorted(group_preflight_reports.items()):
+            lineage_artifacts[
+                f"accvp_observation_preflight_report:{group_name}"
+            ] = str(report_path)
+    elif cfg.stage5.get("accvp_observation_preflight_report"):
         lineage_artifacts["accvp_observation_preflight_report"] = str(
             cfg.stage5.accvp_observation_preflight_report
         )

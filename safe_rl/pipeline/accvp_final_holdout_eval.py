@@ -166,6 +166,7 @@ def _validate_vnext_promotion_evidence(
     runtime_evidence_sha256 = file_sha256(runtime_path)
     runtime_evidence_fingerprint = ""
     runtime_replicate_count = 1
+    runtime_checkpoint_by_seed: dict[int, str] = {}
     if str(runtime.get("artifact_kind", "")) == "accvp_runtime_benchmark_replicates_v1":
         runtime_evidence_fingerprint = _validate_report_fingerprint(
             runtime, name="replicated runtime benchmark"
@@ -191,6 +192,12 @@ def _validate_vnext_promotion_evidence(
                     "replicated runtime benchmark contains a missing or duplicate checkpoint hash"
                 )
             checkpoint_hashes.add(checkpoint_hash)
+            optimizer_seed = int(row.get("optimizer_seed", -1))
+            if optimizer_seed < 0 or optimizer_seed in runtime_checkpoint_by_seed:
+                raise EvidenceProtocolError(
+                    "replicated runtime benchmark contains a missing or duplicate optimizer seed"
+                )
+            runtime_checkpoint_by_seed[optimizer_seed] = checkpoint_hash
             individual_path = Path(str(row.get("report", "")))
             if not individual_path.is_absolute():
                 individual_path = runtime_path.parent / individual_path
@@ -390,14 +397,21 @@ def _validate_vnext_promotion_evidence(
         raise EvidenceProtocolError("replicated Stage5 candidate checkpoint matrix is incomplete")
     candidate_checkpoint_hashes: set[str] = set()
     candidate_checkpoint_training_seeds: set[int] = set()
+    candidate_checkpoint_by_seed: dict[int, str] = {}
     for record in candidate_checkpoint_records:
         if not isinstance(record, dict):
             raise EvidenceProtocolError("replicated Stage5 candidate checkpoint record is invalid")
-        candidate_checkpoint_training_seeds.add(int(record.get("training_seed", -1)))
+        training_seed = int(record.get("training_seed", -1))
+        candidate_checkpoint_training_seeds.add(training_seed)
         digest = str(record.get("checkpoint_sha256", ""))
         if re.fullmatch(r"[0-9a-f]{64}", digest) is None:
             raise EvidenceProtocolError("replicated Stage5 candidate checkpoint hash is invalid")
         candidate_checkpoint_hashes.add(digest)
+        if training_seed in candidate_checkpoint_by_seed:
+            raise EvidenceProtocolError(
+                "replicated Stage5 candidate checkpoint training seed is duplicated"
+            )
+        candidate_checkpoint_by_seed[training_seed] = digest
     if candidate_checkpoint_training_seeds != set(training_seeds):
         raise EvidenceProtocolError(
             "replicated Stage5 candidate checkpoint training seeds are inconsistent"
@@ -422,7 +436,13 @@ def _validate_vnext_promotion_evidence(
             "policy_model_sha256", ""
         )
     )
-    if runtime_policy_sha not in candidate_checkpoint_hashes:
+    if runtime_checkpoint_by_seed:
+        if runtime_checkpoint_by_seed != candidate_checkpoint_by_seed:
+            raise EvidenceProtocolError(
+                "runtime optimizer-seed checkpoint matrix does not exactly match the "
+                "replicated Stage5 candidate side"
+            )
+    elif runtime_policy_sha not in candidate_checkpoint_hashes:
         raise EvidenceProtocolError(
             "runtime benchmark policy is not part of the replicated Stage5 candidate side"
         )

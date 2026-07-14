@@ -45,15 +45,17 @@ configs:
     path: active/accvp_vnext/ppo_candidate_table_full.yaml
     status: canonical
     protocol: accvp-vnext-correctness-v1
-    entrypoint: safe_rl.pipeline.stage3_train_ppo
-    usage: canonical_replicate_template
+    entrypoint: safe_rl.pipeline.stage3_train_ppo_factorial
+    usage: canonical_factorial_template
     minimum_optimizer_replicates: 5
+    factorial_method_count: 4
     generated_config_location: safe_rl_output/runs/<run>/generated_configs
   accvp_vnext_ppo_ablation_matrix:
     path: active/accvp_vnext/ppo_ablation_matrix.yaml
-    status: supported
+    status: canonical
     protocol: accvp-vnext-correctness-v1
-    usage: method_definition_only
+    entrypoint: safe_rl.pipeline.stage3_train_ppo_factorial
+    usage: frozen_factorial_method_definition
   accvp_vnext_workflow:
     path: active/accvp_vnext/workflow.yaml
     status: canonical

@@ -32,6 +32,11 @@ ACCVP safety head 只用于诊断，不能替代 Risk Module 的硬安全门控�
 历史实验只支持将 Reward-v3.1 与 commitment **预注册为候选**；它们仍须在 schema3、
 无泄漏 split、五个 optimizer seeds 和独立 confirmatory cohorts 下重新验证。
 
+这里的正式 factorial 是 **Candidate Table 固定开启条件下的 Reward × commitment 2×2**，
+再加一个 WcDT Reward-v2 公共 baseline。它可以估计 persistence、commitment 及二者交互，
+并在 Reward-v2/no-commitment 条件下比较 Candidate Table 与 WcDT；它不是完整的
+Candidate Table × Reward × commitment 三因素设计。
+
 ## 正式 VNext 入口
 
 正式状态由
@@ -73,6 +78,15 @@ python -m safe_rl.pipeline.run_accvp_vnext_pipeline --run-until accvp_training
 
 # 训练完成后，继续执行真实 SUMO scorer runtime preflight
 python -m safe_rl.pipeline.run_accvp_vnext_pipeline --run-until scorer_runtime_preflight
+
+# 训练四个 Candidate factorial 方法，每个方法五个 optimizer seeds（共20个）
+python -m safe_rl.pipeline.run_accvp_vnext_pipeline --run-until candidate_ppo_replicates
+
+# 完成 WcDT baseline 与四个 Candidate 方法的 policy runtime gates
+python -m safe_rl.pipeline.run_accvp_vnext_pipeline --run-until policy_runtime_replicates
+
+# 生成、执行并聚合六个预注册 Stage5 比较
+python -m safe_rl.pipeline.run_accvp_vnext_pipeline --run-until stage5_replicates_and_aggregate
 ```
 
 目标阶段若已经完成，协调器只输出 `reached target`，不会重跑或覆盖已有 artifact。目标名必须
@@ -100,12 +114,12 @@ python -m safe_rl.pipeline.run_accvp_vnext_pipeline --run-until scorer_runtime_p
 | 8 | `formal_merge` | 合并 formal shards，生成 dataset/split provenance；不会训练模型。|
 | 9 | `accvp_training` | 训练三成员 ensemble，在独立 split 上 calibration 与 operating-point selection，生成 sealed candidate bundle。|
 | 10 | `scorer_runtime_preflight` | 使用 rule policy 访问真实 SUMO state，只测 ACCVP/Risk Candidate Table；使用 development cohort 的 60 个 seeds，报告要求至少 30 个独立 seeds、至少 1,000 个 activation-window decisions 且 `gate.pass=true`。门槛未通过但 lineage 一致时可续跑缺少的 seeds，旧失败报告会归档。|
-| 11 | `candidate_ppo_replicates` | 生成并训练 Candidate factorial 方法的五个 optimizer seeds；当前 workflow 在完整 factorial 协调器完成前主动 blocked。|
+| 11 | `candidate_ppo_replicates` | 冻结 factorial plan，顺序训练四个 Candidate 方法 × 五个 optimizer seeds，共 20 个唯一 checkpoints；支持基于 config/checkpoint/report hash 的安全续跑。|
 | 12 | `baseline_ppo_replicates` | 训练/复用与 Candidate 对齐的五个 WcDT Reward-v2 baseline checkpoints。|
-| 13 | `policy_runtime_replicates` | 对五个 Candidate PPO 执行完整 159D policy runtime benchmark，以最差 replicate 判定 `gate.pass`。|
-| 14 | `stage5_generate` | 从 baseline/candidate manifests 生成同 training seed、同 simulator seeds 的 paired Stage5 配置。|
-| 15 | `stage5_replicates_and_aggregate` | 运行 paired reports，并跨 optimizer seeds 做 hierarchical aggregation；要求聚合 `gate.pass=true`。|
-| 16 | `one_shot_final_holdout` | 在全部代码、阈值和配置冻结后打开一次 sealed holdout；不得调参或重试改善结论。|
+| 13 | `policy_runtime_replicates` | 对四个 Candidate 方法的 20 个 PPO checkpoints 分别执行完整 159D policy runtime benchmark；每个 Stage5 policy group 只绑定自身 checkpoint 的报告，总 gate 取所有方法最差结果。|
+| 14 | `stage5_generate` | 生成六个冻结比较及每个 training seed 的 paired 配置；左右共享 simulator seeds，跨 Reward 比较不使用不可比的训练 `episode_reward`。|
+| 15 | `stage5_replicates_and_aggregate` | 可恢复地运行六组 Stage5，分别做 crossed training-seed × simulator-seed bootstrap，再生成 `stage5_factorial_report_v1`。|
+| 16 | `one_shot_final_holdout` | 只绑定最终方法的五副本 runtime child 与 WcDT-v2 vs Reward-v3.1+commitment promotion child；在全部冻结后显式打开一次。|
 
 当 `accvp_training` 已完成且状态显示 `next_phase=scorer_runtime_preflight` 时，下一步可以二选一：
 
@@ -119,6 +133,45 @@ python -m safe_rl.pipeline.run_accvp_vnext_pipeline --run-until scorer_runtime_p
 
 运行完成后再次执行无参数状态命令，确认 `scorer_runtime_preflight.complete=true` 和下一阶段状态。
 
+### Factorial PPO、runtime 与 Stage5 产物
+
+正常情况下使用总 workflow 入口即可。需要单独恢复 Candidate PPO 阶段时，等价的底层入口为：
+
+```powershell
+python -m safe_rl.pipeline.stage3_train_ppo_factorial `
+  --config safe_rl/config/active/accvp_vnext/ppo_candidate_table_full.yaml `
+  --matrix safe_rl/config/active/accvp_vnext/ppo_ablation_matrix.yaml `
+  --workflow-config safe_rl/config/active/accvp_vnext/workflow.yaml `
+  --optimizer-seeds 1001 1002 1003 1004 1005 `
+  --output-root safe_rl_output/runs/accvp_vnext_factorial
+```
+
+它默认安全续跑：完整 seed 会在重新核验 hash 后跳过。若 Stage3 在写入任何文件前退出，
+只留下空的 `run/stage3/` 目录树，协调器会明确输出 `empty_run_shell_removed` 并安全重建；
+若目录中存在任意文件、符号链接或不完整 checkpoint/report，则仍然 fail closed，要求先人工
+审计并归档，不会自动删除或覆盖。关键产物为：
+
+```text
+safe_rl_output/runs/accvp_vnext_factorial/
+  factorial_plan.json
+  ppo_factorial_manifest.json
+  methods/<method_id>/ppo_replicate_manifest.json
+
+safe_rl_output/runs/accvp_vnext_runtime/
+  factorial_runtime_report.json
+  methods/<method_id>/replicated_runtime_report.json
+
+safe_rl_output/runs/accvp_vnext_stage5/
+  generated/factorial_request.json
+  generated/comparisons/<comparison_id>/replicated_report.json
+  factorial_report.json
+```
+
+Stage5 预注册六个比较：Candidate Table（Reward-v2）归因、v2 下 commitment、无 commitment
+时 persistence、有 commitment 时 persistence、v3.1 下 commitment，以及 WcDT Reward-v2
+对最终完整方法。crossed bootstrap 当前不产生可用于跨比较 Holm 家族的合法 p 值，因此总
+报告会明确记录 `performed=false`，不会从置信区间反推或伪造 p 值。
+
 最终 holdout 只有在全部上游门槛通过并冻结后才能显式打开：
 
 ```powershell
@@ -127,10 +180,10 @@ python -m safe_rl.pipeline.run_accvp_vnext_pipeline `
   --allow-final-holdout
 ```
 
-当前 workflow 会在 `candidate_ppo_replicates` 前 fail closed，直到 factorial PPO/Stage5
-协调器能够把 Reward-v2 固定为消融、把 Reward-v3.1 + commitment 固定为最终候选。
-这避免现有单一 Reward-v2 命令被误当作完整方法。通用
-`safe_rl.pipeline.run_full_pipeline` 仍可用于旧版/一般比较实验，但不是 VNext 正式证据入口。
+factorial 协调器现已将 Reward-v2 固定为消融，并将 Reward-v3.1 + commitment 固定为最终
+候选。`candidate_ppo_replicates` 不再人为 blocked，但任何方法、seed、checkpoint、runtime 或
+Stage5 lineage 缺失都会关闭 artifact gate。通用 `safe_rl.pipeline.run_full_pipeline` 仍可用于
+旧版/一般比较实验，但不是 VNext 正式证据入口。
 
 每次推进前建议重新运行状态命令，确认 `next_phase`、`next_command`、`blocked` 和对应
 artifact。不要因为 report 为 `fail` 就删除数据、放宽阈值或跳过阶段；应读取报告的
@@ -228,7 +281,11 @@ tests/                         # 数据、模型、runtime、统计和协调器�
 
 ```powershell
 python -m compileall -q safe_rl tests
-python -m pytest tests/test_accvp_vnext_pipeline.py tests/test_accvp.py -q
+python -m pytest tests/test_ppo_factorial_training.py `
+  tests/test_accvp_runtime_factorial.py `
+  tests/test_stage5_factorial.py `
+  tests/test_accvp_vnext_pipeline.py `
+  tests/test_evaluation_protocol.py -q
 python -m pytest -q
 ```
 

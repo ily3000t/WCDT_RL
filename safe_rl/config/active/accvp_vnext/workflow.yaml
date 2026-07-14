@@ -10,11 +10,7 @@ automation:
   stop_on_closed_gate: true
   execute_at_most_one_phase_without_run_until: true
   final_holdout_requires_explicit_flag: true
-  blocked_phases:
-    candidate_ppo_replicates: >-
-      Formal factorial PPO orchestration must bind Reward-v2 as an ablation
-      and candidate_table_reward_v3_1_commitment as the final method before
-      this phase may execute.
+  blocked_phases: {}
 
 phase_order:
   - pilot_collection
@@ -64,3 +60,47 @@ method_roles:
   wcdt_reward_v2: action_independent_forecast_baseline
 
 final_method_id: candidate_table_reward_v3_1_commitment
+
+# Candidate Table is held on while Reward (v2/v3.1) and policy commitment
+# (off/on) form the frozen 2x2 factorial.  WcDT Reward-v2 remains the common
+# action-independent baseline.  Cross-reward comparisons deliberately use
+# common task/safety metrics rather than each policy's training reward.
+factorial:
+  candidate_method_ids:
+    - candidate_table_reward_v2
+    - candidate_table_reward_v2_commitment
+    - candidate_table_reward_v3_1
+    - candidate_table_reward_v3_1_commitment
+  runtime_scope: all_candidate_methods
+  final_comparison_id: wcdt_reward_v2__vs__candidate_table_reward_v3_1_commitment
+  comparisons:
+    - comparison_id: wcdt_reward_v2__vs__candidate_table_reward_v2
+      left_method_id: wcdt_reward_v2
+      right_method_id: candidate_table_reward_v2
+      family: candidate_table_attribution
+      role: candidate_table_single_factor
+    - comparison_id: candidate_table_reward_v2__vs__candidate_table_reward_v2_commitment
+      left_method_id: candidate_table_reward_v2
+      right_method_id: candidate_table_reward_v2_commitment
+      family: candidate_factorial_attribution
+      role: commitment_at_reward_v2
+    - comparison_id: candidate_table_reward_v2__vs__candidate_table_reward_v3_1
+      left_method_id: candidate_table_reward_v2
+      right_method_id: candidate_table_reward_v3_1
+      family: candidate_factorial_attribution
+      role: persistence_without_commitment
+    - comparison_id: candidate_table_reward_v2_commitment__vs__candidate_table_reward_v3_1_commitment
+      left_method_id: candidate_table_reward_v2_commitment
+      right_method_id: candidate_table_reward_v3_1_commitment
+      family: candidate_factorial_attribution
+      role: persistence_with_commitment
+    - comparison_id: candidate_table_reward_v3_1__vs__candidate_table_reward_v3_1_commitment
+      left_method_id: candidate_table_reward_v3_1
+      right_method_id: candidate_table_reward_v3_1_commitment
+      family: candidate_factorial_attribution
+      role: commitment_at_reward_v3_1
+    - comparison_id: wcdt_reward_v2__vs__candidate_table_reward_v3_1_commitment
+      left_method_id: wcdt_reward_v2
+      right_method_id: candidate_table_reward_v3_1_commitment
+      family: final_method_confirmatory
+      role: primary_final

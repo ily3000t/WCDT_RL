@@ -35,6 +35,7 @@ def test_config_registry_resolves_every_explicit_entry_and_canonical_vnext_set()
         "accvp_vnext_oracle_regression",
         "accvp_vnext_formal",
         "accvp_vnext_train",
+        "accvp_vnext_ppo_ablation_matrix",
         "accvp_vnext_workflow",
         "ppo_accvp_candidate_table_vnext_dev",
         "ppo_accvp_candidate_table_vnext_full",

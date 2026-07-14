@@ -169,9 +169,9 @@ python -m safe_rl.pipeline.run_accvp_vnext_pipeline `
 15. `stage5_replicates_and_aggregate`
 16. `one_shot_final_holdout`
 
-当前 workflow 故意将 `candidate_ppo_replicates` 标记为 blocked。解锁条件不是“某个 PPO 能
-运行”，而是 factorial orchestration 已能分别生成、审计和评估所有预注册 Reward/commitment
-方法，并将最终方法绑定到 Reward-v3.1 + risk-gated commitment。
+factorial orchestration 已接入该 workflow：它分别生成、审计和评估所有预注册
+Reward/commitment 方法，并将最终方法绑定到 Reward-v3.1 + risk-gated commitment。阶段不再
+人为 blocked；任何一个 child manifest、runtime 或 Stage5 lineage 不完整时仍会 fail closed。
 
 `safe_rl.pipeline.run_full_pipeline` 是通用/历史 pipeline，不能替代以上 VNext 证据链。
 
@@ -258,6 +258,22 @@ Reward-v2 Candidate 回答 Candidate Table 本身是否有增益；Reward-v3.1 p
 risk-gated commitment 回答识别机会后能否持续完成合流。每个正式方法至少五个独立 PPO
 optimizer seeds；optimizer seed 与 simulator seed cohort 不得混用。
 
+四个 Candidate 方法形成 Reward（v2/v3.1）× commitment（off/on）的 2×2 factorial，共
+20 个 PPO checkpoints；WcDT Reward-v2 另有五个 baseline checkpoints。直接入口为：
+
+```powershell
+python -m safe_rl.pipeline.stage3_train_ppo_factorial `
+  --config safe_rl/config/active/accvp_vnext/ppo_candidate_table_full.yaml `
+  --matrix safe_rl/config/active/accvp_vnext/ppo_ablation_matrix.yaml `
+  --workflow-config safe_rl/config/active/accvp_vnext/workflow.yaml `
+  --optimizer-seeds 1001 1002 1003 1004 1005 `
+  --output-root safe_rl_output/runs/accvp_vnext_factorial
+```
+
+`factorial_plan.json` 冻结全部 method/seed/config；每个训练完成后立即更新 child manifest。默认
+resume 只复用 hash 和 Stage3 report 都匹配的结果。启动失败后遗留的纯空目录树可以自动
+移除并重建；只要不完整 run 中已有任何文件或链接，协调器仍拒绝自动覆盖。
+
 生成配置和 checkpoints 只能写入 `safe_rl_output/runs`，manifest 至少记录 resolved config、
 checkpoint、reward semantics、observation contract 和 ACCVP artifact fingerprint 的 hash。
 
@@ -267,8 +283,8 @@ runtime 分两层：
 
 1. scorer preflight：rule/base-state policy 访问真实 SUMO state，只测 ACCVP/Risk Candidate
    Table，不要求尚不存在的 159D Candidate PPO checkpoint；
-2. policy runtime benchmark：五个 Candidate PPO 训练后测试完整 observation/policy 路径，
-   聚合采用最差 replicate，而非平均值。
+2. policy runtime benchmark：四个 Candidate 方法的 20 个 PPO checkpoints 均测试完整
+   observation/policy 路径；每个方法先取五副本最差值，总 gate 再要求四个方法全部通过。
 
 synthetic fault audit 只证明 bounded-stale 状态机在 timeout、NaN、连续故障与恢复输入下的
 行为。若报告声明 `synthetic_context=true`、`real_sumo_executed=false` 或
@@ -279,9 +295,15 @@ bounded stale 状态不得通过 Risk gate；连续故障、恢复和 stale age 
 
 ## 9. Stage5 and holdout
 
-同一 training seed 的 baseline/candidate 必须使用完全相同的 simulator seed ledger。每个
-replicate 先生成 paired report，再跨 optimizer seeds 做 hierarchical aggregation。正式统计
-至少包含 paired BCa、McNemar、多重比较校正和完整 lineage。
+同一 training seed 的左右方法必须使用完全相同的 simulator seed ledger。每个 replicate 先
+生成 paired report，再按 training-seed × simulator-seed crossed bootstrap 聚合。六个比较分别
+回答 Candidate Table、persistence、commitment 和最终方法效果。跨 Reward 比较不使用训练
+`episode_reward`；crossed cells 不满足 pooled McNemar 的独立性时，报告明确不执行该检验。
+只有存在显式且合法的同一家族 p 值时才执行 Holm；不会从置信区间反推 p 值。
+
+每个 Candidate group 必须绑定其自身 checkpoint 对应的 runtime preflight。最终 holdout 只接收
+WcDT Reward-v2 vs Reward-v3.1+commitment 的标准 replicated child report，以及最终方法的五
+副本 runtime child；factorial umbrella 用于上游完整性 gate，不直接替代这两个 promotion artifact。
 
 冻结顺序：
 

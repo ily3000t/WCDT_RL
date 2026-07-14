@@ -10,6 +10,22 @@ from typing import Any
 import yaml
 
 from safe_rl.accvp.contracts.schema import file_sha256, read_json
+from safe_rl.evaluation_protocol import stable_hash
+from safe_rl.pipeline.accvp_runtime_benchmark_factorial import (
+    FACTORIAL_RUNTIME_REPORT_KIND,
+    validate_factorial_runtime_report,
+)
+from safe_rl.pipeline.stage5_factorial_aggregate import FACTORIAL_REPORT_KIND
+from safe_rl.pipeline.stage5_generate_factorial_configs import (
+    FACTORIAL_REQUEST_KIND,
+    FINAL_COMPARISON_ID,
+)
+from safe_rl.ppo_factorial import (
+    EXPECTED_CANDIDATE_METHOD_ROLES,
+    EXPECTED_FINAL_METHOD_ID,
+    validate_factorial_manifest,
+    validate_replicate_manifest,
+)
 from safe_rl.utils.config import REPO_ROOT
 from safe_rl.utils.io import write_json
 
@@ -100,6 +116,136 @@ def _oracle_report_ok(path: Path) -> bool:
     )
 
 
+def _factorial_manifest_ok(path: Path, *, protocol_id: str) -> bool:
+    if not path.is_file():
+        return False
+    try:
+        payload = validate_factorial_manifest(
+            path,
+            require_complete=True,
+            verify_files=True,
+        )
+    except (OSError, ValueError, json.JSONDecodeError):
+        return False
+    return (
+        str(payload.get("protocol_id", "")) == str(protocol_id)
+        and str(payload.get("final_method_id", "")) == EXPECTED_FINAL_METHOD_ID
+        and set(dict(payload.get("methods", {}) or {}))
+        == set(EXPECTED_CANDIDATE_METHOD_ROLES)
+    )
+
+
+def _baseline_manifest_ok(path: Path) -> bool:
+    if not path.is_file():
+        return False
+    try:
+        payload = read_json(path)
+        summary = validate_replicate_manifest(
+            payload,
+            method_id="wcdt_reward_v2",
+            expected_seeds=OPTIMIZER_SEEDS,
+            verify_files=True,
+        )
+    except (OSError, ValueError, json.JSONDecodeError):
+        return False
+    return str(payload.get("status", "")) == "complete" and summary["status"] == "complete"
+
+
+def _factorial_runtime_ok(path: Path, *, factorial_manifest: Path) -> bool:
+    if not path.is_file() or not factorial_manifest.is_file():
+        return False
+    try:
+        payload = validate_factorial_runtime_report(
+            path,
+            factorial_manifest=factorial_manifest,
+            seeds=RUNTIME_SEEDS,
+            backend="vectorized",
+            device="auto",
+        )
+    except (OSError, ValueError, json.JSONDecodeError):
+        return False
+    return (
+        str(payload.get("artifact_kind", "")) == FACTORIAL_RUNTIME_REPORT_KIND
+        and bool(dict(payload.get("gate", {}) or {}).get("pass", False))
+    )
+
+
+def _stage5_factorial_request_ok(
+    path: Path,
+    *,
+    factorial_manifest: Path,
+    runtime_report: Path,
+    baseline_manifest: Path,
+) -> bool:
+    if not path.is_file():
+        return False
+    try:
+        payload = read_json(path)
+        if (
+            str(payload.get("artifact_kind", "")) != FACTORIAL_REQUEST_KIND
+            or str(payload.get("status", "")) != "prepared"
+            or str(payload.get("final_method_id", "")) != EXPECTED_FINAL_METHOD_ID
+            or str(payload.get("final_comparison_id", "")) != FINAL_COMPARISON_ID
+            or str(payload.get("factorial_manifest_sha256", ""))
+            != file_sha256(factorial_manifest)
+            or str(payload.get("runtime_factorial_report_sha256", ""))
+            != file_sha256(runtime_report)
+            or str(payload.get("baseline_replicate_manifest_sha256", ""))
+            != file_sha256(baseline_manifest)
+        ):
+            return False
+        comparisons = list(payload.get("comparisons", []) or [])
+        if len(comparisons) != 6:
+            return False
+        for row in comparisons:
+            request_path = _resolve(row.get("replicated_request", ""))
+            if (
+                not request_path.is_file()
+                or file_sha256(request_path)
+                != str(row.get("replicated_request_sha256", ""))
+            ):
+                return False
+    except (OSError, ValueError, TypeError, json.JSONDecodeError):
+        return False
+    return True
+
+
+def _stage5_factorial_report_ok(
+    path: Path,
+    *,
+    request_path: Path,
+    final_child_report: Path,
+) -> bool:
+    if not path.is_file() or not request_path.is_file():
+        return False
+    try:
+        payload = read_json(path)
+        fingerprint = str(payload.get("report_fingerprint", ""))
+        content = dict(payload)
+        content.pop("report_fingerprint", None)
+        gate = dict(payload.get("gate", {}) or {})
+        final = dict(payload.get("final_comparison_report", {}) or {})
+        if (
+            str(payload.get("artifact_kind", "")) != FACTORIAL_REPORT_KIND
+            or str(payload.get("status", "")) != "complete"
+            or str(payload.get("final_method_id", "")) != EXPECTED_FINAL_METHOD_ID
+            or str(payload.get("final_comparison_id", "")) != FINAL_COMPARISON_ID
+            or str(payload.get("factorial_request_sha256", ""))
+            != file_sha256(request_path)
+            or not bool(gate.get("pass", False))
+            or not all(bool(value) for value in gate.values())
+            or len(list(payload.get("comparisons", []) or [])) != 6
+            or stable_hash(content) != fingerprint
+            or _resolve(final.get("path", "")) != final_child_report.resolve()
+            or not final_child_report.is_file()
+            or str(final.get("sha256", "")) != file_sha256(final_child_report)
+        ):
+            return False
+    except (OSError, ValueError, TypeError, json.JSONDecodeError):
+        return False
+    return True
+
+
 def _module_command(module: str, *args: Any) -> list[str]:
     return [sys.executable, "-m", module, *(str(value) for value in args)]
 
@@ -145,17 +291,29 @@ def workflow_status(
         "safe_rl_output/runs/accvp_vnext_train/accvp/accvp_vnext_schema3_candidate_manifest.json"
     )
     scorer_report = _resolve("safe_rl_output/runs/accvp_vnext_runtime/scorer_preflight.json")
-    candidate_manifest = _resolve(
-        "safe_rl_output/runs/accvp_vnext_replicates/ppo_replicate_manifest.json"
+    factorial_manifest = _resolve(
+        "safe_rl_output/runs/accvp_vnext_factorial/ppo_factorial_manifest.json"
     )
     baseline_path = _resolve(baseline_manifest)
-    runtime_replicates = _resolve(
-        "safe_rl_output/runs/accvp_vnext_runtime/replicated_runtime_report.json"
+    runtime_factorial = _resolve(
+        "safe_rl_output/runs/accvp_vnext_runtime/factorial_runtime_report.json"
+    )
+    final_runtime_replicates = (
+        runtime_factorial.parent
+        / "methods"
+        / EXPECTED_FINAL_METHOD_ID
+        / "replicated_runtime_report.json"
     )
     stage5_request = _resolve(
-        "safe_rl_output/runs/accvp_vnext_stage5/generated/replicated_request.json"
+        "safe_rl_output/runs/accvp_vnext_stage5/generated/factorial_request.json"
     )
-    stage5_report = _resolve("safe_rl_output/runs/accvp_vnext_stage5/replicated_report.json")
+    stage5_report = _resolve("safe_rl_output/runs/accvp_vnext_stage5/factorial_report.json")
+    final_stage5_report = (
+        stage5_request.parent
+        / "comparisons"
+        / FINAL_COMPARISON_ID
+        / "replicated_report.json"
+    )
     holdout_report = _resolve(
         "safe_rl_output/runs/accvp_vnext_final_holdout/accvp_vnext_schema3_final_test_diagnostics.json"
     )
@@ -304,35 +462,28 @@ def workflow_status(
     )
     add(
         "candidate_ppo_replicates",
-        _artifact_ok(
-            candidate_manifest,
-            artifact_kind="ppo_optimizer_replicate_manifest_v1",
-            status="complete",
+        _factorial_manifest_ok(
+            factorial_manifest,
+            protocol_id=str(workflow.get("protocol_id", "")),
         ),
         _module_command(
-            "safe_rl.pipeline.stage3_train_ppo_replicates",
+            "safe_rl.pipeline.stage3_train_ppo_factorial",
             "--config",
             PPO_CONFIG,
             "--matrix",
             MATRIX_CONFIG,
-            "--method-id",
-            "candidate_table_reward_v2",
+            "--workflow-config",
+            workflow_path,
             "--optimizer-seeds",
             *OPTIMIZER_SEEDS,
-            "--run-id-prefix",
-            "ppo_accvp_vnext",
             "--output-root",
-            candidate_manifest.parent,
+            factorial_manifest.parent,
         ),
-        candidate_manifest,
+        factorial_manifest,
     )
     add(
         "baseline_ppo_replicates",
-        _artifact_ok(
-            baseline_path,
-            artifact_kind="ppo_optimizer_replicate_manifest_v1",
-            status="complete",
-        ),
+        _baseline_manifest_ok(baseline_path),
         _module_command(
             "safe_rl.pipeline.stage3_train_ppo_replicates",
             "--config",
@@ -352,58 +503,62 @@ def workflow_status(
     )
     add(
         "policy_runtime_replicates",
-        _artifact_ok(
-            runtime_replicates,
-            artifact_kind="accvp_runtime_benchmark_replicates_v1",
-            gate_pass=True,
+        _factorial_runtime_ok(
+            runtime_factorial,
+            factorial_manifest=factorial_manifest,
         ),
         _module_command(
-            "safe_rl.pipeline.accvp_runtime_benchmark_replicates",
-            "--config-template",
-            PPO_CONFIG,
-            "--replicate-manifest",
-            candidate_manifest,
+            "safe_rl.pipeline.accvp_runtime_benchmark_factorial",
+            "--factorial-manifest",
+            factorial_manifest,
             "--seeds",
             *RUNTIME_SEEDS,
             "--backend",
             "vectorized",
             "--output",
-            runtime_replicates,
+            runtime_factorial,
         ),
-        runtime_replicates,
+        runtime_factorial,
     )
     add(
         "stage5_generate",
-        stage5_request.is_file(),
+        _stage5_factorial_request_ok(
+            stage5_request,
+            factorial_manifest=factorial_manifest,
+            runtime_report=runtime_factorial,
+            baseline_manifest=baseline_path,
+        ),
         _module_command(
-            "safe_rl.pipeline.stage5_generate_replicated_configs",
+            "safe_rl.pipeline.stage5_generate_factorial_configs",
             "--baseline-manifest",
             baseline_path,
-            "--candidate-manifest",
-            candidate_manifest,
+            "--factorial-manifest",
+            factorial_manifest,
             "--protocol",
             PROTOCOL_CONFIG,
             "--seed-role",
             "natural_confirmatory",
-            "--runtime-replicate-report",
-            runtime_replicates,
+            "--runtime-factorial-report",
+            runtime_factorial,
             "--output-dir",
             stage5_request.parent,
+            "--workflow-config",
+            workflow_path,
         ),
         stage5_request,
     )
     add(
         "stage5_replicates_and_aggregate",
-        _artifact_ok(
+        _stage5_factorial_report_ok(
             stage5_report,
-            artifact_kind="stage5_replicated_paired_report_v1",
-            gate_pass=True,
+            request_path=stage5_request,
+            final_child_report=final_stage5_report,
         ),
         _module_command(
-            "safe_rl.pipeline.stage5_run_replicates",
-            "--generated-dir",
-            stage5_request.parent,
-            "--aggregate-output",
+            "safe_rl.pipeline.stage5_run_factorial",
+            "--request",
+            stage5_request,
+            "--output",
             stage5_report,
         ),
         stage5_report,
@@ -418,9 +573,9 @@ def workflow_status(
             "--artifact-manifest",
             predictor_manifest,
             "--runtime-benchmark",
-            runtime_replicates,
+            final_runtime_replicates,
             "--stage5-replicated-report",
-            stage5_report,
+            final_stage5_report,
             "--output-dir",
             holdout_report.parent,
             "--mode",
