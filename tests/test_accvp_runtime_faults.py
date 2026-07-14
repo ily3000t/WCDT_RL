@@ -4,7 +4,7 @@ import json
 
 import pytest
 
-from safe_rl.accvp.fault_injection import (
+from safe_rl.accvp.verification.fault_injection import (
     PREDICTOR_STAGE,
     RISK_STAGE,
     SUPPORTED_FAULTS,

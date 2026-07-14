@@ -4,7 +4,7 @@ import argparse
 import json
 from pathlib import Path
 
-from safe_rl.accvp.availability import audit_risk_secondary_false_negatives
+from safe_rl.accvp.training.availability import audit_risk_secondary_false_negatives
 
 
 def main() -> None:

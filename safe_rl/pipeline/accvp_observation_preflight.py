@@ -6,14 +6,14 @@ from typing import Any
 
 import numpy as np
 
-from safe_rl.accvp.artifacts import apply_v2_bundle_paths
-from safe_rl.accvp.observation import RiskGatedACCVPCandidateTableAugmentor
-from safe_rl.accvp.runtime_contract import (
+from safe_rl.accvp.contracts.artifacts import apply_v2_bundle_paths
+from safe_rl.accvp.serving.observation import RiskGatedACCVPCandidateTableAugmentor
+from safe_rl.accvp.contracts.runtime_contract import (
     compare_formal_runtime_contracts,
     formal_runtime_contract_from_config,
     validate_manifest_runtime_contract,
 )
-from safe_rl.accvp.schema import file_sha256, stable_hash
+from safe_rl.accvp.contracts.schema import file_sha256, stable_hash
 from safe_rl.pipeline.common import make_env
 from safe_rl.risk.risk_aggregator import aggregate_episode_reports
 from safe_rl.rl.evaluation import validate_model_env_observation_shape

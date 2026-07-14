@@ -9,7 +9,7 @@ from typing import Any
 
 import yaml
 
-from safe_rl.accvp.schema import file_sha256, read_json
+from safe_rl.accvp.contracts.schema import file_sha256, read_json
 from safe_rl.utils.config import REPO_ROOT
 from safe_rl.utils.io import write_json
 
@@ -24,7 +24,10 @@ MATRIX_CONFIG = "safe_rl/config/active/accvp_vnext/ppo_ablation_matrix.yaml"
 PROTOCOL_CONFIG = "safe_rl/config/examples/vnext/evaluation_protocol_vnext.example.yaml"
 WORKFLOW_CONFIG = "safe_rl/config/active/accvp_vnext/workflow.yaml"
 OPTIMIZER_SEEDS = [1001, 1002, 1003, 1004, 1005]
-RUNTIME_SEEDS = list(range(50001, 50031))
+# The first 30 development seeds produced only 608 activation-window
+# decisions on the frozen rule-policy workload.  Sixty remain within the
+# preregistered development cohort and provide margin above the >=1000 gate.
+RUNTIME_SEEDS = list(range(50001, 50061))
 
 
 def _resolve(path: str | Path) -> Path:
@@ -293,6 +296,7 @@ def workflow_status(
             *RUNTIME_SEEDS,
             "--backend",
             "vectorized",
+            "--extend-failed-report",
             "--output",
             scorer_report,
         ),

@@ -6,7 +6,7 @@ from typing import Any
 
 import yaml
 
-from safe_rl.accvp.schema import file_sha256, read_json
+from safe_rl.accvp.contracts.schema import file_sha256, read_json
 from safe_rl.pipeline import stage5_paired_eval, stage5_replicated_aggregate
 from safe_rl.pipeline.stage5_replicated_aggregate import REQUEST_ARTIFACT_KIND
 from safe_rl.utils.config import REPO_ROOT, load_config

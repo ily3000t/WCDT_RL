@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import pytest
 
-from safe_rl.accvp.runtime_contract import (
+from safe_rl.accvp.contracts.runtime_contract import (
     canonical_formal_runtime_contract,
     compare_formal_runtime_contracts,
     formal_runtime_contract_from_config,

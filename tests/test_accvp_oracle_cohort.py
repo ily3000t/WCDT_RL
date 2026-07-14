@@ -5,8 +5,8 @@ from pathlib import Path
 
 import pytest
 
-from safe_rl.accvp.dataset import ACCVPBranchDataset, build_split_manifest
-from safe_rl.accvp.schema import read_json
+from safe_rl.accvp.data.dataset import ACCVPBranchDataset, build_split_manifest
+from safe_rl.accvp.contracts.schema import read_json
 
 
 def _write_roots(dataset: Path, roots: list[dict]) -> None:

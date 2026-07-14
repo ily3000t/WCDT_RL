@@ -8,16 +8,17 @@ from typing import Any, Iterable
 
 import numpy as np
 
-from safe_rl.accvp.branch_worker import run_branch_job
-from safe_rl.accvp.protocol import (
+from safe_rl.stage1_counterfactual.branch_worker import run_branch_job
+from safe_rl.accvp.contracts.protocol import (
     activation_bin as _activation_bin,
     counterfactual_data_contract,
     data_contract_hash,
     effective_activation_distance,
     legacy_deadline_bin,
+    scenario_config_hash,
 )
-from safe_rl.accvp.root_context import capture_root_context, synchronise_root_state
-from safe_rl.accvp.schema import (
+from safe_rl.stage1_counterfactual.root_context import capture_root_context, synchronise_root_state
+from safe_rl.accvp.contracts.schema import (
     COUNTERFACTUAL_SCHEMA_VERSION,
     COUNTERFACTUAL_SHARD_MANIFEST_VERSION,
     SCENARIO_EPISODE_KEY_VERSION,
@@ -26,8 +27,8 @@ from safe_rl.accvp.schema import (
     stable_hash,
     write_json_atomic,
 )
-from safe_rl.accvp.shards import assert_new_shard, immutable_shard_dir
-from safe_rl.accvp.snapshot_store import CounterfactualSnapshotStore
+from safe_rl.stage1_counterfactual.shards import assert_new_shard, immutable_shard_dir
+from safe_rl.stage1_counterfactual.snapshot_store import CounterfactualSnapshotStore
 from safe_rl.risk.merge_local import is_candidate_legal
 from safe_rl.risk.risk_module import RiskModuleWrapper
 from safe_rl.shield.safety_shield import SafetyShield
@@ -398,7 +399,7 @@ def collect(
     with (manifests / "branches.jsonl").open("w", encoding="utf-8") as handle:
         for row in branch_rows:
             handle.write(canonical_json(row) + "\n")
-    scenario_config_hash = stable_hash(dict(cfg.scenario))
+    scenario_hash = scenario_config_hash(cfg)
     dataset_manifest = {
         "artifact_kind": "counterfactual_shard_v2",
         "counterfactual_schema_version": COUNTERFACTUAL_SCHEMA_VERSION,
@@ -419,7 +420,7 @@ def collect(
         "exclude_from_model_splits": exclude_from_model_splits,
         "cache_dir": str(store.cache_dir),
         "config_hash": stable_hash(dict(cfg)),
-        "scenario_config_hash": scenario_config_hash,
+        "scenario_config_hash": scenario_hash,
         "scenario_route_hash": str(contract["scenario_route_hash"]),
         "scenario_episode_key_version": SCENARIO_EPISODE_KEY_VERSION,
         "action_execution_profile": str(cfg.scenario.get("action_execution_profile", "current_v1")),

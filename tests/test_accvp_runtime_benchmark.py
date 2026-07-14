@@ -4,7 +4,12 @@ from pathlib import Path
 
 import pytest
 
-from safe_rl.pipeline.accvp_runtime_benchmark import _software_hardware, run
+from safe_rl.accvp.contracts.schema import stable_hash
+from safe_rl.pipeline.accvp_runtime_benchmark import (
+    _software_hardware,
+    _validate_failed_report_extension,
+    run,
+)
 
 
 def test_runtime_benchmark_rejects_nonformal_seed_schedule_before_loading_artifacts(tmp_path: Path):
@@ -63,4 +68,91 @@ def test_runtime_benchmark_separates_scorer_preflight_from_policy_runtime(tmp_pa
             policy_type="rule_gap_acceptance",
             seeds=list(range(29)),
             output=tmp_path / "report.json",
+        )
+
+
+def _failed_extension_fixture(seeds: list[int], identity: dict) -> dict:
+    reports = [
+        {"seed": seed, "episode_reward": float(seed)}
+        for seed in seeds
+    ]
+    seed_hash = stable_hash({"episode_seeds": seeds})
+    return {
+        "artifact_kind": "accvp_runtime_benchmark_v1",
+        "gate": {"pass": False},
+        **identity,
+        "workload": {
+            "requested_episode_seed_sha256": seed_hash,
+            "observed_episode_seed_sha256": seed_hash,
+        },
+        "episodes": reports,
+    }
+
+
+def test_runtime_benchmark_extension_reuses_only_an_exact_failed_prefix():
+    identity = {
+        "benchmark_scope": "scorer_preflight",
+        "policy_type": "rule_gap_acceptance",
+        "backend": "vectorized",
+        "config_file_sha256": "config",
+        "artifact_lineage": {"bundle": "same"},
+        "software_hardware": {"platform": "same", "process_id": 1},
+    }
+    existing_seeds = list(range(50001, 50031))
+    requested = list(range(50001, 50061))
+    payload = _failed_extension_fixture(existing_seeds, identity)
+
+    reports = _validate_failed_report_extension(
+        payload,
+        requested_seeds=requested,
+        expected_identity=identity,
+    )
+    assert [report["seed"] for report in reports] == existing_seeds
+
+    passed = {**payload, "gate": {"pass": True}}
+    with pytest.raises(ValueError, match="passing.*immutable"):
+        _validate_failed_report_extension(
+            passed,
+            requested_seeds=requested,
+            expected_identity=identity,
+        )
+
+    changed = {**payload, "config_file_sha256": "changed"}
+    with pytest.raises(ValueError, match="lineage mismatch"):
+        _validate_failed_report_extension(
+            changed,
+            requested_seeds=requested,
+            expected_identity=identity,
+        )
+
+    new_process = {
+        **payload,
+        "software_hardware": {"platform": "same", "process_id": 999},
+    }
+    reports = _validate_failed_report_extension(
+        new_process,
+        requested_seeds=requested,
+        expected_identity={
+            **identity,
+            "software_hardware": {"platform": "same", "process_id": 2},
+        },
+    )
+    assert len(reports) == 30
+
+    changed_host = {
+        **payload,
+        "software_hardware": {"platform": "different", "process_id": 1},
+    }
+    with pytest.raises(ValueError, match="software_hardware"):
+        _validate_failed_report_extension(
+            changed_host,
+            requested_seeds=requested,
+            expected_identity=identity,
+        )
+
+    with pytest.raises(ValueError, match="exact prefix"):
+        _validate_failed_report_extension(
+            payload,
+            requested_seeds=[*range(60001, 60031), *range(50031, 50061)],
+            expected_identity=identity,
         )

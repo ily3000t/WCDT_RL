@@ -6,7 +6,7 @@ from typing import Any
 
 import yaml
 
-from safe_rl.accvp.schema import file_sha256, read_json
+from safe_rl.accvp.contracts.schema import file_sha256, read_json
 from safe_rl.evaluation_protocol import seeds_for_role, stable_hash
 from safe_rl.pipeline import stage3_train_ppo
 from safe_rl.ppo_replicates import (

@@ -3,7 +3,7 @@ from __future__ import annotations
 import argparse
 from pathlib import Path
 
-from safe_rl.accvp.oracle import write_oracle_report
+from safe_rl.accvp.evaluation.oracle import write_oracle_report
 
 
 def main() -> None:

@@ -4,7 +4,7 @@ import argparse
 from pathlib import Path
 from typing import Any
 
-from safe_rl.accvp.schema import file_sha256, read_json
+from safe_rl.accvp.contracts.schema import file_sha256, read_json
 from safe_rl.evaluation_protocol import protocol_snapshot
 from safe_rl.pipeline.audit_ppo_replicate_lineage import audit_manifest
 from safe_rl.pipeline.stage5_replicated_aggregate import REQUEST_ARTIFACT_KIND

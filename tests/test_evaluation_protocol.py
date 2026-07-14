@@ -7,15 +7,15 @@ import pytest
 
 import safe_rl.pipeline.stage3_train_ppo as stage3_train_ppo
 import safe_rl.pipeline.stage5_paired_eval as stage5_paired_eval
-from safe_rl.accvp.observation import RiskGatedACCVPCandidateTableAugmentor
-from safe_rl.accvp.risk_secondary_audit import combine_audit_reports
-from safe_rl.accvp.runtime import ACCVPRuntimePredictor
-from safe_rl.accvp.runtime_contract import (
+from safe_rl.accvp.serving.observation import RiskGatedACCVPCandidateTableAugmentor
+from safe_rl.accvp.evaluation.risk_secondary import combine_audit_reports
+from safe_rl.accvp.serving.predictor import ACCVPRuntimePredictor
+from safe_rl.accvp.contracts.runtime_contract import (
     canonical_formal_runtime_contract,
     formal_runtime_contract_sha256,
 )
-from safe_rl.accvp.schema import file_sha256, stable_hash
-from safe_rl.accvp.viability_lite import tune_viability_lite_operating_point
+from safe_rl.accvp.contracts.schema import file_sha256, stable_hash
+from safe_rl.accvp.planning.viability_lite import tune_viability_lite_operating_point
 from safe_rl.artifact_revocation import (
     assert_artifact_not_revoked,
     write_artifact_revocation_manifest,

@@ -3,12 +3,12 @@ from __future__ import annotations
 import argparse
 from pathlib import Path
 
-from safe_rl.accvp.artifacts import (
+from safe_rl.accvp.contracts.artifacts import (
     ACCVP_ARTIFACT_GENERATION,
     apply_v2_bundle_paths,
     artifact_filename,
 )
-from safe_rl.accvp.candidate_table_diagnostics import candidate_table_diagnostics
+from safe_rl.accvp.evaluation.candidate_table import candidate_table_diagnostics
 from safe_rl.pipeline.common import write_report
 from safe_rl.utils.config import REPO_ROOT, load_config
 

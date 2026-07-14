@@ -3,8 +3,8 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
-from safe_rl.accvp.artifacts import resolve_v2_bundle
-from safe_rl.accvp.observation import RiskGatedACCVPCandidateTableAugmentor
+from safe_rl.accvp.contracts.artifacts import resolve_v2_bundle
+from safe_rl.accvp.serving.observation import RiskGatedACCVPCandidateTableAugmentor
 from safe_rl.evaluation_protocol import build_stage_lineage, file_sha256, stable_hash
 from safe_rl.prediction.forecast_feature_augmentor import ForecastFeatureAugmentor
 from safe_rl.prediction.actor_selector import actor_selection_config_hash

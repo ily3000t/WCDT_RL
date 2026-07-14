@@ -7,12 +7,12 @@ import traceback
 from pathlib import Path
 from typing import Any
 
-from safe_rl.accvp.candidate_table_diagnostics import (
+from safe_rl.accvp.evaluation.candidate_table import (
     candidate_records_from_dataset,
     load_calibration,
     load_models_from_checkpoint,
 )
-from safe_rl.accvp.artifacts import (
+from safe_rl.accvp.contracts.artifacts import (
     ACCVP_ARTIFACT_KIND,
     FINAL_HOLDOUT_LIFECYCLE_AUTHORIZATION,
     LIFECYCLE_HOLDOUT_GO,
@@ -24,16 +24,16 @@ from safe_rl.accvp.artifacts import (
     bundle_file_entry,
     resolve_v2_bundle,
 )
-from safe_rl.accvp.dataset import ACCVPBranchDataset
-from safe_rl.accvp.diagnostics import final_test_diagnostics
-from safe_rl.accvp.schema import file_sha256, read_json, stable_hash, write_json_atomic
-from safe_rl.accvp.runtime_contract import (
+from safe_rl.accvp.data.dataset import ACCVPBranchDataset
+from safe_rl.accvp.evaluation.diagnostics import final_test_diagnostics
+from safe_rl.accvp.contracts.schema import file_sha256, read_json, stable_hash, write_json_atomic
+from safe_rl.accvp.contracts.runtime_contract import (
     compare_formal_runtime_contracts,
     formal_runtime_contract_from_config,
     formal_runtime_contract_sha256,
     validate_manifest_runtime_contract,
 )
-from safe_rl.accvp.viability_lite import (
+from safe_rl.accvp.planning.viability_lite import (
     collapse_vnext_lite_records,
     evaluate_lite_thresholds,
 )

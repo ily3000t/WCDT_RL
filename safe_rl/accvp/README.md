@@ -3,6 +3,67 @@
 本文档是 ACCVP VNext 的详细执行契约。日常入口见仓库根 `README.md`；配置状态以
 `safe_rl/config/registry.yaml` 为准；机器生成的 artifact/report 才决定阶段 gate 是否打开。
 
+## Code package layout
+
+ACCVP 按职责分包，根目录只保留公共包入口和本文档：
+
+```text
+safe_rl/accvp/
+  contracts/       # schema、data/runtime protocol、artifact lifecycle
+  data/            # dataset loading、component split、legacy migration audit
+  modeling/        # predictor architecture、loss、checkpoint metadata
+  training/        # trainer、calibration、availability、tuning、reproducibility
+  planning/        # candidate plan、selection、controller、Lite planning
+  serving/         # CPU runtime predictor、inference worker、159D observation
+  evaluation/      # candidate/final diagnostics、oracle、pilot、runtime-result audits
+  verification/    # synthetic fault injection；不产生 hard-real-time claim
+  __init__.py
+  README.md
+
+safe_rl/stage1_counterfactual/
+  collector.py      # root trajectory 与 branch job 调度
+  branch_worker.py  # 独立 SUMO counterfactual branch
+  root_context.py   # root capture/restore
+  snapshot_store.py # snapshot 与 row 原子写入
+  shards.py         # immutable shard 与 formal merge
+```
+
+职责边界：
+
+- `stage1_counterfactual` 只生成和合并反事实数据；
+- `data` 只消费合并后的数据并构造无泄漏 split；
+- `modeling` 定义网络与 loss，不负责训练流程或在线超时；
+- `training` 生成 predictor/calibration/operating-point bundle；
+- `planning` 定义动作计划、选择和 ACV-Shield 逻辑；
+- `serving` 负责在线评分、Candidate Table observation 与 bounded stale；
+- `evaluation` 只读取冻结产物并生成审计/实验报告；
+- `verification` 注入 synthetic failure，不能提升部署声明。
+
+`modeling/model.py` 暂时保留 architecture、loss 和 checkpoint metadata 三者共置，因为它们
+共享同一个 architecture/loss version。待出现第二种模型实现时再按 `predictor.py`、`losses.py`
+和 `checkpoint.py` 拆分，避免本次纯结构迁移同时改变数值逻辑。
+
+旧的 `safe_rl.accvp.<flat_module>` Python 导入路径已经迁移到上述子包；仓库内 pipeline 和测试
+已同步更新。CLI 名称、配置路径、run 目录和 generation-aware artifact 文件名均未改变，因此
+已有 schema3 数据与训练 checkpoint 不需要移动或重建。
+
+常用导入迁移：
+
+| 旧路径 | 新路径 |
+| --- | --- |
+| `safe_rl.accvp.schema` | `safe_rl.accvp.contracts.schema` |
+| `safe_rl.accvp.artifacts` | `safe_rl.accvp.contracts.artifacts` |
+| `safe_rl.accvp.dataset` | `safe_rl.accvp.data.dataset` |
+| `safe_rl.accvp.model` | `safe_rl.accvp.modeling.model` |
+| `safe_rl.accvp.train` | `safe_rl.accvp.training.trainer` |
+| `safe_rl.accvp.controller` | `safe_rl.accvp.planning.controller` |
+| `safe_rl.accvp.runtime` | `safe_rl.accvp.serving.predictor` |
+| `safe_rl.accvp.observation` | `safe_rl.accvp.serving.observation` |
+| `safe_rl.accvp.candidate_table_diagnostics` | `safe_rl.accvp.evaluation.candidate_table` |
+| `safe_rl.accvp.fault_injection` | `safe_rl.accvp.verification.fault_injection` |
+| `safe_rl.accvp.branch_worker` | `safe_rl.stage1_counterfactual.branch_worker` |
+| `safe_rl.accvp.shards` | `safe_rl.stage1_counterfactual.shards` |
+
 ## 1. Compatibility boundary
 
 VNext 正式数据和模型必须同时满足：

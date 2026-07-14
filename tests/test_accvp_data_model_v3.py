@@ -6,15 +6,15 @@ from pathlib import Path
 import numpy as np
 import pytest
 
-from safe_rl.accvp.dataset import (
+from safe_rl.accvp.data.dataset import (
     build_split_manifest,
     entry_time_supervision,
     event_supervision_mask,
 )
-from safe_rl.accvp.branch_worker import _conditional_entry_time_fields
-from safe_rl.accvp.migration import audit_legacy_dataset_migration
-from safe_rl.accvp.model import ACCVP_LOSS_VERSION, accvp_loss
-from safe_rl.accvp.schema import (
+from safe_rl.stage1_counterfactual.branch_worker import _conditional_entry_time_fields
+from safe_rl.accvp.data.migration import audit_legacy_dataset_migration
+from safe_rl.accvp.modeling.model import ACCVP_LOSS_VERSION, accvp_loss
+from safe_rl.accvp.contracts.schema import (
     ACTOR_ROW_MAPPING_VERSION,
     COUNTERFACTUAL_SCHEMA_VERSION,
     ROOT_OBSERVATION_FINGERPRINT_VERSION,
@@ -22,7 +22,7 @@ from safe_rl.accvp.schema import (
     actor_row_mapping_hash,
     root_observation_fingerprint,
 )
-from safe_rl.accvp.train import (
+from safe_rl.accvp.training.trainer import (
     COMPONENT_BOOTSTRAP_VERSION,
     OPTIMIZATION_BATCHING_VERSION,
     _fingerprint_action_group_batches,

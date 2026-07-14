@@ -5,12 +5,12 @@ from types import SimpleNamespace
 import numpy as np
 import pytest
 
-from safe_rl.accvp.observation import (
+from safe_rl.accvp.serving.observation import (
     RISK_GATED_ACCVP_OBSERVATION_BOUNDED_STALE_VERSION,
     RiskGatedACCVPCandidateTableAugmentor,
     validate_accvp_observation_config,
 )
-from safe_rl.accvp.reproducibility import configure_deterministic_training
+from safe_rl.accvp.training.reproducibility import configure_deterministic_training
 from safe_rl.pipeline.accvp_observation_preflight import _gate
 from safe_rl.risk import merge_local
 from safe_rl.risk.risk_aggregator import aggregate_episode_reports

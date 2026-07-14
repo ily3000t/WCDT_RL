@@ -3,7 +3,7 @@ from __future__ import annotations
 import argparse
 from pathlib import Path
 
-from safe_rl.accvp.pilot import write_pilot_report
+from safe_rl.accvp.evaluation.pilot import write_pilot_report
 from safe_rl.pipeline.common import load_stage_config
 
 

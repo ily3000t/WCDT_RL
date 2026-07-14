@@ -3,7 +3,7 @@ from __future__ import annotations
 import argparse
 from pathlib import Path
 
-from safe_rl.accvp.targeted_benchmark import (
+from safe_rl.accvp.evaluation.targeted_benchmark import (
     build_replacement_case_table,
     build_targeted_benchmark_summary,
     write_targeted_benchmark_outputs,

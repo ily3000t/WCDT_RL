@@ -3,7 +3,7 @@ from __future__ import annotations
 import argparse
 from pathlib import Path
 
-from safe_rl.accvp.online_trigger_audit import audit_online_triggers, write_online_trigger_audit
+from safe_rl.accvp.evaluation.online_trigger import audit_online_triggers, write_online_trigger_audit
 from safe_rl.utils.config import REPO_ROOT, load_config
 
 

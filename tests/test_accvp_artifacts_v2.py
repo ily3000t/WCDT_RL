@@ -5,7 +5,7 @@ from pathlib import Path
 
 import pytest
 
-from safe_rl.accvp.artifacts import (
+from safe_rl.accvp.contracts.artifacts import (
     ACCVP_ARTIFACT_GENERATION,
     ACCVP_ARTIFACT_KIND,
     ACCVP_BUNDLE_SCHEMA_VERSION,
@@ -20,12 +20,12 @@ from safe_rl.accvp.artifacts import (
     resolve_v2_bundle,
     validate_lifecycle_for_mode,
 )
-from safe_rl.accvp.schema import file_sha256, stable_hash
-from safe_rl.accvp.runtime_contract import (
+from safe_rl.accvp.contracts.schema import file_sha256, stable_hash
+from safe_rl.accvp.contracts.runtime_contract import (
     canonical_formal_runtime_contract,
     formal_runtime_contract_sha256,
 )
-from safe_rl.accvp.viability_lite import write_lite_artifacts
+from safe_rl.accvp.planning.viability_lite import write_lite_artifacts
 from safe_rl.pipeline.accvp_final_holdout_eval import (
     _validate_operating_point_schema,
     _validated_manifest,

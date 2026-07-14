@@ -7,43 +7,49 @@ from types import SimpleNamespace
 import numpy as np
 import pytest
 
-from safe_rl.accvp.candidate_plan import ACCVP_COMMITMENT_PROFILE, build_commitment_plan
-from safe_rl.accvp.calibration import CalibrationBundle, OneSidedBinnedCalibrator, selected_action_metrics
-from safe_rl.accvp.availability import audit_risk_secondary_false_negatives, diagnose_oracle_availability, model_gate_failure_diagnostics
-from safe_rl.accvp.candidate_table_diagnostics import candidate_table_summary
-from safe_rl.accvp.controller import ACCVPController
-from safe_rl.accvp.dataset import build_split_manifest
-from safe_rl.accvp.model import checkpoint_metadata
-from safe_rl.accvp.observation import (
+from safe_rl.accvp.planning.candidate_plan import ACCVP_COMMITMENT_PROFILE, build_commitment_plan
+from safe_rl.accvp.training.calibration import CalibrationBundle, OneSidedBinnedCalibrator, selected_action_metrics
+from safe_rl.accvp.training.availability import audit_risk_secondary_false_negatives, diagnose_oracle_availability, model_gate_failure_diagnostics
+from safe_rl.accvp.evaluation.candidate_table import candidate_table_summary
+from safe_rl.accvp.planning.controller import ACCVPController
+from safe_rl.accvp.data.dataset import build_split_manifest
+from safe_rl.accvp.modeling.model import checkpoint_metadata
+from safe_rl.accvp.serving.observation import (
     RISK_GATED_ACCVP_OBSERVATION_PERSISTENCE_VERSION,
     RISK_GATED_ACCVP_OBSERVATION_VERSION,
     RiskGatedACCVPCandidateTableAugmentor,
     validate_accvp_observation_config,
 )
-from safe_rl.accvp.oracle import counterfactual_oracle_report
-from safe_rl.accvp.pilot import validate_pilot_dataset
-from safe_rl.accvp.protocol import counterfactual_data_contract, data_contract_hash, effective_activation_distance
-from safe_rl.accvp.root_context import RootContext
-from safe_rl.accvp.runtime import ACCVPRuntimePredictor
-from safe_rl.accvp.schema import (
+from safe_rl.accvp.evaluation.oracle import counterfactual_oracle_report
+from safe_rl.accvp.evaluation.pilot import validate_pilot_dataset
+from safe_rl.accvp.contracts.protocol import (
+    counterfactual_data_contract,
+    data_contract_hash,
+    effective_activation_distance,
+    scenario_config_hash,
+    scenario_route_fingerprint,
+)
+from safe_rl.stage1_counterfactual.root_context import RootContext
+from safe_rl.accvp.serving.predictor import ACCVPRuntimePredictor
+from safe_rl.accvp.contracts.schema import (
     COUNTERFACTUAL_SCHEMA_VERSION,
     ENTRY_TIME_LABEL_VERSION,
     actor_row_mapping_hash,
     stable_hash,
 )
-from safe_rl.accvp.risk_secondary_audit import audit_risk_secondary
-from safe_rl.accvp.online_trigger_audit import audit_online_triggers, write_online_trigger_audit
-from safe_rl.accvp.selection import select_viability_action, select_viability_lite_action
-from safe_rl.accvp.shards import merge_counterfactual_shards
-from safe_rl.accvp.snapshot_store import CounterfactualSnapshotStore
-from safe_rl.accvp.targeted_benchmark import build_replacement_case_table, build_targeted_benchmark_summary
-from safe_rl.accvp.viability_lite import (
+from safe_rl.accvp.evaluation.risk_secondary import audit_risk_secondary
+from safe_rl.accvp.evaluation.online_trigger import audit_online_triggers, write_online_trigger_audit
+from safe_rl.accvp.planning.selection import select_viability_action, select_viability_lite_action
+from safe_rl.stage1_counterfactual.shards import merge_counterfactual_shards
+from safe_rl.stage1_counterfactual.snapshot_store import CounterfactualSnapshotStore
+from safe_rl.accvp.evaluation.targeted_benchmark import build_replacement_case_table, build_targeted_benchmark_summary
+from safe_rl.accvp.planning.viability_lite import (
     collapse_vnext_lite_records,
     conditional_merge_success_rate,
     evaluate_lite_thresholds,
     tune_viability_lite_operating_point,
 )
-from safe_rl.accvp.viability_lite_audit import audit_lite_replacements
+from safe_rl.accvp.evaluation.viability_lite import audit_lite_replacements
 from safe_rl.pipeline.accvp_tune_viability_lite import _lite_acceptance_failures
 from safe_rl.pipeline.accvp_observation_preflight import _gate as _accvp_observation_preflight_gate
 from safe_rl.pipeline.stage1_collect_accvp_jobs import (
@@ -61,6 +67,36 @@ from safe_rl.stage1_counterfactual.collector import (
 from safe_rl.sim.action_space import decode_action
 from safe_rl.sim.types import VehicleState
 from safe_rl.utils.config import clone_with_overrides, load_config
+
+
+def test_accvp_source_layout_keeps_domain_modules_out_of_package_root():
+    repository = Path(__file__).resolve().parents[1]
+    package = repository / "safe_rl" / "accvp"
+    expected_subpackages = {
+        "contracts",
+        "data",
+        "modeling",
+        "training",
+        "planning",
+        "serving",
+        "evaluation",
+        "verification",
+    }
+    assert expected_subpackages == {
+        path.name for path in package.iterdir() if path.is_dir() and path.name != "__pycache__"
+    }
+    assert {path.name for path in package.glob("*.py")} == {"__init__.py"}
+    for name in expected_subpackages:
+        assert (package / name / "__init__.py").is_file()
+
+    stage1 = repository / "safe_rl" / "stage1_counterfactual"
+    assert {
+        "collector.py",
+        "branch_worker.py",
+        "root_context.py",
+        "snapshot_store.py",
+        "shards.py",
+    }.issubset({path.name for path in stage1.glob("*.py")})
 
 
 class _Predictor:
@@ -466,6 +502,23 @@ def test_counterfactual_contract_rejects_unknown_configured_version():
     )
     with pytest.raises(ValueError, match="unsupported accvp.data_contract_version"):
         counterfactual_data_contract(cfg, "risk-checkpoint:test")
+
+
+def test_v2_scenario_contract_preserves_retired_noop_hash_compatibility():
+    current = load_config()
+    frozen = load_config()
+    frozen.scenario["merge_opportunity_min_distance_to_taper"] = 60.0
+
+    assert scenario_config_hash(current) == scenario_config_hash(frozen)
+    assert scenario_route_fingerprint(current) == scenario_route_fingerprint(frozen)
+
+
+def test_v2_scenario_contract_still_rejects_executable_semantic_drift():
+    current = load_config()
+    changed = clone_with_overrides(current, {"scenario": {"step_length": 0.2}})
+
+    assert scenario_config_hash(current) != scenario_config_hash(changed)
+    assert scenario_route_fingerprint(current) != scenario_route_fingerprint(changed)
 
 
 def test_viability_branch_rejects_shadow_artifact_manifest(tmp_path: Path):

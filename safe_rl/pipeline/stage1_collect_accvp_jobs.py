@@ -7,8 +7,8 @@ from pathlib import Path
 from time import perf_counter
 
 from safe_rl.pipeline.common import load_stage_config, parse_config_arg
-from safe_rl.accvp.protocol import counterfactual_data_contract, data_contract_hash, effective_activation_distance
-from safe_rl.accvp.schema import file_sha256, read_json, write_json_atomic
+from safe_rl.accvp.contracts.protocol import counterfactual_data_contract, data_contract_hash, effective_activation_distance
+from safe_rl.accvp.contracts.schema import file_sha256, read_json, write_json_atomic
 from safe_rl.stage1_counterfactual.collector import collect
 from safe_rl.utils.config import REPO_ROOT, clone_with_overrides
 from safe_rl.utils.progress import stage_log

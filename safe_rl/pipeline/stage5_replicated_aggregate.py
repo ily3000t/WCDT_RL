@@ -6,7 +6,7 @@ import re
 from pathlib import Path
 from typing import Any, Mapping
 
-from safe_rl.accvp.artifacts import (
+from safe_rl.accvp.contracts.artifacts import (
     ACCVP_ARTIFACT_GENERATION,
     ACCVP_ARTIFACT_KIND,
     ACCVP_BUNDLE_SCHEMA_VERSION,

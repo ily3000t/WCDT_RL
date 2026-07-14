@@ -36,31 +36,88 @@ ACCVP safety head 只用于诊断，不能替代 Risk Module 的硬安全门控�
 
 正式状态由
 [`safe_rl/config/active/accvp_vnext/workflow.yaml`](safe_rl/config/active/accvp_vnext/workflow.yaml)
-和产物报告共同决定。先查看状态，不会启动任务：
+和产物报告共同决定。协调器有三种运行方式。
+
+### 1. 只查看状态
+
+不会启动任务，也不会修改 artifact：
 
 ```powershell
 python -m safe_rl.pipeline.run_accvp_vnext_pipeline
 ```
 
-只执行当前一个阶段：
+重点读取输出中的 `next_phase`、`next_command`、`blocked`、`blocked_reason` 和各阶段
+`complete/artifact`。
+
+### 2. 只执行下一个阶段
 
 ```powershell
 python -m safe_rl.pipeline.run_accvp_vnext_pipeline --execute-next
 ```
 
-连续执行到指定阶段：
+命令最多执行当前 `next_phase` 一次。子进程成功返回后仍会由下一次状态查询验证 artifact gate。
+
+### 3. 连续执行到指定阶段
+
+`--run-until <phase>` 会从当前第一个未完成阶段开始，连续执行并包含目标阶段。例如：
 
 ```powershell
+# 完成 schema3 pilot、oracle 与 pilot gate
 python -m safe_rl.pipeline.run_accvp_vnext_pipeline --run-until pilot_validation
+
+# 从当前状态连续执行到 formal dataset merge 完成
+python -m safe_rl.pipeline.run_accvp_vnext_pipeline --run-until formal_merge
+
+# 包含 ACCVP ensemble training/calibration/operating-point
+python -m safe_rl.pipeline.run_accvp_vnext_pipeline --run-until accvp_training
+
+# 训练完成后，继续执行真实 SUMO scorer runtime preflight
+python -m safe_rl.pipeline.run_accvp_vnext_pipeline --run-until scorer_runtime_preflight
 ```
 
-`--run-until` 不是无条件一键跑完。它会在以下任一情况立即停止：
+目标阶段若已经完成，协调器只输出 `reached target`，不会重跑或覆盖已有 artifact。目标名必须
+来自下面的 phase 表；拼写错误会列出全部合法值。
+
+`--run-until` 不是忽略报告的一键跑完。它会在以下任一情况立即停止：
 
 - 子进程失败；
 - 阶段返回后 artifact gate 仍关闭；
 - workflow 将下一阶段标为 blocked；
 - 到达指定阶段；
 - sealed final holdout 未得到显式授权。
+
+### 阶段与可用的 `--run-until` 目标
+
+| 顺序 | phase | 执行内容与完成标志 |
+| ---: | --- | --- |
+| 1 | `pilot_collection` | 使用全新 VNext run ID 采集 schema3 pilot immutable shards。|
+| 2 | `pilot_merge` | 合并 pilot shards，生成 pilot dataset manifest。|
+| 3 | `oracle_collection` | 仅采集 seed 2/5、`oracle_only=true` 的历史 repairability regression。|
+| 4 | `oracle_merge` | 合并 oracle-only shards；该 dataset 永不进入模型 split。|
+| 5 | `oracle_regression` | 生成 oracle report；`oracle_state` 必须为 `go`。|
+| 6 | `pilot_validation` | 审计 schema、actor mapping、coverage、branch throughput 和 oracle exclusion；`pilot_state=pass`。|
+| 7 | `formal_collection` | 按已通过 pilot 的冻结契约采集 5,000-root formal shards。|
+| 8 | `formal_merge` | 合并 formal shards，生成 dataset/split provenance；不会训练模型。|
+| 9 | `accvp_training` | 训练三成员 ensemble，在独立 split 上 calibration 与 operating-point selection，生成 sealed candidate bundle。|
+| 10 | `scorer_runtime_preflight` | 使用 rule policy 访问真实 SUMO state，只测 ACCVP/Risk Candidate Table；使用 development cohort 的 60 个 seeds，报告要求至少 30 个独立 seeds、至少 1,000 个 activation-window decisions 且 `gate.pass=true`。门槛未通过但 lineage 一致时可续跑缺少的 seeds，旧失败报告会归档。|
+| 11 | `candidate_ppo_replicates` | 生成并训练 Candidate factorial 方法的五个 optimizer seeds；当前 workflow 在完整 factorial 协调器完成前主动 blocked。|
+| 12 | `baseline_ppo_replicates` | 训练/复用与 Candidate 对齐的五个 WcDT Reward-v2 baseline checkpoints。|
+| 13 | `policy_runtime_replicates` | 对五个 Candidate PPO 执行完整 159D policy runtime benchmark，以最差 replicate 判定 `gate.pass`。|
+| 14 | `stage5_generate` | 从 baseline/candidate manifests 生成同 training seed、同 simulator seeds 的 paired Stage5 配置。|
+| 15 | `stage5_replicates_and_aggregate` | 运行 paired reports，并跨 optimizer seeds 做 hierarchical aggregation；要求聚合 `gate.pass=true`。|
+| 16 | `one_shot_final_holdout` | 在全部代码、阈值和配置冻结后打开一次 sealed holdout；不得调参或重试改善结论。|
+
+当 `accvp_training` 已完成且状态显示 `next_phase=scorer_runtime_preflight` 时，下一步可以二选一：
+
+```powershell
+# 只运行 scorer preflight
+python -m safe_rl.pipeline.run_accvp_vnext_pipeline --execute-next
+
+# 等价地，明确指定停止目标
+python -m safe_rl.pipeline.run_accvp_vnext_pipeline --run-until scorer_runtime_preflight
+```
+
+运行完成后再次执行无参数状态命令，确认 `scorer_runtime_preflight.complete=true` 和下一阶段状态。
 
 最终 holdout 只有在全部上游门槛通过并冻结后才能显式打开：
 
@@ -74,21 +131,6 @@ python -m safe_rl.pipeline.run_accvp_vnext_pipeline `
 协调器能够把 Reward-v2 固定为消融、把 Reward-v3.1 + commitment 固定为最终候选。
 这避免现有单一 Reward-v2 命令被误当作完整方法。通用
 `safe_rl.pipeline.run_full_pipeline` 仍可用于旧版/一般比较实验，但不是 VNext 正式证据入口。
-
-## 正式阶段顺序
-
-```text
-pilot collection / merge
-  -> seed 2/5 oracle-only regression
-  -> pilot validation
-  -> formal schema3 collection / merge
-  -> ACCVP ensemble training, calibration, operating point
-  -> scorer runtime preflight
-  -> factorial PPO, five optimizer seeds per method
-  -> policy runtime benchmark (worst replicate gate)
-  -> paired Stage5 reports and hierarchical aggregation
-  -> sealed one-shot final holdout
-```
 
 每次推进前建议重新运行状态命令，确认 `next_phase`、`next_command`、`blocked` 和对应
 artifact。不要因为 report 为 `fail` 就删除数据、放宽阈值或跳过阶段；应读取报告的
@@ -161,8 +203,15 @@ $env:CUBLAS_WORKSPACE_CONFIG = ":4096:8"
 ## 代码结构
 
 ```text
-safe_rl/accvp/                 # schema3、dataset、split、模型、训练与 artifact lifecycle
-safe_rl/stage1_counterfactual/ # snapshot/branch collection
+safe_rl/accvp/contracts/       # schema3、protocol、runtime/artifact contracts
+safe_rl/accvp/data/            # dataset、component split、migration audit
+safe_rl/accvp/modeling/        # predictor、loss、checkpoint metadata
+safe_rl/accvp/training/        # ensemble training、calibration、tuning
+safe_rl/accvp/planning/        # candidate plan、selection、ACV-Shield controller
+safe_rl/accvp/serving/         # runtime predictor、worker、159D observation
+safe_rl/accvp/evaluation/      # oracle、pilot、diagnostics、benchmarks
+safe_rl/accvp/verification/    # synthetic fault injection
+safe_rl/stage1_counterfactual/ # root/snapshot/branch/shard data generation
 safe_rl/risk/                  # Risk Module 与 Candidate Risk backend
 safe_rl/shield/                # Safety Shield 与 bounded-stale 行为
 safe_rl/rl/                    # PPO 训练和 observation/reward integration

@@ -4,7 +4,7 @@ import argparse
 import json
 from pathlib import Path
 
-from safe_rl.accvp.availability import diagnose_oracle_availability
+from safe_rl.accvp.training.availability import diagnose_oracle_availability
 
 
 def main() -> None:

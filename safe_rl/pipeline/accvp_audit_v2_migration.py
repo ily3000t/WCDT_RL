@@ -4,7 +4,7 @@ import argparse
 import json
 from pathlib import Path
 
-from safe_rl.accvp.migration import audit_legacy_dataset_migration
+from safe_rl.accvp.data.migration import audit_legacy_dataset_migration
 
 
 def main() -> None:

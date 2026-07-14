@@ -12,13 +12,13 @@ import numpy as np
 from safe_rl.prediction.forecast_feature_augmentor import ForecastFeatureAugmentor
 from safe_rl.prediction.wcdt_predictor import WcDTPredictor
 from safe_rl.risk.risk_module import RiskModuleWrapper
-from safe_rl.accvp.schema import file_sha256
-from safe_rl.accvp.artifacts import (
+from safe_rl.accvp.contracts.schema import file_sha256
+from safe_rl.accvp.contracts.artifacts import (
     ACCVP_ARTIFACT_KIND,
     apply_v2_bundle_paths,
     validate_lifecycle_for_mode,
 )
-from safe_rl.accvp.observation import RiskGatedACCVPCandidateTableAugmentor
+from safe_rl.accvp.serving.observation import RiskGatedACCVPCandidateTableAugmentor
 from safe_rl.shield.safety_shield import SafetyShield
 from safe_rl.sim.sumo_highway_merge_env import SumoHighwayMergeEnv
 from safe_rl.utils.config import ConfigDict, REPO_ROOT, load_config, prepare_run_dir
@@ -199,7 +199,7 @@ def make_env(
     )
     accvp_controller = None
     if bool(cfg.accvp.get("enabled", False)) and str(cfg.accvp.get("mode", "off")) != "off":
-        from safe_rl.accvp.runtime import build_accvp_controller
+        from safe_rl.accvp.serving.predictor import build_accvp_controller
 
         configured_risk = cfg.accvp.get("risk_checkpoint")
         if configured_risk and risk_checkpoint and file_sha256(configured_risk) != file_sha256(risk_checkpoint):

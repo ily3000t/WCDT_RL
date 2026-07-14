@@ -9,8 +9,8 @@ import pytest
 
 torch = pytest.importorskip("torch")
 
-from safe_rl.accvp.availability import OperatingPointAvailabilityError
-from safe_rl.accvp.artifacts import (
+from safe_rl.accvp.training.availability import OperatingPointAvailabilityError
+from safe_rl.accvp.contracts.artifacts import (
     ACCVP_ARTIFACT_GENERATION,
     ACCVP_ARTIFACT_KIND,
     ACCVP_BUNDLE_SCHEMA_VERSION,
@@ -19,10 +19,10 @@ from safe_rl.accvp.artifacts import (
     artifact_filename,
     resolve_v2_bundle,
 )
-from safe_rl.accvp.dataset import build_split_manifest
-from safe_rl.accvp.protocol import counterfactual_data_contract, effective_activation_distance
-from safe_rl.accvp.runtime_contract import FORMAL_RUNTIME_FEATURE_VERSION
-from safe_rl.accvp.schema import (
+from safe_rl.accvp.data.dataset import build_split_manifest
+from safe_rl.accvp.contracts.protocol import counterfactual_data_contract, effective_activation_distance
+from safe_rl.accvp.contracts.runtime_contract import FORMAL_RUNTIME_FEATURE_VERSION
+from safe_rl.accvp.contracts.schema import (
     COUNTERFACTUAL_SCHEMA_VERSION,
     ENTRY_TIME_LABEL_VERSION,
     ROOT_OBSERVATION_FINGERPRINT_VERSION,
@@ -31,7 +31,7 @@ from safe_rl.accvp.schema import (
     root_observation_fingerprint,
     stable_hash,
 )
-from safe_rl.accvp.train import (
+from safe_rl.accvp.training.trainer import (
     COMPONENT_BOOTSTRAP_VERSION,
     OPTIMIZATION_BATCHING_VERSION,
     _calibrate,
@@ -670,7 +670,7 @@ def test_formal_training_requires_strict_oracle_report(tmp_path: Path, monkeypat
     def unexpected_torch_initialization():
         raise AssertionError("Torch must not initialize before oracle validation")
 
-    monkeypatch.setattr("safe_rl.accvp.train._torch", unexpected_torch_initialization)
+    monkeypatch.setattr("safe_rl.accvp.training.trainer._torch", unexpected_torch_initialization)
     cfg = clone_with_overrides(load_config(), {"accvp": {"oracle_report": None, "ensemble_size": 3}})
     with pytest.raises(FileNotFoundError, match="oracle_report"):
         train_accvp(cfg, tmp_path / "dataset")

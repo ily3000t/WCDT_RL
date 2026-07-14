@@ -5,18 +5,18 @@ from pathlib import Path
 
 import pytest
 
-from safe_rl.accvp.artifacts import (
+from safe_rl.accvp.contracts.artifacts import (
     ACCVP_ARTIFACT_GENERATION,
     ACCVP_ARTIFACT_KIND,
     ACCVP_BUNDLE_SCHEMA_VERSION,
     LIFECYCLE_SEALED_CANDIDATE,
     bundle_file_entry,
 )
-from safe_rl.accvp.runtime_contract import (
+from safe_rl.accvp.contracts.runtime_contract import (
     canonical_formal_runtime_contract,
     formal_runtime_contract_sha256,
 )
-from safe_rl.accvp.schema import file_sha256, stable_hash
+from safe_rl.accvp.contracts.schema import file_sha256, stable_hash
 from safe_rl.analysis.paired_statistics import (
     build_pair_statistics,
     build_replicated_pair_statistics,

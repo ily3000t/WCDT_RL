@@ -8,8 +8,8 @@ from typing import Any, Mapping
 
 import yaml
 
-from safe_rl.accvp.artifacts import resolve_v2_bundle
-from safe_rl.accvp.observation import RiskGatedACCVPCandidateTableAugmentor
+from safe_rl.accvp.contracts.artifacts import resolve_v2_bundle
+from safe_rl.accvp.serving.observation import RiskGatedACCVPCandidateTableAugmentor
 from safe_rl.evaluation_protocol import file_sha256, stable_hash
 from safe_rl.utils.config import REPO_ROOT
 

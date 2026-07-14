@@ -4,7 +4,7 @@ import pytest
 
 torch = pytest.importorskip("torch")
 
-from safe_rl.accvp.model import ACCVPPredictor, accvp_loss, model_kwargs_from_config, warm_start_scene_encoder
+from safe_rl.accvp.modeling.model import ACCVPPredictor, accvp_loss, model_kwargs_from_config, warm_start_scene_encoder
 from safe_rl.prediction.wcdt_v3_predictor import WcDTV3TemporalInteractionPredictor
 from safe_rl.utils.config import load_config
 

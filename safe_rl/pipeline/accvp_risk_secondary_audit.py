@@ -4,14 +4,14 @@ import argparse
 import json
 from pathlib import Path
 
-from safe_rl.accvp.candidate_table_diagnostics import (
+from safe_rl.accvp.evaluation.candidate_table import (
     candidate_records_from_dataset,
     load_calibration,
     load_models_from_checkpoint,
 )
-from safe_rl.accvp.dataset import ACCVPBranchDataset
-from safe_rl.accvp.risk_secondary_audit import audit_risk_secondary, combine_audit_reports, write_risk_secondary_audit
-from safe_rl.accvp.viability_lite import lite_thresholds_from_config
+from safe_rl.accvp.data.dataset import ACCVPBranchDataset
+from safe_rl.accvp.evaluation.risk_secondary import audit_risk_secondary, combine_audit_reports, write_risk_secondary_audit
+from safe_rl.accvp.planning.viability_lite import lite_thresholds_from_config
 from safe_rl.utils.config import REPO_ROOT, load_config
 
 

@@ -5,7 +5,7 @@ from pathlib import Path
 
 import pytest
 
-from safe_rl.accvp.schema import file_sha256
+from safe_rl.accvp.contracts.schema import file_sha256
 from safe_rl.evaluation_protocol import normalise_seed_cohorts
 from safe_rl.pipeline.accvp_runtime_benchmark_replicates import aggregate_runtime_reports
 from safe_rl.pipeline.audit_ppo_replicate_lineage import audit_manifest

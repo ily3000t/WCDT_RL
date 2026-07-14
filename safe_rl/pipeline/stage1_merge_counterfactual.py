@@ -3,7 +3,7 @@ from __future__ import annotations
 import argparse
 from pathlib import Path
 
-from safe_rl.accvp.shards import merge_counterfactual_shards
+from safe_rl.stage1_counterfactual.shards import merge_counterfactual_shards
 from safe_rl.pipeline.common import load_stage_config
 
 

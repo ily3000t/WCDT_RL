@@ -14,7 +14,7 @@ import numpy as np
 
 from safe_rl.prediction.actor_selector import select_merge_relevant_actors
 from safe_rl.prediction.forecast_feature_augmentor import ForecastFeatureAugmentor
-from safe_rl.accvp.observation import RiskGatedACCVPCandidateTableAugmentor, validate_accvp_observation_config
+from safe_rl.accvp.serving.observation import RiskGatedACCVPCandidateTableAugmentor, validate_accvp_observation_config
 from safe_rl.risk.candidate_risk_ranker import CandidateRiskRanker
 from safe_rl.risk.merge_local import is_candidate_legal, merge_local_stats
 from safe_rl.shield.forecast_task_scorer import ForecastAwareTaskScorer

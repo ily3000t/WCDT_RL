@@ -3,7 +3,7 @@ from __future__ import annotations
 import argparse
 from pathlib import Path
 
-from safe_rl.accvp.train import train_accvp
+from safe_rl.accvp.training.trainer import train_accvp
 from safe_rl.pipeline.common import load_stage_config
 
 

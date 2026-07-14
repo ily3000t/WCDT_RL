@@ -1,1 +1,1 @@
-"""Independent ACCVP counterfactual root collection and branch workers."""
+"""Counterfactual root collection, branch execution and shard assembly."""

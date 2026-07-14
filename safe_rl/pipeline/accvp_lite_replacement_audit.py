@@ -4,22 +4,22 @@ import argparse
 import json
 from pathlib import Path
 
-from safe_rl.accvp.artifacts import (
+from safe_rl.accvp.contracts.artifacts import (
     ACCVP_ARTIFACT_GENERATION,
     apply_v2_bundle_paths,
     artifact_filename,
 )
-from safe_rl.accvp.candidate_table_diagnostics import (
+from safe_rl.accvp.evaluation.candidate_table import (
     candidate_records_from_dataset,
     load_calibration,
     load_models_from_checkpoint,
 )
-from safe_rl.accvp.dataset import ACCVPBranchDataset
-from safe_rl.accvp.viability_lite import (
+from safe_rl.accvp.data.dataset import ACCVPBranchDataset
+from safe_rl.accvp.planning.viability_lite import (
     collapse_vnext_lite_records,
     lite_thresholds_from_config,
 )
-from safe_rl.accvp.viability_lite_audit import audit_lite_replacements, write_lite_replacement_audit
+from safe_rl.accvp.evaluation.viability_lite import audit_lite_replacements, write_lite_replacement_audit
 from safe_rl.utils.config import REPO_ROOT, load_config
 
 

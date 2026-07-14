@@ -3,18 +3,18 @@ from __future__ import annotations
 import argparse
 from pathlib import Path
 
-from safe_rl.accvp.candidate_table_diagnostics import (
+from safe_rl.accvp.evaluation.candidate_table import (
     candidate_records_from_dataset,
     load_calibration,
     load_models_from_checkpoint,
 )
-from safe_rl.accvp.artifacts import (
+from safe_rl.accvp.contracts.artifacts import (
     ACCVP_ARTIFACT_GENERATION,
     apply_v2_bundle_paths,
     artifact_filename,
 )
-from safe_rl.accvp.dataset import ACCVPBranchDataset
-from safe_rl.accvp.viability_lite import (
+from safe_rl.accvp.data.dataset import ACCVPBranchDataset
+from safe_rl.accvp.planning.viability_lite import (
     tune_viability_lite_operating_point,
     write_lite_artifacts,
 )

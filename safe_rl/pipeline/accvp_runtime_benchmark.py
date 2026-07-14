@@ -10,21 +10,25 @@ from typing import Any
 
 import numpy as np
 
-from safe_rl.accvp.artifacts import apply_v2_bundle_paths
-from safe_rl.accvp.observation import RiskGatedACCVPCandidateTableAugmentor
-from safe_rl.accvp.runtime_contract import (
+from safe_rl.accvp.contracts.artifacts import apply_v2_bundle_paths
+from safe_rl.accvp.serving.observation import RiskGatedACCVPCandidateTableAugmentor
+from safe_rl.accvp.contracts.runtime_contract import (
     compare_formal_runtime_contracts,
     formal_runtime_contract_from_config,
     validate_manifest_runtime_contract,
 )
-from safe_rl.accvp.schema import file_sha256, stable_hash
+from safe_rl.accvp.contracts.schema import (
+    file_sha256,
+    read_json,
+    stable_hash,
+    write_json_atomic,
+)
 from safe_rl.pipeline.accvp_observation_preflight import _gate
 from safe_rl.pipeline.common import make_env
 from safe_rl.risk.risk_aggregator import aggregate_episode_reports
 from safe_rl.rl.evaluation import validate_model_env_observation_shape
 from safe_rl.rl.ppo import load_ppo
 from safe_rl.utils.config import REPO_ROOT, load_config
-from safe_rl.utils.io import write_json
 
 
 def _resolve(path: str | Path) -> Path:
@@ -94,6 +98,87 @@ def _artifact_lineage(
     return result
 
 
+def _report_episode_seeds(reports: list[dict[str, Any]]) -> list[int]:
+    seeds: list[int] = []
+    for report in reports:
+        value = report.get("seed", report.get("episode_seed"))
+        if value is None:
+            raise ValueError("runtime benchmark extension report has an episode without a seed")
+        seeds.append(int(value))
+    return seeds
+
+
+def _stable_software_hardware(payload: dict[str, Any]) -> dict[str, Any]:
+    """Remove the process id while retaining the latency-comparability host."""
+
+    return {
+        key: value
+        for key, value in dict(payload).items()
+        if key != "process_id"
+    }
+
+
+def _validate_failed_report_extension(
+    payload: dict[str, Any],
+    *,
+    requested_seeds: list[int],
+    expected_identity: dict[str, Any],
+) -> list[dict[str, Any]]:
+    """Return reusable episodes only for an exact failed-report prefix.
+
+    Runtime latency reports may be extended solely to meet the preregistered
+    sample-size gate.  Policy, bundle, config, backend and runtime-contract
+    lineage must remain identical, and a passing report is immutable.
+    """
+
+    if str(payload.get("artifact_kind", "")) != "accvp_runtime_benchmark_v1":
+        raise ValueError("runtime benchmark extension requires a benchmark-v1 report")
+    if bool(dict(payload.get("gate", {}) or {}).get("pass", False)):
+        raise ValueError("a passing runtime benchmark report is immutable and cannot be extended")
+    mismatches: list[str] = []
+    for key, expected in expected_identity.items():
+        actual = payload.get(key)
+        if key == "software_hardware":
+            actual = _stable_software_hardware(dict(actual or {}))
+            expected = _stable_software_hardware(dict(expected or {}))
+        if actual != expected:
+            mismatches.append(key)
+    if mismatches:
+        raise ValueError(
+            "runtime benchmark extension lineage mismatch: " + ", ".join(sorted(mismatches))
+        )
+    reports = [dict(report) for report in list(payload.get("episodes", []) or [])]
+    reused_seeds = _report_episode_seeds(reports)
+    if len(reused_seeds) != len(set(reused_seeds)):
+        raise ValueError("runtime benchmark extension report contains duplicate episode seeds")
+    if requested_seeds[: len(reused_seeds)] != reused_seeds:
+        raise ValueError(
+            "runtime benchmark extension seeds must preserve the existing report as an exact prefix"
+        )
+    workload = dict(payload.get("workload", {}) or {})
+    expected_seed_hash = stable_hash({"episode_seeds": reused_seeds})
+    if str(workload.get("requested_episode_seed_sha256", "")) != expected_seed_hash:
+        raise ValueError("runtime benchmark extension requested-seed hash mismatch")
+    if str(workload.get("observed_episode_seed_sha256", "")) != expected_seed_hash:
+        raise ValueError("runtime benchmark extension observed-seed hash mismatch")
+    if any("episode_reward" not in report for report in reports):
+        raise ValueError("runtime benchmark extension report lacks per-episode rewards")
+    if len(reused_seeds) == len(requested_seeds):
+        raise ValueError("runtime benchmark extension has no new episode seeds to execute")
+    return reports
+
+
+def _failed_report_archive_path(output_path: Path, payload: dict[str, Any]) -> Path:
+    fingerprint = str(payload.get("report_fingerprint", ""))
+    if not fingerprint:
+        fingerprint = stable_hash(payload)
+    return (
+        output_path.parent
+        / "failed_attempts"
+        / f"{output_path.stem}.{fingerprint[:16]}.json"
+    )
+
+
 def run(
     *,
     config_path: str | Path,
@@ -103,6 +188,7 @@ def run(
     backend: str = "vectorized",
     device: str = "auto",
     policy_type: str = "sb3_ppo",
+    extend_failed_report: bool = False,
 ) -> Path:
     backend = str(backend).strip().lower()
     if backend not in {"reference", "vectorized"}:
@@ -122,6 +208,7 @@ def run(
     if len(requested_seeds) < 30 or len(set(requested_seeds)) != len(requested_seeds):
         raise ValueError("formal runtime benchmark requires at least 30 distinct episode seeds")
     cfg = load_config(config_path)
+    output_path = _resolve(output)
     bundle_manifest, _bundle_files = apply_v2_bundle_paths(cfg)
     if bundle_manifest is None:
         raise ValueError("formal runtime benchmark requires a bundle-v2 manifest")
@@ -161,8 +248,54 @@ def run(
         model = None
         controller = RuleGapAcceptancePolicy(cfg)
         benchmark_scope = "scorer_preflight"
-    reports: list[dict[str, Any]] = []
-    rewards: list[float] = []
+    config_file = _resolve(config_path)
+    feature_names_sha = stable_hash(
+        {"feature_names": RiskGatedACCVPCandidateTableAugmentor.feature_names(cfg)}
+    )
+    feature_contract_hash = stable_hash(
+        {
+            "feature_names": RiskGatedACCVPCandidateTableAugmentor.feature_names(cfg),
+            "observation": dict(cfg.accvp.get("observation", {}) or {}),
+        }
+    )
+    artifact_lineage = _artifact_lineage(
+        cfg,
+        model_path,
+        policy_type=policy_type,
+    )
+    software_hardware = _software_hardware()
+    extension_source: dict[str, Any] | None = None
+    expected_extension_identity = {
+        "benchmark_scope": benchmark_scope,
+        "policy_type": policy_type,
+        "backend": backend,
+        "formal_runtime_contract_sha256": str(
+            runtime_contract_check.get("actual_sha256", "")
+        ),
+        "config": str(config_file),
+        "config_file_sha256": file_sha256(config_file),
+        "policy_model_sha256": (
+            "" if model_path is None else file_sha256(model_path)
+        ),
+        "accvp_observation_feature_names_sha256": feature_names_sha,
+        "accvp_observation_feature_contract_hash": feature_contract_hash,
+        "artifact_lineage": artifact_lineage,
+        "software_hardware": software_hardware,
+    }
+    if output_path.exists():
+        if not extend_failed_report:
+            raise FileExistsError(f"runtime benchmark report already exists: {output_path}")
+        extension_source = read_json(output_path)
+        reports = _validate_failed_report_extension(
+            extension_source,
+            requested_seeds=requested_seeds,
+            expected_identity=expected_extension_identity,
+        )
+    else:
+        reports = []
+    reused_episode_count = len(reports)
+    rewards = [float(report["episode_reward"]) for report in reports]
+    pending_seeds = requested_seeds[reused_episode_count:]
     benchmark_started = time.perf_counter()
     shape_env = make_env(cfg, seed=requested_seeds[0], shield_enabled=False)
     try:
@@ -174,7 +307,7 @@ def run(
         env_observation_shape = list(shape_env.observation_space.shape)
     finally:
         shape_env.close()
-    for seed in requested_seeds:
+    for seed in pending_seeds:
         env = make_env(cfg, seed=seed, shield_enabled=False)
         episode_reward = 0.0
         try:
@@ -195,17 +328,14 @@ def run(
         finally:
             env.close()
     metrics = aggregate_episode_reports(reports)
-    observed_seeds = sorted(
-        int(report.get("seed", report.get("episode_seed"))) for report in reports
-    )
-    metrics["accvp_table_seed_schedule_match"] = observed_seeds == sorted(requested_seeds)
+    observed_seeds = _report_episode_seeds(reports)
+    metrics["accvp_table_seed_schedule_match"] = observed_seeds == requested_seeds
     metrics["average_reward"] = float(np.mean(rewards)) if rewards else 0.0
     gate = _gate(
         metrics,
         require_vnext=True,
         runtime_contract_check=runtime_contract_check,
     )
-    config_file = _resolve(config_path)
     payload = {
         "artifact_kind": "accvp_runtime_benchmark_v1",
         "schema_version": 2,
@@ -226,28 +356,13 @@ def run(
         ),
         "formal_runtime_contract_check": runtime_contract_check,
         "config": str(config_file),
-        "config_file_sha256": file_sha256(config_file),
+        "config_file_sha256": expected_extension_identity["config_file_sha256"],
         "config_hash": stable_hash(dict(cfg)),
-        "policy_model_sha256": (
-            "" if model_path is None else file_sha256(model_path)
-        ),
-        "accvp_observation_feature_names_sha256": stable_hash(
-            {
-                "feature_names": RiskGatedACCVPCandidateTableAugmentor.feature_names(cfg)
-            }
-        ),
-        "accvp_observation_feature_contract_hash": stable_hash(
-            {
-                "feature_names": RiskGatedACCVPCandidateTableAugmentor.feature_names(cfg),
-                "observation": dict(cfg.accvp.get("observation", {}) or {}),
-            }
-        ),
-        "artifact_lineage": _artifact_lineage(
-            cfg,
-            model_path,
-            policy_type=policy_type,
-        ),
-        "software_hardware": _software_hardware(),
+        "policy_model_sha256": expected_extension_identity["policy_model_sha256"],
+        "accvp_observation_feature_names_sha256": feature_names_sha,
+        "accvp_observation_feature_contract_hash": feature_contract_hash,
+        "artifact_lineage": artifact_lineage,
+        "software_hardware": software_hardware,
         "workload": {
             "requested_episode_seed_count": len(requested_seeds),
             "requested_episode_seed_sha256": stable_hash({"episode_seeds": requested_seeds}),
@@ -263,6 +378,8 @@ def run(
             "activation_decision_count": int(
                 metrics.get("accvp_table_activation_window_decision_count", 0)
             ),
+            "reused_episode_seed_count": reused_episode_count,
+            "new_episode_seed_count": len(pending_seeds),
         },
         "model_observation_shape": model_observation_shape,
         "env_observation_shape": env_observation_shape,
@@ -271,11 +388,29 @@ def run(
         "gate": gate,
         "episodes": reports,
     }
+    if extension_source is not None:
+        archive_path = _failed_report_archive_path(output_path, extension_source)
+        payload["extension"] = {
+            "mode": "exact_failed_report_prefix_v1",
+            "source_report_fingerprint": str(
+                extension_source.get("report_fingerprint", "")
+            ),
+            "source_gate_pass": False,
+            "reused_episode_seed_count": reused_episode_count,
+            "new_episode_seed_count": len(pending_seeds),
+            "archived_source_report": str(archive_path),
+        }
     payload["report_fingerprint"] = stable_hash(payload)
-    output_path = _resolve(output)
-    if output_path.exists():
-        raise FileExistsError(f"runtime benchmark report already exists: {output_path}")
-    write_json(output_path, payload)
+    if extension_source is not None:
+        archive_path = _failed_report_archive_path(output_path, extension_source)
+        if archive_path.exists():
+            if read_json(archive_path) != extension_source:
+                raise FileExistsError(
+                    f"runtime benchmark failed-report archive collision: {archive_path}"
+                )
+        else:
+            write_json_atomic(archive_path, extension_source)
+    write_json_atomic(output_path, payload)
     return output_path
 
 
@@ -292,6 +427,14 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--output", required=True)
     parser.add_argument("--backend", choices=("reference", "vectorized"), default="vectorized")
     parser.add_argument("--device", default="auto")
+    parser.add_argument(
+        "--extend-failed-report",
+        action="store_true",
+        help=(
+            "Reuse an existing gate-failed report only when it is an exact "
+            "lineage-matched prefix of the requested seed schedule."
+        ),
+    )
     return parser.parse_args()
 
 
@@ -305,6 +448,7 @@ def main() -> None:
         backend=args.backend,
         device=args.device,
         policy_type=args.policy_type,
+        extend_failed_report=args.extend_failed_report,
     )
     print(f"[accvp_runtime_benchmark] report={path}")
 

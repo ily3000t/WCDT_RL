@@ -7,7 +7,7 @@ from typing import Any, Iterable
 
 import numpy as np
 
-from safe_rl.accvp.fault_injection import (
+from safe_rl.accvp.verification.fault_injection import (
     PREDICTOR_STAGE,
     RISK_STAGE,
     SUPPORTED_FAULTS,
@@ -18,12 +18,12 @@ from safe_rl.accvp.fault_injection import (
     FaultSchedule,
     assert_fault_injection_allowed,
 )
-from safe_rl.accvp.observation import (
+from safe_rl.accvp.serving.observation import (
     RISK_GATED_ACCVP_OBSERVATION_BOUNDED_STALE_VERSION,
     RiskGatedACCVPCandidateTableAugmentor,
     validate_accvp_observation_config,
 )
-from safe_rl.accvp.schema import write_json_atomic
+from safe_rl.accvp.contracts.schema import write_json_atomic
 from safe_rl.evaluation_protocol import stable_hash
 from safe_rl.sim.action_space import ACTIONS
 from safe_rl.utils.config import clone_with_overrides, load_config
