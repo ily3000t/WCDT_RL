@@ -3,6 +3,11 @@ run:
   output_root: "safe_rl_output/runs"
   tensorboard: false
 
+# Freeze the formal batch-training device in the config lineage. Calibration,
+# operating-point selection and all runtime inference remain on CPU.
+training:
+  stage2_device: "cuda:0"
+
 experiment:
   note: "VNext formal ACCVP training: schema-v3 actor rows, leakage-free component splits, loss-v2, three-member ensemble."
 

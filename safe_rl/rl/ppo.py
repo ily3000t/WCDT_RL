@@ -52,6 +52,48 @@ def _training_device(config: Any) -> str:
     return "cuda" if requested == "gpu" else requested or "auto"
 
 
+def _ppo_parallelism_config(config: Any) -> dict[str, Any]:
+    """Validate process/thread settings and the optional rollout-size guard."""
+
+    training = config.get("training", {})
+    num_envs = int(training.get("ppo_num_envs", 1))
+    worker_threads = int(training.get("ppo_worker_torch_threads", 1))
+    main_threads = int(training.get("ppo_main_torch_threads", 4))
+    start_method = str(training.get("ppo_start_method", "spawn")).strip()
+    n_steps = int(config.rl.n_steps)
+    if num_envs <= 0:
+        raise ValueError("training.ppo_num_envs must be positive")
+    if worker_threads <= 0:
+        raise ValueError("training.ppo_worker_torch_threads must be positive")
+    if main_threads <= 0:
+        raise ValueError("training.ppo_main_torch_threads must be positive")
+    if not start_method:
+        raise ValueError("training.ppo_start_method must be non-empty")
+    if n_steps <= 0:
+        raise ValueError("rl.n_steps must be positive")
+    rollout_size = num_envs * n_steps
+    expected = training.get("ppo_expected_rollout_size")
+    if expected is not None:
+        expected = int(expected)
+        if expected <= 0:
+            raise ValueError("training.ppo_expected_rollout_size must be positive or null")
+        if rollout_size != expected:
+            raise ValueError(
+                "PPO rollout-size contract changed: "
+                f"ppo_num_envs({num_envs}) * n_steps({n_steps}) = {rollout_size}, "
+                f"expected {expected}. Adjust rl.n_steps together with ppo_num_envs."
+            )
+    return {
+        "num_envs": num_envs,
+        "worker_threads": worker_threads,
+        "main_threads": main_threads,
+        "start_method": start_method,
+        "n_steps": n_steps,
+        "rollout_size": rollout_size,
+        "expected_rollout_size": expected,
+    }
+
+
 def _checkpoint_selection_profile(config: Any | None = None) -> str:
     if config is None:
         return "safety"
@@ -374,14 +416,15 @@ def train_ppo(
     protocol_preflight = _validate_stage3_seed_preflight(config)
     PPO = _require_sb3()
     from stable_baselines3.common.callbacks import BaseCallback, CallbackList
-    num_envs = max(1, int(config.get("training", {}).get("ppo_num_envs", 1)))
-    main_threads = int(config.get("training", {}).get("ppo_main_torch_threads", 4))
+    parallelism = _ppo_parallelism_config(config)
+    num_envs = int(parallelism["num_envs"])
+    main_threads = int(parallelism["main_threads"])
     _configure_torch_threads(main_threads)
     if num_envs > 1:
         from stable_baselines3.common.vec_env import SubprocVecEnv, VecMonitor
 
         env.close()
-        start_method = str(config.get("training", {}).get("ppo_start_method", "spawn"))
+        start_method = str(parallelism["start_method"])
         factories = [
             (lambda rank=rank: _build_ppo_worker_env(config, rank, num_envs))
             for rank in range(num_envs)
@@ -522,6 +565,7 @@ def train_ppo(
         "ppo_num_envs": int(num_envs),
         "ppo_n_steps_per_env": int(config.rl.n_steps),
         "ppo_rollout_size": int(num_envs * int(config.rl.n_steps)),
+        "ppo_expected_rollout_size": parallelism["expected_rollout_size"],
         "ppo_worker_torch_threads": int(config.get("training", {}).get("ppo_worker_torch_threads", 1)),
         "ppo_main_torch_threads": int(main_threads),
         "ppo_worker_model_memory_estimate": _worker_model_memory_estimate(config, num_envs),

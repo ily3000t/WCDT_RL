@@ -5,6 +5,10 @@ run:
   seed: 20001
   output_root: "safe_rl_output/runs"
   tensorboard: true
+
+training:
+  # Formal PPO may change process count only when rl.n_steps is changed with it.
+  ppo_expected_rollout_size: 1024
   replay: false
 
 experiment:

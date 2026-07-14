@@ -5,6 +5,7 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import numpy as np
+import pytest
 
 from safe_rl.accvp.candidate_plan import ACCVP_COMMITMENT_PROFILE, build_commitment_plan
 from safe_rl.accvp.calibration import CalibrationBundle, OneSidedBinnedCalibrator, selected_action_metrics
@@ -456,6 +457,15 @@ def test_explicit_activation_distance_overrides_legacy_deadline_without_mutating
 def test_checkpoint_metadata_tracks_counterfactual_schema_v2():
     metadata = checkpoint_metadata(load_config(), warm_start={})
     assert metadata["counterfactual_schema_version"] == COUNTERFACTUAL_SCHEMA_VERSION
+
+
+def test_counterfactual_contract_rejects_unknown_configured_version():
+    cfg = clone_with_overrides(
+        load_config(),
+        {"accvp": {"data_contract_version": "unsupported_contract"}},
+    )
+    with pytest.raises(ValueError, match="unsupported accvp.data_contract_version"):
+        counterfactual_data_contract(cfg, "risk-checkpoint:test")
 
 
 def test_viability_branch_rejects_shadow_artifact_manifest(tmp_path: Path):

@@ -18,6 +18,7 @@ from safe_rl.sim.metrics import SAFETY_METRIC_VERSION
 
 
 ACCVP_EVENT_DEFINITION_VERSION = "accvp_v2_proxy_safety_taper_viability"
+ACCVP_DATA_CONTRACT_VERSION = "accvp_240_v2"
 
 
 def effective_activation_distance(config: Any) -> float:
@@ -76,8 +77,17 @@ def scenario_route_fingerprint(config: Any) -> str:
 def counterfactual_data_contract(config: Any, risk_model_fingerprint: str) -> dict[str, Any]:
     """Fields that must match before ACCVP shards may be merged or deployed."""
 
+    configured_version = str(
+        config.accvp.get("data_contract_version", ACCVP_DATA_CONTRACT_VERSION)
+    )
+    if configured_version != ACCVP_DATA_CONTRACT_VERSION:
+        raise ValueError(
+            "unsupported accvp.data_contract_version: "
+            f"configured={configured_version!r} "
+            f"supported={ACCVP_DATA_CONTRACT_VERSION!r}"
+        )
     return {
-        "protocol_version": "accvp_240_v2",
+        "protocol_version": configured_version,
         "scenario_config_hash": stable_hash(dict(config.scenario)),
         "scenario_route_hash": scenario_route_fingerprint(config),
         "action_execution_profile": str(config.scenario.get("action_execution_profile", "current_v1")),

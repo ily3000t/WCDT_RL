@@ -1,3 +1,8 @@
+# Compatibility-safe defaults shared by maintained pipelines and historical
+# baselines. This file is not a formal VNext experiment by itself: canonical
+# runs must use safe_rl/config/active/accvp_vnext/*.yaml and registry.yaml.
+
+# Run identity, artifact location and simulator-seed scheduling.
 run:
   output_root: "safe_rl_output/runs"
   # Null keeps temporary artifacts in <output_root parent>/.cache. Set an
@@ -10,20 +15,35 @@ run:
   replay: true
 
 training:
-  device: "auto"
+  # Fallback only. Stage-specific device keys below take precedence.
+  device: "auto"                    # auto | cpu | cuda[:index] | mps
+  # Batch model training: WcDT, Risk Module and ACCVP predictor.
+  # Formal configs should use an explicit device such as cuda:0.
   stage2_device: "auto"
+  # PPO's ~30k-parameter MLP normally runs faster beside SUMO on CPU.
   ppo_device: "cpu"
+  # Deployment/runtime latency contracts currently assume CPU inference.
   forecast_runtime_device: "cpu"
+  # Large offline forecast diagnostics may use an accelerator.
   diagnostics_device: "auto"
+
+  # PPO rollout parallelism. Each environment is a separate spawned process
+  # with its own SUMO, TraCI connection, ACCVP model and Risk model.
   ppo_num_envs: 1
   ppo_start_method: "spawn"
   ppo_worker_torch_threads: 1
   ppo_main_torch_threads: 4
+  # Optional semantic guard. Formal templates set 1024; when num_envs changes,
+  # change rl.n_steps so num_envs * n_steps remains equal to this value.
+  ppo_expected_rollout_size: null
+
+  # DataLoader/backend controls used by legacy WcDT/Risk Stage2 training.
   pin_memory: true
   num_workers: 0
   persistent_workers: true
   cuda_tf32: true
 
+# SUMO scenario, action-execution and actor-ordering contract.
 scenario:
   name: "highway_merge"
   root: "scenarios/highway_merge"
@@ -83,15 +103,12 @@ scenario:
   merge_conflict_gap: 8.0
   merge_opportunity_min_front_gap: 12.0
   merge_opportunity_min_rear_gap: 12.0
-  merge_opportunity_min_distance_to_taper: 60.0
 
+# Maintained WcDT v1/v2/v3 training and checkpoint compatibility settings.
 prediction:
   enabled: true
-  model_type: "wcdt"
   checkpoint: null
-  freeze: true
   horizon_steps: 30
-  num_modes: 10
   train_enabled: true
   wcdt_v1_train_enabled: false
   wcdt_v1_max_agents: 6
@@ -167,27 +184,19 @@ prediction:
   max_lane_num: 32
   max_point_num: 128
 
+# Optional action-independent WcDT feature augmentation for PPO/runtime.
 forecast_features:
   enabled: false
   use_for_ppo_observation: false
   source: "wcdt_v2"
   checkpoint: null
   allow_heuristic_fallback: false
-  freeze_predictor: true
   horizon_steps: 30
-  top_k_agents: 5
-  include_min_distance: true
-  include_ttc: true
-  include_drac: true
-  include_collision_probability: true
-  include_uncertainty: true
-  include_merge_gap: true
+  # One authoritative switch; the runtime feature vector itself is versioned.
   normalize: true
-  normalize_features: true
-  detach_gradient: true
 
+# Deterministic rule policy used by baselines and scorer preflight.
 rule_gap_acceptance:
-  desired_speed_source: "lane_speed_limit"
   idm_min_gap: 2.0
   idm_time_headway: 1.5
   idm_max_acceleration: 1.5
@@ -198,15 +207,12 @@ rule_gap_acceptance:
   merge_rear_ttc_min: 3.0
   deadline_distance: 120.0
 
+# Learned secondary risk scorer. Hard safety authority is still the Shield.
 risk_module:
   enabled: true
   safety_metric_version: "oriented_box_v1"
   candidate_geometry_backend: "vectorized"  # reference is audit-only
-  use_wcdt_latent: true
-  use_explicit_risk_features: true
-  action_conditioned: true
   ranking_loss_enabled: true
-  calibration_enabled: true
   calibration:
     reliability_bins: 10
     temperature_scaling_enabled: false
@@ -236,6 +242,7 @@ risk_module:
     ranking: 0.5
     calibration: 0.1
 
+# PPO optimizer and versioned reward semantics.
 rl:
   backend: "sb3"
   use_wcdt_forecast_features: false
@@ -305,11 +312,11 @@ rl:
     duration_s: 1.0
     preserve_raw_accel: true
 
+# Runtime action-replacement safety controller; disabled unless a config opts in.
 shield:
   enabled: false
   activation_risk_threshold: 0.90
   candidate_action_count: 9
-  coarse_to_fine: true
   risk_threshold: 0.65
   uncertainty_threshold: 0.40
   replacement_margin: 0.15
@@ -340,9 +347,7 @@ shield:
   task_backstop_safety_risk_threshold: 0.35
   task_backstop_uncertainty_threshold: 0.40
   task_backstop_max_first_step_gap_jump: 20.0
-  prefer_closest_safe_action: true
   filter_illegal_candidates: true
-  fallback_action: "decelerate"
   score_weights:
     risk: 1.0
     uncertainty: 0.2
@@ -434,7 +439,6 @@ accvp:
     bonferroni_signal_count: 3
   inference_worker:
     enabled: true
-    restart_on_timeout: true
     prewarm_on_init: true
     startup_timeout_s: 15.0
   training:
@@ -462,7 +466,12 @@ accvp:
     collection_phase: "ad_hoc"  # ad_hoc | pilot | formal
     root_budget: 5000
     roots_per_episode_limit: 3
+    # One root-trajectory SUMO stays in the collector process. These are extra
+    # branch-worker processes, each with an independent SUMO/TraCI connection.
     workers: 2
+    # Queue backpressure per branch worker. This controls memory/port pressure,
+    # not the number of workers and not the number of roots in a shard.
+    pending_branch_jobs_per_worker: 4
     shard_roots: 50
     # Immutable jobs are collected separately and merged into one formal
     # dataset; this list is executable metadata rather than a descriptive tag.
@@ -487,8 +496,10 @@ accvp:
     risk_checkpoint: null
     output_name: "accvp_counterfactual_v2"
 
+# Generic (non-ACCVP) risk-probe data collection pipeline.
 stage1:
   episodes: 500
+  # Generic Risk-probe workers; independent from ACCVP counterfactual workers.
   workers: 1
   shard_episodes: 25
   replay_mode: "risk_or_failure"
@@ -498,7 +509,6 @@ stage1:
     random: 0.10
     merge_heuristic: 0.60
     risk_seek: 0.30
-  random_action_probability: 1.0
   output_name: "risk_probe_buffer"
   output_format: "manifest_npy_v1"
   cleanup_worker_shards: true
@@ -526,6 +536,8 @@ stage1:
         position_jitter: 14.0
         speed_jitter: 3.0
 
+# Generic historical Stage2--5 pipeline inputs/evaluation defaults. VNext uses
+# its dedicated workflow and active configs instead of these values directly.
 stage2:
   input_stage1: null
   input_stage4: null

@@ -30,6 +30,62 @@ Registry statuses：
 - `template`：示例，不是冻结实验；
 - `diagnostic_only`：历史复现与 failure analysis，不能进入正式 lineage。
 
+## `default_safe_rl.yaml` 的边界
+
+`default_safe_rl.yaml` 是兼容默认值，不是可直接生成 VNext 正式证据的实验定义。字段按以下
+原则维护：
+
+- 默认关闭但代码仍支持的能力继续保留，例如 Shield、forecast features 和 ACCVP runtime；
+- WcDT/Risk/通用 Stage1--5 所需的兼容字段继续保留，并在顶层区块注释其责任；
+- 从未被运行时代码读取的开关已经移除。覆盖配置若再次传入这些键会立即报错，避免静默 no-op；
+- 正式数据、Reward、runtime 和 holdout 语义仍只在 `active/accvp_vnext/` 冻结。
+
+已退役 no-op 包括旧 `prediction.freeze/model_type/num_modes`、重复的
+`forecast_features.normalize_features`、未生效的 feature include 开关、未生效的 Risk
+architecture 开关，以及 Shield 的未生效排序开关。迁移时应使用报错中给出的有效字段；不要
+为兼容旧 YAML 把这些键加回默认文件。
+
+`accvp.data_contract_version` 没有被当作无用声明删除：collection 和 training 现在都会验证它
+必须等于受支持的 schema3 data contract，并验证 dataset/config 一致。
+
+## 设备分工
+
+| 配置 | 作用 | VNext 建议 |
+| --- | --- | --- |
+| `training.stage2_device` | WcDT、Risk、ACCVP 批量训练 | 正式配置显式 `cuda:0` |
+| `training.ppo_device` | 小型 PPO MLP 更新 | `cpu` |
+| `training.forecast_runtime_device` | 在线 WcDT 推理 | `cpu`，保持 runtime contract |
+| `training.diagnostics_device` | 大批量离线 diagnostics | `auto` 或显式 GPU |
+
+ACCVP 只在 optimizer/validation batch 阶段使用 `stage2_device`。训练完成的 ensemble 会先回迁
+CPU，再进行 calibration、operating-point selection、序列化和 runtime benchmark。因此改用
+GPU 不会暗中改变在线设备契约，但会改变训练数值与 config lineage；已有 CPU artifact 不能被
+重新标成 GPU artifact。
+
+正式 deterministic CUDA 训练应在新进程启动前设置
+`CUBLAS_WORKSPACE_CONFIG=:4096:8`。代码会关闭 TF32 并把实际训练设备写入 training history、
+checkpoint metadata 和 manifest。
+
+## SUMO 与 PPO 并行
+
+| 配置 | 含义 | 默认值 |
+| --- | --- | --- |
+| `accvp.counterfactual.workers` | root collector 之外的 branch SUMO 进程数 | 2 |
+| `accvp.counterfactual.pending_branch_jobs_per_worker` | 每个 branch worker 的队列回压深度 | 4 |
+| `stage1.workers` | 通用 Risk-probe 的 SUMO worker 数 | 1 |
+| `training.ppo_num_envs` | PPO rollout 的独立 SUMO/TraCI 进程数 | 1 |
+| `training.ppo_worker_torch_threads` | 每个 PPO environment worker 的 Torch 线程数 | 1 |
+| `training.ppo_main_torch_threads` | PPO 主进程更新网络的 Torch 线程数 | 4 |
+| `training.ppo_expected_rollout_size` | 可选的 `num_envs × n_steps` 语义门槛 | null |
+
+Canonical Candidate PPO 把 `ppo_expected_rollout_size` 固定为 1024。若从 1 个环境改为 2 个，
+必须同时把 `rl.n_steps` 从 1024 改为 512；4 个环境对应 256。否则程序会在启动 SUMO rollout
+前拒绝配置。每个 PPO worker 都独立加载 ACCVP/Risk checkpoint，因此先测试 2 个环境，并用
+内存、TraCI 稳定性和 steps/s 报告决定是否增加，不要把单纯增加进程数当作等价加速。
+
+反事实 formal collection 的 `workers` 和 `shard_roots` 属于已生成数据的采集 lineage。不要
+为了应用新默认值重跑已完成 shard，也不要在正在执行的 collection 中修改它们。
+
 `advanced/` 平铺目录已退役。旧 basename 保存在相应 archive family 中；canonical VNext 使用
 简短角色名。
 

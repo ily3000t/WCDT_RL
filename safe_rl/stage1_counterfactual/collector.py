@@ -227,7 +227,17 @@ def collect(
     root_budget = None if configured_budget <= 0 else configured_budget
     configured_episode_limit = int(counterfactual.roots_per_episode_limit)
     roots_per_episode = None if configured_episode_limit <= 0 else configured_episode_limit
-    workers = max(1, int(counterfactual.workers))
+    workers = int(counterfactual.workers)
+    pending_jobs_per_worker = int(
+        counterfactual.get("pending_branch_jobs_per_worker", 4)
+    )
+    if workers <= 0:
+        raise ValueError("accvp.counterfactual.workers must be positive")
+    if pending_jobs_per_worker <= 0:
+        raise ValueError(
+            "accvp.counterfactual.pending_branch_jobs_per_worker must be positive"
+        )
+    pending_job_limit = workers * pending_jobs_per_worker
     output_name = str(counterfactual.output_name)
     stage_dir = prepare_run_dir(cfg, "stage1_counterfactual")
     seed_schedule = _seed_schedule(cfg, episode_seeds, episodes)
@@ -251,7 +261,7 @@ def collect(
     branch_tensor_dir.mkdir(parents=True, exist_ok=True)
     stage_log(
         "stage1_counterfactual",
-        f"collection_id={shard_id} source={source_name} root_policy={policy_name} root_filter={filter_name} root_budget={root_budget or 'unbounded'} workers={workers} seeds={len(seed_schedule)}",
+        f"collection_id={shard_id} source={source_name} root_policy={policy_name} root_filter={filter_name} root_budget={root_budget or 'unbounded'} workers={workers} pending_job_limit={pending_job_limit} seeds={len(seed_schedule)}",
     )
     cfg.accvp["_counterfactual_collection_enabled"] = True
     env = make_env(cfg, seed=int(seed_schedule[0] if seed_schedule else cfg.run.seed), shield_enabled=False)
@@ -374,7 +384,7 @@ def collect(
                                 pending[pool.submit(run_branch_job, job)] = (root_id, action_id)
                             collected += 1
                             roots_this_episode += 1
-                            while len(pending) >= workers * 4:
+                            while len(pending) >= pending_job_limit:
                                 _drain_one(pending, store, root_rows, branch_rows)
                     observation, _reward, terminated, truncated, _info = env.step(raw_action)
             while pending:

@@ -38,6 +38,7 @@ from safe_rl.accvp.schema import (
     write_json_atomic,
 )
 from safe_rl.accvp.oracle import validate_oracle_for_training
+from safe_rl.accvp.protocol import ACCVP_DATA_CONTRACT_VERSION
 from safe_rl.accvp.reproducibility import configure_deterministic_training
 from safe_rl.accvp.runtime_contract import (
     formal_runtime_contract_from_config,
@@ -91,10 +92,50 @@ def _state_dict_sha256(state_dict: dict[str, Any]) -> str:
     return digest.hexdigest()
 
 
-def _tensor_batch(batch: dict[str, np.ndarray], torch: Any) -> dict[str, Any]:
+def _resolve_accvp_training_device(config: Any, torch: Any) -> tuple[str, Any]:
+    """Resolve the batch-training device without changing runtime inference."""
+
+    training = config.get("training", {})
+    requested = str(
+        training.get("stage2_device", training.get("device", "auto"))
+    ).strip().lower()
+    requested = requested or "auto"
+    canonical = "cuda" if requested == "gpu" else requested
+    if canonical == "auto":
+        if bool(torch.cuda.is_available()):
+            return requested, torch.device("cuda:0")
+        mps = getattr(getattr(torch, "backends", None), "mps", None)
+        if mps is not None and bool(mps.is_available()):
+            return requested, torch.device("mps")
+        return requested, torch.device("cpu")
+    if canonical.startswith("cuda") and not bool(torch.cuda.is_available()):
+        raise RuntimeError(
+            "training.stage2_device requests CUDA for ACCVP training, but "
+            "torch.cuda.is_available() is false"
+        )
+    if canonical == "mps":
+        mps = getattr(getattr(torch, "backends", None), "mps", None)
+        if mps is None or not bool(mps.is_available()):
+            raise RuntimeError(
+                "training.stage2_device requests MPS for ACCVP training, but "
+                "PyTorch MPS is unavailable"
+            )
+    return requested, torch.device(canonical)
+
+
+def _tensor_batch(
+    batch: dict[str, np.ndarray],
+    torch: Any,
+    *,
+    device: Any | None = None,
+) -> dict[str, Any]:
     integer = {"history_lane_ids", "history_edge_role_ids", "role_ids", "lane_ids", "edge_role_ids", "candidate_action_ids"}
     return {
-        key: torch.as_tensor(value, dtype=torch.long if key in integer else torch.float32)
+        key: torch.as_tensor(
+            value,
+            dtype=torch.long if key in integer else torch.float32,
+            device=device,
+        )
         for key, value in batch.items()
     }
 
@@ -391,6 +432,8 @@ def _evaluate_loss(
     dataset: ACCVPBranchDataset,
     torch: Any,
     weights: dict[str, Any],
+    *,
+    device: Any | None = None,
 ) -> dict[str, Any]:
     if not len(dataset):
         raise ValueError("cannot evaluate ACCVP loss on an empty dataset")
@@ -398,7 +441,7 @@ def _evaluate_loss(
     accumulator = _new_loss_accumulator()
     with torch.no_grad():
         for batch_np in _batches(dataset, list(range(len(dataset))), 64):
-            batch = _tensor_batch(batch_np, torch)
+            batch = _tensor_batch(batch_np, torch, device=device)
             loss, parts = accvp_loss(_model_output(model, batch), batch, weights)
             _accumulate_loss_statistics(
                 accumulator,
@@ -887,8 +930,23 @@ def train_accvp(config: Any, dataset_dir: str | Path, *, mode: str = "deployable
             "formal ACCVP training requires current counterfactual schema "
             f"{COUNTERFACTUAL_SCHEMA_VERSION}"
         )
-    if str(dict(dataset_manifest.get("data_contract", {})).get("protocol_version", "")) != "accvp_240_v2":
-        raise ValueError("formal ACCVP training requires the schema-v3 accvp_240_v2 data contract")
+    configured_contract_version = str(
+        config.accvp.get("data_contract_version", ACCVP_DATA_CONTRACT_VERSION)
+    )
+    if configured_contract_version != ACCVP_DATA_CONTRACT_VERSION:
+        raise ValueError(
+            "formal ACCVP training has an unsupported data contract: "
+            f"configured={configured_contract_version!r} "
+            f"supported={ACCVP_DATA_CONTRACT_VERSION!r}"
+        )
+    if (
+        str(dict(dataset_manifest.get("data_contract", {})).get("protocol_version", ""))
+        != configured_contract_version
+    ):
+        raise ValueError(
+            "formal ACCVP training requires dataset/config data-contract agreement: "
+            f"configured={configured_contract_version!r}"
+        )
     split_path = dataset_dir / "manifests" / "split_manifest.jsonl"
     if not split_path.exists():
         oracle_exclusion = dict(oracle_report["training_exclusion_audit"])
@@ -963,6 +1021,10 @@ def train_accvp(config: Any, dataset_dir: str | Path, *, mode: str = "deployable
         base_dir=Path.cwd(),
     )
     torch = _torch()
+    requested_training_device, training_device = _resolve_accvp_training_device(
+        config,
+        torch,
+    )
     deterministic_requested = bool(training.get("deterministic", False))
     deterministic_enabled = bool(mode == "deployable" or deterministic_requested)
     configured_threads = training.get("deterministic_torch_threads")
@@ -972,18 +1034,28 @@ def train_accvp(config: Any, dataset_dir: str | Path, *, mode: str = "deployable
         torch,
         enabled=deterministic_enabled,
         torch_threads=None if configured_threads is None else int(configured_threads),
+        cuda_in_scope=getattr(training_device, "type", str(training_device)) == "cuda",
     )
     reproducibility_profile.update(
         {
             "formal_mode_requires_determinism": mode == "deployable",
             "configured_deterministic": deterministic_requested,
             "effective_deterministic": deterministic_enabled,
+            "training_device_requested": requested_training_device,
+            "training_device_effective": str(training_device),
+            "post_training_inference_device": "cpu",
         }
     )
     if mode == "deployable" and not bool(
         reproducibility_profile.get("deterministic_algorithms", False)
     ):
         raise RuntimeError("formal ACCVP training requires deterministic Torch algorithms")
+    stage_log(
+        "accvp_training",
+        "TRAIN_DEVICE "
+        f"requested={requested_training_device} effective={training_device} "
+        "calibration=cpu operating_point=cpu runtime=cpu",
+    )
     loss_weights = dict(training.loss_weights)
     configured_scales = loss_weights.get("response_feature_scales", "auto_train")
     auto_scales = configured_scales is None or (
@@ -1027,7 +1099,7 @@ def train_accvp(config: Any, dataset_dir: str | Path, *, mode: str = "deployable
         member_seed = int(config.run.seed) + int(training.ensemble_seed_offset) * member
         rng = np.random.default_rng(member_seed)
         torch.manual_seed(member_seed)
-        if bool(torch.cuda.is_available()):
+        if getattr(training_device, "type", str(training_device)) == "cuda":
             torch.cuda.manual_seed_all(member_seed)
         model = ACCVPPredictor(**model_kwargs_from_config(config))
         warm_record: dict[str, Any] = {
@@ -1074,6 +1146,7 @@ def train_accvp(config: Any, dataset_dir: str | Path, *, mode: str = "deployable
             warm_record.update(warm_start_scene_encoder(model, states[member % len(states)]))
             warm_record["source_checkpoint"] = str(warm_source.resolve())
             warm_record["source_sha256"] = file_sha256(warm_source)
+        model = model.to(training_device)
         encoder_parameters = list(model.scene.parameters())
         head_parameters = [parameter for name, parameter in model.named_parameters() if not name.startswith("scene.")]
         optimizer = torch.optim.AdamW(
@@ -1107,7 +1180,7 @@ def train_accvp(config: Any, dataset_dir: str | Path, *, mode: str = "deployable
                 groups,
                 int(training.batch_size),
             ):
-                batch = _tensor_batch(batch_np, torch)
+                batch = _tensor_batch(batch_np, torch, device=training_device)
                 optimizer.zero_grad(set_to_none=True)
                 loss, parts = accvp_loss(_model_output(model, batch), batch, loss_weights)
                 _accumulate_loss_statistics(
@@ -1119,7 +1192,13 @@ def train_accvp(config: Any, dataset_dir: str | Path, *, mode: str = "deployable
                 loss.backward()
                 optimizer.step()
             train_statistics = _finalise_loss_statistics(train_accumulator, loss_weights)
-            validation_statistics = _evaluate_loss(model, validation_set, torch, loss_weights)
+            validation_statistics = _evaluate_loss(
+                model,
+                validation_set,
+                torch,
+                loss_weights,
+                device=training_device,
+            )
             validation_loss = float(validation_statistics["total"])
             epoch_record = {
                 "epoch": int(epoch),
@@ -1156,6 +1235,13 @@ def train_accvp(config: Any, dataset_dir: str | Path, *, mode: str = "deployable
         if best_epoch < 0:
             raise RuntimeError("ACCVP training did not select a best epoch")
         epoch_history[best_epoch]["selected_best"] = True
+        # Calibration, operating-point selection, checkpoint serialization and
+        # deployment runtime intentionally remain on CPU. This keeps the
+        # existing runtime latency contract independent of the training device.
+        model = model.to(torch.device("cpu"))
+        del optimizer
+        if getattr(training_device, "type", str(training_device)) == "cuda":
+            torch.cuda.empty_cache()
         models.append(model)
         best_losses.append(best_loss)
         warm_record["freeze_encoder_epochs"] = int(warm.freeze_encoder_epochs)
@@ -1172,6 +1258,8 @@ def train_accvp(config: Any, dataset_dir: str | Path, *, mode: str = "deployable
             {
                 "member": int(member),
                 "member_seed": int(member_seed),
+                "training_device": str(training_device),
+                "post_training_device": "cpu",
                 "bootstrap": {
                     "version": str(bootstrap_plan["version"]),
                     "population_component_count": int(

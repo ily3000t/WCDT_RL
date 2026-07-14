@@ -14,6 +14,7 @@ training:
   ppo_start_method: "spawn"
   ppo_worker_torch_threads: 1
   ppo_main_torch_threads: 4
+  ppo_expected_rollout_size: 1024
 
 rl:
   n_steps: 256

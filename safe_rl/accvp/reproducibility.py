@@ -47,6 +47,7 @@ def configure_deterministic_training(
     *,
     enabled: bool,
     torch_threads: int | None = None,
+    cuda_in_scope: bool | None = None,
 ) -> dict[str, Any]:
     # ``use_deterministic_algorithms`` is process-global. Set it explicitly in
     # both directions so a preceding formal run cannot silently force a later
@@ -55,9 +56,13 @@ def configure_deterministic_training(
         raise ValueError("deterministic torch thread count must be positive")
     baseline = _process_baseline(torch)
     cuda_available = bool(torch.cuda.is_available())
+    configure_cuda_backend = True if cuda_in_scope is None else bool(cuda_in_scope)
+    cuda_contract_required = bool(cuda_available and configure_cuda_backend)
+    if cuda_in_scope is True and not cuda_available:
+        raise RuntimeError("CUDA reproducibility was requested, but CUDA is unavailable")
     is_initialized = getattr(torch.cuda, "is_initialized", None)
     cuda_initialized_before = bool(
-        cuda_available and callable(is_initialized) and is_initialized()
+        cuda_contract_required and callable(is_initialized) and is_initialized()
     )
     if (
         enabled
@@ -75,7 +80,7 @@ def configure_deterministic_training(
         "matmul",
         None,
     )
-    if enabled:
+    if enabled and configure_cuda_backend:
         # This must be present before the first CUDA BLAS operation. Keeping it
         # here also makes the requested contract explicit in the training log.
         os.environ["CUBLAS_WORKSPACE_CONFIG"] = ":4096:8"
@@ -86,7 +91,7 @@ def configure_deterministic_training(
                 cudnn.allow_tf32 = False
         if cuda_matmul is not None and hasattr(cuda_matmul, "allow_tf32"):
             cuda_matmul.allow_tf32 = False
-    else:
+    elif not enabled:
         if bool(baseline["cublas_workspace_config_present"]):
             os.environ["CUBLAS_WORKSPACE_CONFIG"] = str(
                 baseline["cublas_workspace_config"]
@@ -127,6 +132,8 @@ def configure_deterministic_training(
         "torch_threads": int(torch.get_num_threads()),
         "torch_interop_threads": int(torch.get_num_interop_threads()),
         "cuda_available": cuda_available,
+        "cuda_backend_settings_in_scope": configure_cuda_backend,
+        "cuda_contract_required": cuda_contract_required,
         "cuda_initialized_before_configuration": cuda_initialized_before,
         "cuda_version": None if torch.version.cuda is None else str(torch.version.cuda),
         "cublas_workspace_config": os.environ.get("CUBLAS_WORKSPACE_CONFIG", ""),

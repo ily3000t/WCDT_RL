@@ -36,6 +36,7 @@ from safe_rl.accvp.train import (
     OPTIMIZATION_BATCHING_VERSION,
     _calibrate,
     _event_positive_weights,
+    _resolve_accvp_training_device,
     _tensor_batch,
     _train_response_feature_scales,
     build_component_bootstrap_plan,
@@ -372,6 +373,22 @@ def test_duplicate_sample_weights_feed_tensor_loss_balancing_and_normalization()
     )
     assert tensors["sample_weight"].dtype == torch.float32
     assert tensors["sample_weight"].tolist() == pytest.approx([0.25, 0.75])
+    cpu_tensors = _tensor_batch(
+        {"sample_weight": np.asarray([1.0], dtype=np.float32)},
+        torch,
+        device=torch.device("cpu"),
+    )
+    assert cpu_tensors["sample_weight"].device.type == "cpu"
+
+
+def test_accvp_training_device_uses_stage2_contract():
+    cfg = clone_with_overrides(
+        load_config(),
+        {"training": {"device": "auto", "stage2_device": "cpu"}},
+    )
+    requested, device = _resolve_accvp_training_device(cfg, torch)
+    assert requested == "cpu"
+    assert str(device) == "cpu"
 
 
 def test_calibration_collapses_fingerprint_action_groups_to_independent_units():
@@ -454,6 +471,7 @@ def test_formal_training_writes_sealed_candidate_without_opening_final_test(tmp_
         load_config(),
         {
             "run": {"output_root": str(tmp_path / "output"), "run_id": "accvp_train_test", "tensorboard": False},
+            "training": {"stage2_device": "cpu"},
             "prediction": {
                 "wcdt_v3_hidden_dim": 16,
                 "wcdt_v3_temporal_layers": 1,
@@ -496,6 +514,9 @@ def test_formal_training_writes_sealed_candidate_without_opening_final_test(tmp_
     assert history["configured_artifact_generation"] == ACCVP_ARTIFACT_GENERATION
     assert history["reproducibility"]["effective_deterministic"] is True
     assert history["reproducibility"]["deterministic_algorithms"] is True
+    assert history["reproducibility"]["training_device_requested"] == "cpu"
+    assert history["reproducibility"]["training_device_effective"] == "cpu"
+    assert history["reproducibility"]["post_training_inference_device"] == "cpu"
     assert history["duplicate_weighting"]["version"] == "fingerprint_action_total_weight_one_v1"
     assert history["duplicate_weighting"]["weighting_unit"] == "model_input_fingerprint_x_action"
     assert history["duplicate_weighting"]["cluster_sampling_unit"] == "split_component"
@@ -600,6 +621,7 @@ def test_shadow_training_writes_non_deployable_shadow_artifact(tmp_path: Path):
         load_config(),
         {
             "run": {"output_root": str(tmp_path / "output"), "run_id": "accvp_shadow_train_test", "tensorboard": False},
+            "training": {"stage2_device": "cpu"},
             "prediction": {
                 "wcdt_v3_hidden_dim": 16,
                 "wcdt_v3_temporal_layers": 1,
@@ -668,6 +690,7 @@ def test_tuning_failure_writes_non_deployable_diagnostics_without_artifact(tmp_p
         load_config(),
         {
             "run": {"output_root": str(tmp_path / "output"), "run_id": "accvp_train_failure_test", "tensorboard": False},
+            "training": {"stage2_device": "cpu"},
             "prediction": {
                 "wcdt_v3_hidden_dim": 16,
                 "wcdt_v3_temporal_layers": 1,

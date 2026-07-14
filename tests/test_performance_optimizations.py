@@ -18,7 +18,7 @@ from safe_rl.pipeline.stage1_risk_probe import (
     run as run_stage1,
 )
 from safe_rl.prediction.forecast_rollout_bundle import build_forecast_rollout_bundle
-from safe_rl.rl.ppo import _worker_model_memory_estimate
+from safe_rl.rl.ppo import _ppo_parallelism_config, _worker_model_memory_estimate
 from safe_rl.risk.merge_local import (
     candidate_action_risk_samples,
     prepare_candidate_rollout_context,
@@ -124,6 +124,20 @@ def test_episode_seed_schedule_is_unique_across_parallel_envs():
         assert len(seeds) == 10 * num_envs
         assert min(seeds) == base_seed
         assert max(seeds) == base_seed + 10 * num_envs - 1
+
+
+def test_ppo_parallelism_preserves_explicit_rollout_contract():
+    cfg = load_config()
+    cfg.training["ppo_num_envs"] = 2
+    cfg.training["ppo_expected_rollout_size"] = 1024
+    cfg.rl["n_steps"] = 512
+    parallelism = _ppo_parallelism_config(cfg)
+    assert parallelism["rollout_size"] == 1024
+    assert parallelism["num_envs"] == 2
+
+    cfg.rl["n_steps"] = 1024
+    with np.testing.assert_raises_regex(ValueError, "rollout-size contract changed"):
+        _ppo_parallelism_config(cfg)
 
 
 def test_explicit_reset_seed_does_not_apply_parallel_schedule(monkeypatch):

@@ -3,9 +3,14 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
+import pytest
 import yaml
 
-from safe_rl.utils.config import load_config
+from safe_rl.utils.config import (
+    RETIRED_NOOP_CONFIG_PATHS,
+    clone_with_overrides,
+    load_config,
+)
 from safe_rl.pipeline.run_full_pipeline import _pipeline_profile_config_path
 
 
@@ -90,3 +95,32 @@ def test_pipeline_profile_internal_paths_match_registry():
     assert _pipeline_profile_config_path("performance") == (
         CONFIG_ROOT / configs["pipeline_performance"]["path"]
     )
+
+
+def test_default_config_has_no_retired_noop_keys_and_rejects_reintroduction():
+    raw = yaml.safe_load((CONFIG_ROOT / "default_safe_rl.yaml").read_text(encoding="utf-8"))
+    for path in RETIRED_NOOP_CONFIG_PATHS:
+        current = raw
+        for part in path:
+            if not isinstance(current, dict) or part not in current:
+                break
+            current = current[part]
+        else:
+            pytest.fail(f"retired no-op key remains in defaults: {'.'.join(path)}")
+
+    with pytest.raises(ValueError, match="retired no-op keys"):
+        clone_with_overrides(
+            load_config(),
+            {"forecast_features": {"normalize_features": False}},
+        )
+
+
+def test_vnext_device_and_rollout_contracts_are_explicit():
+    train = load_config(CONFIG_ROOT / "active" / "accvp_vnext" / "train.yaml")
+    candidate = load_config(
+        CONFIG_ROOT / "active" / "accvp_vnext" / "ppo_candidate_table_full.yaml"
+    )
+    assert train.training.stage2_device == "cuda:0"
+    assert candidate.training.ppo_expected_rollout_size == 1024
+    assert candidate.training.ppo_num_envs * candidate.rl.n_steps == 1024
+    assert train.accvp.counterfactual.pending_branch_jobs_per_worker == 4
