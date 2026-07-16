@@ -151,6 +151,11 @@ python -m safe_rl.pipeline.stage3_train_ppo_factorial `
 若目录中存在任意文件、符号链接或不完整 checkpoint/report，则仍然 fail closed，要求先人工
 审计并归档，不会自动删除或覆盖。关键产物为：
 
+每个副本的 `run.seed` 固定为 simulator-training cohort 起点，`rl.optimizer_seed` 才随
+1001--1005 变化。Stable-Baselines3 构造模型时会把模型 seed 同时传给 VecEnv，因此 Stage3
+会在模型构造后、第一次 rollout reset 前显式把 VecEnv 恢复为 `run.seed`；preflight 和最终
+lineage 分别校验 `ppo_training` 与 `ppo_optimizer_replicates`，禁止两类 seed 混用。
+
 ```text
 safe_rl_output/runs/accvp_vnext_factorial/
   factorial_plan.json

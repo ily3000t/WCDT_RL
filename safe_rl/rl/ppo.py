@@ -4,7 +4,7 @@ import os
 import shutil
 import time
 from pathlib import Path
-from typing import Any
+from typing import Any, Iterable, Mapping
 
 import numpy as np
 
@@ -161,25 +161,40 @@ def _checkpoint_selection_seeds(config: Any) -> list[int]:
 def _validate_stage3_seed_preflight(config: Any) -> dict[str, Any]:
     selection = _checkpoint_selection_seeds(config)
     training_start = [int(config.run.seed)]
+    optimizer = [_ppo_optimizer_seed(config)]
     snapshot = protocol_snapshot(config)
+    optimizer_role_enabled = _optimizer_seed_role_enabled(config, snapshot=snapshot)
+    audited_roles = {
+        "stage3_training_start": training_start,
+        "stage3_selection": selection,
+    }
+    if optimizer_role_enabled:
+        audited_roles["ppo_optimizer_replicates"] = optimizer
     if bool(snapshot.get("enabled", False)):
-        audit = assert_disjoint_seed_usage(
-            stage3_training_start=training_start,
-            stage3_selection=selection,
-        )
+        audit = assert_disjoint_seed_usage(**audited_roles)
         expected_training = seeds_for_role(config, "stage3_training", fallback=training_start)
         if expected_training and int(config.run.seed) not in set(expected_training):
             raise EvidenceProtocolError(
                 f"Stage3 run.seed={int(config.run.seed)} is outside the registered training cohort"
             )
+        if optimizer_role_enabled:
+            expected_optimizer = seeds_for_role(
+                config,
+                "ppo_optimizer_replicates",
+                fallback=optimizer,
+            )
+            if expected_optimizer and optimizer[0] not in set(expected_optimizer):
+                raise EvidenceProtocolError(
+                    "Stage3 rl.optimizer_seed="
+                    f"{optimizer[0]} is outside the registered optimizer-replicate cohort"
+                )
         enforced = True
     else:
-        audit = audit_seed_cohorts(
-            {"stage3_training_start": training_start, "stage3_selection": selection}
-        )
+        audit = audit_seed_cohorts(audited_roles)
         enforced = False
     return {
         "training_start_seed": int(config.run.seed),
+        "optimizer_seed": int(optimizer[0]),
         "selection_seeds": selection,
         "selection_seed_sha256": stable_hash(sorted(selection)),
         "seed_audit": audit,
@@ -300,7 +315,13 @@ def _episode_seed_trace_record(
 
 
 class _EpisodeSeedTraceCallback:
-    def __init__(self, base_callback: Any) -> None:
+    def __init__(
+        self,
+        base_callback: Any,
+        allowed_episode_seeds: Iterable[int] | None = None,
+    ) -> None:
+        allowed = frozenset(int(seed) for seed in (allowed_episode_seeds or []))
+
         class EpisodeSeedTraceCallback(base_callback):
             def __init__(self) -> None:
                 super().__init__()
@@ -309,6 +330,17 @@ class _EpisodeSeedTraceCallback:
             def _on_step(self) -> bool:
                 dones = np.asarray(self.locals.get("dones", []), dtype=bool).reshape(-1)
                 infos = list(self.locals.get("infos", []))
+                if allowed:
+                    for info in infos:
+                        payload = dict(info or {})
+                        if "episode_seed" not in payload:
+                            continue
+                        observed = int(payload["episode_seed"])
+                        if observed not in allowed:
+                            raise EvidenceProtocolError(
+                                "PPO observed simulator episode seed outside the registered "
+                                f"stage3_training cohort: {observed}"
+                            )
                 for env_rank, done in enumerate(dones):
                     if not bool(done) or env_rank >= len(infos):
                         continue
@@ -342,7 +374,45 @@ def _configure_torch_threads(thread_count: int) -> None:
 def _ppo_optimizer_seed(config: Any) -> int:
     """Return the model RNG seed without changing simulator scheduling."""
 
-    return int(config.rl.get("optimizer_seed", config.run.seed))
+    rl = config.get("rl", {}) if hasattr(config, "get") else {}
+    return int((rl or {}).get("optimizer_seed", config.run.seed))
+
+
+def _optimizer_seed_role_enabled(
+    config: Any,
+    *,
+    snapshot: Mapping[str, Any] | None = None,
+) -> bool:
+    """Whether a config declares optimizer RNG as an independent seed role."""
+
+    rl = config.get("rl", {}) if hasattr(config, "get") else {}
+    roles = (snapshot or protocol_snapshot(config)).get("cohort_roles", {}) or {}
+    return "optimizer_seed" in (rl or {}) or "ppo_optimizer_replicates" in roles
+
+
+def _restore_simulator_seed_after_model_setup(model: Any, config: Any) -> list[int]:
+    """Undo SB3's optimizer-seed propagation into the VecEnv reset seed.
+
+    Stable-Baselines3 exposes one ``seed`` constructor argument and applies it
+    both to policy RNGs and to the wrapped VecEnv.  VNext deliberately assigns
+    independent optimizer and simulator cohorts, so after model construction
+    the next environment reset must be scheduled from ``run.seed`` again.
+    ``VecEnv.seed`` only stages per-environment reset seeds; it does not reseed
+    the already-created policy network or optimizer.
+    """
+
+    vec_env = model.get_env()
+    if vec_env is None or not hasattr(vec_env, "seed"):
+        raise RuntimeError("PPO model did not expose a seedable VecEnv")
+    requested = int(config.run.seed)
+    applied = vec_env.seed(requested)
+    values = [int(seed) for seed in (applied or [])]
+    if values and values[0] != requested:
+        raise RuntimeError(
+            "PPO VecEnv rejected the registered simulator training seed: "
+            f"requested={requested} applied={values}"
+        )
+    return values
 
 
 def _build_ppo_worker_env(config: Any, rank: int, num_envs: int):
@@ -452,6 +522,10 @@ def train_ppo(
         seed=_ppo_optimizer_seed(config),
         verbose=1,
     )
+    # SB3's constructor seeds both the policy and VecEnv with the optimizer
+    # seed. Restore the independently registered simulator cohort before the
+    # first learn()/reset() call.
+    vec_env_training_seeds = _restore_simulator_seed_after_model_setup(model, config)
     output_path = Path(output_path)
     output_path.parent.mkdir(parents=True, exist_ok=True)
     final_path, best_path, selection_report_path = _checkpoint_paths(output_path)
@@ -459,7 +533,15 @@ def train_ppo(
     selection_weights = _checkpoint_selection_weights(config)
     selection_metric = _checkpoint_selection_formula(selection_weights)
     safety_callback = None
-    seed_trace_callback = _EpisodeSeedTraceCallback(BaseCallback).callback
+    allowed_training_seeds = (
+        seeds_for_role(config, "stage3_training", fallback=[int(config.run.seed)])
+        if bool(protocol_preflight.get("disjointness_enforced", False))
+        else []
+    )
+    seed_trace_callback = _EpisodeSeedTraceCallback(
+        BaseCallback,
+        allowed_episode_seeds=allowed_training_seeds,
+    ).callback
     callbacks = [seed_trace_callback]
     if bool(config.stage3.get("eval_enabled", False)):
         safety_callback = _SafetyEvalCallback(BaseCallback, config, output_path).callback
@@ -529,13 +611,16 @@ def train_ppo(
     requested_total_timesteps = int(config.rl.total_timesteps)
     actual_total_timesteps = int(model.num_timesteps)
     rollout_quantum = int(num_envs * int(config.rl.n_steps))
+    lineage_role_seeds = {
+        "stage3_training": training_episode_seeds,
+        "stage3_selection": selection_seeds,
+    }
+    if _optimizer_seed_role_enabled(config):
+        lineage_role_seeds["ppo_optimizer_replicates"] = [_ppo_optimizer_seed(config)]
     evidence_lineage = build_stage_lineage(
         config,
         stage="stage3",
-        role_seeds={
-            "stage3_training": training_episode_seeds,
-            "stage3_selection": selection_seeds,
-        },
+        role_seeds=lineage_role_seeds,
         artifact_paths={
             "final_model": final_path,
             "best_model": best_path if best_path.exists() else None,
@@ -555,6 +640,7 @@ def train_ppo(
         "reward_profile": str(config.rl.get("reward_profile", "default")),
         "optimizer_seed": _ppo_optimizer_seed(config),
         "simulator_training_start_seed": int(config.run.seed),
+        "vec_env_training_seeds": vec_env_training_seeds,
         "checkpoint_selection_profile": selection_profile,
         "checkpoint_selection_weights": selection_weights,
         "checkpoint_selection_metric": selection_metric,

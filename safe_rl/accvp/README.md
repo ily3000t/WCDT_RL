@@ -274,6 +274,11 @@ python -m safe_rl.pipeline.stage3_train_ppo_factorial `
 resume 只复用 hash 和 Stage3 report 都匹配的结果。启动失败后遗留的纯空目录树可以自动
 移除并重建；只要不完整 run 中已有任何文件或链接，协调器仍拒绝自动覆盖。
 
+`run.seed` 是 simulator episode schedule 的起点，`rl.optimizer_seed` 是 PPO 网络与优化器
+随机种子。由于 Stable-Baselines3 默认会把模型 seed 传播给 VecEnv，训练器会在模型创建后、
+首次 rollout reset 前重新应用 `run.seed`。正式 preflight 与 Stage3 lineage 必须同时证明
+simulator seeds 属于 `ppo_training`、optimizer seed 属于 `ppo_optimizer_replicates`。
+
 生成配置和 checkpoints 只能写入 `safe_rl_output/runs`，manifest 至少记录 resolved config、
 checkpoint、reward semantics、observation contract 和 ACCVP artifact fingerprint 的 hash。
 

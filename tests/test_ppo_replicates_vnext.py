@@ -6,12 +6,18 @@ from pathlib import Path
 import pytest
 
 from safe_rl.accvp.contracts.schema import file_sha256
-from safe_rl.evaluation_protocol import normalise_seed_cohorts
+from safe_rl.evaluation_protocol import EvidenceProtocolError, normalise_seed_cohorts
 from safe_rl.pipeline.accvp_runtime_benchmark_replicates import aggregate_runtime_reports
 from safe_rl.pipeline.audit_ppo_replicate_lineage import audit_manifest
 from safe_rl.pipeline.stage3_train_ppo_replicates import build_replicate_plan
 from safe_rl.ppo_replicates import optimizer_seed, validate_reward_semantics
-from safe_rl.rl.ppo import _build_ppo_worker_env, _ppo_optimizer_seed
+from safe_rl.rl.ppo import (
+    _EpisodeSeedTraceCallback,
+    _build_ppo_worker_env,
+    _ppo_optimizer_seed,
+    _restore_simulator_seed_after_model_setup,
+    _validate_stage3_seed_preflight,
+)
 from safe_rl.utils.config import clone_with_overrides, load_config
 
 
@@ -43,6 +49,68 @@ def test_ppo_worker_keeps_simulator_seed_independent_from_optimizer(monkeypatch)
     _build_ppo_worker_env(cfg, rank=0, num_envs=1)
     assert captured["seed"] == 20001
     assert captured["seed"] != _ppo_optimizer_seed(cfg)
+
+
+def test_sb3_model_setup_restores_simulator_seed_after_optimizer_seed_propagation():
+    cfg = load_config(CANDIDATE)
+
+    class FakeVecEnv:
+        def __init__(self):
+            self.requests = []
+
+        def seed(self, seed):
+            self.requests.append(int(seed))
+            return [int(seed)]
+
+    class FakeModel:
+        def __init__(self):
+            self.env = FakeVecEnv()
+
+        def get_env(self):
+            return self.env
+
+    model = FakeModel()
+    applied = _restore_simulator_seed_after_model_setup(model, cfg)
+
+    assert _ppo_optimizer_seed(cfg) == 1001
+    assert applied == [20001]
+    assert model.env.requests == [20001]
+
+
+def test_stage3_seed_preflight_audits_simulator_and_optimizer_cohorts_separately():
+    cfg = load_config(CANDIDATE)
+    preflight = _validate_stage3_seed_preflight(cfg)
+
+    assert preflight["training_start_seed"] == 20001
+    assert preflight["optimizer_seed"] == 1001
+    assert set(preflight["seed_audit"]["cohort_counts"]) == {
+        "stage3_training_start",
+        "stage3_selection",
+        "ppo_optimizer_replicates",
+    }
+
+    invalid = clone_with_overrides(cfg, {"rl": {"optimizer_seed": 999}})
+    with pytest.raises(EvidenceProtocolError, match="optimizer-replicate cohort"):
+        _validate_stage3_seed_preflight(invalid)
+
+
+def test_episode_seed_guard_fails_on_the_first_observed_out_of_cohort_step():
+    class FakeBaseCallback:
+        def __init__(self):
+            self.locals = {}
+            self.num_timesteps = 1
+
+    callback = _EpisodeSeedTraceCallback(
+        FakeBaseCallback,
+        allowed_episode_seeds=[20001, 20002],
+    ).callback
+    callback.locals = {
+        "dones": [False],
+        "infos": [{"episode_seed": 1001, "episode_index": 0}],
+    }
+
+    with pytest.raises(EvidenceProtocolError, match="outside.*stage3_training cohort"):
+        callback._on_step()
 
 
 def test_reward_semantics_mismatch_fails_before_training():
