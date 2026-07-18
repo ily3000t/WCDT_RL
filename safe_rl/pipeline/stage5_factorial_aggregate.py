@@ -140,6 +140,70 @@ def load_factorial_request(request_path: str | Path) -> tuple[Path, dict[str, An
     final = [row for row in rows if str(row.get("comparison_id", "")) == FINAL_COMPARISON_ID]
     if len(final) != 1 or str(final[0].get("right_method_id", "")) != EXPECTED_FINAL_METHOD_ID:
         raise ValueError("Stage5 factorial request lacks its frozen final comparison")
+
+    budget = request.get("evaluation_budget")
+    if budget is not None:
+        if not isinstance(budget, Mapping):
+            raise ValueError("Stage5 factorial evaluation_budget must be an object")
+        secondary = int(budget.get("secondary_simulator_seed_count", 0))
+        primary = int(budget.get("primary_simulator_seed_count", 0))
+        if secondary <= 0 or primary < secondary:
+            raise ValueError("Stage5 factorial simulator-seed budget is invalid")
+        if budget.get("nested_seed_prefix") is not True:
+            raise ValueError("Stage5 factorial requires nested simulator-seed prefixes")
+        if budget.get("episode_cache_enabled") is not True:
+            raise ValueError("Stage5 factorial requires immutable episode-cache reuse")
+        registered = [int(seed) for seed in request.get("simulator_seeds", []) or []]
+        if len(registered) < primary or len(registered) != len(set(registered)):
+            raise ValueError("Stage5 factorial registered simulator-seed cohort is incomplete")
+        if int(budget.get("registered_simulator_seed_count", -1)) != len(registered):
+            raise ValueError("Stage5 factorial registered simulator-seed count mismatch")
+        optimizer_count = len([int(seed) for seed in request.get("optimizer_seeds", []) or []])
+        if optimizer_count < 5:
+            raise ValueError("Stage5 factorial evaluation budget requires five optimizer seeds")
+        for row in rows:
+            expected_count = (
+                primary if str(row.get("role", "")) == "primary_final" else secondary
+            )
+            declared = [int(seed) for seed in row.get("simulator_seeds", []) or []]
+            if int(row.get("simulator_seed_count", -1)) != expected_count:
+                raise ValueError("Stage5 comparison simulator-seed count violates its budget")
+            if declared != registered[:expected_count]:
+                raise ValueError("Stage5 comparison simulator seeds are not the frozen common prefix")
+            if str(row.get("simulator_seed_sha256", "")) != stable_hash(
+                {"episode_seeds": declared}
+            ):
+                raise ValueError("Stage5 comparison simulator-seed hash mismatch")
+        expected_naive = sum(
+            2 * optimizer_count * int(row["simulator_seed_count"])
+            for row in rows
+        )
+        unique_method_count = len(
+            {
+                str(row[key])
+                for row in rows
+                for key in ("left_method_id", "right_method_id")
+            }
+        )
+        expected_unique = (
+            unique_method_count * optimizer_count * secondary
+            + 2 * optimizer_count * (primary - secondary)
+        )
+        if int(budget.get("naive_episode_count", -1)) != expected_naive:
+            raise ValueError("Stage5 factorial naive episode budget mismatch")
+        if int(budget.get("unique_episode_count", -1)) != expected_unique:
+            raise ValueError("Stage5 factorial unique episode budget mismatch")
+
+        risk_path = _resolve(
+            request.get("risk_checkpoint", ""),
+            relative_to=source.parent,
+        )
+        expected_risk_sha = _normalise_sha256(
+            request.get("risk_checkpoint_sha256"),
+            field="risk_checkpoint_sha256",
+        )
+        if not risk_path.is_file() or file_sha256(risk_path) != expected_risk_sha:
+            raise ValueError("Stage5 factorial Risk-checkpoint binding mismatch")
     return source, request
 
 
@@ -221,6 +285,12 @@ def aggregate(request_path: str | Path) -> dict[str, Any]:
             "right_method_id": str(comparison.get("right_method_id", "")),
             "family": family,
             "role": str(comparison.get("role", "")),
+            "simulator_seed_count": int(
+                comparison.get("simulator_seed_count", 0)
+            ),
+            "simulator_seed_sha256": str(
+                comparison.get("simulator_seed_sha256", "")
+            ),
             "report": str(report_path),
             "report_sha256": file_sha256(report_path),
             "gate": dict(report.get("gate", {}) or {}),
@@ -278,6 +348,11 @@ def aggregate(request_path: str | Path) -> dict[str, Any]:
         ),
         "final_method_id": EXPECTED_FINAL_METHOD_ID,
         "final_comparison_id": FINAL_COMPARISON_ID,
+        "evaluation_budget": dict(request.get("evaluation_budget", {}) or {}),
+        "risk_checkpoint": str(request.get("risk_checkpoint", "")),
+        "risk_checkpoint_sha256": str(
+            request.get("risk_checkpoint_sha256", "")
+        ),
         "comparisons": summaries,
         "multiple_comparison_correction": corrections,
         "final_comparison_report": {

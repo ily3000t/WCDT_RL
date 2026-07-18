@@ -6,7 +6,7 @@ from typing import Any, Mapping
 
 import yaml
 
-from safe_rl.accvp.contracts.schema import file_sha256, read_json
+from safe_rl.accvp.contracts.schema import file_sha256, read_json, stable_hash
 from safe_rl.evaluation_protocol import protocol_snapshot
 from safe_rl.pipeline.audit_ppo_replicate_lineage import audit_manifest
 from safe_rl.pipeline.stage5_generate_replicated_configs import (
@@ -28,6 +28,8 @@ FACTORIAL_REQUEST_KIND = "stage5_factorial_request_v1"
 FACTORIAL_REQUEST_SCHEMA_VERSION = 1
 FACTORIAL_RUNTIME_KIND = "accvp_runtime_benchmark_factorial_v1"
 SINGLE_RUNTIME_KIND = "accvp_runtime_benchmark_replicates_v1"
+DEFAULT_SECONDARY_SIMULATOR_SEED_COUNT = 100
+DEFAULT_PRIMARY_SIMULATOR_SEED_COUNT = 300
 FINAL_COMPARISON_ID = (
     "wcdt_reward_v2__vs__candidate_table_reward_v3_1_commitment"
 )
@@ -164,6 +166,64 @@ def _comparison_specs(workflow_config: str | Path | None) -> list[dict[str, str]
             "workflow factorial comparisons disagree with the frozen six-comparison design"
         )
     return parsed
+
+
+def _stage5_evaluation_budget(
+    workflow_config: str | Path | None,
+    *,
+    available_seed_count: int,
+) -> dict[str, Any]:
+    if available_seed_count <= 0:
+        raise ValueError("Stage5 confirmatory seed cohort is empty")
+    if workflow_config is None:
+        return {
+            "secondary_simulator_seed_count": int(available_seed_count),
+            "primary_simulator_seed_count": int(available_seed_count),
+            "nested_seed_prefix": True,
+            "episode_cache_enabled": False,
+            "source": "standalone_full_cohort_default",
+        }
+    source = _resolve(workflow_config)
+    with source.open("r", encoding="utf-8") as handle:
+        workflow = yaml.safe_load(handle) or {}
+    factorial = workflow.get("factorial", {}) or {}
+    raw = factorial.get("stage5_evaluation", {}) if isinstance(factorial, Mapping) else {}
+    if not isinstance(raw, Mapping):
+        raise ValueError("workflow.factorial.stage5_evaluation must be a mapping")
+    secondary = int(
+        raw.get(
+            "secondary_simulator_seed_count",
+            DEFAULT_SECONDARY_SIMULATOR_SEED_COUNT,
+        )
+    )
+    primary = int(
+        raw.get(
+            "primary_simulator_seed_count",
+            DEFAULT_PRIMARY_SIMULATOR_SEED_COUNT,
+        )
+    )
+    nested = bool(raw.get("nested_seed_prefix", True))
+    cache_enabled = bool(raw.get("episode_cache_enabled", True))
+    if secondary <= 0 or primary <= 0:
+        raise ValueError("Stage5 simulator-seed budgets must be positive")
+    if secondary > primary:
+        raise ValueError("Stage5 secondary simulator-seed budget exceeds primary budget")
+    if primary > available_seed_count:
+        raise ValueError(
+            "Stage5 primary simulator-seed budget exceeds the registered confirmatory cohort: "
+            f"required={primary} available={available_seed_count}"
+        )
+    if not nested:
+        raise ValueError("formal Stage5 requires a nested common seed prefix")
+    if not cache_enabled:
+        raise ValueError("formal Stage5 workflow requires episode-cache reuse")
+    return {
+        "secondary_simulator_seed_count": secondary,
+        "primary_simulator_seed_count": primary,
+        "nested_seed_prefix": True,
+        "episode_cache_enabled": True,
+        "source": str(source),
+    }
 
 
 def _runtime_seed_reports(
@@ -329,6 +389,98 @@ def _read_resolved_config(row: Mapping[str, Any]) -> dict[str, Any]:
     return plain(payload)
 
 
+def _risk_checkpoint_binding(config: Mapping[str, Any]) -> dict[str, str]:
+    accvp = dict(config.get("accvp", {}) or {})
+    rl = dict(config.get("rl", {}) or {})
+    reward = dict(rl.get("shield_guided_reward", {}) or {})
+    stage5 = dict(config.get("stage5", {}) or {})
+    candidates = [
+        str(stage5.get("risk_checkpoint", "") or "").strip(),
+        str(accvp.get("risk_checkpoint", "") or "").strip(),
+        str(reward.get("risk_checkpoint", "") or "").strip(),
+    ]
+    paths = [_resolve(source) for source in candidates if source]
+    if not paths:
+        raise ValueError("formal Stage5 method config is missing a frozen Risk checkpoint")
+    records = {
+        (str(path), file_sha256(path))
+        for path in paths
+        if path.is_file()
+    }
+    if len(records) != len(set(paths)):
+        missing = sorted(str(path) for path in paths if not path.is_file())
+        raise FileNotFoundError(
+            "formal Stage5 Risk checkpoint does not exist: " + ", ".join(missing)
+        )
+    hashes = {digest for _path, digest in records}
+    if len(hashes) != 1:
+        raise ValueError("one method config binds multiple different Risk checkpoints")
+    canonical_path = sorted(path for path, _digest in records)[0]
+    return {
+        "path": canonical_path,
+        "sha256": hashes.pop(),
+    }
+
+
+def _episode_cache_binding(
+    *,
+    output: Path,
+    group: Mapping[str, Any],
+    row: Mapping[str, Any],
+    risk_binding: Mapping[str, str],
+) -> dict[str, Any]:
+    method_id = str(row.get("method_id", "")).strip()
+    optimizer_seed = int(row.get("optimizer_seed", row.get("training_seed", -1)))
+    if not method_id or optimizer_seed < 0:
+        raise ValueError("Stage5 cache binding requires method_id and optimizer_seed")
+    group_contract = {
+        key: plain(value)
+        for key, value in group.items()
+        if key not in {"name", "comparative", "evaluation_cache"}
+    }
+    identity = {
+        "method_id": method_id,
+        "optimizer_seed": optimizer_seed,
+        "checkpoint_sha256": _normalise_sha256(
+            row.get("checkpoint_sha256"),
+            field=f"{method_id} checkpoint_sha256",
+        ),
+        "resolved_config": str(_resolve(str(row.get("resolved_config", "")))),
+        "resolved_config_sha256": _normalise_sha256(
+            row.get("resolved_config_sha256"),
+            field=f"{method_id} resolved_config_sha256",
+        ),
+        "reward_semantics_hash": _normalise_sha256(
+            row.get("reward_semantics_hash"),
+            field=f"{method_id} reward_semantics_hash",
+        ),
+        "observation_contract_hash": _normalise_sha256(
+            row.get("observation_contract_hash"),
+            field=f"{method_id} observation_contract_hash",
+        ),
+        "risk_checkpoint_sha256": _normalise_sha256(
+            risk_binding.get("sha256"),
+            field="Stage5 Risk checkpoint sha256",
+        ),
+        "group_execution_contract_sha256": stable_hash(group_contract),
+        "shield_enabled": bool(group.get("shield", False)),
+        "policy_type": str(group.get("policy_type", "sb3_ppo")),
+    }
+    cache_dir = (
+        output.parent
+        / "episode_cache"
+        / method_id
+        / f"optimizer_seed_{optimizer_seed}"
+    ).resolve()
+    return {
+        "artifact_kind": "stage5_episode_cache_binding_v1",
+        "schema_version": 1,
+        "cache_dir": str(cache_dir),
+        "execution_fingerprint": stable_hash(identity),
+        "identity": identity,
+    }
+
+
 def _write_yaml_idempotent(path: Path, payload: Mapping[str, Any]) -> Path:
     if path.exists():
         with path.open("r", encoding="utf-8") as handle:
@@ -400,6 +552,32 @@ def generate(
     for path, _payload in manifests.values():
         if audit_manifest(path, required_seeds=seeds)["status"] != "reusable":
             raise ValueError(f"replicate manifest is not reusable: {path}")
+    config_maps = {
+        method_id: {
+            seed: _read_resolved_config(rows[seed])
+            for seed in seeds
+        }
+        for method_id, rows in row_maps.items()
+    }
+    risk_bindings = {
+        (
+            binding["path"],
+            binding["sha256"],
+        )
+        for configs in config_maps.values()
+        for binding in (
+            _risk_checkpoint_binding(config)
+            for config in configs.values()
+        )
+    }
+    risk_hashes = {digest for _path, digest in risk_bindings}
+    if len(risk_hashes) != 1:
+        raise ValueError("formal Stage5 methods do not bind one frozen Risk checkpoint")
+    risk_paths = sorted(path for path, _digest in risk_bindings)
+    risk_binding = {
+        "path": risk_paths[0],
+        "sha256": risk_hashes.pop(),
+    }
 
     # All Candidate arms are observation-identical and must bind the same frozen
     # ACCVP bundle.  Validate the explicit binding, not only its summary hash.
@@ -454,11 +632,21 @@ def generate(
         role = "stage5_confirmatory" if "stage5_confirmatory" in matching else matching[0]
 
     output = _resolve(output_dir)
+    evaluation_budget = _stage5_evaluation_budget(
+        workflow_config,
+        available_seed_count=len(simulator_seeds),
+    )
     comparison_requests: list[dict[str, Any]] = []
     for comparison in comparisons:
         comparison_id = comparison["comparison_id"]
         left_method = comparison["left_method_id"]
         right_method = comparison["right_method_id"]
+        simulator_seed_count = (
+            int(evaluation_budget["primary_simulator_seed_count"])
+            if comparison["role"] == "primary_final"
+            else int(evaluation_budget["secondary_simulator_seed_count"])
+        )
+        comparison_simulator_seeds = simulator_seeds[:simulator_seed_count]
         left_path, _ = manifests[left_method]
         right_path, _ = manifests[right_method]
         comparison_dir = output / "comparisons" / comparison_id
@@ -466,8 +654,8 @@ def generate(
         for seed in seeds:
             left = row_maps[left_method][seed]
             right = row_maps[right_method][seed]
-            left_cfg = _read_resolved_config(left)
-            right_cfg = _read_resolved_config(right)
+            left_cfg = config_maps[left_method][seed]
+            right_cfg = config_maps[right_method][seed]
             resolved = plain(right_cfg)
             resolved.setdefault("run", {})
             run_id = f"stage5_{comparison_id}_seed_{seed}"
@@ -492,13 +680,29 @@ def generate(
                 "optimizer_seed": seed,
                 "deployable_claim": comparison["role"] == "primary_final",
             }
+            left_group = _group(name=left_name, row=left, config=left_cfg)
+            right_group = _group(name=right_name, row=right, config=right_cfg)
+            if bool(evaluation_budget["episode_cache_enabled"]):
+                left_group["evaluation_cache"] = _episode_cache_binding(
+                    output=output,
+                    group=left_group,
+                    row=left,
+                    risk_binding=risk_binding,
+                )
+                right_group["evaluation_cache"] = _episode_cache_binding(
+                    output=output,
+                    group=right_group,
+                    row=right,
+                    risk_binding=risk_binding,
+                )
             stage5: dict[str, Any] = {
                 "paired_eval": True,
                 "same_seed": True,
                 "compare_shield_off_on": False,
                 "replay_enabled": True,
-                "episodes_per_group": len(simulator_seeds),
-                "seeds": simulator_seeds,
+                "episodes_per_group": len(comparison_simulator_seeds),
+                "seeds": comparison_simulator_seeds,
+                "risk_checkpoint": str(risk_binding["path"]),
                 "require_accvp_observation_runtime_gate": True,
                 "accvp_observation_preflight_reports": runtime_reports,
                 "accvp_observation_preflight_report_sha256s": runtime_report_hashes,
@@ -522,8 +726,8 @@ def generate(
                     }
                 ],
                 "groups": [
-                    _group(name=left_name, row=left, config=left_cfg),
-                    _group(name=right_name, row=right, config=right_cfg),
+                    left_group,
+                    right_group,
                 ],
             }
             resolved["stage5"] = stage5
@@ -559,11 +763,19 @@ def generate(
             "comparison_id": comparison_id,
             "comparison_family": comparison["family"],
             "comparison_role": comparison["role"],
+            "simulator_seed_count": len(comparison_simulator_seeds),
+            "simulator_seeds": comparison_simulator_seeds,
+            "simulator_seed_sha256": stable_hash(
+                {"episode_seeds": comparison_simulator_seeds}
+            ),
             "left_method_id": left_method,
             "right_method_id": right_method,
             "formal_aggregation": True,
             "minimum_training_seed_count": 5,
             "require_strict_lineage": True,
+            "require_episode_cache": bool(
+                evaluation_budget["episode_cache_enabled"]
+            ),
             "candidate_manifest": {
                 key: right_binding[key]
                 for key in ("path", "sha256", "artifact_fingerprint", "artifact_variant")
@@ -610,6 +822,11 @@ def generate(
         comparison_requests.append(
             {
                 **comparison,
+                "simulator_seed_count": len(comparison_simulator_seeds),
+                "simulator_seeds": comparison_simulator_seeds,
+                "simulator_seed_sha256": stable_hash(
+                    {"episode_seeds": comparison_simulator_seeds}
+                ),
                 "generated_dir": str(comparison_dir),
                 "replicated_request": str(request_path),
                 "replicated_request_sha256": file_sha256(request_path),
@@ -640,6 +857,27 @@ def generate(
         "optimizer_seeds": seeds,
         "simulator_seed_role": role,
         "simulator_seeds": simulator_seeds,
+        "evaluation_budget": {
+            **evaluation_budget,
+            "registered_simulator_seed_count": len(simulator_seeds),
+            "naive_episode_count": sum(
+                2 * len(seeds) * int(row["simulator_seed_count"])
+                for row in comparison_requests
+            ),
+            "unique_episode_count": (
+                len(manifests)
+                * len(seeds)
+                * int(evaluation_budget["secondary_simulator_seed_count"])
+                + 2
+                * len(seeds)
+                * (
+                    int(evaluation_budget["primary_simulator_seed_count"])
+                    - int(evaluation_budget["secondary_simulator_seed_count"])
+                )
+            ),
+        },
+        "risk_checkpoint": str(risk_binding["path"]),
+        "risk_checkpoint_sha256": str(risk_binding["sha256"]),
         "comparisons": comparison_requests,
         "final_comparison_report": final_rows[0]["aggregate_report"],
     }

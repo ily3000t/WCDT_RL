@@ -19,6 +19,11 @@ from safe_rl.analysis.paired_statistics import (
 )
 from safe_rl.evaluation_protocol import file_sha256, stable_hash
 from safe_rl.pipeline.common import write_report
+from safe_rl.pipeline.stage5_episode_cache import (
+    CACHE_EPISODE_KIND,
+    CACHE_IDENTITY_KIND,
+    CACHE_SCHEMA_VERSION,
+)
 
 
 REQUEST_ARTIFACT_KIND = "stage5_replicated_aggregate_request_v1"
@@ -292,6 +297,158 @@ def _lineage_checkpoint_sha256(source: Mapping[str, Any], *, group_name: str) ->
     return _explicit_sha256(record.get("sha256"), field=f"lineage {key} sha256")
 
 
+def _validate_episode_cache_lineage(
+    *,
+    source: Mapping[str, Any],
+    evidence: Mapping[str, Any],
+    source_path: Path,
+    group_names: tuple[str, str],
+    simulator_seeds: list[int],
+) -> dict[str, Any]:
+    declared = evidence.get("stage5_episode_caches", {})
+    if not isinstance(declared, Mapping):
+        raise ValueError(f"source Stage5 cache lineage is not an object: {source_path}")
+    group_records: dict[str, Any] = {}
+    present_count = 0
+    for group_name in group_names:
+        group = _group_report(source, group_name)
+        cache = group.get("episode_cache")
+        lineage = declared.get(group_name)
+        if cache is None and lineage is None:
+            continue
+        present_count += 1
+        if not isinstance(cache, Mapping) or not isinstance(lineage, Mapping):
+            raise ValueError(
+                f"source Stage5 cache lineage is incomplete for group {group_name!r}: "
+                f"{source_path}"
+            )
+        if dict(cache) != dict(lineage):
+            raise ValueError(
+                f"source Stage5 group/cache lineage mismatch for {group_name!r}: "
+                f"{source_path}"
+            )
+        if int(cache.get("requested_seed_count", -1)) != len(simulator_seeds):
+            raise ValueError(f"Stage5 cache seed count mismatch for group {group_name!r}")
+        if str(cache.get("requested_seed_sha256", "")) != stable_hash(
+            {"episode_seeds": simulator_seeds}
+        ):
+            raise ValueError(f"Stage5 cache seed hash mismatch for group {group_name!r}")
+        if int(cache.get("cache_hit_count", 0)) + int(
+            cache.get("executed_episode_count", 0)
+        ) != len(simulator_seeds):
+            raise ValueError(f"Stage5 cache hit/execute accounting mismatch for {group_name!r}")
+        identity_path = _resolve(
+            cache.get("identity_artifact", ""),
+            base_dir=source_path.parent,
+        )
+        expected_identity_sha = _explicit_sha256(
+            cache.get("identity_artifact_sha256"),
+            field=f"{group_name} cache identity_artifact_sha256",
+        )
+        if not identity_path.is_file() or file_sha256(identity_path) != expected_identity_sha:
+            raise ValueError(f"Stage5 cache identity artifact changed for {group_name!r}")
+        identity_payload = _read_json(identity_path)
+        execution_fingerprint = str(cache.get("execution_fingerprint", ""))
+        if (
+            str(identity_payload.get("artifact_kind", "")) != CACHE_IDENTITY_KIND
+            or int(identity_payload.get("schema_version", -1)) != CACHE_SCHEMA_VERSION
+            or str(identity_payload.get("execution_fingerprint", ""))
+            != execution_fingerprint
+        ):
+            raise ValueError(f"Stage5 cache identity contract mismatch for {group_name!r}")
+        identity = identity_payload.get("identity")
+        if not isinstance(identity, Mapping) or stable_hash(identity) != execution_fingerprint:
+            raise ValueError(f"Stage5 cache identity fingerprint mismatch for {group_name!r}")
+        if _explicit_sha256(
+            identity.get("checkpoint_sha256"),
+            field=f"{group_name} cache checkpoint_sha256",
+        ) != _lineage_checkpoint_sha256(source, group_name=group_name):
+            raise ValueError(f"Stage5 cache/checkpoint lineage mismatch for {group_name!r}")
+        artifacts = evidence.get("artifacts", {})
+        risk_record = (
+            artifacts.get("risk_checkpoint")
+            if isinstance(artifacts, Mapping)
+            else None
+        )
+        if not isinstance(risk_record, Mapping):
+            raise ValueError(f"Stage5 cache lineage is missing Risk checkpoint for {group_name!r}")
+        if _explicit_sha256(
+            identity.get("risk_checkpoint_sha256"),
+            field=f"{group_name} cache risk_checkpoint_sha256",
+        ) != _explicit_sha256(
+            risk_record.get("sha256"),
+            field="Stage5 lineage Risk checkpoint sha256",
+        ):
+            raise ValueError(f"Stage5 cache/Risk lineage mismatch for {group_name!r}")
+        episode_records = cache.get("episode_records", {})
+        if not isinstance(episode_records, Mapping):
+            raise ValueError(f"Stage5 cache records are not an object for {group_name!r}")
+        expected_keys = {str(seed) for seed in simulator_seeds}
+        if set(str(key) for key in episode_records) != expected_keys:
+            raise ValueError(f"Stage5 cache record coverage mismatch for {group_name!r}")
+        reported_episodes = {
+            str(int(item.get("seed", item.get("episode_seed", -1)))): dict(item)
+            for item in list(group.get("episodes", []) or [])
+        }
+        verified: dict[str, dict[str, str]] = {}
+        for seed in simulator_seeds:
+            record = episode_records[str(seed)]
+            if not isinstance(record, Mapping):
+                raise ValueError(f"Stage5 cache record is invalid for seed {seed}")
+            path = _resolve(record.get("path", ""), base_dir=source_path.parent)
+            expected_sha = _explicit_sha256(
+                record.get("sha256"),
+                field=f"{group_name} cache seed {seed} sha256",
+            )
+            if not path.is_file() or file_sha256(path) != expected_sha:
+                raise ValueError(
+                    f"Stage5 immutable cache record changed for {group_name!r} seed {seed}"
+                )
+            payload = _read_json(path)
+            if (
+                str(payload.get("artifact_kind", "")) != CACHE_EPISODE_KIND
+                or int(payload.get("schema_version", -1)) != CACHE_SCHEMA_VERSION
+                or str(payload.get("execution_fingerprint", ""))
+                != execution_fingerprint
+                or int(payload.get("seed", -1)) != seed
+            ):
+                raise ValueError(
+                    f"Stage5 immutable cache record contract mismatch for "
+                    f"{group_name!r} seed {seed}"
+                )
+            episode = payload.get("episode")
+            if not isinstance(episode, Mapping) or dict(episode) != reported_episodes[
+                str(seed)
+            ]:
+                raise ValueError(
+                    f"Stage5 report/cache episode mismatch for {group_name!r} seed {seed}"
+                )
+            verified[str(seed)] = {"path": str(path.resolve()), "sha256": expected_sha}
+        expected_fingerprint = stable_hash(
+            {
+                "execution_fingerprint": execution_fingerprint,
+                "episode_records": verified,
+                "requested_seeds": simulator_seeds,
+            }
+        )
+        if str(cache.get("episode_record_fingerprint", "")) != expected_fingerprint:
+            raise ValueError(f"Stage5 cache record fingerprint mismatch for {group_name!r}")
+        group_records[group_name] = {
+            "execution_fingerprint": execution_fingerprint,
+            "identity_artifact": str(identity_path.resolve()),
+            "identity_artifact_sha256": expected_identity_sha,
+            "episode_record_fingerprint": expected_fingerprint,
+            "cache_hit_count": int(cache.get("cache_hit_count", 0)),
+            "executed_episode_count": int(cache.get("executed_episode_count", 0)),
+        }
+    if present_count not in {0, len(group_names)}:
+        raise ValueError(f"source Stage5 report mixes cached and uncached paired groups: {source_path}")
+    return {
+        "enabled": present_count == len(group_names),
+        "groups": group_records,
+    }
+
+
 def _validate_source_report(
     source: Mapping[str, Any],
     *,
@@ -365,6 +522,13 @@ def _validate_source_report(
             raise ValueError(
                 f"source Stage5 lineage_fingerprint mismatch: {source_path}"
             )
+    episode_cache_lineage = _validate_episode_cache_lineage(
+        source=source,
+        evidence=evidence,
+        source_path=source_path,
+        group_names=(left_group_name, right_group_name),
+        simulator_seeds=left_seeds,
+    )
     acceptance = (
         None
         if source_acceptance_key is None
@@ -400,6 +564,7 @@ def _validate_source_report(
         "simulator_seeds": left_seeds,
         "acceptance": acceptance,
         "candidate_group_bundle": candidate_group_bundle,
+        "episode_cache_lineage": episode_cache_lineage,
     }
 
 
@@ -417,7 +582,32 @@ def aggregate_manifest(manifest_path: str | Path) -> dict[str, Any]:
     if not request_rows:
         raise ValueError("replicated aggregate request requires at least one replicate")
     require_strict_lineage = bool(manifest.get("require_strict_lineage", True))
+    require_episode_cache = bool(manifest.get("require_episode_cache", False))
     formal_aggregation = bool(manifest.get("formal_aggregation", True))
+    declared_simulator_seeds = [
+        int(value) for value in list(manifest.get("simulator_seeds", []) or [])
+    ]
+    has_declared_simulator_contract = any(
+        key in manifest
+        for key in (
+            "simulator_seeds",
+            "simulator_seed_count",
+            "simulator_seed_sha256",
+        )
+    )
+    if has_declared_simulator_contract:
+        if not declared_simulator_seeds:
+            raise ValueError("replicated aggregate simulator-seed contract is empty")
+        if len(declared_simulator_seeds) != len(set(declared_simulator_seeds)):
+            raise ValueError("replicated aggregate simulator-seed contract has duplicates")
+        if int(manifest.get("simulator_seed_count", -1)) != len(
+            declared_simulator_seeds
+        ):
+            raise ValueError("replicated aggregate simulator-seed count mismatch")
+        if str(manifest.get("simulator_seed_sha256", "")) != stable_hash(
+            {"episode_seeds": declared_simulator_seeds}
+        ):
+            raise ValueError("replicated aggregate simulator-seed hash mismatch")
     minimum_training_seed_count = int(
         manifest.get(
             "minimum_training_seed_count",
@@ -505,6 +695,20 @@ def aggregate_manifest(manifest_path: str | Path) -> dict[str, Any]:
             protocol_ids.add(str(source_metadata["protocol_id"]))
         if source_metadata["safety_metric_version"]:
             safety_metric_versions.add(str(source_metadata["safety_metric_version"]))
+        if has_declared_simulator_contract and source_metadata[
+            "simulator_seeds"
+        ] != sorted(declared_simulator_seeds):
+            raise ValueError(
+                "source Stage5 report does not match the preregistered simulator-seed "
+                f"contract: {source_path}"
+            )
+        if require_episode_cache and not bool(
+            source_metadata["episode_cache_lineage"].get("enabled", False)
+        ):
+            raise ValueError(
+                f"formal Stage5 source report is missing immutable episode-cache lineage: "
+                f"{source_path}"
+            )
         source_sha256 = file_sha256(source_path)
         resolved_source = str(source_path.resolve())
         source_records[resolved_source] = {
@@ -542,6 +746,9 @@ def aggregate_manifest(manifest_path: str | Path) -> dict[str, Any]:
                 "source_acceptance": source_metadata["acceptance"],
                 "candidate_group_bundle": source_metadata[
                     "candidate_group_bundle"
+                ],
+                "episode_cache_lineage": source_metadata[
+                    "episode_cache_lineage"
                 ],
             }
         )
@@ -632,6 +839,7 @@ def aggregate_manifest(manifest_path: str | Path) -> dict[str, Any]:
         "request_manifest_sha256": file_sha256(manifest_path),
         "formal_aggregation": formal_aggregation,
         "minimum_training_seed_count": minimum_training_seed_count,
+        "require_episode_cache": require_episode_cache,
         "protocol_id": next(iter(protocol_ids), ""),
         "safety_metric_version": next(iter(safety_metric_versions), ""),
         "source_reports": [
@@ -665,6 +873,14 @@ def aggregate_manifest(manifest_path: str | Path) -> dict[str, Any]:
         ),
         "strict_source_lineage_satisfied": (
             not formal_aggregation or require_strict_lineage
+        ),
+        "immutable_episode_cache_lineage_satisfied": (
+            not require_episode_cache
+            or all(
+                isinstance(row.get("episode_cache_lineage"), Mapping)
+                and row["episode_cache_lineage"].get("enabled") is True
+                for row in lineage_replicates
+            )
         ),
         "candidate_bundle_binding_satisfied": (
             not formal_aggregation or bool(candidate_binding.get("required", False))

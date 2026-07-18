@@ -20,6 +20,7 @@ from safe_rl.evaluation_protocol import (
 )
 from safe_rl.pipeline.common import latest_stage_file, load_stage_config, parse_config_arg, write_report
 from safe_rl.pipeline.accvp_observation_preflight import _gate as _accvp_observation_runtime_gate
+from safe_rl.pipeline.stage5_episode_cache import evaluate_policy_cached
 from safe_rl.rl.evaluation import evaluate_policy
 from safe_rl.sim.metrics import SAFETY_METRIC_VERSION
 from safe_rl.utils.config import clone_with_overrides, prepare_run_dir
@@ -1123,6 +1124,7 @@ def run(cfg) -> Path:
     replay_dir = stage_dir / "replay"
     group_reports = {}
     accvp_group_bindings: dict[str, dict[str, Any]] = {}
+    episode_cache_bindings: dict[str, dict[str, Any]] = {}
     for group_idx, group in enumerate(cfg.stage5.groups):
         group_cfg = clone_with_overrides(cfg, _group_overrides(group))
         if str(group_cfg.rl.get("reward_profile", "default")) in {"shield_guided_forecast", "merge_timing_forecast"}:
@@ -1153,18 +1155,42 @@ def run(cfg) -> Path:
             "stage5",
             f"group={group.name} policy_type={policy_type} forecast={bool(group.forecast_features)} shield={bool(group.shield)} model={model_path}",
         )
-        group_reports[group.name] = evaluate_policy(
-            group_cfg,
-            model_path,
-            seeds=seeds,
-            shield_enabled=bool(group.shield),
-            risk_checkpoint=risk_checkpoint if bool(group.shield) else None,
-            replay_dir=replay_dir if bool(cfg.stage5.get("replay_enabled", True)) and bool(cfg.run.get("replay", True)) else None,
-            group_name=str(group.name),
-            tensorboard=tb,
-            tensorboard_step_offset=group_idx * max(1, len(seeds)),
-            policy_type=policy_type,
-        )
+        cache_binding = dict(group.get("evaluation_cache", {}) or {})
+        if cache_binding:
+            group_reports[group.name] = evaluate_policy_cached(
+                evaluator=evaluate_policy,
+                cfg=group_cfg,
+                model_path=model_path,
+                seeds=seeds,
+                shield_enabled=bool(group.shield),
+                risk_checkpoint=risk_checkpoint if bool(group.shield) else None,
+                group_name=str(group.name),
+                policy_type=policy_type,
+                binding=cache_binding,
+            )
+            episode_cache_bindings[str(group.name)] = dict(
+                group_reports[group.name]["episode_cache"]
+            )
+            stage_log(
+                "stage5",
+                f"group={group.name} cache_hits="
+                f"{episode_cache_bindings[str(group.name)]['cache_hit_count']} "
+                f"executed={episode_cache_bindings[str(group.name)]['executed_episode_count']} "
+                f"cache={episode_cache_bindings[str(group.name)]['identity_artifact']}",
+            )
+        else:
+            group_reports[group.name] = evaluate_policy(
+                group_cfg,
+                model_path,
+                seeds=seeds,
+                shield_enabled=bool(group.shield),
+                risk_checkpoint=risk_checkpoint if bool(group.shield) else None,
+                replay_dir=replay_dir if bool(cfg.stage5.get("replay_enabled", True)) and bool(cfg.run.get("replay", True)) else None,
+                group_name=str(group.name),
+                tensorboard=tb,
+                tensorboard_step_offset=group_idx * max(1, len(seeds)),
+                policy_type=policy_type,
+            )
         group_reports[group.name]["stage3_observation_contract_validation"] = observation_contract
         bundle_lineage = observation_contract.get("accvp_bundle")
         if isinstance(bundle_lineage, dict):
@@ -1211,6 +1237,10 @@ def run(cfg) -> Path:
         name: accvp_group_bindings[name]
         for name in sorted(accvp_group_bindings)
     }
+    evidence_lineage["stage5_episode_caches"] = {
+        name: episode_cache_bindings[name]
+        for name in sorted(episode_cache_bindings)
+    }
     evidence_lineage["lineage_fingerprint"] = stable_hash(evidence_lineage)
 
     shield_off = {name: report for name, report in group_reports.items() if not bool(report.get("shield_enabled", False))}
@@ -1245,6 +1275,21 @@ def run(cfg) -> Path:
         "evidence_lineage": evidence_lineage,
         "stage3_lineage_validation": model_lineage,
         "frozen_accvp_runtime_preflight": frozen_runtime_preflight,
+        "episode_cache_summary": {
+            "enabled_group_count": len(episode_cache_bindings),
+            "cache_hit_count": sum(
+                int(item.get("cache_hit_count", 0))
+                for item in episode_cache_bindings.values()
+            ),
+            "executed_episode_count": sum(
+                int(item.get("executed_episode_count", 0))
+                for item in episode_cache_bindings.values()
+            ),
+            "bindings": {
+                name: episode_cache_bindings[name]
+                for name in sorted(episode_cache_bindings)
+            },
+        },
     }
     write_report(stage_dir / "formal_paired_eval_report.json", report)
     tb.close()

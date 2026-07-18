@@ -73,6 +73,16 @@ factorial:
     - candidate_table_reward_v3_1_commitment
   runtime_scope: all_candidate_methods
   final_comparison_id: wcdt_reward_v2__vs__candidate_table_reward_v3_1_commitment
+  stage5_evaluation:
+    # Secondary attribution contrasts use the common first 100 seeds.  The
+    # preregistered primary comparison extends that same prefix to all 300
+    # natural-confirmatory seeds.  Episode results are cached by immutable
+    # checkpoint/config/runtime identity, so a method/seed cell is simulated
+    # once and reused across comparisons.
+    secondary_simulator_seed_count: 100
+    primary_simulator_seed_count: 300
+    nested_seed_prefix: true
+    episode_cache_enabled: true
   comparisons:
     - comparison_id: wcdt_reward_v2__vs__candidate_table_reward_v2
       left_method_id: wcdt_reward_v2

@@ -11,6 +11,7 @@ from safe_rl.accvp.contracts.schema import file_sha256, stable_hash
 from safe_rl.evaluation_protocol import EvidenceProtocolError
 from safe_rl.pipeline import (
     stage5_factorial_aggregate,
+    stage5_episode_cache,
     stage5_generate_factorial_configs,
     stage5_paired_eval,
     stage5_run_factorial,
@@ -32,10 +33,116 @@ CANDIDATE_METHODS = (
 )
 
 
+class _AttrDict(dict):
+    __getattr__ = dict.__getitem__
+
+
 def _json(path: Path, payload: dict) -> Path:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(payload, sort_keys=True), encoding="utf-8")
     return path
+
+
+def test_episode_cache_reuses_common_prefix_and_only_executes_extension(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    model = tmp_path / "policy.zip"
+    risk = tmp_path / "risk.pt"
+    model.write_bytes(b"policy")
+    risk.write_bytes(b"risk")
+    identity = {
+        "method_id": "candidate_table_reward_v3_1_commitment",
+        "optimizer_seed": 1001,
+        "checkpoint_sha256": file_sha256(model),
+        "resolved_config": str(tmp_path / "resolved.yaml"),
+        "resolved_config_sha256": "a" * 64,
+        "reward_semantics_hash": "b" * 64,
+        "observation_contract_hash": "c" * 64,
+        "risk_checkpoint_sha256": file_sha256(risk),
+        "group_execution_contract_sha256": "d" * 64,
+        "shield_enabled": True,
+        "policy_type": "sb3_ppo",
+    }
+    binding = {
+        "artifact_kind": "stage5_episode_cache_binding_v1",
+        "schema_version": 1,
+        "cache_dir": str(tmp_path / "cache"),
+        "execution_fingerprint": stable_hash(identity),
+        "identity": identity,
+    }
+    calls: list[list[int]] = []
+
+    def fake_evaluator(
+        _cfg,
+        _model_path,
+        *,
+        seeds,
+        **_kwargs,
+    ):
+        calls.append(list(seeds))
+        return {
+            "episodes": [
+                {
+                    "seed": int(seed),
+                    "episode_reward": float(seed),
+                    "merge_success": True,
+                }
+                for seed in seeds
+            ],
+            "model_observation_shape": [159],
+            "env_observation_shape": [159],
+            "policy_type": "sb3_ppo",
+        }
+
+    monkeypatch.setattr(
+        stage5_episode_cache,
+        "aggregate_episode_reports",
+        lambda reports, task_quality=None: {"episodes": len(reports)},
+    )
+    cfg = SimpleNamespace(stage5=_AttrDict(task_quality={}))
+
+    first = stage5_episode_cache.evaluate_policy_cached(
+        evaluator=fake_evaluator,
+        cfg=cfg,
+        model_path=model,
+        seeds=[80001, 80002],
+        shield_enabled=True,
+        risk_checkpoint=risk,
+        group_name="candidate_seed_1001",
+        policy_type="sb3_ppo",
+        binding=binding,
+    )
+    repeated = stage5_episode_cache.evaluate_policy_cached(
+        evaluator=fake_evaluator,
+        cfg=cfg,
+        model_path=model,
+        seeds=[80001, 80002],
+        shield_enabled=True,
+        risk_checkpoint=risk,
+        group_name="candidate_seed_1001",
+        policy_type="sb3_ppo",
+        binding=binding,
+    )
+    extended = stage5_episode_cache.evaluate_policy_cached(
+        evaluator=fake_evaluator,
+        cfg=cfg,
+        model_path=model,
+        seeds=[80001, 80002, 80003],
+        shield_enabled=True,
+        risk_checkpoint=risk,
+        group_name="candidate_seed_1001",
+        policy_type="sb3_ppo",
+        binding=binding,
+    )
+
+    assert calls == [[80001, 80002], [80003]]
+    assert first["episode_cache"]["executed_episode_count"] == 2
+    assert repeated["episode_cache"]["cache_hit_count"] == 2
+    assert repeated["episode_cache"]["executed_episode_count"] == 0
+    assert extended["episode_cache"]["cache_hit_count"] == 2
+    assert extended["episode_cache"]["executed_episode_count"] == 1
+    assert [row["seed"] for row in extended["episodes"]] == [80001, 80002, 80003]
 
 
 def _runtime_fixture(tmp_path: Path) -> tuple[Path, Path, dict]:
@@ -137,6 +244,8 @@ def test_generate_writes_group_specific_runtime_bindings(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     seeds = list(range(1001, 1006))
+    risk_checkpoint = tmp_path / "risk_module.pt"
+    risk_checkpoint.write_bytes(b"frozen-risk")
     artifact_binding = {
         "accvp_artifact_manifest": str(tmp_path / "accvp_bundle.json"),
         "accvp_artifact_manifest_sha256": "a" * 64,
@@ -160,8 +269,13 @@ def test_generate_writes_group_specific_runtime_bindings(
                 "training_semantics_version": method_id,
                 "merge_timing_reward": {"reward_version": method_id},
                 "policy_lateral_commitment": {"enabled": "commitment" in method_id},
+                "shield_guided_reward": {
+                    "risk_checkpoint": str(risk_checkpoint),
+                },
             },
         }
+        if method_id != "wcdt_reward_v2":
+            config["accvp"]["risk_checkpoint"] = str(risk_checkpoint)
         config_path.parent.mkdir(parents=True, exist_ok=True)
         config_path.write_text(yaml.safe_dump(config), encoding="utf-8")
         records = []
@@ -246,10 +360,29 @@ def test_generate_writes_group_specific_runtime_bindings(
         "protocol_snapshot",
         lambda _cfg: {
             "cohort_roles": {"stage5_confirmatory": "natural_confirmatory"},
-            "cohorts": {"natural_confirmatory": [50001, 50002]},
+            "cohorts": {"natural_confirmatory": list(range(80001, 80301))},
         },
     )
     protocol_path = _json(tmp_path / "protocol.json", {})
+    workflow = tmp_path / "workflow.yaml"
+    workflow.write_text(
+        yaml.safe_dump(
+            {
+                "artifact_kind": "accvp_vnext_workflow_contract_v1",
+                "factorial": {
+                    "stage5_evaluation": {
+                        "secondary_simulator_seed_count": 100,
+                        "primary_simulator_seed_count": 300,
+                        "nested_seed_prefix": True,
+                        "episode_cache_enabled": True,
+                    },
+                    "comparisons": [dict(item) for item in DEFAULT_COMPARISONS],
+                },
+            },
+            sort_keys=False,
+        ),
+        encoding="utf-8",
+    )
     output = tmp_path / "generated"
     request_path = stage5_generate_factorial_configs.generate(
         baseline_manifest=manifests["wcdt_reward_v2"],
@@ -258,15 +391,25 @@ def test_generate_writes_group_specific_runtime_bindings(
         seed_role="stage5_confirmatory",
         runtime_factorial_report=runtime_path,
         output_dir=output,
+        workflow_config=workflow,
     )
     request = json.loads(request_path.read_text(encoding="utf-8"))
     assert request["final_method_id"] == EXPECTED_FINAL_METHOD_ID
     assert len(request["comparisons"]) == 6
+    assert request["evaluation_budget"]["naive_episode_count"] == 8000
+    assert request["evaluation_budget"]["unique_episode_count"] == 4500
+    assert request["risk_checkpoint_sha256"] == file_sha256(risk_checkpoint)
 
     single_dir = output / "comparisons" / DEFAULT_COMPARISONS[0]["comparison_id"]
     single_cfg = yaml.safe_load((single_dir / "stage5_seed_1001.yaml").read_text(encoding="utf-8"))
     assert len(single_cfg["stage5"]["accvp_observation_preflight_reports"]) == 1
     assert "accvp_observation_preflight_report" not in single_cfg["stage5"]
+    assert single_cfg["stage5"]["episodes_per_group"] == 100
+    assert len(single_cfg["stage5"]["seeds"]) == 100
+    assert single_cfg["stage5"]["risk_checkpoint"] == str(risk_checkpoint.resolve())
+    assert single_cfg["stage5"]["groups"][1]["evaluation_cache"]["artifact_kind"] == (
+        "stage5_episode_cache_binding_v1"
+    )
 
     crossed_id = DEFAULT_COMPARISONS[1]["comparison_id"]
     crossed_cfg = yaml.safe_load(
@@ -276,6 +419,19 @@ def test_generate_writes_group_specific_runtime_bindings(
     )
     assert len(crossed_cfg["stage5"]["accvp_observation_preflight_reports"]) == 2
     assert "accvp_observation_preflight_report" not in crossed_cfg["stage5"]
+    final_cfg = yaml.safe_load(
+        (
+            output
+            / "comparisons"
+            / FINAL_COMPARISON_ID
+            / "stage5_seed_1001.yaml"
+        ).read_text(encoding="utf-8")
+    )
+    assert final_cfg["stage5"]["episodes_per_group"] == 300
+    first_wcdt = single_cfg["stage5"]["groups"][0]["evaluation_cache"]
+    final_wcdt = final_cfg["stage5"]["groups"][0]["evaluation_cache"]
+    assert first_wcdt["cache_dir"] == final_wcdt["cache_dir"]
+    assert first_wcdt["execution_fingerprint"] == final_wcdt["execution_fingerprint"]
 
 
 def test_factorial_aggregate_exposes_final_child_and_does_not_invent_pvalues(

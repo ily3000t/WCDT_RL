@@ -306,6 +306,21 @@ bounded stale 状态不得通过 Risk gate；连续故障、恢复和 stale age 
 `episode_reward`；crossed cells 不满足 pooled McNemar 的独立性时，报告明确不执行该检验。
 只有存在显式且合法的同一家族 p 值时才执行 Holm；不会从置信区间反推 p 值。
 
+VNext Stage5 使用嵌套的两级 confirmatory seed 预算：
+
+- 五个次要机制比较使用 seed ledger 的固定前 100 个 seeds；
+- `wcdt_v2_vs_final_method` 主要比较使用相同的前 100 个 seeds，并扩展到固定 300 个；
+- 同一 method、optimizer seed、policy checkpoint、Risk checkpoint 和执行契约具有唯一 cache
+  identity；单个 simulator seed 的 episode 记录创建后不可覆盖；
+- 重复出现的方法从缓存读取，主要比较只执行尚未存在的后 200 个 seeds；
+- paired report 和 replicated aggregate 都校验 cache identity、每个 episode 文件 hash、seed
+  覆盖及 lineage，缓存不完整或被修改会 fail closed。
+
+按五个 optimizer seeds 计算，分层设计若不复用仍需 8,000 episodes；不可变缓存把实际唯一
+SUMO episodes 降为 4,500（五个唯一方法在 100-seed 前缀上各 500，加上主比较两种方法各扩展
+1,000）。它替代原先“六个比较全部 300 seeds”的 18,000 episodes，但不减少主要比较的 300
+seeds，也不改变训练、runtime 或 final holdout 的 seed cohort。
+
 每个 Candidate group 必须绑定其自身 checkpoint 对应的 runtime preflight。最终 holdout 只接收
 WcDT Reward-v2 vs Reward-v3.1+commitment 的标准 replicated child report，以及最终方法的五
 副本 runtime child；factorial umbrella 用于上游完整性 gate，不直接替代这两个 promotion artifact。

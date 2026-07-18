@@ -117,8 +117,8 @@ python -m safe_rl.pipeline.run_accvp_vnext_pipeline --run-until stage5_replicate
 | 11 | `candidate_ppo_replicates` | 冻结 factorial plan，顺序训练四个 Candidate 方法 × 五个 optimizer seeds，共 20 个唯一 checkpoints；支持基于 config/checkpoint/report hash 的安全续跑。|
 | 12 | `baseline_ppo_replicates` | 训练/复用与 Candidate 对齐的五个 WcDT Reward-v2 baseline checkpoints。|
 | 13 | `policy_runtime_replicates` | 对四个 Candidate 方法的 20 个 PPO checkpoints 分别执行完整 159D policy runtime benchmark；每个 Stage5 policy group 只绑定自身 checkpoint 的报告，总 gate 取所有方法最差结果。|
-| 14 | `stage5_generate` | 生成六个冻结比较及每个 training seed 的 paired 配置；左右共享 simulator seeds，跨 Reward 比较不使用不可比的训练 `episode_reward`。|
-| 15 | `stage5_replicates_and_aggregate` | 可恢复地运行六组 Stage5，分别做 crossed training-seed × simulator-seed bootstrap，再生成 `stage5_factorial_report_v1`。|
+| 14 | `stage5_generate` | 生成六个冻结比较及每个 training seed 的 paired 配置；次要机制比较使用 confirmatory ledger 的前 100 个 seeds，WcDT-v2 对最终完整方法使用同一前缀扩展到 300 个 seeds。左右共享 simulator seeds，跨 Reward 比较不使用不可比的训练 `episode_reward`。|
+| 15 | `stage5_replicates_and_aggregate` | 可恢复地运行六组 Stage5；同一 method/checkpoint 的单 seed episode 写入不可变缓存并跨比较复用，然后分别做 crossed training-seed × simulator-seed bootstrap，最终生成 `stage5_factorial_report_v1`。|
 | 16 | `one_shot_final_holdout` | 只绑定最终方法的五副本 runtime child 与 WcDT-v2 vs Reward-v3.1+commitment promotion child；在全部冻结后显式打开一次。|
 
 当 `accvp_training` 已完成且状态显示 `next_phase=scorer_runtime_preflight` 时，下一步可以二选一：
@@ -169,6 +169,8 @@ safe_rl_output/runs/accvp_vnext_runtime/
 safe_rl_output/runs/accvp_vnext_stage5/
   generated/factorial_request.json
   generated/comparisons/<comparison_id>/replicated_report.json
+  episode_cache/<method_id>/optimizer_seed_<seed>/identity.json
+  episode_cache/<method_id>/optimizer_seed_<seed>/episodes/seed_<simulator_seed>.json
   factorial_report.json
 ```
 
@@ -176,6 +178,15 @@ Stage5 预注册六个比较：Candidate Table（Reward-v2）归因、v2 下 com
 时 persistence、有 commitment 时 persistence、v3.1 下 commitment，以及 WcDT Reward-v2
 对最终完整方法。crossed bootstrap 当前不产生可用于跨比较 Holm 家族的合法 p 值，因此总
 报告会明确记录 `performed=false`，不会从置信区间反推或伪造 p 值。
+
+为了避免把六个问题都机械地扩展到 300 个 seeds，workflow 冻结两级预算：五个次要机制比较
+各使用同一 confirmatory ledger 的前 100 个 seeds；唯一的主要比较
+`wcdt_v2_vs_final_method` 使用相同前缀并扩展到 300 个。每个方法、optimizer seed、checkpoint、
+Risk checkpoint 和执行契约共同定义一个 cache identity；每个 simulator seed 独立写入一次且
+不可覆盖。因而同一 WcDT 或 Candidate 方法出现在多个比较时会复用完全相同的 episode，
+主要比较只补跑缺少的 200 个 seeds。该设计把实际 SUMO 负载从原先的 18,000 episodes 降为
+4,500 个唯一 episodes；统计比较仍只读取各自预注册的 seed 子集，不会把次要比较结果混入
+主要比较。
 
 最终 holdout 只有在全部上游门槛通过并冻结后才能显式打开：
 
