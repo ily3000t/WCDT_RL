@@ -99,6 +99,10 @@ def _gate(
         "accvp_table_model_error_count",
         "accvp_table_invalid_bundle_count",
         "accvp_table_invalid_output_count",
+        "accvp_table_runtime_context_error_count",
+        "accvp_table_critical_actor_overflow_count",
+        "accvp_table_unexpected_value_error_count",
+        "accvp_table_runtime_error_reasons",
         "accvp_table_warmup_error_count",
         "accvp_table_warmup_ready_rate",
         "accvp_table_latency_p95",
@@ -149,6 +153,18 @@ def _gate(
         "model_error_count_zero": int(metrics.get("accvp_table_model_error_count", 0)) == 0,
         "invalid_bundle_count_zero": int(metrics.get("accvp_table_invalid_bundle_count", 0)) == 0,
         "invalid_output_count_zero": int(metrics.get("accvp_table_invalid_output_count", 0)) == 0,
+        "runtime_context_error_count_zero": int(
+            metrics.get("accvp_table_runtime_context_error_count", 0)
+        )
+        == 0,
+        "critical_actor_overflow_count_zero": int(
+            metrics.get("accvp_table_critical_actor_overflow_count", 0)
+        )
+        == 0,
+        "unexpected_value_error_count_zero": int(
+            metrics.get("accvp_table_unexpected_value_error_count", 0)
+        )
+        == 0,
         "warmup_error_count_zero": int(metrics.get("accvp_table_warmup_error_count", 0)) == 0,
         "warmup_ready": float(metrics.get("accvp_table_warmup_ready_rate", 0.0)) >= 1.0,
         "latency_p95_within_0_30s": (
@@ -183,7 +199,7 @@ def _gate(
             "last_valid_fallback_rate_activation_window": "<= 0.005",
             "hard_fail_closed_count": "0",
             "max_consecutive_timeouts": "<= 1",
-            "model/bundle/output/warmup_errors": "0",
+            "model/bundle/output/context/overflow/unexpected/warmup_errors": "0",
             "warmup_ready_rate": "1.0",
             "latency_p95_s": "<= 0.30",
             "latency_p99_s": "<= 0.40",

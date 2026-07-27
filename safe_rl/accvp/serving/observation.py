@@ -15,7 +15,11 @@ from typing import Any
 import numpy as np
 
 from safe_rl.accvp.contracts.protocol import effective_activation_distance
-from safe_rl.accvp.serving.predictor import ACCVPRuntimePredictor
+from safe_rl.accvp.serving.predictor import (
+    ACCVPCriticalActorOverflow,
+    ACCVPRuntimeContextError,
+    ACCVPRuntimePredictor,
+)
 from safe_rl.accvp.contracts.schema import file_sha256
 from safe_rl.risk.merge_local import is_candidate_legal
 from safe_rl.risk.risk_module import RiskModuleWrapper
@@ -75,6 +79,9 @@ class ACCVPObservationStats:
     model_error_count: int = 0
     invalid_bundle_count: int = 0
     invalid_output_count: int = 0
+    runtime_context_error_count: int = 0
+    critical_actor_overflow_count: int = 0
+    unexpected_value_error_count: int = 0
     fail_closed_count: int = 0
     hard_fail_closed_count: int = 0
     last_valid_fallback_count: int = 0
@@ -89,6 +96,7 @@ class ACCVPObservationStats:
     consecutive_timeout_count: int = 0
     max_consecutive_timeout_count: int = 0
     stale_rejection_reasons: dict[str, int] = field(default_factory=dict)
+    runtime_error_reasons: dict[str, int] = field(default_factory=dict)
     stale_age_s: list[float] = field(default_factory=list)
     stale_context_delta_norm: list[float] = field(default_factory=list)
     warmup_latency_s: list[float] = field(default_factory=list)
@@ -156,6 +164,10 @@ class ACCVPObservationStats:
             "accvp_table_model_error_count": int(self.model_error_count),
             "accvp_table_invalid_bundle_count": int(self.invalid_bundle_count),
             "accvp_table_invalid_output_count": int(self.invalid_output_count),
+            "accvp_table_runtime_context_error_count": int(self.runtime_context_error_count),
+            "accvp_table_critical_actor_overflow_count": int(self.critical_actor_overflow_count),
+            "accvp_table_unexpected_value_error_count": int(self.unexpected_value_error_count),
+            "accvp_table_runtime_error_reasons": dict(self.runtime_error_reasons),
             "accvp_table_fail_closed_count": int(self.fail_closed_count),
             "accvp_table_hard_fail_closed_count": int(self.hard_fail_closed_count),
             "accvp_table_last_valid_fallback_count": int(self.last_valid_fallback_count),
@@ -232,6 +244,9 @@ class ACCVPObservationStats:
                 and int(self.model_error_count) == 0
                 and int(self.invalid_bundle_count) == 0
                 and int(self.invalid_output_count) == 0
+                and int(self.runtime_context_error_count) == 0
+                and int(self.critical_actor_overflow_count) == 0
+                and int(self.unexpected_value_error_count) == 0
                 and int(self.warmup_error_count) == 0
                 and (total_latency["p95"] is not None and float(total_latency["p95"]) <= 0.30)
                 and (total_latency["p99"] is not None and float(total_latency["p99"]) <= 0.40)
@@ -676,12 +691,25 @@ class RiskGatedACCVPCandidateTableAugmentor:
         except ACCVPInvalidRuntimeOutput:
             self.stats.consecutive_timeout_count = 0
             self.stats.invalid_output_count += 1
+            self._record_runtime_error("invalid_runtime_output")
+        except ACCVPCriticalActorOverflow as exc:
+            self.stats.consecutive_timeout_count = 0
+            self.stats.runtime_context_error_count += 1
+            self.stats.critical_actor_overflow_count += 1
+            self._record_runtime_error(exc.reason_code)
+        except ACCVPRuntimeContextError as exc:
+            self.stats.consecutive_timeout_count = 0
+            self.stats.runtime_context_error_count += 1
+            self._record_runtime_error(exc.reason_code)
         except ValueError:
             self.stats.consecutive_timeout_count = 0
-            self.stats.invalid_bundle_count += 1
-        except Exception:
+            self.stats.unexpected_value_error_count += 1
+            self.stats.model_error_count += 1
+            self._record_runtime_error("unexpected_value_error")
+        except Exception as exc:
             self.stats.consecutive_timeout_count = 0
             self.stats.model_error_count += 1
+            self._record_runtime_error(f"model_error:{type(exc).__name__}")
         self._record_latency(time.perf_counter() - started, stage_latencies)
         if self.fail_closed_defaults:
             return self._invalid_table_rows(context, self._fail_closed_rows(context))
@@ -694,6 +722,12 @@ class RiskGatedACCVPCandidateTableAugmentor:
             self.stats.max_consecutive_timeout_count,
             self.stats.consecutive_timeout_count,
         )
+
+    def _record_runtime_error(self, reason: str) -> None:
+        key = str(reason or "unknown_runtime_error")
+        self.stats.runtime_error_reasons[key] = int(
+            self.stats.runtime_error_reasons.get(key, 0)
+        ) + 1
 
     def _validate_scores(
         self,

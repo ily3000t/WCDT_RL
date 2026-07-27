@@ -31,6 +31,58 @@ def _require_torch():
     return torch
 
 
+class ACCVPRuntimeContextError(ValueError):
+    """A fail-closed runtime input/coverage error with a stable audit code."""
+
+    def __init__(self, message: str, *, reason_code: str):
+        super().__init__(message)
+        self.reason_code = str(reason_code)
+
+
+class ACCVPCriticalActorOverflow(ACCVPRuntimeContextError):
+    """Critical merge actors could not all be represented in the fixed rows."""
+
+
+def validate_runtime_actor_rows(runtime: dict[str, Any], actor_count: int) -> int:
+    """Validate the fixed actor-row contract while allowing legal padded rows.
+
+    V3 represents absent actors with an empty ``actor_row_ids`` value and a
+    zero mask.  Fewer live actors than the configured row capacity is therefore
+    normal and must not be treated as incomplete coverage.  A critical actor
+    overflow remains a fail-closed condition.
+    """
+
+    expected = int(actor_count)
+    actor_row_ids = [str(value) for value in list(runtime.get("actor_row_ids", []))]
+    actor_mask = np.asarray(runtime.get("mask", []), dtype=np.float32)
+    if actor_mask.ndim == 2 and actor_mask.shape[0] == 1:
+        actor_mask = actor_mask[0]
+    actor_mask = actor_mask.reshape(-1)
+    if len(actor_row_ids) != expected or int(actor_mask.size) != expected:
+        raise ACCVPRuntimeContextError(
+            "ACCVP runtime actor row shape does not match the fixed model contract",
+            reason_code="actor_row_shape_mismatch",
+        )
+    for row, (vehicle_id, valid) in enumerate(zip(actor_row_ids, actor_mask.tolist())):
+        if float(valid) > 0.0 and not vehicle_id:
+            raise ACCVPRuntimeContextError(
+                f"ACCVP runtime actor row {row} is valid but has no vehicle ID",
+                reason_code="valid_actor_row_missing_id",
+            )
+        if float(valid) <= 0.0 and vehicle_id:
+            raise ACCVPRuntimeContextError(
+                f"ACCVP runtime actor row {row} is padded but has a vehicle ID",
+                reason_code="padded_actor_row_has_id",
+            )
+    selection = runtime.get("actor_selection")
+    if bool(getattr(selection, "critical_overflow", False)):
+        raise ACCVPCriticalActorOverflow(
+            "ACCVP runtime critical actor coverage exceeds the fixed model capacity",
+            reason_code="critical_actor_overflow",
+        )
+    return int(np.count_nonzero(actor_mask > 0.0))
+
+
 class ACCVPRuntimePredictor:
     def __init__(self, config: Any, checkpoint: str | Path, *, use_inference_worker: bool = True):
         torch = _require_torch()
@@ -172,19 +224,28 @@ class ACCVPRuntimePredictor:
 
     def prepare_candidates(self, context: dict[str, Any], legal_actions: list[CandidateAction]) -> dict[str, Any]:
         if not legal_actions:
-            raise ValueError("cannot prepare ACCVP inference without legal actions")
+            raise ACCVPRuntimeContextError(
+                "cannot prepare ACCVP inference without legal actions",
+                reason_code="no_legal_actions",
+            )
         ego = context.get("ego")
         history = context.get("history")
         if ego is None or history is None:
-            raise ValueError("ACCVP runtime requires ego and history")
+            raise ACCVPRuntimeContextError(
+                "ACCVP runtime requires ego and history",
+                reason_code="missing_ego_or_history",
+            )
         profile_from_config(self.config)
-        runtime = build_v3_runtime_batch(self.config, history, str(ego.vehicle_id))
-        selected = [str(value) for value in runtime.get("runtime_agent_ids", [])[1:]]
-        selection = runtime.get("actor_selection")
-        if len(selected) < int(self.config.accvp.actor_count) or bool(
-            getattr(selection, "critical_overflow", False)
-        ):
-            raise ValueError("ACCVP runtime actor coverage is incomplete")
+        try:
+            runtime = build_v3_runtime_batch(self.config, history, str(ego.vehicle_id))
+        except ACCVPRuntimeContextError:
+            raise
+        except ValueError as exc:
+            raise ACCVPRuntimeContextError(
+                f"ACCVP runtime batch construction failed: {exc}",
+                reason_code="runtime_batch_invalid",
+            ) from exc
+        validate_runtime_actor_rows(runtime, int(self.config.accvp.actor_count))
         candidate_plans = np.stack(
             [
                 build_commitment_plan(

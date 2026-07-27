@@ -109,11 +109,21 @@ def _accvp_observation_metrics(reports: list[dict]) -> dict:
     model_error_count = int(sum(int(report.get("accvp_table_model_error_count", 0)) for report in reports))
     invalid_bundle_count = int(sum(int(report.get("accvp_table_invalid_bundle_count", 0)) for report in reports))
     invalid_output_count = int(sum(int(report.get("accvp_table_invalid_output_count", 0)) for report in reports))
+    runtime_context_error_count = int(
+        sum(int(report.get("accvp_table_runtime_context_error_count", 0)) for report in reports)
+    )
+    critical_actor_overflow_count = int(
+        sum(int(report.get("accvp_table_critical_actor_overflow_count", 0)) for report in reports)
+    )
+    unexpected_value_error_count = int(
+        sum(int(report.get("accvp_table_unexpected_value_error_count", 0)) for report in reports)
+    )
     latencies: list[float] = []
     warmup_latencies: list[float] = []
     stale_ages: list[float] = []
     stale_context_deltas: list[float] = []
     stale_rejection_reasons: Counter[str] = Counter()
+    runtime_error_reasons: Counter[str] = Counter()
     stage_latencies: dict[str, list[float]] = {
         "context_legality": [],
         "accvp_prepare_candidates": [],
@@ -138,6 +148,7 @@ def _accvp_observation_metrics(reports: list[dict]) -> dict:
             float(value) for value in list(report.get("accvp_table_stale_context_delta_norm", []) or [])
         )
         stale_rejection_reasons.update(dict(report.get("accvp_table_stale_rejection_reasons", {}) or {}))
+        runtime_error_reasons.update(dict(report.get("accvp_table_runtime_error_reasons", {}) or {}))
         stage_payload = dict(report.get("accvp_table_latency_stage_s", {}) or {})
         for stage_name in stage_latencies:
             stage_latencies[stage_name].extend(
@@ -169,6 +180,9 @@ def _accvp_observation_metrics(reports: list[dict]) -> dict:
         and model_error_count == 0
         and invalid_bundle_count == 0
         and invalid_output_count == 0
+        and runtime_context_error_count == 0
+        and critical_actor_overflow_count == 0
+        and unexpected_value_error_count == 0
         and warmup_error_count == 0
         and warmup_ready_rate >= 1.0
         and latency_p95 is not None
@@ -217,6 +231,10 @@ def _accvp_observation_metrics(reports: list[dict]) -> dict:
         "accvp_table_model_error_count": model_error_count,
         "accvp_table_invalid_bundle_count": invalid_bundle_count,
         "accvp_table_invalid_output_count": invalid_output_count,
+        "accvp_table_runtime_context_error_count": runtime_context_error_count,
+        "accvp_table_critical_actor_overflow_count": critical_actor_overflow_count,
+        "accvp_table_unexpected_value_error_count": unexpected_value_error_count,
+        "accvp_table_runtime_error_reasons": dict(runtime_error_reasons),
         "accvp_table_latency_count": int(len(latencies)),
         "accvp_table_latency_p50": latency_summary["p50"],
         "accvp_table_latency_p95": latency_summary["p95"],

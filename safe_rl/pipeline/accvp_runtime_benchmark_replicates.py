@@ -99,6 +99,9 @@ def runtime_replicate_request_fingerprint(
         {
             "artifact_kind": RUNTIME_REPLICATE_REPORT_KIND,
             "schema_version": RUNTIME_REPLICATE_REPORT_SCHEMA_VERSION,
+            "runtime_implementation_version": (
+                accvp_runtime_benchmark.RUNTIME_IMPLEMENTATION_VERSION
+            ),
             "method_id": str(manifest.get("method_id", "")),
             "config_template": str(config_template),
             "config_template_sha256": file_sha256(config_template),
@@ -126,6 +129,10 @@ def _validate_single_runtime_report(
         raise ValueError("existing runtime replicate has an unsupported artifact kind")
     if str(report.get("policy_type", "")) != "sb3_ppo":
         raise ValueError("existing runtime replicate is not an SB3 PPO policy benchmark")
+    if str(report.get("runtime_implementation_version", "")) != (
+        accvp_runtime_benchmark.RUNTIME_IMPLEMENTATION_VERSION
+    ):
+        raise ValueError("existing runtime replicate implementation version mismatch")
     if str(report.get("backend", "")) != str(backend):
         raise ValueError("existing runtime replicate backend disagrees with the request")
     if str(report.get("policy_model_sha256", "")) != str(row.get("checkpoint_sha256", "")):
@@ -162,6 +169,10 @@ def validate_runtime_replicate_report(
         raise ValueError("unsupported replicated runtime benchmark report schema")
     if str(report.get("status", "")) != "complete":
         raise ValueError("replicated runtime benchmark report is not complete")
+    if str(report.get("runtime_implementation_version", "")) != (
+        accvp_runtime_benchmark.RUNTIME_IMPLEMENTATION_VERSION
+    ):
+        raise ValueError("replicated runtime benchmark implementation version mismatch")
     if str(report.get("request_fingerprint", "")) != expected_request_fingerprint:
         raise ValueError("replicated runtime benchmark request fingerprint mismatch")
     if str(report.get("replicate_manifest_sha256", "")) != file_sha256(replicate_manifest):
@@ -300,6 +311,9 @@ def run(
     payload = {
         "artifact_kind": RUNTIME_REPLICATE_REPORT_KIND,
         "schema_version": RUNTIME_REPLICATE_REPORT_SCHEMA_VERSION,
+        "runtime_implementation_version": (
+            accvp_runtime_benchmark.RUNTIME_IMPLEMENTATION_VERSION
+        ),
         "status": "complete",
         "method_id": str(manifest.get("method_id", "")),
         "backend": backend,

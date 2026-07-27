@@ -181,6 +181,46 @@ def test_factorial_runtime_resume_reuses_complete_total_and_rejects_changed_requ
         )
 
 
+def test_factorial_runtime_archives_failed_legacy_implementation_before_rerun(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    factorial_source, factorial = _factorial_fixture(tmp_path)
+    calls: list[dict] = []
+    _install_factorial_fakes(monkeypatch, factorial, calls)
+    output = tmp_path / "runtime" / "factorial_runtime_report.json"
+    factorial_runtime.run(
+        factorial_manifest=factorial_source,
+        seeds=SIMULATOR_SEEDS,
+        backend="vectorized",
+        output=output,
+    )
+
+    legacy = json.loads(output.read_text(encoding="utf-8"))
+    legacy.pop("runtime_implementation_version")
+    legacy["gate"]["pass"] = False
+    legacy["report_fingerprint"] = factorial_runtime._report_fingerprint(legacy)
+    _write_json(output, legacy)
+    calls.clear()
+
+    factorial_runtime.run(
+        factorial_manifest=factorial_source,
+        seeds=SIMULATOR_SEEDS,
+        backend="vectorized",
+        output=output,
+    )
+
+    assert len(calls) == 4
+    report = json.loads(output.read_text(encoding="utf-8"))
+    assert report["runtime_implementation_version"] == (
+        factorial_runtime.RUNTIME_IMPLEMENTATION_VERSION
+    )
+    prior = report["prior_failed_attempt"]
+    archive_dir = Path(prior["archive_dir"])
+    assert prior["runtime_implementation_version"] == "legacy"
+    assert (archive_dir / output.name).is_file()
+    assert (archive_dir / "methods").is_dir()
+
+
 def test_replicate_runtime_resume_validator_rejects_checkpoint_or_seed_drift(tmp_path: Path):
     template = tmp_path / "template.yaml"
     template.write_text("run:\n  seed: 1\n", encoding="utf-8")
@@ -201,6 +241,9 @@ def test_replicate_runtime_resume_validator_rejects_checkpoint_or_seed_drift(tmp
         child_payload = {
             "artifact_kind": "accvp_runtime_benchmark_v1",
             "schema_version": 2,
+            "runtime_implementation_version": (
+                replicate_runtime.accvp_runtime_benchmark.RUNTIME_IMPLEMENTATION_VERSION
+            ),
             "policy_type": "sb3_ppo",
             "backend": "vectorized",
             "policy_model_sha256": checkpoint_hash,
@@ -238,6 +281,9 @@ def test_replicate_runtime_resume_validator_rejects_checkpoint_or_seed_drift(tmp
     aggregate = {
         "artifact_kind": replicate_runtime.RUNTIME_REPLICATE_REPORT_KIND,
         "schema_version": 1,
+        "runtime_implementation_version": (
+            replicate_runtime.accvp_runtime_benchmark.RUNTIME_IMPLEMENTATION_VERSION
+        ),
         "status": "complete",
         "request_fingerprint": request_fingerprint,
         "replicate_manifest_sha256": file_sha256(manifest_path),

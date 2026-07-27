@@ -31,6 +31,9 @@ from safe_rl.rl.ppo import load_ppo
 from safe_rl.utils.config import REPO_ROOT, load_config
 
 
+RUNTIME_IMPLEMENTATION_VERSION = "accvp_runtime_mask_aware_actor_rows_v2"
+
+
 def _resolve(path: str | Path) -> Path:
     value = Path(path)
     return value.resolve() if value.is_absolute() else (REPO_ROOT / value).resolve()
@@ -339,6 +342,7 @@ def run(
     payload = {
         "artifact_kind": "accvp_runtime_benchmark_v1",
         "schema_version": 2,
+        "runtime_implementation_version": RUNTIME_IMPLEMENTATION_VERSION,
         "benchmark_scope": benchmark_scope,
         "policy_type": policy_type,
         "backend": backend,

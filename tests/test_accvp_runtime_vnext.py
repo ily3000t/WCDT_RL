@@ -10,6 +10,10 @@ from safe_rl.accvp.serving.observation import (
     RiskGatedACCVPCandidateTableAugmentor,
     validate_accvp_observation_config,
 )
+from safe_rl.accvp.serving.predictor import (
+    ACCVPCriticalActorOverflow,
+    validate_runtime_actor_rows,
+)
 from safe_rl.accvp.training.reproducibility import configure_deterministic_training
 from safe_rl.pipeline.accvp_observation_preflight import _gate
 from safe_rl.risk import merge_local
@@ -152,6 +156,19 @@ def _context(
 
 def _table(vector: np.ndarray) -> np.ndarray:
     return vector[: 9 * 11].reshape((9, 11))
+
+
+def test_runtime_actor_rows_allow_masked_padding_but_reject_critical_overflow():
+    runtime = {
+        "actor_row_ids": ["front", "rear", "", ""],
+        "mask": np.asarray([[1.0, 1.0, 0.0, 0.0]], dtype=np.float32),
+        "actor_selection": SimpleNamespace(critical_overflow=False),
+    }
+    assert validate_runtime_actor_rows(runtime, 4) == 2
+
+    runtime["actor_selection"] = SimpleNamespace(critical_overflow=True)
+    with pytest.raises(ACCVPCriticalActorOverflow, match="critical actor coverage"):
+        validate_runtime_actor_rows(runtime, 4)
 
 
 def test_v3_feature_contract_is_107d_and_validates():
@@ -375,6 +392,10 @@ def _strict_metrics():
         "accvp_table_model_error_count": 0,
         "accvp_table_invalid_bundle_count": 0,
         "accvp_table_invalid_output_count": 0,
+        "accvp_table_runtime_context_error_count": 0,
+        "accvp_table_critical_actor_overflow_count": 0,
+        "accvp_table_unexpected_value_error_count": 0,
+        "accvp_table_runtime_error_reasons": {},
         "accvp_table_warmup_error_count": 0,
         "accvp_table_warmup_ready_rate": 1.0,
         "accvp_table_latency_p95": 0.30,
@@ -395,6 +416,10 @@ def test_strict_runtime_gate_enforces_tail_latency_and_failure_rates():
     assert failing["pass"] is False
     assert failing["checks"]["latency_p99_within_0_40s"] is False
     assert failing["checks"]["max_consecutive_timeouts"] is False
+
+    context_failure = _strict_metrics()
+    context_failure["accvp_table_critical_actor_overflow_count"] = 1
+    assert _gate(context_failure)["pass"] is False
 
 
 def test_strict_runtime_gate_cannot_pass_a_mismatched_runtime_contract():

@@ -7,6 +7,7 @@ from typing import Any
 from safe_rl.accvp.contracts.schema import file_sha256, read_json
 from safe_rl.evaluation_protocol import stable_hash
 from safe_rl.pipeline import accvp_runtime_benchmark_replicates as replicate_runtime
+from safe_rl.pipeline.accvp_runtime_benchmark import RUNTIME_IMPLEMENTATION_VERSION
 from safe_rl.ppo_factorial import (
     EXPECTED_CANDIDATE_METHOD_ROLES,
     EXPECTED_FINAL_METHOD_ID,
@@ -84,6 +85,7 @@ def _request_fingerprint(
         {
             "artifact_kind": FACTORIAL_RUNTIME_REPORT_KIND,
             "schema_version": FACTORIAL_RUNTIME_REPORT_SCHEMA_VERSION,
+            "runtime_implementation_version": RUNTIME_IMPLEMENTATION_VERSION,
             "factorial_manifest": str(factorial_source),
             "factorial_manifest_sha256": file_sha256(factorial_source),
             "factorial_manifest_fingerprint": str(factorial.get("manifest_fingerprint", "")),
@@ -114,6 +116,8 @@ def _validate_factorial_runtime_report(
         raise ValueError("unsupported factorial policy-runtime report schema")
     if str(report.get("status", "")) != "complete":
         raise ValueError("factorial policy-runtime report is not complete")
+    if str(report.get("runtime_implementation_version", "")) != RUNTIME_IMPLEMENTATION_VERSION:
+        raise ValueError("factorial policy-runtime implementation version mismatch")
     if str(report.get("request_fingerprint", "")) != expected_request_fingerprint:
         raise ValueError("factorial policy-runtime request fingerprint mismatch")
     if str(report.get("factorial_manifest_sha256", "")) != file_sha256(factorial_source):
@@ -272,21 +276,61 @@ def run(
         backend=backend,
         device=device,
     )
+    prior_failed_attempt: dict[str, Any] | None = None
     if output_path.exists():
         if not resume:
             raise FileExistsError(output_path)
-        _validate_factorial_runtime_report(
-            read_json(output_path),
-            output_path=output_path,
-            factorial_source=factorial_source,
-            factorial=factorial,
-            requested_seeds=requested_seeds,
-            backend=backend,
-            device=device,
-            expected_request_fingerprint=request_fingerprint,
-        )
-        print(f"[accvp_runtime_factorial] status=complete action=skip report={output_path}", flush=True)
-        return output_path
+        existing = read_json(output_path)
+        existing_version = str(existing.get("runtime_implementation_version", ""))
+        if (
+            str(existing.get("artifact_kind", "")) == FACTORIAL_RUNTIME_REPORT_KIND
+            and str(existing.get("status", "")) == "complete"
+            and not bool(existing.get("gate", {}).get("pass", False))
+            and existing_version != RUNTIME_IMPLEMENTATION_VERSION
+        ):
+            declared = str(existing.get("report_fingerprint", ""))
+            if not declared or declared != _report_fingerprint(existing):
+                raise ValueError("refusing to archive a failed runtime report with invalid fingerprint")
+            archive_dir = (
+                output_path.parent
+                / "failed_attempts"
+                / f"{existing_version or 'legacy'}_{declared[:16]}"
+            ).resolve()
+            if archive_dir.exists():
+                raise FileExistsError(
+                    f"failed runtime archive already exists; inspect it before retrying: {archive_dir}"
+                )
+            archive_dir.mkdir(parents=True, exist_ok=False)
+            methods_dir = output_path.parent / "methods"
+            if methods_dir.exists():
+                methods_dir.replace(archive_dir / "methods")
+            output_path.replace(archive_dir / output_path.name)
+            prior_failed_attempt = {
+                "runtime_implementation_version": existing_version or "legacy",
+                "report_fingerprint": declared,
+                "gate_pass": False,
+                "archive_dir": str(archive_dir),
+                "report_sha256": file_sha256(archive_dir / output_path.name),
+            }
+            print(
+                "[accvp_runtime_factorial] action=archive_failed_implementation "
+                f"from={existing_version or 'legacy'} to={RUNTIME_IMPLEMENTATION_VERSION} "
+                f"archive={archive_dir}",
+                flush=True,
+            )
+        else:
+            _validate_factorial_runtime_report(
+                existing,
+                output_path=output_path,
+                factorial_source=factorial_source,
+                factorial=factorial,
+                requested_seeds=requested_seeds,
+                backend=backend,
+                device=device,
+                expected_request_fingerprint=request_fingerprint,
+            )
+            print(f"[accvp_runtime_factorial] status=complete action=skip report={output_path}", flush=True)
+            return output_path
 
     methods: dict[str, Any] = {}
     for method_id, role in EXPECTED_CANDIDATE_METHOD_ROLES.items():
@@ -362,6 +406,7 @@ def run(
     payload = {
         "artifact_kind": FACTORIAL_RUNTIME_REPORT_KIND,
         "schema_version": FACTORIAL_RUNTIME_REPORT_SCHEMA_VERSION,
+        "runtime_implementation_version": RUNTIME_IMPLEMENTATION_VERSION,
         "status": "complete",
         "backend": str(backend),
         "device": str(device),
@@ -379,6 +424,8 @@ def run(
         "gate": {"checks": checks, "pass": all(checks.values())},
         "request_fingerprint": request_fingerprint,
     }
+    if prior_failed_attempt is not None:
+        payload["prior_failed_attempt"] = prior_failed_attempt
     payload["report_fingerprint"] = _report_fingerprint(payload)
     write_json_new(output_path, payload)
     _validate_factorial_runtime_report(
