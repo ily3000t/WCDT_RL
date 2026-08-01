@@ -10,6 +10,7 @@ import numpy as np
 
 from safe_rl.stage1_counterfactual.branch_worker import run_branch_job
 from safe_rl.accvp.contracts.protocol import (
+    ACCVP_SELECTOR3_DATA_CONTRACT_VERSION,
     activation_bin as _activation_bin,
     counterfactual_data_contract,
     data_contract_hash,
@@ -31,6 +32,7 @@ from safe_rl.stage1_counterfactual.shards import assert_new_shard, immutable_sha
 from safe_rl.stage1_counterfactual.snapshot_store import CounterfactualSnapshotStore
 from safe_rl.risk.merge_local import is_candidate_legal
 from safe_rl.risk.risk_module import RiskModuleWrapper
+from safe_rl.prediction.wcdt_v3_predictor import build_v3_runtime_batch
 from safe_rl.shield.safety_shield import SafetyShield
 from safe_rl.sim.action_space import ACTIONS
 from safe_rl.utils.config import REPO_ROOT, prepare_run_dir
@@ -99,6 +101,9 @@ def _root_filter_matches(root_filter: str, deadline_bin: str) -> bool:
 def _cache_dir(cfg: Any, output_name: str, counterfactual: Any) -> Path:
     configured = counterfactual.get("cache_root") or cfg.run.get("cache_root")
     if configured:
+        # Explicit cache_root is a run-scoped root. Canonical configs already
+        # include the run identity in this path; appending run_id again creates
+        # duplicated, overlong Windows paths that SUMO saveState cannot open.
         root = Path(str(configured))
         if not root.is_absolute():
             root = REPO_ROOT / root
@@ -110,8 +115,13 @@ def _cache_dir(cfg: Any, output_name: str, counterfactual: Any) -> Path:
         output_root = Path(str(cfg.run.output_root))
         if not output_root.is_absolute():
             output_root = REPO_ROOT / output_root
-        root = (output_root.parent if output_root.name.lower() == "runs" else output_root) / ".cache"
-    return root / str(cfg.run.run_id) / "stage1_counterfactual" / str(output_name)
+        cache_base = (
+            output_root.parent
+            if output_root.name.lower() == "runs"
+            else output_root
+        ) / ".cache"
+        root = cache_base / str(cfg.run.run_id)
+    return root / "stage1_counterfactual" / str(output_name)
 
 
 def _drain_one(
@@ -272,6 +282,7 @@ def collect(
     contract = counterfactual_data_contract(cfg, secondary_risk.fingerprint)
     contract_hash = data_contract_hash(contract)
     root_rows: list[dict[str, Any]] = []
+    rejected_root_rows: list[dict[str, Any]] = []
     branch_rows: list[dict[str, Any]] = []
     pending: dict[Any, tuple[str, int]] = {}
     collected = 0
@@ -306,12 +317,115 @@ def collect(
                         deadline_bin = legacy_deadline_bin(activation)
                         legal_ids = [int(action.index) for action in ACTIONS if is_candidate_legal(action, context)]
                         if legal_ids and _root_filter_matches(filter_name, activation):
+                            root_id = (
+                                f"seed{int(env.seed_value)}_decision"
+                                f"{int(env._decision_index)}_{uuid.uuid4().hex[:12]}"
+                            )
+                            preview = build_v3_runtime_batch(
+                                cfg,
+                                env.history,
+                                env.ego_id,
+                                max_actors_override=int(
+                                    cfg.accvp.actor_count
+                                ),
+                                selector_scope="accvp",
+                            )
+                            selection = preview["actor_selection"]
+                            selected_actor_ids = {
+                                str(value)
+                                for value in preview["actor_row_ids"]
+                                if str(value)
+                            }
+                            critical_actor_ids = {
+                                str(value)
+                                for value in selection.critical_actor_ids
+                            }
+                            task_coverage_complete = bool(
+                                not selection.critical_overflow
+                                and critical_actor_ids.issubset(selected_actor_ids)
+                            )
+                            risk_coverage_complete = bool(
+                                context.get(
+                                    "risk_safety_actor_coverage_complete", False
+                                )
+                            )
+                            if (
+                                str(contract.get("protocol_version", ""))
+                                == ACCVP_SELECTOR3_DATA_CONTRACT_VERSION
+                                and not (
+                                    task_coverage_complete
+                                    and risk_coverage_complete
+                                )
+                            ):
+                                local = context.get("merge_local")
+                                taper_distance = (
+                                    local.get("merge_distance", float("inf"))
+                                    if isinstance(local, dict)
+                                    else getattr(local, "merge_distance", float("inf"))
+                                )
+                                rejected_root_rows.append(
+                                    {
+                                        "root_id": root_id,
+                                        "rejection_reason": (
+                                            "critical_actor_overflow"
+                                            if selection.critical_overflow
+                                            else (
+                                                "task_actor_coverage_incomplete"
+                                                if not task_coverage_complete
+                                                else "risk_safety_actor_coverage_incomplete"
+                                            )
+                                        ),
+                                        "episode_seed": int(env.seed_value),
+                                        "decision_index": int(env._decision_index),
+                                        "root_policy": policy_name,
+                                        "root_filter": filter_name,
+                                        "collection_source": source_name,
+                                        "traffic_profile": str(
+                                            context.get("curriculum_profile", "unknown")
+                                        ),
+                                        "activation_bin": activation,
+                                        "taper_distance_m": float(taper_distance),
+                                        "selected_actor_capacity": int(
+                                            cfg.accvp.actor_count
+                                        ),
+                                        "selected_actor_ids": sorted(
+                                            selected_actor_ids
+                                        ),
+                                        "critical_actor_count": int(
+                                            selection.critical_count
+                                        ),
+                                        "contextual_actor_count": int(
+                                            selection.contextual_count
+                                        ),
+                                        "critical_actor_overflow": bool(
+                                            selection.critical_overflow
+                                        ),
+                                        "dropped_critical_actor_ids": list(
+                                            selection.dropped_critical_ids
+                                        ),
+                                        "safety_actor_coverage_complete": bool(
+                                            task_coverage_complete
+                                        ),
+                                        "task_actor_coverage_complete": bool(
+                                            task_coverage_complete
+                                        ),
+                                        "risk_safety_actor_coverage_complete": bool(
+                                            risk_coverage_complete
+                                        ),
+                                        "selector": selection.to_dict(),
+                                        "data_contract_hash": contract_hash,
+                                    }
+                                )
+                                roots_this_episode += 1
+                                observation, _reward, terminated, truncated, _info = (
+                                    env.step(raw_action)
+                                )
+                                continue
                             # The raw action may have been chosen from a stale
                             # subscription view. Oracle semantics must use the
                             # same synchronised state as the snapshot.
                             raw_action_legal = int(raw_action) in set(legal_ids)
                             secondary_scores = secondary_risk.score(context, legal_ids)
-                            root_id = f"seed{int(env.seed_value)}_decision{int(env._decision_index)}_{uuid.uuid4().hex[:12]}"
                             snapshot_path = store.save_snapshot_from_root(env, root_id)
                             root = capture_root_context(
                                 env,
@@ -370,6 +484,33 @@ def collect(
                                     "metadata_path": str(metadata_path),
                                     "tensor_path": str(tensor_path),
                                     "expected_action_ids": legal_ids,
+                                    "critical_actor_count": int(
+                                        root.metadata["critical_actor_count"]
+                                    ),
+                                    "contextual_actor_count": int(
+                                        root.metadata["contextual_actor_count"]
+                                    ),
+                                    "critical_actor_overflow": bool(
+                                        root.metadata["critical_actor_overflow"]
+                                    ),
+                                    "dropped_critical_actor_ids": list(
+                                        root.metadata["dropped_critical_actor_ids"]
+                                    ),
+                                    "safety_actor_coverage_complete": bool(
+                                        root.metadata[
+                                            "safety_actor_coverage_complete"
+                                        ]
+                                    ),
+                                    "task_actor_coverage_complete": bool(
+                                        root.metadata[
+                                            "task_actor_coverage_complete"
+                                        ]
+                                    ),
+                                    "risk_safety_actor_coverage_complete": bool(
+                                        root.metadata[
+                                            "risk_safety_actor_coverage_complete"
+                                        ]
+                                    ),
                                     "complete": False,
                                 }
                             )
@@ -399,6 +540,9 @@ def collect(
     with (manifests / "branches.jsonl").open("w", encoding="utf-8") as handle:
         for row in branch_rows:
             handle.write(canonical_json(row) + "\n")
+    with (manifests / "rejected_roots.jsonl").open("w", encoding="utf-8") as handle:
+        for row in rejected_root_rows:
+            handle.write(canonical_json(row) + "\n")
     scenario_hash = scenario_config_hash(cfg)
     dataset_manifest = {
         "artifact_kind": "counterfactual_shard_v2",
@@ -413,6 +557,37 @@ def collect(
         "root_budget": root_budget,
         "collected_roots": collected,
         "complete_roots": sum(1 for row in root_rows if row.get("complete")),
+        "rejected_root_count": len(rejected_root_rows),
+        "critical_actor_overflow_count": sum(
+            bool(row.get("critical_actor_overflow", False))
+            for row in rejected_root_rows
+        ),
+        "safety_actor_coverage_incomplete_count": sum(
+            not bool(row.get("task_actor_coverage_complete", False))
+            for row in rejected_root_rows
+        ),
+        "task_actor_coverage_incomplete_count": sum(
+            not bool(row.get("task_actor_coverage_complete", False))
+            for row in rejected_root_rows
+        ),
+        "risk_safety_actor_coverage_incomplete_count": sum(
+            not bool(
+                row.get("risk_safety_actor_coverage_complete", False)
+            )
+            for row in rejected_root_rows
+        ),
+        "critical_actor_count_histogram": dict(
+            Counter(
+                str(int(row.get("critical_actor_count", 0)))
+                for row in [*root_rows, *rejected_root_rows]
+            )
+        ),
+        "contextual_actor_count_histogram": dict(
+            Counter(
+                str(int(row.get("contextual_actor_count", 0)))
+                for row in [*root_rows, *rejected_root_rows]
+            )
+        ),
         "failed_branches": sum(1 for row in branch_rows if row.get("branch_status") != "completed"),
         "collection_job": job_payload,
         "oracle_only": oracle_only,

@@ -177,6 +177,14 @@ def connected_lane_index(config: Any, from_edge: str, from_lane: int, to_edge: s
     return _net_lane_connections(net_file).get((str(from_edge), int(from_lane), str(to_edge)))
 
 
+def lane_indices(config: Any, edge_id: str) -> tuple[int, ...]:
+    """Return deterministic lane indices from the frozen SUMO network."""
+
+    net_file = str(config.scenario.get("net_file", ""))
+    geometry = _net_lane_geometry(net_file) if net_file else {}
+    return tuple(sorted(int(value) for value in geometry.get(str(edge_id), {})))
+
+
 def _lane_geometry(config: Any, edge_id: str, lane_index: int | None = None) -> dict[str, Any] | None:
     net_file = str(config.scenario.get("net_file", ""))
     geometry = _net_lane_geometry(net_file) if net_file else {}

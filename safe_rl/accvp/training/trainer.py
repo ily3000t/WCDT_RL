@@ -40,7 +40,12 @@ from safe_rl.accvp.contracts.schema import (
     write_json_atomic,
 )
 from safe_rl.accvp.evaluation.oracle import validate_oracle_for_training
-from safe_rl.accvp.contracts.protocol import ACCVP_DATA_CONTRACT_VERSION
+from safe_rl.accvp.evaluation.formal import FORMAL_VALIDATION_KIND
+from safe_rl.accvp.contracts.protocol import (
+    ACCVP_DATA_CONTRACT_VERSION,
+    ACCVP_SELECTOR3_DATA_CONTRACT_VERSION,
+    SUPPORTED_ACCVP_DATA_CONTRACT_VERSIONS,
+)
 from safe_rl.accvp.training.reproducibility import configure_deterministic_training
 from safe_rl.accvp.contracts.runtime_contract import (
     formal_runtime_contract_from_config,
@@ -65,6 +70,52 @@ OPTIMIZATION_BATCHING_VERSION = "complete_fingerprint_action_group_batches_v1"
 TRAINING_HISTORY_SCHEMA_VERSION = 2
 LOSS_REDUCTION_VERSION = "nested_exact_weighted_numerator_denominator_sum_v2"
 LOSS_COMPONENTS = ("trajectory", "events", "geometry", "ordering", "smoothness")
+
+
+def _validate_formal_validation_for_training(
+    config: Any,
+    dataset_dir: Path,
+    dataset_manifest: dict[str, Any],
+    *,
+    required: bool,
+) -> dict[str, Any] | None:
+    configured = config.accvp.get("formal_validation_report")
+    if not configured:
+        if required:
+            raise ValueError(
+                "selector3 formal ACCVP training requires "
+                "accvp.formal_validation_report"
+            )
+        return None
+    path = Path(str(configured)).resolve()
+    if not path.is_file():
+        raise FileNotFoundError(path)
+    report = read_json(path)
+    if str(report.get("artifact_kind", "")) != FORMAL_VALIDATION_KIND:
+        raise ValueError("unsupported ACCVP formal-validation report")
+    if str(report.get("formal_state", "")) != "pass":
+        raise ValueError("ACCVP formal-validation gate is not open")
+    if Path(str(report.get("dataset_dir", ""))).resolve() != dataset_dir.resolve():
+        raise ValueError("ACCVP formal-validation dataset path mismatch")
+    if str(report.get("dataset_fingerprint", "")) != str(
+        dataset_manifest.get("dataset_fingerprint", "")
+    ):
+        raise ValueError("ACCVP formal-validation dataset fingerprint mismatch")
+    if str(report.get("data_contract_hash", "")) != str(
+        dataset_manifest.get("data_contract_hash", "")
+    ):
+        raise ValueError("ACCVP formal-validation data-contract mismatch")
+    declared = str(report.get("report_fingerprint", ""))
+    recomputed = stable_hash(
+        {key: value for key, value in report.items() if key != "report_fingerprint"}
+    )
+    if not declared or declared != recomputed:
+        raise ValueError("ACCVP formal-validation report fingerprint mismatch")
+    return {
+        "path": str(path),
+        "sha256": file_sha256(path),
+        "report_fingerprint": declared,
+    }
 
 
 def _configured_artifact_generation(config: Any) -> str:
@@ -736,6 +787,7 @@ def _write_predictor_and_calibration(
     reproducibility_profile: dict[str, Any],
     duplicate_weighting: dict[str, Any],
     formal_runtime_contract: dict[str, Any],
+    formal_validation_lineage: dict[str, Any] | None,
     torch: Any,
     mode: str,
     operating_point: dict[str, Any] | None = None,
@@ -776,6 +828,7 @@ def _write_predictor_and_calibration(
     metadata["duplicate_weighting"] = dict(duplicate_weighting)
     metadata["artifact_generation"] = ACCVP_ARTIFACT_GENERATION
     metadata["configured_artifact_generation"] = _configured_artifact_generation(config)
+    metadata["formal_validation"] = formal_validation_lineage
     payload = {
         "metadata": metadata,
         "model_state_dicts": [model.state_dict() for model in models],
@@ -852,6 +905,7 @@ def _write_predictor_and_calibration(
         "risk_model_fingerprint": str(dataset_manifest.get("risk_model_fingerprint", "")),
         "config_hash": stable_hash(dict(config)),
         "oracle_report": oracle_report,
+        "formal_validation": formal_validation_lineage,
         "response_feature_normalization": metadata["response_feature_normalization"],
         "training_history_sha256": history_sha256,
         "training_history_fingerprint": history_payload["history_fingerprint"],
@@ -935,11 +989,11 @@ def train_accvp(config: Any, dataset_dir: str | Path, *, mode: str = "deployable
     configured_contract_version = str(
         config.accvp.get("data_contract_version", ACCVP_DATA_CONTRACT_VERSION)
     )
-    if configured_contract_version != ACCVP_DATA_CONTRACT_VERSION:
+    if configured_contract_version not in SUPPORTED_ACCVP_DATA_CONTRACT_VERSIONS:
         raise ValueError(
             "formal ACCVP training has an unsupported data contract: "
             f"configured={configured_contract_version!r} "
-            f"supported={ACCVP_DATA_CONTRACT_VERSION!r}"
+            f"supported={sorted(SUPPORTED_ACCVP_DATA_CONTRACT_VERSIONS)!r}"
         )
     if (
         str(dict(dataset_manifest.get("data_contract", {})).get("protocol_version", ""))
@@ -949,6 +1003,16 @@ def train_accvp(config: Any, dataset_dir: str | Path, *, mode: str = "deployable
             "formal ACCVP training requires dataset/config data-contract agreement: "
             f"configured={configured_contract_version!r}"
         )
+    formal_validation_lineage = _validate_formal_validation_for_training(
+        config,
+        dataset_dir,
+        dataset_manifest,
+        required=(
+            mode == "deployable"
+            and configured_contract_version
+            == ACCVP_SELECTOR3_DATA_CONTRACT_VERSION
+        ),
+    )
     split_path = dataset_dir / "manifests" / "split_manifest.jsonl"
     if not split_path.exists():
         oracle_exclusion = dict(oracle_report["training_exclusion_audit"])
@@ -1360,6 +1424,7 @@ def train_accvp(config: Any, dataset_dir: str | Path, *, mode: str = "deployable
             reproducibility_profile=reproducibility_profile,
             duplicate_weighting=duplicate_weighting,
             formal_runtime_contract=formal_runtime_contract,
+            formal_validation_lineage=formal_validation_lineage,
             torch=torch,
             mode="shadow",
         )
@@ -1428,6 +1493,7 @@ def train_accvp(config: Any, dataset_dir: str | Path, *, mode: str = "deployable
         reproducibility_profile=reproducibility_profile,
         duplicate_weighting=duplicate_weighting,
         formal_runtime_contract=formal_runtime_contract,
+        formal_validation_lineage=formal_validation_lineage,
         torch=torch,
         mode="deployable",
         operating_point=operating_point,

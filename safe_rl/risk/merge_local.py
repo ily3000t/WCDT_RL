@@ -5,7 +5,7 @@ import hashlib
 import json
 import time
 from contextlib import nullcontext
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Any
 
 import numpy as np
@@ -354,13 +354,11 @@ def rollout_ego(
     acceleration = float(action.accel_cmd) * 1.5
     source_lane = int(ego.lane_index)
     target_lane = source_lane + int(action.lateral_cmd)
-    current = VehicleState(**{**ego.to_dict(), "lane_index": source_lane})
-    target_current = VehicleState(
-        **{
-            **ego.to_dict(),
-            "lane_index": target_lane,
-            "lane_id": f"{ego.edge_id}_{target_lane}",
-        }
+    current = replace(ego, lane_index=source_lane)
+    target_current = replace(
+        ego,
+        lane_index=target_lane,
+        lane_id=f"{ego.edge_id}_{target_lane}",
     )
     lane_change_duration = max(
         float(config.scenario.get("lane_change_duration", 1.0)) if config is not None else 1.0,
@@ -408,14 +406,18 @@ def rollout_ego(
                 elif raw_progress >= 1.0:
                     next_state = target_next
                 else:
-                    next_state = VehicleState(
-                        **{
-                            **source_next.to_dict(),
-                            "x": float(source_next.x + progress * (target_next.x - source_next.x)),
-                            "y": float(source_next.y + progress * (target_next.y - source_next.y)),
-                            "lane_index": source_lane,
-                            "lane_id": f"{source_next.edge_id}_{source_lane}",
-                        }
+                    next_state = replace(
+                        source_next,
+                        x=float(
+                            source_next.x
+                            + progress * (target_next.x - source_next.x)
+                        ),
+                        y=float(
+                            source_next.y
+                            + progress * (target_next.y - source_next.y)
+                        ),
+                        lane_index=source_lane,
+                        lane_id=f"{source_next.edge_id}_{source_lane}",
                     )
                     dx = float(next_state.x - current.x)
                     dy = float(next_state.y - current.y)

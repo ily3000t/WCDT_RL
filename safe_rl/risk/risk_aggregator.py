@@ -115,6 +115,17 @@ def _accvp_observation_metrics(reports: list[dict]) -> dict:
     critical_actor_overflow_count = int(
         sum(int(report.get("accvp_table_critical_actor_overflow_count", 0)) for report in reports)
     )
+    risk_safety_actor_coverage_incomplete_count = int(
+        sum(
+            int(
+                report.get(
+                    "accvp_table_risk_safety_actor_coverage_incomplete_count",
+                    0,
+                )
+            )
+            for report in reports
+        )
+    )
     unexpected_value_error_count = int(
         sum(int(report.get("accvp_table_unexpected_value_error_count", 0)) for report in reports)
     )
@@ -124,6 +135,9 @@ def _accvp_observation_metrics(reports: list[dict]) -> dict:
     stale_context_deltas: list[float] = []
     stale_rejection_reasons: Counter[str] = Counter()
     runtime_error_reasons: Counter[str] = Counter()
+    critical_actor_overflow_histogram: Counter[str] = Counter()
+    critical_actor_overflow_examples: list[dict] = []
+    critical_actor_overflow_sample_limit = 20
     stage_latencies: dict[str, list[float]] = {
         "context_legality": [],
         "accvp_prepare_candidates": [],
@@ -149,6 +163,19 @@ def _accvp_observation_metrics(reports: list[dict]) -> dict:
         )
         stale_rejection_reasons.update(dict(report.get("accvp_table_stale_rejection_reasons", {}) or {}))
         runtime_error_reasons.update(dict(report.get("accvp_table_runtime_error_reasons", {}) or {}))
+        critical_actor_overflow_histogram.update(
+            dict(report.get("accvp_table_critical_actor_overflow_histogram", {}) or {})
+        )
+        remaining = critical_actor_overflow_sample_limit - len(
+            critical_actor_overflow_examples
+        )
+        if remaining > 0:
+            critical_actor_overflow_examples.extend(
+                dict(value)
+                for value in list(
+                    report.get("accvp_table_critical_actor_overflow_examples", []) or []
+                )[:remaining]
+            )
         stage_payload = dict(report.get("accvp_table_latency_stage_s", {}) or {})
         for stage_name in stage_latencies:
             stage_latencies[stage_name].extend(
@@ -182,6 +209,7 @@ def _accvp_observation_metrics(reports: list[dict]) -> dict:
         and invalid_output_count == 0
         and runtime_context_error_count == 0
         and critical_actor_overflow_count == 0
+        and risk_safety_actor_coverage_incomplete_count == 0
         and unexpected_value_error_count == 0
         and warmup_error_count == 0
         and warmup_ready_rate >= 1.0
@@ -233,6 +261,17 @@ def _accvp_observation_metrics(reports: list[dict]) -> dict:
         "accvp_table_invalid_output_count": invalid_output_count,
         "accvp_table_runtime_context_error_count": runtime_context_error_count,
         "accvp_table_critical_actor_overflow_count": critical_actor_overflow_count,
+        "accvp_table_task_actor_overflow_count": critical_actor_overflow_count,
+        "accvp_table_risk_safety_actor_coverage_incomplete_count": (
+            risk_safety_actor_coverage_incomplete_count
+        ),
+        "accvp_table_critical_actor_overflow_histogram": dict(
+            critical_actor_overflow_histogram
+        ),
+        "accvp_table_critical_actor_overflow_examples": critical_actor_overflow_examples,
+        "accvp_table_critical_actor_overflow_sample_limit": (
+            critical_actor_overflow_sample_limit
+        ),
         "accvp_table_unexpected_value_error_count": unexpected_value_error_count,
         "accvp_table_runtime_error_reasons": dict(runtime_error_reasons),
         "accvp_table_latency_count": int(len(latencies)),

@@ -1,0 +1,19 @@
+{
+  "schema_version": 1,
+  "protocol_id": "accvp-vnext-correctness-v2-selector3",
+  "cohorts": {
+    "oracle_regression": {"values": [2, 5]},
+    "ppo_optimizer_replicates": {"values": [1001, 1002, 1003, 1004, 1005]},
+    "selector_diagnostic": {"values": [50021, 50027]},
+    "data_collection": {"ranges": [{"start": 10001, "count": 5000}]},
+    "ppo_training": {"ranges": [{"start": 20001, "count": 10000}]},
+    "ppo_selection": {"ranges": [{"start": 40001, "count": 50}]},
+    "runtime_confirmatory": {"ranges": [{"start": 55001, "count": 60}]},
+    "targeted_development": {"ranges": [{"start": 60001, "count": 2000}]},
+    "targeted_confirmatory": {"ranges": [{"start": 70001, "count": 500}]},
+    "natural_confirmatory": {"ranges": [{"start": 80001, "count": 300}]},
+    "ood_profile_1": {"ranges": [{"start": 90001, "count": 100}]},
+    "ood_profile_2": {"ranges": [{"start": 91001, "count": 100}]},
+    "ood_profile_3": {"ranges": [{"start": 92001, "count": 100}]}
+  }
+}

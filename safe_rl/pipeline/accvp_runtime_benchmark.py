@@ -31,7 +31,9 @@ from safe_rl.rl.ppo import load_ppo
 from safe_rl.utils.config import REPO_ROOT, load_config
 
 
-RUNTIME_IMPLEMENTATION_VERSION = "accvp_runtime_mask_aware_actor_rows_v2"
+RUNTIME_IMPLEMENTATION_VERSION = (
+    "accvp_runtime_conflict_selector_shallow_state_copy_v4"
+)
 
 
 def _resolve(path: str | Path) -> Path:
@@ -269,6 +271,7 @@ def run(
     software_hardware = _software_hardware()
     extension_source: dict[str, Any] | None = None
     expected_extension_identity = {
+        "runtime_implementation_version": RUNTIME_IMPLEMENTATION_VERSION,
         "benchmark_scope": benchmark_scope,
         "policy_type": policy_type,
         "backend": backend,
@@ -285,15 +288,67 @@ def run(
         "artifact_lineage": artifact_lineage,
         "software_hardware": software_hardware,
     }
+    prior_failed_implementation: dict[str, Any] | None = None
     if output_path.exists():
         if not extend_failed_report:
             raise FileExistsError(f"runtime benchmark report already exists: {output_path}")
-        extension_source = read_json(output_path)
-        reports = _validate_failed_report_extension(
-            extension_source,
-            requested_seeds=requested_seeds,
-            expected_identity=expected_extension_identity,
+        existing = read_json(output_path)
+        existing_version = str(
+            existing.get("runtime_implementation_version", "")
         )
+        if existing_version != RUNTIME_IMPLEMENTATION_VERSION:
+            if bool(dict(existing.get("gate", {}) or {}).get("pass", False)):
+                raise ValueError(
+                    "a passing report from another runtime implementation is "
+                    "immutable and cannot be reused by Selector-v3"
+                )
+            declared = str(existing.get("report_fingerprint", ""))
+            expected_fingerprint = stable_hash(
+                {
+                    key: value
+                    for key, value in existing.items()
+                    if key != "report_fingerprint"
+                }
+            )
+            if not declared or declared != expected_fingerprint:
+                raise ValueError(
+                    "refusing to archive a failed runtime report with an "
+                    "invalid fingerprint"
+                )
+            archive_path = _failed_report_archive_path(output_path, existing)
+            if archive_path.exists():
+                if read_json(archive_path) != existing:
+                    raise FileExistsError(
+                        "runtime benchmark failed-report archive collision: "
+                        f"{archive_path}"
+                    )
+            else:
+                write_json_atomic(archive_path, existing)
+            prior_failed_implementation = {
+                "runtime_implementation_version": (
+                    existing_version or "legacy"
+                ),
+                "report_fingerprint": declared,
+                "report_sha256": file_sha256(archive_path),
+                "archived_source_report": str(archive_path),
+                "episodes_reused": 0,
+            }
+            reports = []
+            print(
+                "[accvp_runtime_benchmark] "
+                "action=archive_failed_implementation "
+                f"from={existing_version or 'legacy'} "
+                f"to={RUNTIME_IMPLEMENTATION_VERSION} "
+                f"archive={archive_path}",
+                flush=True,
+            )
+        else:
+            extension_source = existing
+            reports = _validate_failed_report_extension(
+                extension_source,
+                requested_seeds=requested_seeds,
+                expected_identity=expected_extension_identity,
+            )
     else:
         reports = []
     reused_episode_count = len(reports)
@@ -404,6 +459,8 @@ def run(
             "new_episode_seed_count": len(pending_seeds),
             "archived_source_report": str(archive_path),
         }
+    if prior_failed_implementation is not None:
+        payload["prior_failed_implementation"] = prior_failed_implementation
     payload["report_fingerprint"] = stable_hash(payload)
     if extension_source is not None:
         archive_path = _failed_report_archive_path(output_path, extension_source)

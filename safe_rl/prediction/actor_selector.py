@@ -6,6 +6,10 @@ import json
 from typing import Any
 
 from safe_rl.risk.merge_local import merge_local_stats
+from safe_rl.prediction.candidate_conflict import (
+    CANDIDATE_CONFLICT_ORACLE_VERSION,
+    candidate_union_conflict_oracle,
+)
 from safe_rl.sim.metrics import INF_TTC, bbox_gap
 from safe_rl.sim.scenario_semantics import (
     distance_to_taper,
@@ -18,6 +22,11 @@ from safe_rl.sim.types import VehicleState
 
 
 ACTOR_SELECTION_VERSION = "merge_relevance_v2"
+ACTOR_SELECTION_VERSION_V2 = ACTOR_SELECTION_VERSION
+ACTOR_SELECTION_VERSION_V3 = "candidate_union_conflict_relevance_v3"
+SUPPORTED_ACTOR_SELECTION_VERSIONS = frozenset(
+    {ACTOR_SELECTION_VERSION_V2, ACTOR_SELECTION_VERSION_V3}
+)
 
 
 def _plain(value: Any) -> Any:
@@ -30,10 +39,37 @@ def _plain(value: Any) -> Any:
     return value
 
 
-def actor_relevance_config(cfg: Any) -> dict[str, Any]:
-    configured = cfg.prediction.get("actor_relevance", {})
-    return {
-        "version": str(configured.get("version", ACTOR_SELECTION_VERSION)),
+def actor_relevance_config(
+    cfg: Any,
+    *,
+    selector_scope: str = "prediction",
+) -> dict[str, Any]:
+    """Resolve a selector without conflating forecast and ACCVP contracts.
+
+    ``prediction`` is frozen by WcDT checkpoint lineage. ``accvp`` selects
+    task actors for counterfactual data and Candidate Table inference. ACCVP
+    falls back to the prediction selector for legacy configurations.
+    """
+
+    if selector_scope == "prediction":
+        configured = cfg.prediction.get("actor_relevance", {})
+    elif selector_scope == "accvp":
+        configured = cfg.accvp.get("actor_relevance")
+        if configured is None:
+            configured = cfg.prediction.get("actor_relevance", {})
+    else:
+        raise ValueError(
+            "selector_scope must be 'prediction' or 'accvp': "
+            f"{selector_scope!r}"
+        )
+    version = str(configured.get("version", ACTOR_SELECTION_VERSION))
+    if version not in SUPPORTED_ACTOR_SELECTION_VERSIONS:
+        raise ValueError(
+            f"unsupported {selector_scope} actor_relevance.version: "
+            f"{version!r}; supported={sorted(SUPPORTED_ACTOR_SELECTION_VERSIONS)}"
+        )
+    result = {
+        "version": version,
         "current_gap_distance": float(configured.get("current_gap_distance", 45.0)),
         "effective_gap_distance": float(configured.get("effective_gap_distance", 35.0)),
         "ttc_threshold": float(configured.get("ttc_threshold", 5.0)),
@@ -50,10 +86,50 @@ def actor_relevance_config(cfg: Any) -> dict[str, Any]:
             configured.get("cv_uncertainty_merge_corridor_penalty", 0.10)
         ),
     }
+    if version == ACTOR_SELECTION_VERSION_V3:
+        result.update(
+            {
+                "candidate_conflict_horizon_s": float(
+                    configured.get(
+                        "candidate_conflict_horizon_s",
+                        cfg.accvp.get("response_horizon_s", 3.0),
+                    )
+                ),
+                "candidate_conflict_surface_gap": float(
+                    configured.get(
+                        "candidate_conflict_surface_gap", 30.0
+                    )
+                ),
+                "actor_longitudinal_accel_bound": float(
+                    configured.get(
+                        "actor_longitudinal_accel_bound", 2.0
+                    )
+                ),
+                "unknown_topology_lateral_reach_m": float(
+                    configured.get(
+                        "unknown_topology_lateral_reach_m", 3.5
+                    )
+                ),
+            }
+        )
+    return result
 
 
-def actor_selection_config_hash(cfg: Any) -> str:
-    payload = json.dumps(_plain(actor_relevance_config(cfg)), sort_keys=True, separators=(",", ":"))
+def actor_selection_config_hash(
+    cfg: Any,
+    *,
+    selector_scope: str = "prediction",
+) -> str:
+    payload = json.dumps(
+        _plain(
+            actor_relevance_config(
+                cfg,
+                selector_scope=selector_scope,
+            )
+        ),
+        sort_keys=True,
+        separators=(",", ":"),
+    )
     return hashlib.sha256(payload.encode("utf-8")).hexdigest()
 
 
@@ -61,6 +137,9 @@ def actor_selection_config_hash(cfg: Any) -> str:
 class ActorRelevance:
     vehicle_id: str
     role: str
+    edge_id: str
+    lane_id: str
+    lane_index: int
     route_progress: float | None
     signed_longitudinal_gap: float | None
     current_surface_gap: float
@@ -73,6 +152,15 @@ class ActorRelevance:
     relevance_class: str = "non_relevant"
     critical: bool = False
     contextual: bool = False
+    candidate_conflict_eligible: bool = False
+    conflict_candidate_ids: tuple[int, ...] = ()
+    conflict_hypothesis_ids: tuple[str, ...] = ()
+    conflict_surface_ids: tuple[str, ...] = ()
+    earliest_conflict_time_s: float = INF_TTC
+    earliest_overlap_time_s: float = INF_TTC
+    minimum_swept_obb_gap: float = INF_TTC
+    nearest_candidate_conflict: bool = False
+    conflict_oracle_version: str = ""
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -95,6 +183,8 @@ class ActorSelectionResult:
     critical_count: int = 0
     contextual_count: int = 0
     critical_overflow: bool = False
+    legal_candidate_ids: tuple[int, ...] = ()
+    conflict_oracle_version: str = ""
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -110,6 +200,8 @@ class ActorSelectionResult:
             "critical_count": int(self.critical_count),
             "contextual_count": int(self.contextual_count),
             "critical_overflow": bool(self.critical_overflow),
+            "legal_candidate_ids": list(self.legal_candidate_ids),
+            "conflict_oracle_version": self.conflict_oracle_version,
             "actor_metadata": {
                 vehicle_id: metadata.to_dict()
                 for vehicle_id, metadata in self.actor_metadata.items()
@@ -148,12 +240,23 @@ def _priority(metadata: ActorRelevance) -> tuple[float, ...]:
         "target_lane_other": 3.0,
         "other": 4.0,
     }
+    role_rank = (
+        1.0
+        if metadata.nearest_candidate_conflict
+        else role_priority.get(metadata.role, 4.0)
+    )
     return (
         {"critical": 0.0, "contextual": 1.0}.get(metadata.relevance_class, 2.0),
-        role_priority.get(metadata.role, 4.0),
+        role_rank,
+        (
+            metadata.earliest_conflict_time_s
+            if metadata.earliest_conflict_time_s < INF_TTC
+            else INF_TTC
+        ),
         metadata.ttc if metadata.ttc < INF_TTC else INF_TTC,
         metadata.effective_gap,
         metadata.current_surface_gap,
+        metadata.minimum_swept_obb_gap,
     )
 
 
@@ -162,10 +265,22 @@ def select_merge_relevant_actors(
     ego: VehicleState,
     current_vehicles: list[VehicleState],
     max_actors: int,
+    *,
+    selector_scope: str = "prediction",
 ) -> ActorSelectionResult:
-    """Select merge-relevant actors using only the current decision state."""
+    """Select merge-relevant actors using only the current decision state.
 
-    settings = actor_relevance_config(cfg)
+    ``merge_relevance_v2`` is intentionally retained byte-for-byte at the
+    semantic decision boundary for historical reproduction.  Selector-v3
+    restricts the critical class to the merge conflict surface; global
+    gap/TTC heuristics may make an unrelated actor contextual, but never
+    critical unless it is the true nearest geometric conflict.
+    """
+
+    settings = actor_relevance_config(
+        cfg,
+        selector_scope=selector_scope,
+    )
     horizon_seconds = float(cfg.scenario.forecast_horizon_steps) * float(cfg.scenario.step_length)
     vehicles = [
         vehicle
@@ -183,6 +298,17 @@ def select_merge_relevant_actors(
     lowest_ttc_id = ""
     lowest_ttc = INF_TTC
     ego_taper_distance = float(distance_to_taper(cfg, ego))
+    conflict_evidence = {}
+    legal_candidate_ids: tuple[int, ...] = ()
+    if settings["version"] == ACTOR_SELECTION_VERSION_V3:
+        conflict_evidence, legal_candidate_ids = (
+            candidate_union_conflict_oracle(
+                cfg,
+                ego,
+                current_vehicles,
+                selector_scope=selector_scope,
+            )
+        )
     for actor in vehicles:
         actor_progress = merge_corridor_progress(cfg, actor)
         signed_gap = (
@@ -218,6 +344,7 @@ def select_merge_relevant_actors(
             lowest_ttc = float(ttc)
             lowest_ttc_id = str(actor.vehicle_id)
         role = _role(cfg, actor, target_front_id, target_rear_id)
+        conflict = conflict_evidence.get(str(actor.vehicle_id))
         reasons: list[str] = []
         if surface_gap <= settings["current_gap_distance"]:
             reasons.append("current_gap")
@@ -227,10 +354,21 @@ def select_merge_relevant_actors(
             reasons.append("ttc")
         if role in {"auxiliary_local", "ramp_local"} and surface_gap <= settings["local_actor_distance"]:
             reasons.append("merge_local")
+        if bool(
+            getattr(conflict, "candidate_conflict_eligible", False)
+        ):
+            reasons.append("candidate_union_conflict")
+        if bool(
+            getattr(conflict, "nearest_candidate_conflict", False)
+        ):
+            reasons.append("nearest_candidate_conflict")
         relevant = bool(reasons)
         metadata = ActorRelevance(
             vehicle_id=str(actor.vehicle_id),
             role=role,
+            edge_id=str(actor.edge_id),
+            lane_id=str(actor.lane_id),
+            lane_index=int(actor.lane_index),
             route_progress=actor_progress,
             signed_longitudinal_gap=signed_gap,
             current_surface_gap=surface_gap,
@@ -242,10 +380,43 @@ def select_merge_relevant_actors(
             relevant=relevant,
             relevance_class="contextual" if relevant else "non_relevant",
             contextual=relevant,
+            candidate_conflict_eligible=bool(
+                getattr(conflict, "candidate_conflict_eligible", False)
+            ),
+            conflict_candidate_ids=tuple(
+                getattr(conflict, "conflict_candidate_ids", ())
+            ),
+            conflict_hypothesis_ids=tuple(
+                getattr(conflict, "conflict_hypothesis_ids", ())
+            ),
+            conflict_surface_ids=tuple(
+                getattr(conflict, "conflict_surface_ids", ())
+            ),
+            earliest_conflict_time_s=float(
+                getattr(conflict, "earliest_conflict_time_s", INF_TTC)
+            ),
+            earliest_overlap_time_s=float(
+                getattr(conflict, "earliest_overlap_time_s", INF_TTC)
+            ),
+            minimum_swept_obb_gap=float(
+                getattr(conflict, "minimum_swept_obb_gap", INF_TTC)
+            ),
+            nearest_candidate_conflict=bool(
+                getattr(conflict, "nearest_candidate_conflict", False)
+            ),
+            conflict_oracle_version=(
+                CANDIDATE_CONFLICT_ORACLE_VERSION
+                if conflict is not None
+                else ""
+            ),
         )
         base[str(actor.vehicle_id)] = metadata
 
-    if nearest_id and nearest_gap <= settings["nearest_conflict_distance"]:
+    if (
+        settings["version"] == ACTOR_SELECTION_VERSION_V2
+        and nearest_id
+        and nearest_gap <= settings["nearest_conflict_distance"]
+    ):
         item = base[nearest_id]
         reasons = tuple(dict.fromkeys([*item.relevance_reasons, "nearest_conflict"]))
         base[nearest_id] = ActorRelevance(
@@ -259,6 +430,22 @@ def select_merge_relevant_actors(
                 "contextual": False,
             }
         )
+
+    if settings["version"] == ACTOR_SELECTION_VERSION_V3:
+        lowest_ttc_id = ""
+        lowest_ttc = INF_TTC
+        conflict_surface = [
+            item
+            for item in base.values()
+            if item.candidate_conflict_eligible
+        ]
+        finite_surface = [item for item in conflict_surface if item.ttc < INF_TTC]
+        if finite_surface:
+            lowest_ttc_id = min(
+                finite_surface,
+                key=lambda item: (item.ttc, item.effective_gap, item.vehicle_id),
+            ).vehicle_id
+            lowest_ttc = float(base[lowest_ttc_id].ttc)
 
     if lowest_ttc_id and lowest_ttc < INF_TTC:
         item = base[lowest_ttc_id]
@@ -277,19 +464,33 @@ def select_merge_relevant_actors(
     metadata_map: dict[str, ActorRelevance] = {}
     for vehicle_id, item in base.items():
         reasons = set(item.relevance_reasons)
-        critical = bool(
-            item.critical
-            or (item.role in {"target_front", "target_rear"} and item.relevant)
-            or "ttc" in reasons
-            or "effective_gap" in reasons
-            or "nearest_conflict" in reasons
-            or "lowest_ttc" in reasons
-            or (
-                item.role in {"auxiliary_local", "ramp_local"}
-                and item.relevant
-                and ego_taper_distance <= settings["critical_taper_distance"]
+        if settings["version"] == ACTOR_SELECTION_VERSION_V3:
+            critical = bool(
+                item.critical
+                or item.role in {"target_front", "target_rear"}
+                or item.candidate_conflict_eligible
+                or "lowest_ttc" in reasons
+                or (
+                    item.role in {"auxiliary_local", "ramp_local"}
+                    and item.current_surface_gap
+                    <= settings["local_actor_distance"]
+                    and ego_taper_distance <= settings["critical_taper_distance"]
+                )
             )
-        )
+        else:
+            critical = bool(
+                item.critical
+                or (item.role in {"target_front", "target_rear"} and item.relevant)
+                or "ttc" in reasons
+                or "effective_gap" in reasons
+                or "nearest_conflict" in reasons
+                or "lowest_ttc" in reasons
+                or (
+                    item.role in {"auxiliary_local", "ramp_local"}
+                    and item.relevant
+                    and ego_taper_distance <= settings["critical_taper_distance"]
+                )
+            )
         relevance_class = (
             "critical"
             if critical
@@ -301,6 +502,7 @@ def select_merge_relevant_actors(
                 "critical": critical,
                 "contextual": relevance_class == "contextual",
                 "relevance_class": relevance_class,
+                "relevant": bool(critical or item.relevant),
             }
         )
         priority = _priority(normalized)
@@ -332,7 +534,10 @@ def select_merge_relevant_actors(
         overflow=critical_overflow,
         actor_metadata=metadata_map,
         version=str(settings["version"]),
-        config_hash=actor_selection_config_hash(cfg),
+        config_hash=actor_selection_config_hash(
+            cfg,
+            selector_scope=selector_scope,
+        ),
         critical_actor_ids=tuple(item.vehicle_id for item in critical),
         contextual_actor_ids=tuple(item.vehicle_id for item in contextual),
         dropped_critical_ids=dropped_critical,
@@ -340,4 +545,10 @@ def select_merge_relevant_actors(
         critical_count=len(critical),
         contextual_count=len(contextual),
         critical_overflow=critical_overflow,
+        legal_candidate_ids=legal_candidate_ids,
+        conflict_oracle_version=(
+            CANDIDATE_CONFLICT_ORACLE_VERSION
+            if settings["version"] == ACTOR_SELECTION_VERSION_V3
+            else ""
+        ),
     )

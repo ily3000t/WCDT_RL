@@ -21,8 +21,10 @@ from safe_rl.accvp.serving.observation import (
     validate_accvp_observation_config,
 )
 from safe_rl.accvp.evaluation.oracle import counterfactual_oracle_report
+from safe_rl.accvp.evaluation.formal import _configured_contract_matches
 from safe_rl.accvp.evaluation.pilot import validate_pilot_dataset
 from safe_rl.accvp.contracts.protocol import (
+    counterfactual_data_contract_candidates,
     counterfactual_data_contract,
     data_contract_hash,
     effective_activation_distance,
@@ -162,6 +164,56 @@ def test_counterfactual_secondary_risk_uses_one_ordered_shield_batch():
         "secondary_safety_pass": False,
         "veto_reason": "risk_score",
     }
+
+
+def test_formal_contract_accepts_exact_sumo_resolved_candidate_and_rejects_tamper(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    cfg = load_config()
+    cfg.scenario.pop("sumo_installation_fingerprint", None)
+    installation = SimpleNamespace(
+        sumo_binary="C:/sumo/bin/sumo.exe",
+        sumo_gui_binary="C:/sumo/bin/sumo-gui.exe",
+        netconvert_binary="C:/sumo/bin/netconvert.exe",
+        tools_directory="C:/sumo/tools",
+        sumo_home="C:/sumo",
+        sumo_version="SUMO 1.22.0",
+        to_dict=lambda: {
+            "sumo_binary": "C:/sumo/bin/sumo.exe",
+            "sumo_version": "SUMO 1.22.0",
+        },
+    )
+    monkeypatch.setattr(
+        "safe_rl.accvp.contracts.protocol.resolve_sumo_installation",
+        lambda _scenario: installation,
+    )
+    risk_fingerprint = "risk_checkpoint:test"
+    candidates = counterfactual_data_contract_candidates(
+        cfg,
+        risk_fingerprint,
+    )
+    assert len(candidates) == 2
+    resolved = candidates[-1]
+    assert resolved != candidates[0]
+    manifest = {
+        "risk_model_fingerprint": risk_fingerprint,
+        "data_contract": resolved,
+        "data_contract_hash": data_contract_hash(resolved),
+    }
+    assert _configured_contract_matches(cfg, manifest)
+
+    tampered = {
+        **resolved,
+        "scenario_route_hash": "tampered-route",
+    }
+    assert not _configured_contract_matches(
+        cfg,
+        {
+            **manifest,
+            "data_contract": tampered,
+            "data_contract_hash": data_contract_hash(tampered),
+        },
+    )
 
 
 def _cfg(mode: str):
@@ -2122,6 +2174,12 @@ def test_vnext_collection_configs_are_schema3_budgeted_and_path_isolated():
         oracle.accvp.counterfactual,
     )
     assert len({pilot_cache, formal_cache, oracle_cache}) == 3
+    assert oracle_cache.parts.count(str(oracle.run.run_id)) == 1
+    assert oracle_cache == (
+        Path(oracle.accvp.counterfactual.cache_root).resolve()
+        / "stage1_counterfactual"
+        / str(oracle.accvp.counterfactual.output_name)
+    )
 
 
 def test_incomplete_vnext_shard_is_quarantined_before_retry(tmp_path: Path):

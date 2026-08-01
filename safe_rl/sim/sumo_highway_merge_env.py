@@ -2420,6 +2420,12 @@ class SumoHighwayMergeEnv(gym.Env):
         context = {
             "ego": ego,
             "vehicles": vehicles,
+            # History is refreshed from the complete TraCI vehicle list at
+            # each environment step. Risk/Shield consumes this all-vehicle
+            # context independently of ACCVP's fixed task-actor rows.
+            "risk_safety_actor_coverage_complete": bool(
+                ego is not None and self.ego_id in latest
+            ),
             "history": self.history,
             "config": self.config,
             "lane_count": self._lane_count(ego.edge_id) if ego is not None else 1,

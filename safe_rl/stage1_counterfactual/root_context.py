@@ -113,7 +113,13 @@ def capture_root_context(
     ego = context.get("ego")
     if ego is None:
         raise RuntimeError("cannot capture ACCVP root without an ego state")
-    runtime = build_v3_runtime_batch(env.config, env.history, env.ego_id)
+    runtime = build_v3_runtime_batch(
+        env.config,
+        env.history,
+        env.ego_id,
+        max_actors_override=int(env.config.accvp.actor_count),
+        selector_scope="accvp",
+    )
     selection = runtime["actor_selection"].to_dict()
     actor_row_ids = [str(value) for value in runtime["actor_row_ids"]]
     if len(actor_row_ids) != int(env.config.accvp.actor_count):
@@ -127,8 +133,11 @@ def capture_root_context(
     mapping_hash = actor_row_mapping_hash(actor_row_ids, actor_row_source_indices, actor_row_mask)
     critical_actor_ids = [str(value) for value in selection.get("critical_actor_ids", [])]
     selected_actor_coverage_complete = len(selected_actor_ids) >= int(env.config.accvp.actor_count)
-    safety_actor_coverage_complete = set(critical_actor_ids).issubset(set(selected_actor_ids)) and not bool(
+    task_actor_coverage_complete = set(critical_actor_ids).issubset(set(selected_actor_ids)) and not bool(
         selection.get("critical_overflow", False)
+    )
+    risk_safety_actor_coverage_complete = bool(
+        context.get("risk_safety_actor_coverage_complete", False)
     )
     snapshot = Path(snapshot_path)
     root_id = root_id or f"seed{int(env.seed_value)}_decision{int(env._decision_index)}_{uuid.uuid4().hex[:12]}"
@@ -206,7 +215,19 @@ def capture_root_context(
         "selected_actor_count": len(selected_actor_ids),
         "selected_actor_capacity": int(env.config.accvp.actor_count),
         "selected_actor_coverage_complete": bool(selected_actor_coverage_complete),
-        "safety_actor_coverage_complete": bool(safety_actor_coverage_complete),
+        # Compatibility alias. Selector-v3 gates use task coverage explicitly;
+        # Risk/Shield coverage is a separate all-vehicle contract.
+        "safety_actor_coverage_complete": bool(task_actor_coverage_complete),
+        "task_actor_coverage_complete": bool(task_actor_coverage_complete),
+        "risk_safety_actor_coverage_complete": bool(
+            risk_safety_actor_coverage_complete
+        ),
+        "critical_actor_count": int(selection.get("critical_count", 0)),
+        "contextual_actor_count": int(selection.get("contextual_count", 0)),
+        "critical_actor_overflow": bool(selection.get("critical_overflow", False)),
+        "dropped_critical_actor_ids": [
+            str(value) for value in selection.get("dropped_critical_ids", [])
+        ],
         "selector": selection,
         "root_ego": ego.to_dict(),
         "root_observation_fingerprint_version": ROOT_OBSERVATION_FINGERPRINT_VERSION,

@@ -81,6 +81,7 @@ class ACCVPObservationStats:
     invalid_output_count: int = 0
     runtime_context_error_count: int = 0
     critical_actor_overflow_count: int = 0
+    risk_safety_actor_coverage_incomplete_count: int = 0
     unexpected_value_error_count: int = 0
     fail_closed_count: int = 0
     hard_fail_closed_count: int = 0
@@ -97,6 +98,9 @@ class ACCVPObservationStats:
     max_consecutive_timeout_count: int = 0
     stale_rejection_reasons: dict[str, int] = field(default_factory=dict)
     runtime_error_reasons: dict[str, int] = field(default_factory=dict)
+    critical_actor_overflow_histogram: dict[str, int] = field(default_factory=dict)
+    critical_actor_overflow_examples: list[dict[str, Any]] = field(default_factory=list)
+    critical_actor_overflow_sample_limit: int = 20
     stale_age_s: list[float] = field(default_factory=list)
     stale_context_delta_norm: list[float] = field(default_factory=list)
     warmup_latency_s: list[float] = field(default_factory=list)
@@ -166,6 +170,23 @@ class ACCVPObservationStats:
             "accvp_table_invalid_output_count": int(self.invalid_output_count),
             "accvp_table_runtime_context_error_count": int(self.runtime_context_error_count),
             "accvp_table_critical_actor_overflow_count": int(self.critical_actor_overflow_count),
+            "accvp_table_task_actor_overflow_count": int(
+                self.critical_actor_overflow_count
+            ),
+            "accvp_table_risk_safety_actor_coverage_incomplete_count": int(
+                self.risk_safety_actor_coverage_incomplete_count
+            ),
+            "accvp_table_critical_actor_overflow_histogram": dict(
+                self.critical_actor_overflow_histogram
+            ),
+            "accvp_table_critical_actor_overflow_examples": list(
+                self.critical_actor_overflow_examples[
+                    : max(0, int(self.critical_actor_overflow_sample_limit))
+                ]
+            ),
+            "accvp_table_critical_actor_overflow_sample_limit": int(
+                self.critical_actor_overflow_sample_limit
+            ),
             "accvp_table_unexpected_value_error_count": int(self.unexpected_value_error_count),
             "accvp_table_runtime_error_reasons": dict(self.runtime_error_reasons),
             "accvp_table_fail_closed_count": int(self.fail_closed_count),
@@ -246,6 +267,10 @@ class ACCVPObservationStats:
                 and int(self.invalid_output_count) == 0
                 and int(self.runtime_context_error_count) == 0
                 and int(self.critical_actor_overflow_count) == 0
+                and int(
+                    self.risk_safety_actor_coverage_incomplete_count
+                )
+                == 0
                 and int(self.unexpected_value_error_count) == 0
                 and int(self.warmup_error_count) == 0
                 and (total_latency["p95"] is not None and float(total_latency["p95"]) <= 0.30)
@@ -383,7 +408,13 @@ class RiskGatedACCVPCandidateTableAugmentor:
         self.last_valid_max_gap_delta_m = max(
             0.0, float(obs_cfg.get("last_valid_max_gap_delta_m", 8.0))
         )
-        self.stats = ACCVPObservationStats()
+        self.critical_actor_overflow_sample_limit = max(
+            0,
+            int(obs_cfg.get("critical_actor_overflow_sample_limit", 20)),
+        )
+        self.stats = ACCVPObservationStats(
+            critical_actor_overflow_sample_limit=self.critical_actor_overflow_sample_limit
+        )
         self._cache_key: tuple[Any, ...] | None = None
         self._cache_value: np.ndarray | None = None
         self._last_valid_value: np.ndarray | None = None
@@ -450,7 +481,9 @@ class RiskGatedACCVPCandidateTableAugmentor:
         return bool(config.accvp.get("observation", {}).get("enabled", False))
 
     def reset_episode_state(self) -> None:
-        self.stats = ACCVPObservationStats()
+        self.stats = ACCVPObservationStats(
+            critical_actor_overflow_sample_limit=self.critical_actor_overflow_sample_limit
+        )
         self._cache_key = None
         self._cache_value = None
         self._last_valid_value = None
@@ -697,9 +730,15 @@ class RiskGatedACCVPCandidateTableAugmentor:
             self.stats.runtime_context_error_count += 1
             self.stats.critical_actor_overflow_count += 1
             self._record_runtime_error(exc.reason_code)
+            self._record_critical_actor_overflow(exc.details)
         except ACCVPRuntimeContextError as exc:
             self.stats.consecutive_timeout_count = 0
             self.stats.runtime_context_error_count += 1
+            if (
+                exc.reason_code
+                == "risk_safety_actor_coverage_incomplete"
+            ):
+                self.stats.risk_safety_actor_coverage_incomplete_count += 1
             self._record_runtime_error(exc.reason_code)
         except ValueError:
             self.stats.consecutive_timeout_count = 0
@@ -728,6 +767,21 @@ class RiskGatedACCVPCandidateTableAugmentor:
         self.stats.runtime_error_reasons[key] = int(
             self.stats.runtime_error_reasons.get(key, 0)
         ) + 1
+
+    def _record_critical_actor_overflow(self, details: dict[str, Any]) -> None:
+        payload = dict(details or {})
+        key = (
+            f"capacity={int(payload.get('capacity', -1))},"
+            f"critical_count={int(payload.get('critical_count', -1))}"
+        )
+        self.stats.critical_actor_overflow_histogram[key] = int(
+            self.stats.critical_actor_overflow_histogram.get(key, 0)
+        ) + 1
+        if (
+            len(self.stats.critical_actor_overflow_examples)
+            < self.stats.critical_actor_overflow_sample_limit
+        ):
+            self.stats.critical_actor_overflow_examples.append(payload)
 
     def _validate_scores(
         self,

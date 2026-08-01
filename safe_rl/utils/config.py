@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import copy
+import json
 import os
 from datetime import datetime
 from pathlib import Path
@@ -90,21 +91,116 @@ def _reject_retired_noop_keys(override: Mapping[str, Any]) -> None:
         )
 
 
+def _resolve_extended_config(
+    source: Path,
+    *,
+    active: tuple[Path, ...] = (),
+) -> dict[str, Any]:
+    resolved = source.resolve()
+    if resolved in active:
+        cycle = " -> ".join(str(path) for path in (*active, resolved))
+        raise ValueError(f"configuration extends cycle: {cycle}")
+    with resolved.open("r", encoding="utf-8") as file:
+        payload = yaml.safe_load(file) or {}
+    if not isinstance(payload, Mapping):
+        raise ValueError(f"configuration overlay must be a mapping: {resolved}")
+    payload = dict(payload)
+    parent_value = payload.pop("extends", None)
+    _reject_retired_noop_keys(payload)
+    if parent_value is None:
+        return payload
+    parent = Path(str(parent_value))
+    if not parent.is_absolute():
+        repo_candidate = (REPO_ROOT / parent).resolve()
+        parent = (
+            repo_candidate
+            if repo_candidate.is_file()
+            else (resolved.parent / parent).resolve()
+        )
+    inherited = _resolve_extended_config(
+        parent,
+        active=(*active, resolved),
+    )
+    return _deep_merge(inherited, payload)
+
+
 def load_config(config_path: str | os.PathLike[str] | None = None) -> ConfigDict:
-    """Load the default config and overlay an optional YAML config."""
+    """Load defaults plus an optional recursively inherited YAML overlay.
+
+    ``extends`` is resolved before the final merge and is intentionally
+    removed from the resolved configuration. This lets canonical protocol
+    generations override only their contract/path changes without copying
+    hundreds of unrelated defaults.
+    """
 
     with DEFAULT_CONFIG_PATH.open("r", encoding="utf-8") as file:
         data = yaml.safe_load(file) or {}
 
     if config_path:
         path = Path(config_path)
-        with path.open("r", encoding="utf-8") as file:
-            override = yaml.safe_load(file) or {}
-        _reject_retired_noop_keys(override)
+        override = _resolve_extended_config(path)
         data = _deep_merge(data, override)
 
-    cfg = _to_config_dict(data)
-    return resolve_paths(cfg)
+    cfg = resolve_paths(_to_config_dict(data))
+    return _apply_selector_capacity_lock(cfg)
+
+
+def _apply_selector_capacity_lock(cfg: ConfigDict) -> ConfigDict:
+    """Apply an immutable selector audit capacity to every downstream stage."""
+
+    selector_contract = cfg.accvp.get("selector_contract", {}) or {}
+    if not bool(selector_contract.get("require_capacity_lock", False)):
+        return cfg
+    configured = selector_contract.get("audit_report")
+    if not configured:
+        raise ValueError(
+            "accvp.selector_contract.require_capacity_lock requires audit_report"
+        )
+    path = Path(str(configured))
+    if not path.is_absolute():
+        path = (REPO_ROOT / path).resolve()
+    if not path.is_file():
+        raise FileNotFoundError(
+            f"selector capacity audit report does not exist: {path}"
+        )
+    with path.open("r", encoding="utf-8") as handle:
+        report = json.load(handle)
+    if str(report.get("artifact_kind", "")) != "accvp_selector_contract_audit_v1":
+        raise ValueError("unsupported selector capacity audit report")
+    if (
+        str(report.get("protocol_id", ""))
+        != "accvp-vnext-correctness-v2-selector3"
+    ):
+        raise ValueError("selector capacity audit protocol_id mismatch")
+    from safe_rl.accvp.contracts.schema import stable_hash
+
+    declared_fingerprint = str(report.get("report_fingerprint", ""))
+    recomputed_fingerprint = stable_hash(
+        {
+            key: value
+            for key, value in report.items()
+            if key != "report_fingerprint"
+        }
+    )
+    if (
+        not declared_fingerprint
+        or declared_fingerprint != recomputed_fingerprint
+    ):
+        raise ValueError("selector capacity audit report fingerprint mismatch")
+    if str(report.get("audit_state", "")) != "pass":
+        raise ValueError("selector capacity audit is blocked")
+    capacity = int(report.get("selected_capacity", -1))
+    if capacity not in {6, 8}:
+        raise ValueError("selector capacity audit must freeze capacity 6 or 8")
+    # The audit freezes ACCVP task rows only. WcDT keeps the independent
+    # selector/max-agent contract stored in its checkpoint.
+    cfg.accvp["actor_count"] = capacity
+    cfg.accvp.selector_contract["resolved_capacity"] = capacity
+    cfg.accvp.selector_contract["audit_report"] = str(path)
+    cfg.accvp.selector_contract["audit_report_fingerprint"] = str(
+        declared_fingerprint
+    )
+    return cfg
 
 
 def resolve_paths(cfg: ConfigDict) -> ConfigDict:

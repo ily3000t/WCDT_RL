@@ -11,6 +11,10 @@ from typing import Any, Iterable
 
 import numpy as np
 
+from safe_rl.accvp.contracts.protocol import (
+    ACCVP_DATA_CONTRACT_VERSION,
+    ACCVP_SELECTOR3_DATA_CONTRACT_VERSION,
+)
 from safe_rl.accvp.contracts.schema import (
     ACTOR_ROW_MAPPING_VERSION,
     COUNTERFACTUAL_DATASET_MANIFEST_VERSION,
@@ -67,10 +71,14 @@ def assert_new_shard(path: str | Path) -> Path:
 def shard_fingerprints(shard_dir: str | Path) -> dict[str, str]:
     shard = Path(shard_dir)
     manifests = shard / "manifests"
+    rejected = manifests / "rejected_roots.jsonl"
     return {
         "dataset_manifest_sha256": file_sha256(manifests / "dataset_manifest.json"),
         "roots_manifest_sha256": jsonl_sha256(manifests / "roots.jsonl"),
         "branches_manifest_sha256": jsonl_sha256(manifests / "branches.jsonl"),
+        "rejected_roots_manifest_sha256": (
+            jsonl_sha256(rejected) if rejected.exists() else ""
+        ),
     }
 
 
@@ -135,7 +143,14 @@ def merge_counterfactual_shards(
     # Only the formal counterfactual data contract is required to match.
     baseline = dict(manifests[0]["data_contract"])
     baseline_hash = str(manifests[0]["data_contract_hash"])
-    strict_actor_rows = str(baseline.get("protocol_version", "")) == "accvp_240_v2"
+    protocol_version = str(baseline.get("protocol_version", ""))
+    strict_actor_rows = protocol_version in {
+        ACCVP_DATA_CONTRACT_VERSION,
+        ACCVP_SELECTOR3_DATA_CONTRACT_VERSION,
+    }
+    strict_selector_coverage = (
+        protocol_version == ACCVP_SELECTOR3_DATA_CONTRACT_VERSION
+    )
     if stable_hash(baseline) != baseline_hash:
         raise ValueError(f"invalid counterfactual data_contract hash in shard {shards[0]}")
     for shard, manifest in zip(shards[1:], manifests[1:]):
@@ -154,6 +169,7 @@ def merge_counterfactual_shards(
         raise ValueError("formal ACCVP dataset requires a frozen Risk Module checkpoint, not heuristic risk")
 
     root_rows: list[dict[str, Any]] = []
+    rejected_root_rows: list[dict[str, Any]] = []
     branch_rows: list[dict[str, Any]] = []
     root_ids: set[str] = set()
     root_state_fingerprints: dict[str, dict[str, str]] = {}
@@ -175,6 +191,23 @@ def merge_counterfactual_shards(
                 "root_policy_checkpoint_fingerprint": str(manifest.get("root_policy_checkpoint_fingerprint", "")),
                 "collection_job": dict(manifest.get("collection_job", {})),
                 "complete_roots": int(manifest.get("complete_roots", 0)),
+                "rejected_root_count": int(manifest.get("rejected_root_count", 0)),
+                "critical_actor_overflow_count": int(
+                    manifest.get("critical_actor_overflow_count", 0)
+                ),
+                "safety_actor_coverage_incomplete_count": int(
+                    manifest.get("safety_actor_coverage_incomplete_count", 0)
+                ),
+                "task_actor_coverage_incomplete_count": int(
+                    manifest.get(
+                        "task_actor_coverage_incomplete_count", 0
+                    )
+                ),
+                "risk_safety_actor_coverage_incomplete_count": int(
+                    manifest.get(
+                        "risk_safety_actor_coverage_incomplete_count", 0
+                    )
+                ),
                 "failed_branches": int(manifest.get("failed_branches", 0)),
                 "branch_status_counts": dict(manifest.get("branch_status_counts", {})),
                 **fingerprints,
@@ -182,6 +215,19 @@ def merge_counterfactual_shards(
         )
         shard_roots = _jsonl(roots_path)
         shard_branches = _jsonl(branches_path)
+        rejected_path = shard / "manifests" / "rejected_roots.jsonl"
+        shard_rejected = _jsonl(rejected_path) if rejected_path.exists() else []
+        if strict_selector_coverage and len(shard_rejected) != int(
+            manifest.get("rejected_root_count", -1)
+        ):
+            raise ValueError(
+                f"selector3 shard rejected-root count mismatch: {shard}"
+            )
+        for rejected in shard_rejected:
+            enriched_rejected = dict(rejected)
+            enriched_rejected["source_shard_id"] = str(manifest["collection_id"])
+            enriched_rejected["source_shard_path"] = str(shard)
+            rejected_root_rows.append(enriched_rejected)
         completed = {str(row["root_id"]) for row in shard_roots if bool(row.get("complete", False))}
         for root in shard_roots:
             root_id = str(root["root_id"])
@@ -251,6 +297,70 @@ def merge_counterfactual_shards(
                     raise ValueError(f"root observation fingerprint content mismatch in shard {shard}: {root_id}")
                 root_mapping_hashes[root_id] = mapping_hash
                 root_actor_row_ids[root_id] = actor_row_ids
+                if strict_selector_coverage:
+                    selector = dict(root_metadata.get("selector", {}) or {})
+                    required_coverage = {
+                        "critical_actor_count": int(
+                            root_metadata.get(
+                                "critical_actor_count",
+                                selector.get("critical_count", -1),
+                            )
+                        ),
+                        "contextual_actor_count": int(
+                            root_metadata.get(
+                                "contextual_actor_count",
+                                selector.get("contextual_count", -1),
+                            )
+                        ),
+                        "critical_actor_overflow": bool(
+                            root_metadata.get(
+                                "critical_actor_overflow",
+                                selector.get("critical_overflow", True),
+                            )
+                        ),
+                        "dropped_critical_actor_ids": [
+                            str(value)
+                            for value in root_metadata.get(
+                                "dropped_critical_actor_ids",
+                                selector.get("dropped_critical_ids", []),
+                            )
+                        ],
+                        "safety_actor_coverage_complete": bool(
+                            root_metadata.get(
+                                "safety_actor_coverage_complete",
+                                False,
+                            )
+                        ),
+                        "task_actor_coverage_complete": bool(
+                            root_metadata.get(
+                                "task_actor_coverage_complete", False
+                            )
+                        ),
+                        "risk_safety_actor_coverage_complete": bool(
+                            root_metadata.get(
+                                "risk_safety_actor_coverage_complete", False
+                            )
+                        ),
+                    }
+                    if (
+                        required_coverage["critical_actor_overflow"]
+                        or required_coverage["dropped_critical_actor_ids"]
+                        or not required_coverage[
+                            "task_actor_coverage_complete"
+                        ]
+                        or not required_coverage[
+                            "risk_safety_actor_coverage_complete"
+                        ]
+                    ):
+                        raise ValueError(
+                            "selector3 completed root has incomplete task/Risk actor "
+                            f"coverage: {root_id}"
+                        )
+                    for key, expected in required_coverage.items():
+                        if root.get(key) != expected:
+                            raise ValueError(
+                                f"selector3 root manifest {key} mismatch: {root_id}"
+                            )
             else:
                 observation_fingerprint = str(root.get("root_state_fingerprint", ""))
             root_state_fingerprint = observation_fingerprint
@@ -292,6 +402,36 @@ def merge_counterfactual_shards(
                         "scenario_episode_key_version": SCENARIO_EPISODE_KEY_VERSION,
                         "scenario_episode_key": root_scenario_episode_key,
                         "scenario_route_hash": str(baseline["scenario_route_hash"]),
+                        "critical_actor_count": int(
+                            root_metadata.get("critical_actor_count", 0)
+                        ),
+                        "contextual_actor_count": int(
+                            root_metadata.get("contextual_actor_count", 0)
+                        ),
+                        "critical_actor_overflow": bool(
+                            root_metadata.get("critical_actor_overflow", False)
+                        ),
+                        "dropped_critical_actor_ids": [
+                            str(value)
+                            for value in root_metadata.get(
+                                "dropped_critical_actor_ids", []
+                            )
+                        ],
+                        "safety_actor_coverage_complete": bool(
+                            root_metadata.get(
+                                "safety_actor_coverage_complete", False
+                            )
+                        ),
+                        "task_actor_coverage_complete": bool(
+                            root_metadata.get(
+                                "task_actor_coverage_complete", False
+                            )
+                        ),
+                        "risk_safety_actor_coverage_complete": bool(
+                            root_metadata.get(
+                                "risk_safety_actor_coverage_complete", False
+                            )
+                        ),
                     }
                 )
             enriched["source_shard_id"] = str(manifest["collection_id"])
@@ -309,6 +449,22 @@ def merge_counterfactual_shards(
             root_id = str(branch.get("root_id", ""))
             if strict_actor_rows:
                 validate_branch_row(branch)
+                if strict_selector_coverage and (
+                    bool(branch.get("critical_actor_overflow", False))
+                    or list(branch.get("dropped_critical_actor_ids", []) or [])
+                    or not bool(
+                        branch.get("task_actor_coverage_complete", False)
+                    )
+                    or not bool(
+                        branch.get(
+                            "risk_safety_actor_coverage_complete", False
+                        )
+                    )
+                ):
+                    raise ValueError(
+                        "selector3 branch has incomplete task/Risk actor coverage: "
+                        f"{branch.get('branch_id')}"
+                    )
                 if str(branch.get("actor_row_mapping_hash", "")) != root_mapping_hashes.get(root_id, ""):
                     raise ValueError(f"counterfactual branch actor-row mapping mismatch: {branch.get('branch_id')}")
                 expected_actor_ids = root_actor_row_ids.get(root_id, [])
@@ -335,6 +491,10 @@ def merge_counterfactual_shards(
     branch_rows.sort(key=lambda row: (str(row["root_id"]), int(row["action_id"])))
     roots_path = _write_jsonl(manifest_dir / "roots.jsonl", root_rows)
     branches_path = _write_jsonl(manifest_dir / "branches.jsonl", branch_rows)
+    rejected_roots_path = _write_jsonl(
+        manifest_dir / "rejected_roots.jsonl",
+        rejected_root_rows,
+    )
     coverage = {
         "collection_source": dict(Counter(str(row.get("collection_source", "unknown")) for row in root_rows)),
         "root_policy": dict(Counter(str(row.get("root_policy", row.get("root_source", "unknown"))) for row in root_rows)),
@@ -364,6 +524,37 @@ def merge_counterfactual_shards(
         "config_hash": stable_hash({"source_config_hashes": source_config_hashes}),
         "source_shards": shard_records,
         "root_count": len(root_rows),
+        "rejected_root_count": len(rejected_root_rows),
+        "critical_actor_overflow_count": sum(
+            bool(row.get("critical_actor_overflow", False))
+            for row in [*root_rows, *rejected_root_rows]
+        ),
+        "safety_actor_coverage_incomplete_count": sum(
+            not bool(row.get("task_actor_coverage_complete", False))
+            for row in [*root_rows, *rejected_root_rows]
+        ),
+        "task_actor_coverage_incomplete_count": sum(
+            not bool(row.get("task_actor_coverage_complete", False))
+            for row in [*root_rows, *rejected_root_rows]
+        ),
+        "risk_safety_actor_coverage_incomplete_count": sum(
+            not bool(
+                row.get("risk_safety_actor_coverage_complete", False)
+            )
+            for row in [*root_rows, *rejected_root_rows]
+        ),
+        "critical_actor_count_histogram": dict(
+            Counter(
+                str(int(row.get("critical_actor_count", 0)))
+                for row in [*root_rows, *rejected_root_rows]
+            )
+        ),
+        "contextual_actor_count_histogram": dict(
+            Counter(
+                str(int(row.get("contextual_actor_count", 0)))
+                for row in [*root_rows, *rejected_root_rows]
+            )
+        ),
         "branch_count": len(branch_rows),
         "unique_root_state_fingerprint_count": len(root_state_fingerprints),
         "duplicate_root_state_fingerprint_count": len(duplicate_root_state_fingerprints),
@@ -371,6 +562,7 @@ def merge_counterfactual_shards(
         "coverage": coverage,
         "roots_manifest_sha256": file_sha256(roots_path),
         "branches_manifest_sha256": file_sha256(branches_path),
+        "rejected_roots_manifest_sha256": file_sha256(rejected_roots_path),
     }
     manifest["dataset_fingerprint"] = stable_hash(manifest)
     write_json_atomic(manifest_dir / "dataset_manifest.json", manifest)

@@ -11,6 +11,7 @@ from typing import Any, Iterable
 import numpy as np
 
 from safe_rl.accvp.planning.candidate_plan import build_commitment_plan
+from safe_rl.accvp.contracts.protocol import ACCVP_SELECTOR3_DATA_CONTRACT_VERSION
 from safe_rl.accvp.contracts.schema import (
     COUNTERFACTUAL_SCHEMA_VERSION,
     ENTRY_TIME_LABEL_VERSION,
@@ -211,6 +212,28 @@ def build_split_manifest(
         raise ValueError("ACCVP model split has no roots after excluding oracle-only cohorts")
     dataset_manifest_path = dataset / "manifests" / "dataset_manifest.json"
     dataset_manifest = read_json(dataset_manifest_path) if dataset_manifest_path.exists() else {}
+    selector3_contract = (
+        str(
+            dict(dataset_manifest.get("data_contract", {}) or {}).get(
+                "protocol_version", ""
+            )
+        )
+        == ACCVP_SELECTOR3_DATA_CONTRACT_VERSION
+    )
+    incomplete_coverage_roots = [
+        str(row.get("root_id", ""))
+        for row in complete_roots
+        if (
+            not bool(row.get("task_actor_coverage_complete", False))
+            or bool(row.get("critical_actor_overflow", False))
+            or bool(list(row.get("dropped_critical_actor_ids", []) or []))
+        )
+    ]
+    if selector3_contract and incomplete_coverage_roots:
+        raise ValueError(
+            "selector3 ACCVP roots with incomplete task actor coverage cannot "
+            f"enter any split: {incomplete_coverage_roots[:10]}"
+        )
     strict_fingerprints = int(dataset_manifest.get("counterfactual_schema_version", -1)) >= COUNTERFACTUAL_SCHEMA_VERSION
     dataset_scenario_route_hash = _dataset_scenario_route_hash(dataset_manifest)
     missing_fingerprints = [str(row.get("root_id", "")) for row in roots if not _root_observation_fingerprint(row)]
@@ -326,6 +349,9 @@ def build_split_manifest(
         "excluded_oracle_root_ids": sorted(str(row.get("root_id", "")) for row in excluded_roots),
         "excluded_oracle_root_reason_counts": dict(
             Counter(str(excluded_reason(row)) for row in excluded_roots)
+        ),
+        "task_actor_coverage_incomplete_root_count": len(
+            incomplete_coverage_roots
         ),
         "missing_observation_fingerprint_count": len(missing_fingerprints),
         "scenario_episode_key_version": SCENARIO_EPISODE_KEY_VERSION,
@@ -548,6 +574,30 @@ class ACCVPBranchDataset:
             for row in _jsonl(manifest_dir / "roots.jsonl")
             if bool(row.get("complete", False))
         ]
+        dataset_manifest = read_json(manifest_dir / "dataset_manifest.json")
+        selector3_contract = (
+            str(
+                dict(dataset_manifest.get("data_contract", {}) or {}).get(
+                    "protocol_version", ""
+                )
+            )
+            == ACCVP_SELECTOR3_DATA_CONTRACT_VERSION
+        )
+        selected_incomplete_roots = [
+            str(row.get("root_id", ""))
+            for row in complete_roots
+            if splits.get(str(row.get("root_id", ""))) == split
+            and (
+                not bool(row.get("task_actor_coverage_complete", False))
+                or bool(row.get("critical_actor_overflow", False))
+                or bool(list(row.get("dropped_critical_actor_ids", []) or []))
+            )
+        ]
+        if selector3_contract and selected_incomplete_roots:
+            raise ValueError(
+                "selector3 ACCVP split contains roots with incomplete safety "
+                f"actor coverage: {selected_incomplete_roots[:10]}"
+            )
         selected_oracle_roots = [
             str(row.get("root_id", ""))
             for row in complete_roots

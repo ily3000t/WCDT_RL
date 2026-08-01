@@ -56,6 +56,26 @@ class CounterfactualSnapshotStore:
             "expected_action_ids": [int(value) for value in expected_action_ids],
             "branch_status": {str(value): "pending" for value in expected_action_ids},
             "complete": False,
+            "critical_actor_count": int(root.metadata.get("critical_actor_count", 0)),
+            "contextual_actor_count": int(root.metadata.get("contextual_actor_count", 0)),
+            "critical_actor_overflow": bool(
+                root.metadata.get("critical_actor_overflow", False)
+            ),
+            "dropped_critical_actor_ids": [
+                str(value)
+                for value in root.metadata.get("dropped_critical_actor_ids", [])
+            ],
+            "safety_actor_coverage_complete": bool(
+                root.metadata.get("safety_actor_coverage_complete", False)
+            ),
+            "task_actor_coverage_complete": bool(
+                root.metadata.get("task_actor_coverage_complete", False)
+            ),
+            "risk_safety_actor_coverage_complete": bool(
+                root.metadata.get(
+                    "risk_safety_actor_coverage_complete", False
+                )
+            ),
         }
         self._write_root_manifest(root.root_id, row)
         return metadata_path, tensor_path

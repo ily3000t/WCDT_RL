@@ -10,7 +10,8 @@ safe_rl/config/
   default_safe_rl.yaml
   registry.yaml
   active/
-    accvp_vnext/       # canonical VNext entrypoints and workflow contract
+    accvp_vnext_selector3/ # canonical Selector-v3 entrypoints/workflow
+    accvp_vnext/       # V1 diagnostic-only reproduction
     pipeline/          # maintained generic pipeline profiles
     smoke/             # maintained smoke-only profiles
   baselines/
@@ -38,7 +39,9 @@ Registry statuses：
 - 默认关闭但代码仍支持的能力继续保留，例如 Shield、forecast features 和 ACCVP runtime；
 - WcDT/Risk/通用 Stage1--5 所需的兼容字段继续保留，并在顶层区块注释其责任；
 - 从未被运行时代码读取的开关已经移除。覆盖配置若再次传入这些键会立即报错，避免静默 no-op；
-- 正式数据、Reward、runtime 和 holdout 语义仍只在 `active/accvp_vnext/` 冻结。
+- 正式数据、Reward、runtime 和 holdout 语义只在
+  `active/accvp_vnext_selector3/` 冻结；`active/accvp_vnext/` 已降级为
+  `diagnostic_only`。
 
 已退役 no-op 包括旧 `prediction.freeze/model_type/num_modes`、重复的
 `forecast_features.normalize_features`、未生效的 feature include 开关、未生效的 Risk
@@ -89,19 +92,20 @@ Canonical Candidate PPO 把 `ppo_expected_rollout_size` 固定为 1024。若从 
 `advanced/` 平铺目录已退役。旧 basename 保存在相应 archive family 中；canonical VNext 使用
 简短角色名。
 
-## Canonical VNext set
+## Canonical Selector-v3 set
 
 ```text
-active/accvp_vnext/workflow.yaml
-active/accvp_vnext/pilot.yaml
-active/accvp_vnext/oracle_regression.yaml
-active/accvp_vnext/formal.yaml
-active/accvp_vnext/train.yaml
-active/accvp_vnext/ppo_candidate_table_dev.yaml
-active/accvp_vnext/ppo_candidate_table_full.yaml
-active/accvp_vnext/ppo_ablation_matrix.yaml
+active/accvp_vnext_selector3/selector_audit.yaml
+active/accvp_vnext_selector3/workflow.yaml
+active/accvp_vnext_selector3/pilot.yaml
+active/accvp_vnext_selector3/oracle_regression.yaml
+active/accvp_vnext_selector3/formal.yaml
+active/accvp_vnext_selector3/train.yaml
+active/accvp_vnext_selector3/ppo_candidate_table_full.yaml
+active/accvp_vnext_selector3/ppo_ablation_matrix.yaml
 ```
 
+`selector_audit.yaml` 是唯一允许在容量报告产生前加载 Selector-v3 的配置。
 `workflow.yaml` 描述阶段顺序、artifact gate、最终方法角色和六个 factorial 比较；数值科学
 阈值仍保留在各自 pilot/runtime/Stage5 配置中，避免重复声明和漂移。
 
@@ -145,7 +149,7 @@ python -m safe_rl.pipeline.run_accvp_vnext_pipeline --execute-next
 
 ```powershell
 python -m safe_rl.pipeline.run_accvp_vnext_pipeline `
-  --workflow-config safe_rl/config/active/accvp_vnext/workflow.yaml `
+  --workflow-config safe_rl/config/active/accvp_vnext_selector3/workflow.yaml `
   --run-until pilot_validation
 ```
 
@@ -167,9 +171,9 @@ python -m safe_rl.pipeline.run_accvp_vnext_pipeline `
 PPO factorial、runtime、Stage5 paired config 和 resolved config 写入：
 
 ```text
-safe_rl_output/runs/accvp_vnext_factorial/
-safe_rl_output/runs/accvp_vnext_runtime/
-safe_rl_output/runs/accvp_vnext_stage5/generated/
+safe_rl_output/runs/accvp_vnext_selector3_factorial/
+safe_rl_output/runs/accvp_vnext_selector3_runtime/
+safe_rl_output/runs/accvp_vnext_selector3_stage5/generated/
 ```
 
 不要把每个 optimizer seed 的生成配置加入 `active/`，否则会重新造成配置膨胀。机器专用路径
@@ -182,5 +186,6 @@ retention 或删除应在独立 manifest-driven audit 后进行。
 
 archive 配置仍有三类价值：历史实验复现、方法演进说明、failure-case regression。它们不得
 用于 VNext training、calibration、operating-point selection、confirmatory evaluation、final
-holdout 或 artifact promotion。`artifact_revocation_manifest_vnext.json` 是旧 artifact 的撤销
-边界；registry family coverage 由测试强制检查。
+holdout 或 artifact promotion。`artifact_revocation_manifest_selector3.json` 将 schema2 和
+Selector-v2 V1 artifacts 标为 `diagnostic_only`；Selector-v3 正式 lineage 不得复用这些
+产物。registry family coverage 由测试强制检查。

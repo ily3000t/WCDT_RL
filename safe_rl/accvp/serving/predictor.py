@@ -34,16 +34,111 @@ def _require_torch():
 class ACCVPRuntimeContextError(ValueError):
     """A fail-closed runtime input/coverage error with a stable audit code."""
 
-    def __init__(self, message: str, *, reason_code: str):
+    def __init__(
+        self,
+        message: str,
+        *,
+        reason_code: str,
+        details: dict[str, Any] | None = None,
+    ):
         super().__init__(message)
         self.reason_code = str(reason_code)
+        self.details = dict(details or {})
 
 
 class ACCVPCriticalActorOverflow(ACCVPRuntimeContextError):
     """Critical merge actors could not all be represented in the fixed rows."""
 
 
-def validate_runtime_actor_rows(runtime: dict[str, Any], actor_count: int) -> int:
+ACCVPTaskActorOverflow = ACCVPCriticalActorOverflow
+
+
+def _context_value(value: Any, name: str, default: Any) -> Any:
+    if isinstance(value, dict):
+        return value.get(name, default)
+    return getattr(value, name, default)
+
+
+def _overflow_details(
+    runtime: dict[str, Any],
+    actor_count: int,
+    context: dict[str, Any] | None,
+    optimizer_seed: int | None,
+) -> dict[str, Any]:
+    selection = runtime.get("actor_selection")
+    metadata = dict(getattr(selection, "actor_metadata", {}) or {})
+    selected_ids = [str(value) for value in getattr(selection, "selected_actor_ids", ())]
+    dropped_ids = [str(value) for value in getattr(selection, "dropped_critical_ids", ())]
+    critical_ids = [str(value) for value in getattr(selection, "critical_actor_ids", ())]
+    actor_details: list[dict[str, Any]] = []
+    for vehicle_id in critical_ids:
+        item = metadata.get(vehicle_id)
+        reasons = list(getattr(item, "relevance_reasons", ()) or ())
+        actor_details.append(
+            {
+                "vehicle_id": vehicle_id,
+                "selected": vehicle_id in selected_ids,
+                "dropped": vehicle_id in dropped_ids,
+                "role": str(getattr(item, "role", "unknown")),
+                "edge_id": str(getattr(item, "edge_id", "")),
+                "lane_id": str(getattr(item, "lane_id", "")),
+                "lane_index": int(getattr(item, "lane_index", -1)),
+                "gap_m": float(getattr(item, "current_surface_gap", float("inf"))),
+                "effective_gap_m": float(getattr(item, "effective_gap", float("inf"))),
+                "ttc_s": float(getattr(item, "ttc", float("inf"))),
+                "candidate_conflict_eligible": bool(
+                    getattr(item, "candidate_conflict_eligible", False)
+                ),
+                "conflict_candidate_ids": list(
+                    getattr(item, "conflict_candidate_ids", ()) or ()
+                ),
+                "conflict_hypothesis_ids": list(
+                    getattr(item, "conflict_hypothesis_ids", ()) or ()
+                ),
+                "conflict_surface_ids": list(
+                    getattr(item, "conflict_surface_ids", ()) or ()
+                ),
+                "earliest_conflict_time_s": float(
+                    getattr(item, "earliest_conflict_time_s", float("inf"))
+                ),
+                "earliest_overlap_time_s": float(
+                    getattr(item, "earliest_overlap_time_s", float("inf"))
+                ),
+                "minimum_swept_obb_gap_m": float(
+                    getattr(item, "minimum_swept_obb_gap", float("inf"))
+                ),
+                "nearest_candidate_conflict": bool(
+                    getattr(item, "nearest_candidate_conflict", False)
+                ),
+                "trigger_reasons": reasons,
+            }
+        )
+    runtime_context = dict(context or {})
+    local = runtime_context.get("merge_local")
+    return {
+        "capacity": int(actor_count),
+        "critical_count": int(getattr(selection, "critical_count", len(critical_ids))),
+        "selected_actor_ids": selected_ids,
+        "dropped_critical_ids": dropped_ids,
+        "critical_actors": actor_details,
+        "selector_version": str(getattr(selection, "version", "")),
+        "selector_config_hash": str(getattr(selection, "config_hash", "")),
+        "episode_seed": int(runtime_context.get("episode_seed", -1)),
+        "optimizer_seed": -1 if optimizer_seed is None else int(optimizer_seed),
+        "decision_index": int(runtime_context.get("decision_index", -1)),
+        "taper_distance_m": float(
+            _context_value(local, "merge_distance", float("inf"))
+        ),
+    }
+
+
+def validate_runtime_actor_rows(
+    runtime: dict[str, Any],
+    actor_count: int,
+    *,
+    context: dict[str, Any] | None = None,
+    optimizer_seed: int | None = None,
+) -> int:
     """Validate the fixed actor-row contract while allowing legal padded rows.
 
     V3 represents absent actors with an empty ``actor_row_ids`` value and a
@@ -76,9 +171,27 @@ def validate_runtime_actor_rows(runtime: dict[str, Any], actor_count: int) -> in
             )
     selection = runtime.get("actor_selection")
     if bool(getattr(selection, "critical_overflow", False)):
+        details = _overflow_details(runtime, expected, context, optimizer_seed)
         raise ACCVPCriticalActorOverflow(
-            "ACCVP runtime critical actor coverage exceeds the fixed model capacity",
+            "ACCVP runtime critical actor coverage exceeds the fixed model capacity: "
+            + json.dumps(details, sort_keys=True, separators=(",", ":")),
             reason_code="critical_actor_overflow",
+            details=details,
+        )
+    if context is not None and not bool(
+        context.get("risk_safety_actor_coverage_complete", True)
+    ):
+        raise ACCVPRuntimeContextError(
+            "Risk/Shield runtime context does not contain a complete "
+            "all-vehicle state",
+            reason_code="risk_safety_actor_coverage_incomplete",
+            details={
+                "episode_seed": int(context.get("episode_seed", -1)),
+                "optimizer_seed": (
+                    -1 if optimizer_seed is None else int(optimizer_seed)
+                ),
+                "decision_index": int(context.get("decision_index", -1)),
+            },
         )
     return int(np.count_nonzero(actor_mask > 0.0))
 
@@ -237,7 +350,13 @@ class ACCVPRuntimePredictor:
             )
         profile_from_config(self.config)
         try:
-            runtime = build_v3_runtime_batch(self.config, history, str(ego.vehicle_id))
+            runtime = build_v3_runtime_batch(
+                self.config,
+                history,
+                str(ego.vehicle_id),
+                max_actors_override=int(self.config.accvp.actor_count),
+                selector_scope="accvp",
+            )
         except ACCVPRuntimeContextError:
             raise
         except ValueError as exc:
@@ -245,7 +364,17 @@ class ACCVPRuntimePredictor:
                 f"ACCVP runtime batch construction failed: {exc}",
                 reason_code="runtime_batch_invalid",
             ) from exc
-        validate_runtime_actor_rows(runtime, int(self.config.accvp.actor_count))
+        validate_runtime_actor_rows(
+            runtime,
+            int(self.config.accvp.actor_count),
+            context=context,
+            optimizer_seed=int(
+                self.config.rl.get(
+                    "optimizer_seed",
+                    self.config.run.get("seed", -1),
+                )
+            ),
+        )
         candidate_plans = np.stack(
             [
                 build_commitment_plan(

@@ -1,0 +1,24 @@
+extends: safe_rl/config/active/accvp_vnext/formal.yaml
+
+# This is the only Selector-v3 config that is allowed to run before the
+# capacity report exists. It reads old full root histories and does not write
+# any schema-v3 branch labels.
+run:
+  run_id: "accvp_vnext_selector3_audit"
+
+evaluation_protocol:
+  protocol_id: "accvp-vnext-correctness-v2-selector3"
+  seed_ledger: "safe_rl/config/accvp_vnext_selector3_seed_ledger.json"
+  revocation_manifest: "safe_rl/config/artifact_revocation_manifest_selector3.json"
+
+accvp:
+  actor_relevance:
+    version: "candidate_union_conflict_relevance_v3"
+    candidate_conflict_horizon_s: 3.0
+    candidate_conflict_surface_gap: 30.0
+    actor_longitudinal_accel_bound: 2.0
+    local_actor_distance: 45.0
+    critical_taper_distance: 120.0
+  data_contract_version: "accvp_240_v3_conflict_selector"
+  selector_contract:
+    require_capacity_lock: false

@@ -77,6 +77,15 @@ def build_factorial_plan(
     seeds = _validated_seeds(optimizer_seeds, contract["minimum_optimizer_replicates"])
     root = resolve_path(output_root)
     config_source = resolve_path(config_path)
+    template_cfg = load_config(config_source)
+    replicate_run_id_prefix = str(
+        dict(template_cfg.get("experiment", {}) or {}).get(
+            "replicate_run_id_prefix",
+            "ppo_accvp_vnext",
+        )
+    ).strip()
+    if not replicate_run_id_prefix:
+        raise ValueError("experiment.replicate_run_id_prefix cannot be empty")
     methods: dict[str, Any] = {}
     run_ids: set[str] = set()
     config_paths: set[str] = set()
@@ -91,7 +100,7 @@ def build_factorial_plan(
             method_id=method_id,
             optimizer_seeds=seeds,
             output_root=method_root,
-            run_id_prefix=f"ppo_accvp_vnext_{method_id}",
+            run_id_prefix=f"{replicate_run_id_prefix}_{method_id}",
             require_artifacts=require_artifacts,
         )
         config_records: list[dict[str, Any]] = []

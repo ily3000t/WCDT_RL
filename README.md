@@ -1,7 +1,7 @@
 # WCDT_ACCVP / SAFE_RL
 
 本仓库研究 SUMO `highway_merge` 场景中的安全强化学习。当前正式实验主线是
-**ACCVP VNext**：用 action-conditioned Candidate Table 估计候选动作的合流可行性，
+**ACCVP VNext Selector-v3**：用 action-conditioned Candidate Table 估计候选动作的合流可行性，
 由独立 Risk/Safety Shield 保持局部安全权威，再通过成对、多训练副本的闭环评估检验收益。
 
 旧 WcDT、schema-v2 ACCVP、Reward-v2/v3 开发实验仍可用于复现和故障诊断，但不能直接
@@ -37,10 +37,10 @@ ACCVP safety head 只用于诊断，不能替代 Risk Module 的硬安全门控�
 并在 Reward-v2/no-commitment 条件下比较 Candidate Table 与 WcDT；它不是完整的
 Candidate Table × Reward × commitment 三因素设计。
 
-## 正式 VNext 入口
+## 正式 Selector-v3 入口
 
 正式状态由
-[`safe_rl/config/active/accvp_vnext/workflow.yaml`](safe_rl/config/active/accvp_vnext/workflow.yaml)
+[`safe_rl/config/active/accvp_vnext_selector3/workflow.yaml`](safe_rl/config/active/accvp_vnext_selector3/workflow.yaml)
 和产物报告共同决定。协调器有三种运行方式。
 
 ### 1. 只查看状态
@@ -104,22 +104,25 @@ python -m safe_rl.pipeline.run_accvp_vnext_pipeline --run-until stage5_replicate
 
 | 顺序 | phase | 执行内容与完成标志 |
 | ---: | --- | --- |
-| 1 | `pilot_collection` | 使用全新 VNext run ID 采集 schema3 pilot immutable shards。|
-| 2 | `pilot_merge` | 合并 pilot shards，生成 pilot dataset manifest。|
-| 3 | `oracle_collection` | 仅采集 seed 2/5、`oracle_only=true` 的历史 repairability regression。|
-| 4 | `oracle_merge` | 合并 oracle-only shards；该 dataset 永不进入模型 split。|
-| 5 | `oracle_regression` | 生成 oracle report；`oracle_state` 必须为 `go`。|
-| 6 | `pilot_validation` | 审计 schema、actor mapping、coverage、branch throughput 和 oracle exclusion；`pilot_state=pass`。|
-| 7 | `formal_collection` | 按已通过 pilot 的冻结契约采集 5,000-root formal shards。|
-| 8 | `formal_merge` | 合并 formal shards，生成 dataset/split provenance；不会训练模型。|
-| 9 | `accvp_training` | 训练三成员 ensemble，在独立 split 上 calibration 与 operating-point selection，生成 sealed candidate bundle。|
-| 10 | `scorer_runtime_preflight` | 使用 rule policy 访问真实 SUMO state，只测 ACCVP/Risk Candidate Table；使用 development cohort 的 60 个 seeds，报告要求至少 30 个独立 seeds、至少 1,000 个 activation-window decisions 且 `gate.pass=true`。门槛未通过但 lineage 一致时可续跑缺少的 seeds，旧失败报告会归档。|
-| 11 | `candidate_ppo_replicates` | 冻结 factorial plan，顺序训练四个 Candidate 方法 × 五个 optimizer seeds，共 20 个唯一 checkpoints；支持基于 config/checkpoint/report hash 的安全续跑。|
-| 12 | `baseline_ppo_replicates` | 训练/复用与 Candidate 对齐的五个 WcDT Reward-v2 baseline checkpoints。|
-| 13 | `policy_runtime_replicates` | 对四个 Candidate 方法的 20 个 PPO checkpoints 分别执行完整 159D policy runtime benchmark；每个 Stage5 policy group 只绑定自身 checkpoint 的报告，总 gate 取所有方法最差结果。|
-| 14 | `stage5_generate` | 生成六个冻结比较及每个 training seed 的 paired 配置；次要机制比较使用 confirmatory ledger 的前 100 个 seeds，WcDT-v2 对最终完整方法使用同一前缀扩展到 300 个 seeds。左右共享 simulator seeds，跨 Reward 比较不使用不可比的训练 `episode_reward`。|
-| 15 | `stage5_replicates_and_aggregate` | 可恢复地运行六组 Stage5；同一 method/checkpoint 的单 seed episode 写入不可变缓存并跨比较复用，然后分别做 crossed training-seed × simulator-seed bootstrap，最终生成 `stage5_factorial_report_v1`。|
-| 16 | `one_shot_final_holdout` | 只绑定最终方法的五副本 runtime child 与 WcDT-v2 vs Reward-v3.1+commitment promotion child；在全部冻结后显式打开一次。|
+| 1 | `selector_contract_audit` | 先审计旧 5,000 root 的全量 current/history 输入，再在 1002/1004 × 50021/50027 四个 diagnostic replay 上并行 shadow selector-v2/v3；严格冻结容量 6 或 8。|
+| 2 | `pilot_collection` | 使用全新 Selector-v3 run ID 采集 schema3 pilot immutable shards。|
+| 3 | `pilot_merge` | 合并 pilot shards，生成 pilot dataset manifest。|
+| 4 | `oracle_collection` | 仅采集 seed 2/5、`oracle_only=true` 的历史 repairability regression。|
+| 5 | `oracle_merge` | 合并 oracle-only shards；该 dataset 永不进入模型 split。|
+| 6 | `oracle_regression` | 生成 oracle report；`oracle_state` 必须为 `go`。|
+| 7 | `pilot_validation` | 审计 schema、actor mapping、task/Risk coverage、branch throughput 和 oracle exclusion；`pilot_state=pass`。|
+| 8 | `formal_collection` | 按已通过 pilot 的冻结 selector/capacity 契约采集 5,000-root formal shards。|
+| 9 | `formal_merge` | 合并 formal shards，生成 dataset provenance；不会训练模型。|
+| 10 | `formal_validation` | 在训练前强制检查 rejected/overflow/task coverage/Risk coverage、branch success 与无泄漏 split；`formal_state=pass`。|
+| 11 | `accvp_training` | 训练三成员 ensemble，在独立 split 上 calibration 与 operating-point selection，生成 sealed candidate bundle。|
+| 12 | `scorer_runtime_preflight` | 使用 rule policy 访问真实 SUMO state，只测 ACCVP/Risk Candidate Table；正式 runtime 使用未观察过的 55001–55060，且旧 implementation 的失败报告只归档、不复用 episodes。|
+| 13 | `candidate_ppo_replicates` | 冻结 factorial plan，顺序训练四个 Candidate 方法 × 五个 optimizer seeds，共 20 个唯一 checkpoints。|
+| 14 | `baseline_ppo_replicates` | 复用已有五副本 WcDT manifest；不完整或有冲突时 fail closed，不覆盖现有目录。|
+| 15 | `baseline_lineage_audit` | 独立核验五个 WcDT checkpoint/config/report hash、Reward/observation/预算和 optimizer seed；只有 `status=reusable` 才放行。|
+| 16 | `policy_runtime_replicates` | 对四个 Candidate 方法的 20 个 PPO checkpoints 分别执行完整 policy runtime benchmark，总 gate 取所有方法最差结果。|
+| 17 | `stage5_generate` | 生成六个冻结比较及每个 training seed 的 paired 配置。|
+| 18 | `stage5_replicates_and_aggregate` | 可恢复地运行六组 Stage5 并进行 replicated aggregation。|
+| 19 | `one_shot_final_holdout` | 只绑定最终方法与主要 comparison；在全部冻结后显式打开一次。|
 
 当 `accvp_training` 已完成且状态显示 `next_phase=scorer_runtime_preflight` 时，下一步可以二选一：
 
@@ -139,11 +142,11 @@ python -m safe_rl.pipeline.run_accvp_vnext_pipeline --run-until scorer_runtime_p
 
 ```powershell
 python -m safe_rl.pipeline.stage3_train_ppo_factorial `
-  --config safe_rl/config/active/accvp_vnext/ppo_candidate_table_full.yaml `
-  --matrix safe_rl/config/active/accvp_vnext/ppo_ablation_matrix.yaml `
-  --workflow-config safe_rl/config/active/accvp_vnext/workflow.yaml `
+  --config safe_rl/config/active/accvp_vnext_selector3/ppo_candidate_table_full.yaml `
+  --matrix safe_rl/config/active/accvp_vnext_selector3/ppo_ablation_matrix.yaml `
+  --workflow-config safe_rl/config/active/accvp_vnext_selector3/workflow.yaml `
   --optimizer-seeds 1001 1002 1003 1004 1005 `
-  --output-root safe_rl_output/runs/accvp_vnext_factorial
+  --output-root safe_rl_output/runs/accvp_vnext_selector3_factorial
 ```
 
 它默认安全续跑：完整 seed 会在重新核验 hash 后跳过。若 Stage3 在写入任何文件前退出，
@@ -157,16 +160,16 @@ python -m safe_rl.pipeline.stage3_train_ppo_factorial `
 lineage 分别校验 `ppo_training` 与 `ppo_optimizer_replicates`，禁止两类 seed 混用。
 
 ```text
-safe_rl_output/runs/accvp_vnext_factorial/
+safe_rl_output/runs/accvp_vnext_selector3_factorial/
   factorial_plan.json
   ppo_factorial_manifest.json
   methods/<method_id>/ppo_replicate_manifest.json
 
-safe_rl_output/runs/accvp_vnext_runtime/
+safe_rl_output/runs/accvp_vnext_selector3_runtime/
   factorial_runtime_report.json
   methods/<method_id>/replicated_runtime_report.json
 
-safe_rl_output/runs/accvp_vnext_stage5/
+safe_rl_output/runs/accvp_vnext_selector3_stage5/
   generated/factorial_request.json
   generated/comparisons/<comparison_id>/replicated_report.json
   episode_cache/<method_id>/optimizer_seed_<seed>/identity.json
@@ -207,7 +210,9 @@ artifact。不要因为 report 为 `fail` 就删除数据、放宽阈值或跳�
 
 ## 不可绕过的数据契约
 
-- 正式反事实数据必须是 schema3；旧 schema2 数据只能用于 diagnostic。
+- 正式反事实数据必须是 schema3 + `accvp_240_v3_conflict_selector`；旧 schema2 和 V1 selector-v2 数据只能用于 diagnostic。
+- Selector-v3 使用所有合法 ego candidate swept tubes 与 actor 可达管道的并集；当前不在目标车道不能据此降级为非冲突 actor。
+- ACCVP split 使用 `task_actor_coverage_complete`；Risk/Shield 的全车状态完整性由独立的 `risk_safety_actor_coverage_complete` 约束。
 - actor rows 只能由 `selected_indices` 生成，并由 mapping hash 约束。
 - split component 联合绑定 model-input fingerprint 与 scenario/traffic/episode seed。
 - ensemble bootstrap 以 fingerprint component 为单位，重复样本组总权重为 1。
@@ -227,7 +232,8 @@ artifact。不要因为 report 为 `fail` 就删除数据、放宽阈值或跳�
 
 ```text
 safe_rl/config/
-  active/accvp_vnext/  # canonical VNext configs and workflow
+  active/accvp_vnext_selector3/  # canonical Selector-v3 configs/workflow
+  active/accvp_vnext/            # V1 diagnostic-only reproduction
   baselines/           # maintained comparison arms
   examples/            # templates, not frozen experiments
   archive/             # diagnostic_only historical configs

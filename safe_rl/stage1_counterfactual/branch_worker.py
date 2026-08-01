@@ -241,6 +241,23 @@ def _branch_outcome(job: dict[str, Any]) -> dict[str, Any]:
             "actor_row_mapping_hash": mapping_hash,
             "selected_actor_coverage_complete": bool(root.metadata.get("selected_actor_coverage_complete", False)),
             "safety_actor_coverage_complete": bool(root.metadata.get("safety_actor_coverage_complete", False)),
+            "task_actor_coverage_complete": bool(
+                root.metadata.get("task_actor_coverage_complete", False)
+            ),
+            "risk_safety_actor_coverage_complete": bool(
+                root.metadata.get(
+                    "risk_safety_actor_coverage_complete", False
+                )
+            ),
+            "critical_actor_count": int(root.metadata.get("critical_actor_count", 0)),
+            "contextual_actor_count": int(root.metadata.get("contextual_actor_count", 0)),
+            "critical_actor_overflow": bool(
+                root.metadata.get("critical_actor_overflow", False)
+            ),
+            "dropped_critical_actor_ids": [
+                str(value)
+                for value in root.metadata.get("dropped_critical_actor_ids", [])
+            ],
             "event_observed": viability_status != "censored",
             "censor_time": float(censor_time),
             "censor_reason": censor_reason,

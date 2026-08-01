@@ -8,6 +8,7 @@ from pathlib import Path
 from typing import Any, Iterable, Mapping
 
 from safe_rl.accvp.contracts.schema import file_sha256, read_json, write_json_atomic
+from safe_rl.accvp.contracts.protocol import ACCVP_SELECTOR3_DATA_CONTRACT_VERSION
 
 
 def _jsonl(path: Path) -> list[dict[str, Any]]:
@@ -38,6 +39,23 @@ def validate_pilot_dataset(
         raise ValueError("ACCVP pilot validation requires a dataset merged from pilot shards")
     roots = [row for row in _jsonl(manifests / "roots.jsonl") if bool(row.get("complete", False))]
     branches = [row for row in _jsonl(manifests / "branches.jsonl") if row.get("branch_status") == "completed"]
+    selector3_contract = (
+        str(
+            dict(manifest.get("data_contract", {}) or {}).get(
+                "protocol_version", ""
+            )
+        )
+        == ACCVP_SELECTOR3_DATA_CONTRACT_VERSION
+    )
+    coverage_incomplete_root_ids = [
+        str(row.get("root_id", ""))
+        for row in roots
+        if (
+            not bool(row.get("task_actor_coverage_complete", False))
+            or bool(row.get("critical_actor_overflow", False))
+            or bool(list(row.get("dropped_critical_actor_ids", []) or []))
+        )
+    ]
     counts = Counter(str(row.get("collection_source", "unknown")) for row in roots)
     source_coverage = {
         name: {
@@ -51,18 +69,55 @@ def validate_pilot_dataset(
     source_manifests = []
     completed_branches = 0
     failed_branches = 0
+    rejected_root_count = 0
+    critical_actor_overflow_count = 0
+    source_coverage_incomplete_count = 0
+    source_risk_coverage_incomplete_count = 0
     for source in manifest.get("source_shards", []):
         path = Path(str(source["path"])) / "manifests" / "dataset_manifest.json"
         source_manifest = read_json(path)
         status = Counter({str(key): int(value) for key, value in dict(source_manifest.get("branch_status_counts", {})).items()})
         completed_branches += int(status.get("completed", 0))
         failed_branches += sum(value for key, value in status.items() if key != "completed")
+        rejected_root_count += int(source_manifest.get("rejected_root_count", 0))
+        critical_actor_overflow_count += int(
+            source_manifest.get("critical_actor_overflow_count", 0)
+        )
+        source_coverage_incomplete_count += int(
+            source_manifest.get("task_actor_coverage_incomplete_count", 0)
+        )
+        source_risk_coverage_incomplete_count += int(
+            source_manifest.get(
+                "risk_safety_actor_coverage_incomplete_count", 0
+            )
+        )
         source_manifests.append(
             {
                 "collection_id": str(source_manifest["collection_id"]),
                 "collection_source": str(source_manifest.get("collection_source", "unknown")),
                 "manifest_path": str(path),
                 "branch_status_counts": dict(status),
+                "rejected_root_count": int(
+                    source_manifest.get("rejected_root_count", 0)
+                ),
+                "critical_actor_overflow_count": int(
+                    source_manifest.get("critical_actor_overflow_count", 0)
+                ),
+                "safety_actor_coverage_incomplete_count": int(
+                    source_manifest.get(
+                        "safety_actor_coverage_incomplete_count", 0
+                    )
+                ),
+                "task_actor_coverage_incomplete_count": int(
+                    source_manifest.get(
+                        "task_actor_coverage_incomplete_count", 0
+                    )
+                ),
+                "risk_safety_actor_coverage_incomplete_count": int(
+                    source_manifest.get(
+                        "risk_safety_actor_coverage_incomplete_count", 0
+                    )
+                ),
             }
         )
     branch_success_rate = float(completed_branches) / max(1, completed_branches + failed_branches)
@@ -79,6 +134,45 @@ def validate_pilot_dataset(
         "branch_success_rate": branch_success_rate >= float(min_branch_success_rate),
         "observed_viability_fraction": observed_viability_fraction >= float(min_observed_viability_fraction),
     }
+    if selector3_contract:
+        conditions.update(
+            {
+                "rejected_root_count_zero": rejected_root_count == 0,
+                "critical_actor_overflow_zero": (
+                    critical_actor_overflow_count == 0
+                    and int(manifest.get("critical_actor_overflow_count", -1))
+                    == 0
+                ),
+                "task_actor_coverage_complete": (
+                    not coverage_incomplete_root_ids
+                    and source_coverage_incomplete_count == 0
+                    and int(
+                        manifest.get(
+                            "task_actor_coverage_incomplete_count", -1
+                        )
+                    )
+                    == 0
+                ),
+                "risk_safety_actor_coverage_complete": (
+                    source_risk_coverage_incomplete_count == 0
+                    and int(
+                        manifest.get(
+                            "risk_safety_actor_coverage_incomplete_count", -1
+                        )
+                    )
+                    == 0
+                    and all(
+                        bool(
+                            row.get(
+                                "risk_safety_actor_coverage_complete",
+                                False,
+                            )
+                        )
+                        for row in roots
+                    )
+                ),
+            }
+        )
     oracle = None
     if oracle_report_path is not None:
         oracle = read_json(oracle_report_path)
@@ -177,6 +271,15 @@ def validate_pilot_dataset(
         "branch_success_rate": branch_success_rate,
         "observed_viability_fraction": observed_viability_fraction,
         "activation_branch_count": len(activation_branches),
+        "selector3_contract": selector3_contract,
+        "rejected_root_count": rejected_root_count,
+        "critical_actor_overflow_count": critical_actor_overflow_count,
+        "task_actor_coverage_incomplete_count": (
+            len(coverage_incomplete_root_ids)
+        ),
+        "task_actor_coverage_incomplete_root_ids": (
+            coverage_incomplete_root_ids[:20]
+        ),
         "source_manifests": source_manifests,
         "oracle_report": None if oracle is None else str(Path(oracle_report_path).resolve()),
         "conditions": conditions,

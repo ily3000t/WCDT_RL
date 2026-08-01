@@ -1,0 +1,29 @@
+{
+  "schema_version": 1,
+  "artifact_kind": "safe_rl_artifact_revocation_manifest_v1",
+  "protocol_id": "accvp-vnext-correctness-v2-selector3",
+  "status": "superseded",
+  "deployable": false,
+  "allowed_usage": "diagnostic_only",
+  "reason": "All pre-Selector-v3 ACCVP data, predictors, Candidate PPO policies and runtime/Stage5 reports lack the candidate-union task-actor coverage contract. They remain available only for history, failure analysis and the explicitly scoped selector state-source audit.",
+  "path_base": "../..",
+  "artifacts": [
+    {"path": "safe_rl_output/runs/accvp_240_formal_dataset", "match": "path_prefix", "status": "superseded", "deployable": false, "allowed_usage": "diagnostic_only"},
+    {"path": "safe_rl_output/runs/accvp_240_shadow_train", "match": "path_prefix", "status": "superseded", "deployable": false, "allowed_usage": "diagnostic_only"},
+    {"path": "safe_rl_output/runs/accvp_vnext_pilot_dataset", "match": "path_prefix", "status": "superseded", "deployable": false, "allowed_usage": "diagnostic_only"},
+    {"path": "safe_rl_output/runs/accvp_vnext_oracle_regression_dataset", "match": "path_prefix", "status": "superseded", "deployable": false, "allowed_usage": "diagnostic_only"},
+    {"path": "safe_rl_output/runs/accvp_vnext_formal_dataset", "match": "path_prefix", "status": "superseded", "deployable": false, "allowed_usage": "diagnostic_only"},
+    {"path": "safe_rl_output/runs/accvp_vnext_train", "match": "path_prefix", "status": "superseded", "deployable": false, "allowed_usage": "diagnostic_only"},
+    {"path": "safe_rl_output/runs/accvp_vnext_factorial", "match": "path_prefix", "status": "superseded", "deployable": false, "allowed_usage": "diagnostic_only"},
+    {"path": "safe_rl_output/runs/ppo_accvp_vnext_candidate_table_", "match": "path_prefix", "status": "superseded", "deployable": false, "allowed_usage": "diagnostic_only"},
+    {"path": "safe_rl_output/runs/accvp_vnext_runtime", "match": "path_prefix", "status": "superseded", "deployable": false, "allowed_usage": "diagnostic_only"},
+    {"path": "safe_rl_output/runs/accvp_vnext_stage5", "match": "path_prefix", "status": "superseded", "deployable": false, "allowed_usage": "diagnostic_only"},
+    {"path": "safe_rl_output/runs/accvp_vnext_final_holdout", "match": "path_prefix", "status": "superseded", "deployable": false, "allowed_usage": "diagnostic_only"}
+  ],
+  "metadata": {
+    "replacement_protocol": "accvp-vnext-correctness-v2-selector3",
+    "deletion_required": false,
+    "formal_lineage_loading_allowed": false,
+    "selector_audit_state_source_exception": true
+  }
+}

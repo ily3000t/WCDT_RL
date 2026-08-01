@@ -101,11 +101,19 @@ def build_v3_numpy_batch(
     history_edge_roles: np.ndarray | None = None,
     agent_length: np.ndarray | None = None,
     agent_width: np.ndarray | None = None,
+    max_agents_override: int | None = None,
 ) -> dict[str, np.ndarray]:
     sample_indices = np.asarray(indices, dtype=np.int64)
     history_steps = int(history.shape[2])
     horizon = int(min(future.shape[2], cfg.prediction.get("wcdt_v3_horizon_steps", cfg.scenario.forecast_horizon_steps)))
-    max_agents = int(cfg.prediction.get("wcdt_v3_max_agents", min(cfg.prediction.max_pred_num, history.shape[1] - 1)))
+    max_agents = int(
+        max_agents_override
+        if max_agents_override is not None
+        else cfg.prediction.get(
+            "wcdt_v3_max_agents",
+            min(cfg.prediction.max_pred_num, history.shape[1] - 1),
+        )
+    )
     max_agents = max(1, max_agents)
     dt = float(cfg.scenario.step_length)
     batch = sample_indices.shape[0]
@@ -256,17 +264,32 @@ def selected_vehicle_ids_from_indices(
     return resolved
 
 
-def build_v3_runtime_batch(cfg: Any, history: HistoryBuffer, ego_id: str) -> dict[str, Any]:
+def build_v3_runtime_batch(
+    cfg: Any,
+    history: HistoryBuffer,
+    ego_id: str,
+    *,
+    max_actors_override: int | None = None,
+    selector_scope: str = "prediction",
+) -> dict[str, Any]:
     latest = history.latest()
     ego = latest.get(ego_id)
     if ego is None:
         raise ValueError(f"WcDT v3 runtime history has no ego vehicle {ego_id!r}.")
-    max_actors = int(cfg.prediction.get("wcdt_v3_max_agents", cfg.prediction.max_pred_num))
+    max_actors = int(
+        max_actors_override
+        if max_actors_override is not None
+        else cfg.prediction.get(
+            "wcdt_v3_max_agents",
+            cfg.prediction.max_pred_num,
+        )
+    )
     selection = select_merge_relevant_actors(
         cfg,
         ego,
         list(latest.values()),
         max_actors,
+        selector_scope=selector_scope,
     )
     runtime_history = history.build_tensor_for_ids(
         ego_id,
@@ -297,6 +320,7 @@ def build_v3_runtime_batch(cfg: Any, history: HistoryBuffer, ego_id: str) -> dic
         history_valid_mask=runtime_history["history_valid_mask"][None, ...],
         history_lane_indices=runtime_history["history_lane_index"][None, ...],
         history_edge_roles=runtime_history["history_edge_role"][None, ...],
+        max_agents_override=max_actors,
     )
     output = {
         key: value[0:1] if key != "selected_indices" else value[0]

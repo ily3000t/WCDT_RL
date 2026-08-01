@@ -15,51 +15,107 @@ statuses:
 configs:
   accvp_vnext_pilot:
     path: active/accvp_vnext/pilot.yaml
-    status: canonical
+    status: diagnostic_only
     protocol: accvp-vnext-correctness-v1
     entrypoint: safe_rl.pipeline.stage1_collect_accvp_jobs
+    replaced_by: accvp_vnext_selector3_pilot
   accvp_vnext_oracle_regression:
     path: active/accvp_vnext/oracle_regression.yaml
-    status: canonical
+    status: diagnostic_only
     protocol: accvp-vnext-correctness-v1
     entrypoint: safe_rl.pipeline.stage1_collect_accvp_jobs
+    replaced_by: accvp_vnext_selector3_oracle_regression
   accvp_vnext_formal:
     path: active/accvp_vnext/formal.yaml
-    status: canonical
+    status: diagnostic_only
     protocol: accvp-vnext-correctness-v1
     entrypoint: safe_rl.pipeline.stage1_collect_accvp_jobs
+    replaced_by: accvp_vnext_selector3_formal
   accvp_vnext_train:
     path: active/accvp_vnext/train.yaml
-    status: canonical
+    status: diagnostic_only
     protocol: accvp-vnext-correctness-v1
     entrypoint: safe_rl.pipeline.stage2_train_accvp
+    replaced_by: accvp_vnext_selector3_train
   ppo_accvp_candidate_table_vnext_dev:
     path: active/accvp_vnext/ppo_candidate_table_dev.yaml
-    status: canonical
+    status: diagnostic_only
     protocol: accvp-vnext-correctness-v1
     entrypoint: safe_rl.pipeline.stage3_train_ppo
     usage: canonical_replicate_template
     minimum_optimizer_replicates: 5
     generated_config_location: safe_rl_output/runs/<run>/generated_configs
+    replaced_by: ppo_accvp_candidate_table_selector3_full
   ppo_accvp_candidate_table_vnext_full:
     path: active/accvp_vnext/ppo_candidate_table_full.yaml
-    status: canonical
+    status: diagnostic_only
     protocol: accvp-vnext-correctness-v1
     entrypoint: safe_rl.pipeline.stage3_train_ppo_factorial
     usage: canonical_factorial_template
     minimum_optimizer_replicates: 5
     factorial_method_count: 4
     generated_config_location: safe_rl_output/runs/<run>/generated_configs
+    replaced_by: ppo_accvp_candidate_table_selector3_full
   accvp_vnext_ppo_ablation_matrix:
     path: active/accvp_vnext/ppo_ablation_matrix.yaml
-    status: canonical
+    status: diagnostic_only
     protocol: accvp-vnext-correctness-v1
     entrypoint: safe_rl.pipeline.stage3_train_ppo_factorial
     usage: frozen_factorial_method_definition
+    replaced_by: accvp_vnext_selector3_ppo_ablation_matrix
   accvp_vnext_workflow:
     path: active/accvp_vnext/workflow.yaml
-    status: canonical
+    status: diagnostic_only
     protocol: accvp-vnext-correctness-v1
+    entrypoint: safe_rl.pipeline.run_accvp_vnext_pipeline
+    usage: workflow_contract
+    replaced_by: accvp_vnext_selector3_workflow
+
+  accvp_vnext_selector3_selector_audit:
+    path: active/accvp_vnext_selector3/selector_audit.yaml
+    status: canonical
+    protocol: accvp-vnext-correctness-v2-selector3
+    entrypoint: safe_rl.pipeline.accvp_selector_contract_audit
+    usage: selector_capacity_audit_only
+  accvp_vnext_selector3_pilot:
+    path: active/accvp_vnext_selector3/pilot.yaml
+    status: canonical
+    protocol: accvp-vnext-correctness-v2-selector3
+    entrypoint: safe_rl.pipeline.stage1_collect_accvp_jobs
+  accvp_vnext_selector3_oracle_regression:
+    path: active/accvp_vnext_selector3/oracle_regression.yaml
+    status: canonical
+    protocol: accvp-vnext-correctness-v2-selector3
+    entrypoint: safe_rl.pipeline.stage1_collect_accvp_jobs
+  accvp_vnext_selector3_formal:
+    path: active/accvp_vnext_selector3/formal.yaml
+    status: canonical
+    protocol: accvp-vnext-correctness-v2-selector3
+    entrypoint: safe_rl.pipeline.stage1_collect_accvp_jobs
+  accvp_vnext_selector3_train:
+    path: active/accvp_vnext_selector3/train.yaml
+    status: canonical
+    protocol: accvp-vnext-correctness-v2-selector3
+    entrypoint: safe_rl.pipeline.stage2_train_accvp
+  ppo_accvp_candidate_table_selector3_full:
+    path: active/accvp_vnext_selector3/ppo_candidate_table_full.yaml
+    status: canonical
+    protocol: accvp-vnext-correctness-v2-selector3
+    entrypoint: safe_rl.pipeline.stage3_train_ppo_factorial
+    usage: canonical_factorial_template
+    minimum_optimizer_replicates: 5
+    factorial_method_count: 4
+    generated_config_location: safe_rl_output/runs/<run>/generated_configs
+  accvp_vnext_selector3_ppo_ablation_matrix:
+    path: active/accvp_vnext_selector3/ppo_ablation_matrix.yaml
+    status: canonical
+    protocol: accvp-vnext-correctness-v2-selector3
+    entrypoint: safe_rl.pipeline.stage3_train_ppo_factorial
+    usage: frozen_factorial_method_definition
+  accvp_vnext_selector3_workflow:
+    path: active/accvp_vnext_selector3/workflow.yaml
+    status: canonical
+    protocol: accvp-vnext-correctness-v2-selector3
     entrypoint: safe_rl.pipeline.run_accvp_vnext_pipeline
     usage: workflow_contract
 
@@ -126,6 +182,10 @@ configs:
     path: examples/vnext/evaluation_protocol_vnext.example.yaml
     status: template
     protocol: accvp-vnext-correctness-v1
+  evaluation_protocol_selector3_example:
+    path: examples/vnext/evaluation_protocol_selector3.example.yaml
+    status: template
+    protocol: accvp-vnext-correctness-v2-selector3
   stage5_replicated_aggregate_vnext_example:
     path: examples/vnext/stage5_replicated_aggregate_vnext.example.json
     status: template

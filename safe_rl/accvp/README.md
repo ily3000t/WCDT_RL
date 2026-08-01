@@ -45,7 +45,8 @@ safe_rl/stage1_counterfactual/
 
 旧的 `safe_rl.accvp.<flat_module>` Python 导入路径已经迁移到上述子包；仓库内 pipeline 和测试
 已同步更新。CLI 名称、配置路径、run 目录和 generation-aware artifact 文件名均未改变，因此
-已有 schema3 数据与训练 checkpoint 不需要移动或重建。
+旧 Selector-v2 schema3 数据与 checkpoint 不移动、不删除，但在 Selector-v3 协议下标为
+`diagnostic_only`；新证据使用独立 run 目录重新采集和训练。
 
 常用导入迁移：
 
@@ -70,7 +71,8 @@ VNext 正式数据和模型必须同时满足：
 
 - `artifact_generation: vnext_schema3`
 - `schema_version: 3`
-- `data_contract_version: accvp_240_v2`
+- `data_contract_version: accvp_240_v3_conflict_selector`
+- `accvp.actor_relevance.version: candidate_union_conflict_relevance_v3`
 - `actor_row_mapping_version: selected_indices_v2`
 - `root_observation_fingerprint_version: model_input_fingerprint_v3`
 - `entry_time_label_version: conditional_entry_time_v1`
@@ -79,6 +81,15 @@ VNext 正式数据和模型必须同时满足：
 旧 schema2 数据没有足够证据证明 `selected_actor_ids`、branch response rows 与 WcDT token
 rows 的唯一映射，因此不能迁移为完整 VNext actor-response supervision。它只允许在明确
 标注的 diagnostic/migration audit 中使用。
+
+Selector-v2 V1 数据虽然是 schema3，但 actor-response rows 只覆盖旧 selector 选择的 actor，
+也不能迁移成 Selector-v3 formal supervision。V1 的 predictor、Candidate PPO、runtime 和
+Stage5 报告同样只允许用于历史复现、失败诊断和明确标注的 selector state-source audit。
+
+`prediction.actor_relevance` 与 `prediction.wcdt_v3_max_agents` 属于既有 WcDT checkpoint
+契约；`accvp.actor_relevance` 与 `accvp.actor_count` 属于 Candidate Table 数据/推理契约。
+两者不得通过修改 checkpoint hash 校验来混用。Selector-v3 审计只冻结 ACCVP 容量，
+不会改变旧 WcDT 的 selector-v2、6-actor lineage。
 
 ## 2. Data semantics
 
@@ -97,6 +108,24 @@ response rows 和 token rows 必须共享 mapping hash。缺失或不一致时�
 
 诊断可以保存 `target_lane_entry_time_raw_s`，但不能把 failure/censored 的 raw late entry
 重新解释为训练标签。
+
+### Selector-v3 task actor contract
+
+Selector-v3 不以 actor 当前 lane 直接推断“非冲突”。它对所有合法 ego candidate
+commitment plans 构造 swept tubes，并与每个 actor 的 route-aware keep-lane 和所有可达相邻
+lane hypotheses（含有界纵向加速度 envelope）求交。报告必须记录
+`conflict_candidate_ids`、`earliest_conflict_time_s`、
+`minimum_swept_obb_gap` 和 `conflict_surface_ids`。
+
+排序固定为 relevance class → mandatory role → earliest conflict time → TTC →
+effective/surface gap → vehicle ID。vehicle ID 只作最终 tie-break。
+
+coverage 分为两个职责：
+
+- `task_actor_coverage_complete`：所有影响 Candidate task viability 的 critical actors 都进入
+  ACCVP rows；它是全部 model splits/calibration/operating/test 的准入门槛；
+- `risk_safety_actor_coverage_complete`：Risk/Shield 使用的全量当前车辆状态完整；这些车辆
+  不必全部占用 ACCVP actor rows。
 
 ### Split and bootstrap
 
@@ -143,7 +172,7 @@ python -m safe_rl.pipeline.run_accvp_vnext_pipeline --execute-next
 
 ```powershell
 python -m safe_rl.pipeline.run_accvp_vnext_pipeline `
-  --workflow-config safe_rl/config/active/accvp_vnext/workflow.yaml `
+  --workflow-config safe_rl/config/active/accvp_vnext_selector3/workflow.yaml `
   --run-until pilot_validation
 ```
 
@@ -152,22 +181,32 @@ python -m safe_rl.pipeline.run_accvp_vnext_pipeline `
 
 阶段顺序为：
 
-1. `pilot_collection`
-2. `pilot_merge`
-3. `oracle_collection`
-4. `oracle_merge`
-5. `oracle_regression`
-6. `pilot_validation`
-7. `formal_collection`
-8. `formal_merge`
-9. `accvp_training`
-10. `scorer_runtime_preflight`
-11. `candidate_ppo_replicates`
-12. `baseline_ppo_replicates`
-13. `policy_runtime_replicates`
-14. `stage5_generate`
-15. `stage5_replicates_and_aggregate`
-16. `one_shot_final_holdout`
+1. `selector_contract_audit`
+2. `pilot_collection`
+3. `pilot_merge`
+4. `oracle_collection`
+5. `oracle_merge`
+6. `oracle_regression`
+7. `pilot_validation`
+8. `formal_collection`
+9. `formal_merge`
+10. `formal_validation`
+11. `accvp_training`
+12. `scorer_runtime_preflight`
+13. `candidate_ppo_replicates`
+14. `baseline_ppo_replicates`
+15. `baseline_lineage_audit`
+16. `policy_runtime_replicates`
+17. `stage5_generate`
+18. `stage5_replicates_and_aggregate`
+19. `one_shot_final_holdout`
+
+`selector_contract_audit` 先验证旧 formal roots 是否真的保存了全量 current/history
+vehicle state；若只有旧 selected rows，则必须停止并做 selector-only root recollection。
+当前协议只声明 intent-agnostic conservative reachable tubes，不把缺失的显式 future route
+intent 伪装成精确轨迹。审计随后在全部 5,000 roots 和
+1002/1004 × 50021/50027 四个 diagnostic replay 上比较 selector-v2/v3，严格按
+6 actors → 8 actors → blocked 冻结容量。
 
 factorial orchestration 已接入该 workflow：它分别生成、审计和评估所有预注册
 Reward/commitment 方法，并将最终方法绑定到 Reward-v3.1 + risk-gated commitment。阶段不再
@@ -177,11 +216,11 @@ Reward/commitment 方法，并将最终方法绑定到 Reward-v3.1 + risk-gated 
 
 ## 4. Pilot gate
 
-canonical 配置：
+canonical Selector-v3 配置：
 
-- `safe_rl/config/active/accvp_vnext/pilot.yaml`
-- `safe_rl/config/active/accvp_vnext/oracle_regression.yaml`
-- `safe_rl/config/active/accvp_vnext/formal.yaml`
+- `safe_rl/config/active/accvp_vnext_selector3/pilot.yaml`
+- `safe_rl/config/active/accvp_vnext_selector3/oracle_regression.yaml`
+- `safe_rl/config/active/accvp_vnext_selector3/formal.yaml`
 
 pilot validation 同时检查：
 
@@ -263,11 +302,11 @@ optimizer seeds；optimizer seed 与 simulator seed cohort 不得混用。
 
 ```powershell
 python -m safe_rl.pipeline.stage3_train_ppo_factorial `
-  --config safe_rl/config/active/accvp_vnext/ppo_candidate_table_full.yaml `
-  --matrix safe_rl/config/active/accvp_vnext/ppo_ablation_matrix.yaml `
-  --workflow-config safe_rl/config/active/accvp_vnext/workflow.yaml `
+  --config safe_rl/config/active/accvp_vnext_selector3/ppo_candidate_table_full.yaml `
+  --matrix safe_rl/config/active/accvp_vnext_selector3/ppo_ablation_matrix.yaml `
+  --workflow-config safe_rl/config/active/accvp_vnext_selector3/workflow.yaml `
   --optimizer-seeds 1001 1002 1003 1004 1005 `
-  --output-root safe_rl_output/runs/accvp_vnext_factorial
+  --output-root safe_rl_output/runs/accvp_vnext_selector3_factorial
 ```
 
 `factorial_plan.json` 冻结全部 method/seed/config；每个训练完成后立即更新 child manifest。默认

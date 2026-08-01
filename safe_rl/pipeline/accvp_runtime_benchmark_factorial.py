@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+from collections import Counter
 from pathlib import Path
 from typing import Any
 
@@ -403,6 +404,23 @@ def run(
             methods[EXPECTED_FINAL_METHOD_ID].get("gate", {}).get("pass", False)
         ),
     }
+    overflow_histogram: Counter[str] = Counter()
+    overflow_examples: list[dict[str, Any]] = []
+    overflow_count = 0
+    for entry in methods.values():
+        child_gate = dict(entry.get("gate", {}) or {})
+        overflow_count += int(child_gate.get("critical_actor_overflow_count", 0))
+        overflow_histogram.update(
+            dict(child_gate.get("critical_actor_overflow_histogram", {}) or {})
+        )
+        remaining = 20 - len(overflow_examples)
+        if remaining > 0:
+            overflow_examples.extend(
+                dict(value)
+                for value in list(
+                    child_gate.get("critical_actor_overflow_examples", []) or []
+                )[:remaining]
+            )
     payload = {
         "artifact_kind": FACTORIAL_RUNTIME_REPORT_KIND,
         "schema_version": FACTORIAL_RUNTIME_REPORT_SCHEMA_VERSION,
@@ -421,6 +439,12 @@ def run(
         "method_roles": dict(factorial.get("method_roles", {}) or {}),
         "simulator_seeds": requested_seeds,
         "methods": methods,
+        "critical_actor_overflow": {
+            "count": overflow_count,
+            "histogram": dict(overflow_histogram),
+            "examples": overflow_examples,
+            "sample_limit": 20,
+        },
         "gate": {"checks": checks, "pass": all(checks.values())},
         "request_fingerprint": request_fingerprint,
     }

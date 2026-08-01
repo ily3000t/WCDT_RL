@@ -38,12 +38,18 @@ PPO_CONFIG = "safe_rl/config/active/accvp_vnext/ppo_candidate_table_full.yaml"
 BASELINE_PPO_CONFIG = "safe_rl/config/baselines/wcdt/ppo_wcdt_v3_reward_v2.yaml"
 MATRIX_CONFIG = "safe_rl/config/active/accvp_vnext/ppo_ablation_matrix.yaml"
 PROTOCOL_CONFIG = "safe_rl/config/examples/vnext/evaluation_protocol_vnext.example.yaml"
-WORKFLOW_CONFIG = "safe_rl/config/active/accvp_vnext/workflow.yaml"
+WORKFLOW_CONFIG = (
+    "safe_rl/config/active/accvp_vnext_selector3/workflow.yaml"
+)
 OPTIMIZER_SEEDS = [1001, 1002, 1003, 1004, 1005]
 # The first 30 development seeds produced only 608 activation-window
 # decisions on the frozen rule-policy workload.  Sixty remain within the
 # preregistered development cohort and provide margin above the >=1000 gate.
 RUNTIME_SEEDS = list(range(50001, 50061))
+DEFAULT_BASELINE_MANIFEST = (
+    "safe_rl_output/runs/wcdt_vnext_replicates/"
+    "ppo_replicate_manifest.json"
+)
 
 
 def _resolve(path: str | Path) -> Path:
@@ -135,7 +141,11 @@ def _factorial_manifest_ok(path: Path, *, protocol_id: str) -> bool:
     )
 
 
-def _baseline_manifest_ok(path: Path) -> bool:
+def _baseline_manifest_ok(
+    path: Path,
+    *,
+    optimizer_seeds: list[int] = OPTIMIZER_SEEDS,
+) -> bool:
     if not path.is_file():
         return False
     try:
@@ -143,7 +153,7 @@ def _baseline_manifest_ok(path: Path) -> bool:
         summary = validate_replicate_manifest(
             payload,
             method_id="wcdt_reward_v2",
-            expected_seeds=OPTIMIZER_SEEDS,
+            expected_seeds=optimizer_seeds,
             verify_files=True,
         )
     except (OSError, ValueError, json.JSONDecodeError):
@@ -151,14 +161,44 @@ def _baseline_manifest_ok(path: Path) -> bool:
     return str(payload.get("status", "")) == "complete" and summary["status"] == "complete"
 
 
-def _factorial_runtime_ok(path: Path, *, factorial_manifest: Path) -> bool:
+def _baseline_lineage_audit_ok(
+    path: Path,
+    *,
+    optimizer_seeds: list[int],
+) -> bool:
+    if not path.is_file():
+        return False
+    try:
+        payload = read_json(path)
+    except (OSError, ValueError, json.JSONDecodeError):
+        return False
+    return bool(
+        str(payload.get("artifact_kind", ""))
+        == "ppo_replicate_lineage_audit_v1"
+        and str(payload.get("status", "")) == "reusable"
+        and [int(value) for value in payload.get("required_seeds", [])]
+        == sorted(optimizer_seeds)
+        and [int(value) for value in payload.get("valid_seeds", [])]
+        == sorted(optimizer_seeds)
+        and not list(payload.get("missing_seeds", []) or [])
+        and not list(payload.get("invalid_records", []) or [])
+        and not list(payload.get("global_reasons", []) or [])
+    )
+
+
+def _factorial_runtime_ok(
+    path: Path,
+    *,
+    factorial_manifest: Path,
+    runtime_seeds: list[int] = RUNTIME_SEEDS,
+) -> bool:
     if not path.is_file() or not factorial_manifest.is_file():
         return False
     try:
         payload = validate_factorial_runtime_report(
             path,
             factorial_manifest=factorial_manifest,
-            seeds=RUNTIME_SEEDS,
+            seeds=runtime_seeds,
             backend="vectorized",
             device="auto",
         )
@@ -264,39 +304,168 @@ def _load_workflow_contract(path: str | Path) -> tuple[Path, dict[str, Any]]:
     return source, payload
 
 
+def _workflow_path_value(
+    workflow: dict[str, Any],
+    key: str,
+    default: str | Path,
+) -> str:
+    return str(dict(workflow.get("paths", {}) or {}).get(key, default))
+
+
+def _workflow_seed_values(
+    workflow: dict[str, Any],
+    key: str,
+    default: list[int],
+) -> list[int]:
+    configured = dict(workflow.get("seeds", {}) or {}).get(key)
+    if configured is None:
+        return list(default)
+    if isinstance(configured, dict) and {"start", "count"}.issubset(
+        configured
+    ):
+        start = int(configured["start"])
+        count = int(configured["count"])
+        values = list(range(start, start + count))
+    else:
+        values = [int(value) for value in list(configured)]
+    if not values or len(values) != len(set(values)):
+        raise ValueError(f"workflow seed schedule {key!r} must be non-empty and unique")
+    return values
+
+
 def workflow_status(
     *,
-    baseline_manifest: str | Path = "safe_rl_output/runs/wcdt_vnext_replicates/ppo_replicate_manifest.json",
+    baseline_manifest: str | Path = DEFAULT_BASELINE_MANIFEST,
     workflow_config: str | Path = WORKFLOW_CONFIG,
 ) -> dict[str, Any]:
     workflow_path, workflow = _load_workflow_contract(workflow_config)
+    pilot_config = _workflow_path_value(workflow, "pilot_config", PILOT_CONFIG)
+    oracle_config = _workflow_path_value(workflow, "oracle_config", ORACLE_CONFIG)
+    formal_config = _workflow_path_value(workflow, "formal_config", FORMAL_CONFIG)
+    train_config = _workflow_path_value(workflow, "train_config", TRAIN_CONFIG)
+    ppo_config = _workflow_path_value(workflow, "ppo_config", PPO_CONFIG)
+    baseline_ppo_config = _workflow_path_value(
+        workflow, "baseline_ppo_config", BASELINE_PPO_CONFIG
+    )
+    matrix_config = _workflow_path_value(workflow, "matrix_config", MATRIX_CONFIG)
+    protocol_config = _workflow_path_value(
+        workflow, "protocol_config", PROTOCOL_CONFIG
+    )
+    optimizer_seeds = _workflow_seed_values(
+        workflow, "optimizer_replicates", OPTIMIZER_SEEDS
+    )
+    runtime_seeds = _workflow_seed_values(
+        workflow, "runtime", RUNTIME_SEEDS
+    )
     pilot_shard_root = _resolve(
-        "safe_rl_output/runs/accvp_vnext_pilot/stage1_counterfactual/accvp_vnext_schema3_pilot/shards"
+        _workflow_path_value(
+            workflow,
+            "pilot_shard_root",
+            "safe_rl_output/runs/accvp_vnext_pilot/stage1_counterfactual/"
+            "accvp_vnext_schema3_pilot/shards",
+        )
     )
     oracle_shard_root = _resolve(
-        "safe_rl_output/runs/accvp_vnext_oracle_regression/stage1_counterfactual/accvp_vnext_schema3_oracle_regression/shards"
+        _workflow_path_value(
+            workflow,
+            "oracle_shard_root",
+            "safe_rl_output/runs/accvp_vnext_oracle_regression/"
+            "stage1_counterfactual/accvp_vnext_schema3_oracle_regression/shards",
+        )
     )
     formal_shard_root = _resolve(
-        "safe_rl_output/runs/accvp_vnext_formal/stage1_counterfactual/accvp_vnext_schema3_formal/shards"
+        _workflow_path_value(
+            workflow,
+            "formal_shard_root",
+            "safe_rl_output/runs/accvp_vnext_formal/stage1_counterfactual/"
+            "accvp_vnext_schema3_formal/shards",
+        )
     )
     pilot_shards = _complete_shards(pilot_shard_root)
     oracle_shards = _complete_shards(oracle_shard_root)
     formal_shards = _complete_shards(formal_shard_root)
-    pilot_dataset = _resolve("safe_rl_output/runs/accvp_vnext_pilot_dataset")
-    oracle_dataset = _resolve("safe_rl_output/runs/accvp_vnext_oracle_regression_dataset")
-    formal_dataset = _resolve("safe_rl_output/runs/accvp_vnext_formal_dataset")
-    oracle_report = _resolve("safe_rl_output/runs/accvp_vnext_oracle_regression/oracle_report.json")
-    pilot_report = _resolve("safe_rl_output/runs/accvp_vnext_pilot/pilot_report.json")
+    pilot_dataset = _resolve(
+        _workflow_path_value(
+            workflow, "pilot_dataset", "safe_rl_output/runs/accvp_vnext_pilot_dataset"
+        )
+    )
+    oracle_dataset = _resolve(
+        _workflow_path_value(
+            workflow,
+            "oracle_dataset",
+            "safe_rl_output/runs/accvp_vnext_oracle_regression_dataset",
+        )
+    )
+    formal_dataset = _resolve(
+        _workflow_path_value(
+            workflow, "formal_dataset", "safe_rl_output/runs/accvp_vnext_formal_dataset"
+        )
+    )
+    oracle_report = _resolve(
+        _workflow_path_value(
+            workflow,
+            "oracle_report",
+            "safe_rl_output/runs/accvp_vnext_oracle_regression/oracle_report.json",
+        )
+    )
+    pilot_report = _resolve(
+        _workflow_path_value(
+            workflow,
+            "pilot_report",
+            "safe_rl_output/runs/accvp_vnext_pilot/pilot_report.json",
+        )
+    )
+    formal_validation_report = _resolve(
+        _workflow_path_value(
+            workflow,
+            "formal_validation_report",
+            "safe_rl_output/runs/accvp_vnext_formal/formal_validation.json",
+        )
+    )
     predictor_manifest = _resolve(
-        "safe_rl_output/runs/accvp_vnext_train/accvp/accvp_vnext_schema3_candidate_manifest.json"
+        _workflow_path_value(
+            workflow,
+            "predictor_manifest",
+            "safe_rl_output/runs/accvp_vnext_train/accvp/"
+            "accvp_vnext_schema3_candidate_manifest.json",
+        )
     )
-    scorer_report = _resolve("safe_rl_output/runs/accvp_vnext_runtime/scorer_preflight.json")
+    scorer_report = _resolve(
+        _workflow_path_value(
+            workflow,
+            "scorer_report",
+            "safe_rl_output/runs/accvp_vnext_runtime/scorer_preflight.json",
+        )
+    )
     factorial_manifest = _resolve(
-        "safe_rl_output/runs/accvp_vnext_factorial/ppo_factorial_manifest.json"
+        _workflow_path_value(
+            workflow,
+            "factorial_manifest",
+            "safe_rl_output/runs/accvp_vnext_factorial/ppo_factorial_manifest.json",
+        )
     )
-    baseline_path = _resolve(baseline_manifest)
+    baseline_default = _workflow_path_value(
+        workflow, "baseline_manifest", DEFAULT_BASELINE_MANIFEST
+    )
+    baseline_path = _resolve(
+        baseline_default
+        if str(baseline_manifest) == DEFAULT_BASELINE_MANIFEST
+        else baseline_manifest
+    )
+    baseline_lineage_audit = _resolve(
+        _workflow_path_value(
+            workflow,
+            "baseline_lineage_audit",
+            "safe_rl_output/runs/accvp_vnext_baseline_audit/"
+            "wcdt_baseline_report.json",
+        )
+    )
     runtime_factorial = _resolve(
-        "safe_rl_output/runs/accvp_vnext_runtime/factorial_runtime_report.json"
+        _workflow_path_value(
+            workflow,
+            "runtime_factorial_report",
+            "safe_rl_output/runs/accvp_vnext_runtime/factorial_runtime_report.json",
+        )
     )
     final_runtime_replicates = (
         runtime_factorial.parent
@@ -305,9 +474,19 @@ def workflow_status(
         / "replicated_runtime_report.json"
     )
     stage5_request = _resolve(
-        "safe_rl_output/runs/accvp_vnext_stage5/generated/factorial_request.json"
+        _workflow_path_value(
+            workflow,
+            "stage5_request",
+            "safe_rl_output/runs/accvp_vnext_stage5/generated/factorial_request.json",
+        )
     )
-    stage5_report = _resolve("safe_rl_output/runs/accvp_vnext_stage5/factorial_report.json")
+    stage5_report = _resolve(
+        _workflow_path_value(
+            workflow,
+            "stage5_report",
+            "safe_rl_output/runs/accvp_vnext_stage5/factorial_report.json",
+        )
+    )
     final_stage5_report = (
         stage5_request.parent
         / "comparisons"
@@ -315,7 +494,20 @@ def workflow_status(
         / "replicated_report.json"
     )
     holdout_report = _resolve(
-        "safe_rl_output/runs/accvp_vnext_final_holdout/accvp_vnext_schema3_final_test_diagnostics.json"
+        _workflow_path_value(
+            workflow,
+            "holdout_report",
+            "safe_rl_output/runs/accvp_vnext_final_holdout/"
+            "accvp_vnext_schema3_final_test_diagnostics.json",
+        )
+    )
+    selector_audit_report = _resolve(
+        _workflow_path_value(
+            workflow,
+            "selector_audit_report",
+            "safe_rl_output/runs/accvp_vnext_selector3_audit/"
+            "selector_contract_audit.json",
+        )
     )
 
     phases: list[dict[str, Any]] = []
@@ -330,16 +522,71 @@ def workflow_status(
             }
         )
 
+    declared_phase_names = {
+        str(value) for value in list(workflow["phase_order"])
+    }
+    if "selector_contract_audit" in declared_phase_names:
+        selector_audit_config = _workflow_path_value(
+            workflow,
+            "selector_audit_config",
+            "safe_rl/config/active/accvp_vnext_selector3/selector_audit.yaml",
+        )
+        selector_source_dataset = _workflow_path_value(
+            workflow,
+            "selector_source_dataset",
+            "safe_rl_output/runs/accvp_vnext_formal_dataset",
+        )
+        selector_source_factorial = _workflow_path_value(
+            workflow,
+            "selector_source_factorial_manifest",
+            "safe_rl_output/runs/accvp_vnext_factorial/"
+            "ppo_factorial_manifest.json",
+        )
+        selector_optimizer_seeds = _workflow_seed_values(
+            workflow, "selector_optimizer_replicates", [1002, 1004]
+        )
+        selector_simulator_seeds = _workflow_seed_values(
+            workflow, "selector_diagnostic", [50021, 50027]
+        )
+        add(
+            "selector_contract_audit",
+            _artifact_ok(
+                selector_audit_report,
+                artifact_kind="accvp_selector_contract_audit_v1",
+                state_field="audit_state",
+            ),
+            _module_command(
+                "safe_rl.pipeline.accvp_selector_contract_audit",
+                "--config",
+                selector_audit_config,
+                "--dataset",
+                selector_source_dataset,
+                "--factorial-manifest",
+                selector_source_factorial,
+                "--optimizer-seeds",
+                *selector_optimizer_seeds,
+                "--simulator-seeds",
+                *selector_simulator_seeds,
+                "--output",
+                selector_audit_report,
+            ),
+            selector_audit_report,
+        )
+
     add(
         "pilot_collection",
         len(pilot_shards) >= 10,
-        _module_command("safe_rl.pipeline.stage1_collect_accvp_jobs", "--config", PILOT_CONFIG),
+        _module_command(
+            "safe_rl.pipeline.stage1_collect_accvp_jobs",
+            "--config",
+            pilot_config,
+        ),
         pilot_shard_root,
     )
     merge_pilot = _module_command(
         "safe_rl.pipeline.stage1_merge_counterfactual",
         "--config",
-        PILOT_CONFIG,
+        pilot_config,
         *[value for shard in pilot_shards for value in ("--shard", shard)],
         "--output",
         pilot_dataset,
@@ -353,7 +600,11 @@ def workflow_status(
     add(
         "oracle_collection",
         bool(oracle_shards),
-        _module_command("safe_rl.pipeline.stage1_collect_accvp_jobs", "--config", ORACLE_CONFIG),
+        _module_command(
+            "safe_rl.pipeline.stage1_collect_accvp_jobs",
+            "--config",
+            oracle_config,
+        ),
         oracle_shard_root,
     )
     add(
@@ -363,7 +614,7 @@ def workflow_status(
             _module_command(
                 "safe_rl.pipeline.stage1_merge_counterfactual",
                 "--config",
-                ORACLE_CONFIG,
+                oracle_config,
                 *[value for shard in oracle_shards for value in ("--shard", shard)],
                 "--output",
                 oracle_dataset,
@@ -398,7 +649,7 @@ def workflow_status(
         _module_command(
             "safe_rl.pipeline.stage1_validate_accvp_pilot",
             "--config",
-            PILOT_CONFIG,
+            pilot_config,
             "--dataset",
             pilot_dataset,
             "--oracle-report",
@@ -411,7 +662,11 @@ def workflow_status(
     add(
         "formal_collection",
         len(formal_shards) >= 50,
-        _module_command("safe_rl.pipeline.stage1_collect_accvp_jobs", "--config", FORMAL_CONFIG),
+        _module_command(
+            "safe_rl.pipeline.stage1_collect_accvp_jobs",
+            "--config",
+            formal_config,
+        ),
         formal_shard_root,
     )
     add(
@@ -421,7 +676,7 @@ def workflow_status(
             _module_command(
                 "safe_rl.pipeline.stage1_merge_counterfactual",
                 "--config",
-                FORMAL_CONFIG,
+                formal_config,
                 *[value for shard in formal_shards for value in ("--shard", shard)],
                 "--output",
                 formal_dataset,
@@ -431,10 +686,33 @@ def workflow_status(
         ),
         formal_dataset,
     )
+    if "formal_validation" in declared_phase_names:
+        add(
+            "formal_validation",
+            _artifact_ok(
+                formal_validation_report,
+                artifact_kind="accvp_selector3_formal_validation_v1",
+                state_field="formal_state",
+            ),
+            _module_command(
+                "safe_rl.pipeline.stage1_validate_accvp_formal",
+                "--config",
+                formal_config,
+                "--dataset",
+                formal_dataset,
+                "--output",
+                formal_validation_report,
+            ),
+            formal_validation_report,
+        )
     add(
         "accvp_training",
         predictor_manifest.is_file(),
-        _module_command("safe_rl.pipeline.stage2_train_accvp", "--config", TRAIN_CONFIG),
+        _module_command(
+            "safe_rl.pipeline.stage2_train_accvp",
+            "--config",
+            train_config,
+        ),
         predictor_manifest,
     )
     add(
@@ -447,11 +725,11 @@ def workflow_status(
         _module_command(
             "safe_rl.pipeline.accvp_runtime_benchmark",
             "--config",
-            PPO_CONFIG,
+            ppo_config,
             "--policy-type",
             "rule_gap_acceptance",
             "--seeds",
-            *RUNTIME_SEEDS,
+            *runtime_seeds,
             "--backend",
             "vectorized",
             "--extend-failed-report",
@@ -469,13 +747,13 @@ def workflow_status(
         _module_command(
             "safe_rl.pipeline.stage3_train_ppo_factorial",
             "--config",
-            PPO_CONFIG,
+            ppo_config,
             "--matrix",
-            MATRIX_CONFIG,
+            matrix_config,
             "--workflow-config",
             workflow_path,
             "--optimizer-seeds",
-            *OPTIMIZER_SEEDS,
+            *optimizer_seeds,
             "--output-root",
             factorial_manifest.parent,
         ),
@@ -483,17 +761,20 @@ def workflow_status(
     )
     add(
         "baseline_ppo_replicates",
-        _baseline_manifest_ok(baseline_path),
+        _baseline_manifest_ok(
+            baseline_path,
+            optimizer_seeds=optimizer_seeds,
+        ),
         _module_command(
             "safe_rl.pipeline.stage3_train_ppo_replicates",
             "--config",
-            BASELINE_PPO_CONFIG,
+            baseline_ppo_config,
             "--matrix",
-            MATRIX_CONFIG,
+            matrix_config,
             "--method-id",
             "wcdt_reward_v2",
             "--optimizer-seeds",
-            *OPTIMIZER_SEEDS,
+            *optimizer_seeds,
             "--run-id-prefix",
             "ppo_wcdt_vnext",
             "--output-root",
@@ -501,18 +782,39 @@ def workflow_status(
         ),
         baseline_path,
     )
+    if "baseline_lineage_audit" in declared_phase_names:
+        add(
+            "baseline_lineage_audit",
+            _baseline_lineage_audit_ok(
+                baseline_lineage_audit,
+                optimizer_seeds=optimizer_seeds,
+            ),
+            _module_command(
+                "safe_rl.pipeline.audit_ppo_replicate_lineage",
+                "--replicate-manifest",
+                baseline_path,
+                "--method-config",
+                baseline_ppo_config,
+                "--required-seeds",
+                *optimizer_seeds,
+                "--output",
+                baseline_lineage_audit,
+            ),
+            baseline_lineage_audit,
+        )
     add(
         "policy_runtime_replicates",
         _factorial_runtime_ok(
             runtime_factorial,
             factorial_manifest=factorial_manifest,
+            runtime_seeds=runtime_seeds,
         ),
         _module_command(
             "safe_rl.pipeline.accvp_runtime_benchmark_factorial",
             "--factorial-manifest",
             factorial_manifest,
             "--seeds",
-            *RUNTIME_SEEDS,
+            *runtime_seeds,
             "--backend",
             "vectorized",
             "--output",
@@ -535,7 +837,7 @@ def workflow_status(
             "--factorial-manifest",
             factorial_manifest,
             "--protocol",
-            PROTOCOL_CONFIG,
+            protocol_config,
             "--seed-role",
             "natural_confirmatory",
             "--runtime-factorial-report",
@@ -569,7 +871,7 @@ def workflow_status(
         _module_command(
             "safe_rl.pipeline.accvp_final_holdout_eval",
             "--config",
-            TRAIN_CONFIG,
+            train_config,
             "--artifact-manifest",
             predictor_manifest,
             "--runtime-benchmark",

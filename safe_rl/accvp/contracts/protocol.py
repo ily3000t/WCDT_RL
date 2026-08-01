@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import copy
 from pathlib import Path
 from typing import Any
 
@@ -12,13 +13,25 @@ from safe_rl.accvp.contracts.schema import (
     file_sha256,
     stable_hash,
 )
-from safe_rl.prediction.actor_selector import ACTOR_SELECTION_VERSION, actor_selection_config_hash
+from safe_rl.prediction.actor_selector import (
+    ACTOR_SELECTION_VERSION_V3,
+    actor_relevance_config,
+    actor_selection_config_hash,
+)
 from safe_rl.prediction.wcdt_v3_predictor import TRAJECTORY_SCHEMA_VERSION
 from safe_rl.sim.metrics import SAFETY_METRIC_VERSION
+from safe_rl.utils.sumo_installation import (
+    resolve_sumo_installation,
+    sumo_installation_from_config,
+)
 
 
 ACCVP_EVENT_DEFINITION_VERSION = "accvp_v2_proxy_safety_taper_viability"
 ACCVP_DATA_CONTRACT_VERSION = "accvp_240_v2"
+ACCVP_SELECTOR3_DATA_CONTRACT_VERSION = "accvp_240_v3_conflict_selector"
+SUPPORTED_ACCVP_DATA_CONTRACT_VERSIONS = frozenset(
+    {ACCVP_DATA_CONTRACT_VERSION, ACCVP_SELECTOR3_DATA_CONTRACT_VERSION}
+)
 
 # ``accvp_240_v2`` was frozen while this retired, runtime-inert key still
 # existed in the default scenario mapping.  Removing the no-op configuration
@@ -113,13 +126,28 @@ def counterfactual_data_contract(config: Any, risk_model_fingerprint: str) -> di
     configured_version = str(
         config.accvp.get("data_contract_version", ACCVP_DATA_CONTRACT_VERSION)
     )
-    if configured_version != ACCVP_DATA_CONTRACT_VERSION:
+    if configured_version not in SUPPORTED_ACCVP_DATA_CONTRACT_VERSIONS:
         raise ValueError(
             "unsupported accvp.data_contract_version: "
             f"configured={configured_version!r} "
-            f"supported={ACCVP_DATA_CONTRACT_VERSION!r}"
+            f"supported={sorted(SUPPORTED_ACCVP_DATA_CONTRACT_VERSIONS)!r}"
         )
-    return {
+    selection_version = str(
+        actor_relevance_config(
+            config,
+            selector_scope="accvp",
+        )["version"]
+    )
+    if (
+        configured_version == ACCVP_SELECTOR3_DATA_CONTRACT_VERSION
+        and selection_version != ACTOR_SELECTION_VERSION_V3
+    ):
+        raise ValueError(
+            f"{ACCVP_SELECTOR3_DATA_CONTRACT_VERSION} requires "
+            f"accvp.actor_relevance.version={ACTOR_SELECTION_VERSION_V3!r}"
+        )
+    selector_contract = dict(config.accvp.get("selector_contract", {}) or {})
+    contract = {
         "protocol_version": configured_version,
         "scenario_config_hash": scenario_config_hash(config),
         "scenario_route_hash": scenario_route_fingerprint(config),
@@ -136,8 +164,11 @@ def counterfactual_data_contract(config: Any, risk_model_fingerprint: str) -> di
         "entry_time_label_version": ENTRY_TIME_LABEL_VERSION,
         "response_feature_order": ["x", "y", "heading", "speed", "accel"],
         "wcdt_trajectory_schema_version": int(TRAJECTORY_SCHEMA_VERSION),
-        "actor_selection_version": ACTOR_SELECTION_VERSION,
-        "actor_selection_config_hash": actor_selection_config_hash(config),
+        "actor_selection_version": selection_version,
+        "actor_selection_config_hash": actor_selection_config_hash(
+            config,
+            selector_scope="accvp",
+        ),
         "vehicle_state_ordering_version": str(
             config.scenario.get("vehicle_state_ordering_version", "unspecified_legacy")
         ),
@@ -145,6 +176,78 @@ def counterfactual_data_contract(config: Any, risk_model_fingerprint: str) -> di
         "event_definition_version": ACCVP_EVENT_DEFINITION_VERSION,
         "risk_model_fingerprint": str(risk_model_fingerprint),
     }
+    if configured_version == ACCVP_SELECTOR3_DATA_CONTRACT_VERSION:
+        if not bool(selector_contract.get("require_capacity_lock", False)):
+            raise ValueError(
+                "selector3 data contract requires a frozen selector capacity audit"
+            )
+        audit_report = selector_contract.get("audit_report")
+        if not audit_report:
+            raise ValueError("selector3 data contract requires selector audit_report")
+        audit_path = Path(str(audit_report))
+        if not audit_path.is_file():
+            raise FileNotFoundError(audit_path)
+        contract["selector_capacity_audit_report_sha256"] = file_sha256(
+            audit_path
+        )
+        contract["selector_capacity_audit_report_fingerprint"] = str(
+            selector_contract.get("audit_report_fingerprint", "")
+        )
+    return contract
+
+
+def config_with_sumo_installation_fingerprint(config: Any) -> Any:
+    """Mirror the collector's runtime scenario fingerprint mutation.
+
+    Collection resolves the concrete SUMO installation before freezing the
+    data contract. Offline validators must reproduce that exact mutation
+    rather than compare the dataset against an unresolved YAML scenario.
+    """
+
+    candidate = copy.deepcopy(config)
+    installation = (
+        sumo_installation_from_config(candidate.scenario)
+        if candidate.scenario.get("sumo_installation_fingerprint")
+        else resolve_sumo_installation(candidate.scenario)
+    )
+    candidate.scenario["sumo_binary"] = installation.sumo_binary
+    candidate.scenario["sumo_gui_binary"] = installation.sumo_gui_binary
+    candidate.scenario["netconvert_binary"] = installation.netconvert_binary
+    candidate.scenario[
+        "sumo_tools_directory"
+    ] = installation.tools_directory
+    candidate.scenario["sumo_home"] = installation.sumo_home
+    candidate.scenario["sumo_version"] = installation.sumo_version
+    candidate.scenario[
+        "sumo_installation_fingerprint"
+    ] = installation.to_dict()
+    return candidate
+
+
+def counterfactual_data_contract_candidates(
+    config: Any,
+    risk_model_fingerprint: str,
+) -> tuple[dict[str, Any], ...]:
+    """Return exact offline and runtime-resolved contract candidates.
+
+    A candidate is never field-relaxed: callers still require full mapping and
+    hash equality. Resolution failure leaves only the raw contract, preserving
+    fail-closed behavior on machines without the configured SUMO installation.
+    """
+
+    candidates = [
+        counterfactual_data_contract(config, risk_model_fingerprint)
+    ]
+    try:
+        resolved = counterfactual_data_contract(
+            config_with_sumo_installation_fingerprint(config),
+            risk_model_fingerprint,
+        )
+    except Exception:
+        resolved = None
+    if resolved is not None and resolved not in candidates:
+        candidates.append(resolved)
+    return tuple(candidates)
 
 
 def data_contract_hash(contract: dict[str, Any]) -> str:

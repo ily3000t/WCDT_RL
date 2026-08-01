@@ -7,34 +7,18 @@ from pathlib import Path
 from time import perf_counter
 
 from safe_rl.pipeline.common import load_stage_config, parse_config_arg
-from safe_rl.accvp.contracts.protocol import counterfactual_data_contract, data_contract_hash, effective_activation_distance
+from safe_rl.accvp.contracts.protocol import (
+    counterfactual_data_contract_candidates,
+    data_contract_hash,
+    effective_activation_distance,
+)
 from safe_rl.accvp.contracts.schema import file_sha256, read_json, write_json_atomic
 from safe_rl.stage1_counterfactual.collector import collect
 from safe_rl.utils.config import REPO_ROOT, clone_with_overrides
 from safe_rl.utils.progress import stage_log
-from safe_rl.utils.sumo_installation import resolve_sumo_installation, sumo_installation_from_config
 
 
 _REWARD_RISK_PROFILES = {"shield_guided_forecast", "merge_timing_forecast"}
-
-
-def _cfg_with_sumo_installation_fingerprint(cfg):
-    """Mirror the collector's scenario fingerprint mutation for preflight checks."""
-
-    candidate = clone_with_overrides(cfg, {})
-    installation = (
-        sumo_installation_from_config(candidate.scenario)
-        if candidate.scenario.get("sumo_installation_fingerprint")
-        else resolve_sumo_installation(candidate.scenario)
-    )
-    candidate.scenario["sumo_binary"] = installation.sumo_binary
-    candidate.scenario["sumo_gui_binary"] = installation.sumo_gui_binary
-    candidate.scenario["netconvert_binary"] = installation.netconvert_binary
-    candidate.scenario["sumo_tools_directory"] = installation.tools_directory
-    candidate.scenario["sumo_home"] = installation.sumo_home
-    candidate.scenario["sumo_version"] = installation.sumo_version
-    candidate.scenario["sumo_installation_fingerprint"] = installation.to_dict()
-    return candidate
 
 
 def materialise_collection_job(cfg, job) -> tuple[object, dict]:
@@ -287,15 +271,13 @@ def validate_required_pilot(cfg) -> None:
     if not risk_checkpoint:
         raise FileNotFoundError("formal ACCVP collection requires counterfactual.risk_checkpoint")
     risk_fingerprint = f"risk_checkpoint:{file_sha256(risk_checkpoint)}"
-    expected_hashes = {data_contract_hash(counterfactual_data_contract(cfg, risk_fingerprint))}
-    try:
-        sumo_cfg = _cfg_with_sumo_installation_fingerprint(cfg)
-        expected_hashes.add(data_contract_hash(counterfactual_data_contract(sumo_cfg, risk_fingerprint)))
-    except Exception:
-        # If the raw config hash already matches, validation should not require
-        # a SUMO installation.  If it does not match, the final error below
-        # still blocks formal collection.
-        pass
+    expected_hashes = {
+        data_contract_hash(contract)
+        for contract in counterfactual_data_contract_candidates(
+            cfg,
+            risk_fingerprint,
+        )
+    }
     if str(report.get("data_contract_hash", "")) not in expected_hashes:
         raise ValueError("pilot report data contract does not match formal ACCVP collection")
 

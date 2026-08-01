@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+from collections import Counter
 from pathlib import Path
 from typing import Any
 
@@ -39,6 +40,37 @@ def aggregate_runtime_reports(reports: list[dict[str, Any]]) -> dict[str, Any]:
         float(dict(item.get("accvp_table_latency_per_stage", {}) or {}).get("risk_secondary", {}).get("p95", 1.0e9))
         for item in metrics
     ]
+    overflow_count = int(
+        sum(
+            int(item.get("accvp_table_critical_actor_overflow_count", 0))
+            for item in metrics
+        )
+    )
+    risk_coverage_incomplete_count = int(
+        sum(
+            int(
+                item.get(
+                    "accvp_table_risk_safety_actor_coverage_incomplete_count",
+                    0,
+                )
+            )
+            for item in metrics
+        )
+    )
+    overflow_histogram: Counter[str] = Counter()
+    overflow_examples: list[dict[str, Any]] = []
+    for item in metrics:
+        overflow_histogram.update(
+            dict(item.get("accvp_table_critical_actor_overflow_histogram", {}) or {})
+        )
+        remaining = 20 - len(overflow_examples)
+        if remaining > 0:
+            overflow_examples.extend(
+                dict(value)
+                for value in list(
+                    item.get("accvp_table_critical_actor_overflow_examples", []) or []
+                )[:remaining]
+            )
     worst = {
         "min_fresh_valid_rate_activation_window": min(
             _number(item, "accvp_table_valid_rate_activation_window", default=0.0) for item in metrics
@@ -77,8 +109,23 @@ def aggregate_runtime_reports(reports: list[dict[str, Any]]) -> dict[str, Any]:
         "total_p95": worst["max_total_p95_s"] <= 0.30,
         "total_p99": worst["max_total_p99_s"] <= 0.40,
         "total_max": worst["max_total_max_s"] <= 0.50,
+        "critical_actor_overflow_zero": overflow_count == 0,
+        "risk_safety_actor_coverage_complete": (
+            risk_coverage_incomplete_count == 0
+        ),
     }
-    return {"worst_case": worst, "checks": checks, "pass": all(checks.values())}
+    return {
+        "worst_case": worst,
+        "critical_actor_overflow_count": overflow_count,
+        "critical_actor_overflow_histogram": dict(overflow_histogram),
+        "critical_actor_overflow_examples": overflow_examples,
+        "critical_actor_overflow_sample_limit": 20,
+        "risk_safety_actor_coverage_incomplete_count": (
+            risk_coverage_incomplete_count
+        ),
+        "checks": checks,
+        "pass": all(checks.values()),
+    }
 
 
 def _report_fingerprint(payload: dict[str, Any]) -> str:
