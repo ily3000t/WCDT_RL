@@ -1,16 +1,30 @@
 from __future__ import annotations
 
+import copy
 import json
 from pathlib import Path
 
 import pytest
 
 from safe_rl.accvp.contracts.schema import file_sha256
-from safe_rl.evaluation_protocol import EvidenceProtocolError, normalise_seed_cohorts
+from safe_rl.evaluation_protocol import (
+    EvidenceProtocolError,
+    normalise_seed_cohorts,
+    stable_hash,
+)
 from safe_rl.pipeline.accvp_runtime_benchmark_replicates import aggregate_runtime_reports
-from safe_rl.pipeline.audit_ppo_replicate_lineage import audit_manifest
+from safe_rl.pipeline.audit_ppo_replicate_lineage import (
+    INACTIVE_ACCVP_COMPATIBILITY_VERSION,
+    LINEAGE_AUDIT_IMPLEMENTATION_VERSION,
+    audit_manifest,
+    write_audit_report,
+)
 from safe_rl.pipeline.stage3_train_ppo_replicates import build_replicate_plan
-from safe_rl.ppo_replicates import optimizer_seed, validate_reward_semantics
+from safe_rl.ppo_replicates import (
+    observation_contract,
+    optimizer_seed,
+    validate_reward_semantics,
+)
 from safe_rl.rl.ppo import (
     _EpisodeSeedTraceCallback,
     _build_ppo_worker_env,
@@ -224,3 +238,170 @@ def test_lineage_audit_can_reuse_valid_subset_and_reports_missing_seeds(tmp_path
     assert audit["status"] == "partially_reusable"
     assert audit["valid_seeds"] == [1001, 1002, 1003]
     assert audit["missing_seeds"] == [1004, 1005]
+
+
+def _lineage_manifest_with_frozen_observation(
+    tmp_path: Path,
+    frozen_payload: dict,
+) -> Path:
+    checkpoint = tmp_path / "checkpoint_1001.zip"
+    config = tmp_path / "config_1001.yaml"
+    report = tmp_path / "report_1001.json"
+    checkpoint.write_bytes(b"checkpoint-1001")
+    config.write_text("optimizer_seed: 1001\n", encoding="utf-8")
+    frozen_hash = stable_hash(frozen_payload)
+    report.write_text(
+        json.dumps(
+            {
+                "observation_contract": frozen_payload,
+                "observation_contract_hash": frozen_hash,
+                "observation_dim": 63,
+                "observation_shape": [63],
+            }
+        ),
+        encoding="utf-8",
+    )
+    reward_hash = validate_reward_semantics(load_config(BASELINE))["sha256"]
+    manifest = tmp_path / "lineage_manifest.json"
+    manifest.write_text(
+        json.dumps(
+            {
+                "artifact_kind": "ppo_optimizer_replicate_manifest_v1",
+                "schema_version": 1,
+                "status": "complete",
+                "method_id": "wcdt_reward_v2",
+                "records": [
+                    {
+                        "method_id": "wcdt_reward_v2",
+                        "training_seed": 1001,
+                        "optimizer_seed": 1001,
+                        "checkpoint": str(checkpoint),
+                        "checkpoint_sha256": file_sha256(checkpoint),
+                        "resolved_config": str(config),
+                        "resolved_config_sha256": file_sha256(config),
+                        "stage3_report": str(report),
+                        "stage3_report_sha256": file_sha256(report),
+                        "training_budget": {"total_timesteps": 100000},
+                        "reward_semantics_hash": reward_hash,
+                        "observation_contract_hash": frozen_hash,
+                    }
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+    return manifest
+
+
+def test_lineage_audit_ignores_only_inactive_accvp_default_drift(tmp_path: Path):
+    current = observation_contract(load_config(BASELINE), require_artifacts=False)
+    frozen_payload = copy.deepcopy(current["payload"])
+    assert frozen_payload["accvp_observation_enabled"] is False
+    frozen_payload["accvp_observation"].pop("critical_actor_overflow_sample_limit")
+    assert stable_hash(frozen_payload) != current["sha256"]
+    manifest = _lineage_manifest_with_frozen_observation(tmp_path, frozen_payload)
+
+    audit = audit_manifest(
+        manifest,
+        required_seeds=[1001],
+        method_config=BASELINE,
+    )
+
+    assert audit["status"] == "reusable"
+    assert audit["audit_implementation_version"] == LINEAGE_AUDIT_IMPLEMENTATION_VERSION
+    assert audit["invalid_records"] == []
+    assert audit["compatibility_migrations"] == [
+        {
+            "optimizer_seed": 1001,
+            "compatibility_version": INACTIVE_ACCVP_COMPATIBILITY_VERSION,
+            "declared_observation_contract_hash": stable_hash(frozen_payload),
+            "current_observation_contract_hash": current["sha256"],
+            "effective_observation_contract_hash": stable_hash(
+                {
+                    key: value
+                    for key, value in frozen_payload.items()
+                    if key != "accvp_observation"
+                }
+            ),
+        }
+    ]
+
+
+def test_lineage_audit_rejects_active_observation_drift(tmp_path: Path):
+    current = observation_contract(load_config(BASELINE), require_artifacts=False)
+    frozen_payload = copy.deepcopy(current["payload"])
+    frozen_payload["forecast_source"] = "changed_active_predictor"
+    manifest = _lineage_manifest_with_frozen_observation(tmp_path, frozen_payload)
+
+    audit = audit_manifest(
+        manifest,
+        required_seeds=[1001],
+        method_config=BASELINE,
+    )
+
+    assert audit["status"] == "retrain_required"
+    assert audit["invalid_records"] == [
+        {
+            "optimizer_seed": 1001,
+            "reasons": ["effective observation contract differs from method config"],
+        }
+    ]
+
+
+def test_lineage_audit_archives_failed_report_and_is_idempotent(tmp_path: Path):
+    output = tmp_path / "baseline_audit.json"
+    output.write_text(
+        json.dumps(
+            {
+                "artifact_kind": "ppo_replicate_lineage_audit_v1",
+                "schema_version": 1,
+                "status": "retrain_required",
+            }
+        ),
+        encoding="utf-8",
+    )
+    report = {
+        "artifact_kind": "ppo_replicate_lineage_audit_v1",
+        "schema_version": 1,
+        "audit_implementation_version": LINEAGE_AUDIT_IMPLEMENTATION_VERSION,
+        "status": "reusable",
+    }
+
+    written, action = write_audit_report(output, report)
+    assert written == output.resolve()
+    assert action == "archive_failed_and_replace"
+    payload = json.loads(output.read_text(encoding="utf-8"))
+    archive = Path(payload["prior_failed_audit"]["archived_source_report"])
+    assert archive.is_file()
+    assert json.loads(archive.read_text(encoding="utf-8"))["status"] == "retrain_required"
+
+    _written_again, second_action = write_audit_report(output, report)
+    assert second_action == "reuse_identical"
+
+
+def test_lineage_audit_replaces_unfingerprinted_legacy_reusable_report(tmp_path: Path):
+    output = tmp_path / "legacy_passing_audit.json"
+    output.write_text(
+        json.dumps(
+            {
+                "artifact_kind": "ppo_replicate_lineage_audit_v1",
+                "schema_version": 1,
+                "status": "reusable",
+            }
+        ),
+        encoding="utf-8",
+    )
+    report = {
+        "artifact_kind": "ppo_replicate_lineage_audit_v1",
+        "schema_version": 1,
+        "audit_implementation_version": LINEAGE_AUDIT_IMPLEMENTATION_VERSION,
+        "status": "reusable",
+    }
+
+    _written, action = write_audit_report(output, report)
+
+    assert action == "archive_failed_and_replace"
+    payload = json.loads(output.read_text(encoding="utf-8"))
+    assert payload["audit_fingerprint"] == stable_hash(
+        {key: value for key, value in payload.items() if key != "audit_fingerprint"}
+    )

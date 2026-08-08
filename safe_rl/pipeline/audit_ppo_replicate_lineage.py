@@ -1,22 +1,162 @@
 from __future__ import annotations
 
 import argparse
+import json
 from pathlib import Path
-from typing import Any
+from typing import Any, Mapping
 
-from safe_rl.accvp.contracts.schema import file_sha256, read_json
+from safe_rl.accvp.contracts.schema import (
+    file_sha256,
+    read_json,
+    write_json_atomic,
+)
+from safe_rl.evaluation_protocol import stable_hash
 from safe_rl.ppo_replicates import (
     REPLICATE_MANIFEST_KIND,
     observation_contract,
     validate_reward_semantics,
-    write_json_new,
 )
 from safe_rl.utils.config import REPO_ROOT, load_config
+
+
+LINEAGE_AUDIT_KIND = "ppo_replicate_lineage_audit_v1"
+LINEAGE_AUDIT_IMPLEMENTATION_VERSION = (
+    "effective_observation_contract_from_frozen_stage3_v2"
+)
+INACTIVE_ACCVP_COMPATIBILITY_VERSION = "inactive_accvp_defaults_ignored_v1"
 
 
 def _resolve(path: str | Path) -> Path:
     value = Path(path)
     return value.resolve() if value.is_absolute() else (REPO_ROOT / value).resolve()
+
+
+def _effective_observation_payload(payload: Mapping[str, Any]) -> dict[str, Any]:
+    """Return only observation semantics that can affect the policy input.
+
+    Historical WcDT-only runs recorded the complete inherited ACCVP observation
+    block even though ACCVP was disabled.  Adding a new default inside that
+    inactive block changed the raw hash without changing the 63D policy input.
+    Active ACCVP fields remain strict and are never removed here.
+    """
+
+    effective = dict(payload)
+    if not bool(effective.get("accvp_observation_enabled", False)):
+        effective.pop("accvp_observation", None)
+        for key in tuple(effective):
+            if key.startswith("accvp_artifact_") or key == "formal_runtime_contract_sha256":
+                effective.pop(key, None)
+    return effective
+
+
+def _frozen_observation_payload(report: Mapping[str, Any]) -> dict[str, Any] | None:
+    value = report.get("observation_contract")
+    if not isinstance(value, Mapping):
+        return None
+    if isinstance(value.get("payload"), Mapping):
+        return dict(value["payload"])
+    return dict(value)
+
+
+def _observation_compatibility(
+    row: Mapping[str, Any],
+    *,
+    expected_contract: Mapping[str, Any],
+) -> tuple[bool, dict[str, Any] | None, str | None]:
+    declared = str(row.get("observation_contract_hash", ""))
+    expected = str(expected_contract.get("sha256", ""))
+    if declared == expected:
+        return True, None, None
+
+    report_value = str(row.get("stage3_report", ""))
+    if not report_value:
+        return False, None, "observation contract differs from method config"
+    report_path = _resolve(report_value)
+    if not report_path.is_file():
+        return False, None, "observation contract differs from method config"
+    try:
+        report = read_json(report_path)
+    except (OSError, ValueError, json.JSONDecodeError):
+        return False, None, "stage3 report cannot prove the observation contract"
+    frozen_hash = str(report.get("observation_contract_hash", ""))
+    frozen_payload = _frozen_observation_payload(report)
+    if frozen_hash != declared or frozen_payload is None:
+        return False, None, "stage3 report does not prove the declared observation contract"
+    if stable_hash(frozen_payload) != declared:
+        return False, None, "stage3 observation payload SHA-256 mismatch"
+
+    expected_payload = expected_contract.get("payload")
+    if not isinstance(expected_payload, Mapping):
+        return False, None, "method config observation contract lacks a payload"
+    frozen_effective = _effective_observation_payload(frozen_payload)
+    expected_effective = _effective_observation_payload(expected_payload)
+    if frozen_effective != expected_effective:
+        return False, None, "effective observation contract differs from method config"
+    migration = {
+        "optimizer_seed": int(row.get("optimizer_seed", row.get("training_seed", -1))),
+        "compatibility_version": INACTIVE_ACCVP_COMPATIBILITY_VERSION,
+        "declared_observation_contract_hash": declared,
+        "current_observation_contract_hash": expected,
+        "effective_observation_contract_hash": stable_hash(frozen_effective),
+    }
+    return True, migration, None
+
+
+def write_audit_report(path: str | Path, report: Mapping[str, Any]) -> tuple[Path, str]:
+    """Write an audit idempotently while preserving failed predecessors."""
+
+    output = _resolve(path)
+    core = dict(report)
+    if output.exists():
+        existing = read_json(output)
+        declared_fingerprint = str(existing.get("audit_fingerprint", ""))
+        fingerprint_payload = {
+            key: value for key, value in existing.items() if key != "audit_fingerprint"
+        }
+        fingerprint_valid = bool(declared_fingerprint) and (
+            stable_hash(fingerprint_payload) == declared_fingerprint
+        )
+        existing_core = {
+            key: value
+            for key, value in existing.items()
+            if key not in {"audit_fingerprint", "prior_failed_audit"}
+        }
+        if existing_core == core and fingerprint_valid:
+            return output, "reuse_identical"
+        if (
+            str(existing.get("status", "")) == "reusable"
+            and str(existing.get("audit_implementation_version", ""))
+            == LINEAGE_AUDIT_IMPLEMENTATION_VERSION
+            and fingerprint_valid
+        ):
+            raise FileExistsError(
+                "passing PPO lineage audit is immutable and differs from the requested audit: "
+                f"{output}"
+            )
+        archive = (
+            output.parent
+            / "failed_attempts"
+            / f"{output.stem}.{file_sha256(output)[:16]}{output.suffix}"
+        )
+        if archive.exists():
+            if read_json(archive) != existing:
+                raise FileExistsError(f"PPO lineage audit archive collision: {archive}")
+        else:
+            write_json_atomic(archive, existing)
+        core["prior_failed_audit"] = {
+            "archived_source_report": str(archive),
+            "report_sha256": file_sha256(archive),
+            "status": str(existing.get("status", "")),
+            "audit_implementation_version": str(
+                existing.get("audit_implementation_version", "legacy")
+            ),
+        }
+        action = "archive_failed_and_replace"
+    else:
+        action = "write_new"
+    core["audit_fingerprint"] = stable_hash(core)
+    write_json_atomic(output, core)
+    return output, action
 
 
 def audit_manifest(
@@ -28,15 +168,17 @@ def audit_manifest(
     required = sorted(set(int(seed) for seed in required_seeds))
     if len(required) != len(required_seeds):
         raise ValueError("required optimizer seeds must be unique")
-    expected_reward = expected_observation = None
+    expected_reward = None
+    expected_observation_contract: dict[str, Any] | None = None
     if method_config is not None:
         cfg = load_config(_resolve(method_config))
         expected_reward = validate_reward_semantics(cfg)["sha256"]
-        expected_observation = observation_contract(cfg, require_artifacts=False)["sha256"]
+        expected_observation_contract = observation_contract(cfg, require_artifacts=False)
     if manifest_path is None:
         return {
-            "artifact_kind": "ppo_replicate_lineage_audit_v1",
+            "artifact_kind": LINEAGE_AUDIT_KIND,
             "schema_version": 1,
+            "audit_implementation_version": LINEAGE_AUDIT_IMPLEMENTATION_VERSION,
             "status": "retrain_required",
             "reason": "a method config alone cannot prove independent checkpoint lineage",
             "required_seeds": required,
@@ -56,6 +198,7 @@ def audit_manifest(
     valid: list[int] = []
     invalid: list[dict[str, Any]] = []
     valid_rows: list[dict[str, Any]] = []
+    compatibility_migrations: list[dict[str, Any]] = []
     for seed in required:
         candidates = by_seed.get(seed, [])
         reasons: list[str] = []
@@ -83,8 +226,15 @@ def audit_manifest(
                     reasons.append(f"{path_field} SHA-256 mismatch")
             if expected_reward and str(row.get("reward_semantics_hash", "")) != expected_reward:
                 reasons.append("reward semantics differ from method config")
-            if expected_observation and str(row.get("observation_contract_hash", "")) != expected_observation:
-                reasons.append("observation contract differs from method config")
+            if expected_observation_contract is not None:
+                compatible, migration, reason = _observation_compatibility(
+                    row,
+                    expected_contract=expected_observation_contract,
+                )
+                if not compatible:
+                    reasons.append(str(reason))
+                elif migration is not None:
+                    compatibility_migrations.append(migration)
         if reasons:
             invalid.append({"optimizer_seed": seed, "reasons": reasons})
         else:
@@ -114,8 +264,9 @@ def audit_manifest(
     else:
         status = "reusable"
     return {
-        "artifact_kind": "ppo_replicate_lineage_audit_v1",
+        "artifact_kind": LINEAGE_AUDIT_KIND,
         "schema_version": 1,
+        "audit_implementation_version": LINEAGE_AUDIT_IMPLEMENTATION_VERSION,
         "status": status,
         "manifest": str(source),
         "manifest_sha256": file_sha256(source),
@@ -126,6 +277,7 @@ def audit_manifest(
         "invalid_records": invalid,
         "global_reasons": global_reasons,
         "duplicate_checkpoint_hashes": duplicate_checkpoint_hashes,
+        "compatibility_migrations": compatibility_migrations,
     }
 
 
@@ -141,8 +293,11 @@ def main() -> None:
         required_seeds=args.required_seeds,
         method_config=args.method_config,
     )
-    output = write_json_new(_resolve(args.output), report)
-    print(f"ppo_replicate_lineage_audit={output} status={report['status']}")
+    output, action = write_audit_report(args.output, report)
+    print(
+        f"ppo_replicate_lineage_audit={output} "
+        f"status={report['status']} action={action}"
+    )
 
 
 if __name__ == "__main__":

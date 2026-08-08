@@ -15,6 +15,9 @@ from safe_rl.pipeline.accvp_runtime_benchmark_factorial import (
     FACTORIAL_RUNTIME_REPORT_KIND,
     validate_factorial_runtime_report,
 )
+from safe_rl.pipeline.audit_ppo_replicate_lineage import (
+    LINEAGE_AUDIT_IMPLEMENTATION_VERSION,
+)
 from safe_rl.pipeline.stage5_factorial_aggregate import FACTORIAL_REPORT_KIND
 from safe_rl.pipeline.stage5_generate_factorial_configs import (
     FACTORIAL_REQUEST_KIND,
@@ -172,9 +175,15 @@ def _baseline_lineage_audit_ok(
         payload = read_json(path)
     except (OSError, ValueError, json.JSONDecodeError):
         return False
+    declared_fingerprint = str(payload.get("audit_fingerprint", ""))
+    fingerprint_payload = {
+        key: value for key, value in payload.items() if key != "audit_fingerprint"
+    }
     return bool(
         str(payload.get("artifact_kind", ""))
         == "ppo_replicate_lineage_audit_v1"
+        and str(payload.get("audit_implementation_version", ""))
+        == LINEAGE_AUDIT_IMPLEMENTATION_VERSION
         and str(payload.get("status", "")) == "reusable"
         and [int(value) for value in payload.get("required_seeds", [])]
         == sorted(optimizer_seeds)
@@ -183,6 +192,8 @@ def _baseline_lineage_audit_ok(
         and not list(payload.get("missing_seeds", []) or [])
         and not list(payload.get("invalid_records", []) or [])
         and not list(payload.get("global_reasons", []) or [])
+        and bool(declared_fingerprint)
+        and stable_hash(fingerprint_payload) == declared_fingerprint
     )
 
 
