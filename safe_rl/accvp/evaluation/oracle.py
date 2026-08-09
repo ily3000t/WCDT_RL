@@ -219,7 +219,12 @@ def write_oracle_report(
     return report
 
 
-def validate_oracle_for_training(config: Any, dataset_dir: str | Path) -> dict[str, Any]:
+def validate_oracle_for_training(
+    config: Any,
+    dataset_dir: str | Path,
+    *,
+    allowed_model_collection_phases: Iterable[str] = ("formal",),
+) -> dict[str, Any]:
     """Validate the independent oracle-regression premise for formal training.
 
     The oracle cohort may live in a separate schema-v3 dataset.  Its report is
@@ -314,8 +319,15 @@ def validate_oracle_for_training(config: Any, dataset_dir: str | Path) -> dict[s
     model_provenance = _dataset_provenance(dataset)
     if not bool(model_provenance.get("formal_dataset", False)):
         raise ValueError("ACCVP training requires a merged formal counterfactual dataset")
-    if str(model_provenance.get("collection_phase", "")) != "formal":
-        raise ValueError("ACCVP training requires a dataset merged from formal collection shards")
+    allowed_phases = {
+        str(value) for value in allowed_model_collection_phases
+    }
+    model_phase = str(model_provenance.get("collection_phase", ""))
+    if not allowed_phases or model_phase not in allowed_phases:
+        raise ValueError(
+            "ACCVP training dataset collection phase is not allowed: "
+            f"actual={model_phase!r} allowed={sorted(allowed_phases)!r}"
+        )
     for key in (
         "counterfactual_schema_version",
         "data_contract_hash",

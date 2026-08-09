@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, replace
 import hashlib
 import json
 from typing import Any
@@ -12,11 +12,13 @@ from safe_rl.prediction.candidate_conflict import (
 )
 from safe_rl.sim.metrics import INF_TTC, bbox_gap
 from safe_rl.sim.scenario_semantics import (
+    auxiliary_lane_index,
     distance_to_taper,
     is_auxiliary_edge,
     is_ramp_edge,
     is_target_lane,
     merge_corridor_progress,
+    with_cached_scenario_semantics,
 )
 from safe_rl.sim.types import VehicleState
 
@@ -24,8 +26,13 @@ from safe_rl.sim.types import VehicleState
 ACTOR_SELECTION_VERSION = "merge_relevance_v2"
 ACTOR_SELECTION_VERSION_V2 = ACTOR_SELECTION_VERSION
 ACTOR_SELECTION_VERSION_V3 = "candidate_union_conflict_relevance_v3"
+ACTOR_SELECTION_VERSION_V4 = "merge_conflict_relevance_v4_lane_aware"
 SUPPORTED_ACTOR_SELECTION_VERSIONS = frozenset(
-    {ACTOR_SELECTION_VERSION_V2, ACTOR_SELECTION_VERSION_V3}
+    {
+        ACTOR_SELECTION_VERSION_V2,
+        ACTOR_SELECTION_VERSION_V3,
+        ACTOR_SELECTION_VERSION_V4,
+    }
 )
 
 
@@ -86,7 +93,10 @@ def actor_relevance_config(
             configured.get("cv_uncertainty_merge_corridor_penalty", 0.10)
         ),
     }
-    if version == ACTOR_SELECTION_VERSION_V3:
+    if version in {
+        ACTOR_SELECTION_VERSION_V3,
+        ACTOR_SELECTION_VERSION_V4,
+    }:
         result.update(
             {
                 "candidate_conflict_horizon_s": float(
@@ -216,12 +226,18 @@ def _role(
     actor: VehicleState,
     target_front_id: str,
     target_rear_id: str,
+    *,
+    lane_aware_auxiliary: bool = False,
 ) -> str:
     if actor.vehicle_id == target_front_id:
         return "target_front"
     if actor.vehicle_id == target_rear_id:
         return "target_rear"
-    if is_auxiliary_edge(cfg, actor.edge_id):
+    if is_auxiliary_edge(cfg, actor.edge_id) and (
+        not lane_aware_auxiliary
+        or int(actor.lane_index)
+        == int(auxiliary_lane_index(cfg, actor.edge_id))
+    ):
         return "auxiliary_local"
     if is_ramp_edge(cfg, actor.edge_id):
         return "ramp_local"
@@ -246,7 +262,9 @@ def _priority(metadata: ActorRelevance) -> tuple[float, ...]:
         else role_priority.get(metadata.role, 4.0)
     )
     return (
-        {"critical": 0.0, "contextual": 1.0}.get(metadata.relevance_class, 2.0),
+        {"critical": 0.0, "contextual": 1.0}.get(
+            metadata.relevance_class, 2.0
+        ),
         role_rank,
         (
             metadata.earliest_conflict_time_s
@@ -260,6 +278,143 @@ def _priority(metadata: ActorRelevance) -> tuple[float, ...]:
     )
 
 
+def reclassify_v3_telemetry_for_selector_v4(
+    cfg: Any,
+    selector_payload: dict[str, Any],
+    *,
+    ego_taper_distance: float,
+    max_actors: int = 12,
+) -> ActorSelectionResult:
+    """Exactly replay Selector-v4 from full Selector-v3 actor telemetry.
+
+    Candidate tubes, TTC and geometric evidence are unchanged between v3 and
+    v4. This path is valid only when the v3 payload contains metadata for the
+    full current vehicle set; callers must verify that input coverage and the
+    frozen v3 selector hash match before using it.
+    """
+
+    if str(selector_payload.get("version", "")) != ACTOR_SELECTION_VERSION_V3:
+        raise ValueError("Selector-v4 telemetry replay requires Selector-v3 input")
+    if str(selector_payload.get("conflict_oracle_version", "")) != (
+        CANDIDATE_CONFLICT_ORACLE_VERSION
+    ):
+        raise ValueError("Selector-v4 telemetry replay conflict oracle mismatch")
+    raw_metadata = dict(selector_payload.get("actor_metadata", {}) or {})
+    if not raw_metadata:
+        raise ValueError("Selector-v4 telemetry replay requires full actor metadata")
+
+    settings = actor_relevance_config(cfg, selector_scope="accvp")
+    metadata_map: dict[str, ActorRelevance] = {}
+    for vehicle_id, raw in raw_metadata.items():
+        values = dict(raw)
+        for field_name in (
+            "relevance_reasons",
+            "selection_priority",
+            "conflict_candidate_ids",
+            "conflict_hypothesis_ids",
+            "conflict_surface_ids",
+        ):
+            values[field_name] = tuple(values.get(field_name, ()) or ())
+        item = ActorRelevance(**values)
+        role = item.role
+        if role not in {"target_front", "target_rear"} and is_auxiliary_edge(
+            cfg, item.edge_id
+        ):
+            if int(item.lane_index) == int(
+                auxiliary_lane_index(cfg, item.edge_id)
+            ):
+                role = "auxiliary_local"
+            elif is_target_lane(cfg, item.edge_id, item.lane_index):
+                role = "target_lane_other"
+            else:
+                role = "other"
+        reasons = list(item.relevance_reasons)
+        if role not in {"auxiliary_local", "ramp_local"}:
+            reasons = [reason for reason in reasons if reason != "merge_local"]
+        reasons = list(dict.fromkeys(reasons))
+        critical = bool(
+            role in {"target_front", "target_rear"}
+            or item.candidate_conflict_eligible
+            or item.nearest_candidate_conflict
+            or "lowest_ttc" in reasons
+            or (
+                role in {"auxiliary_local", "ramp_local"}
+                and item.current_surface_gap
+                <= float(settings["local_actor_distance"])
+                and float(ego_taper_distance)
+                <= float(settings["critical_taper_distance"])
+            )
+        )
+        relevant = bool(critical or reasons)
+        relevance_class = (
+            "critical"
+            if critical
+            else ("contextual" if relevant else "non_relevant")
+        )
+        normalized = replace(
+            item,
+            role=role,
+            relevance_reasons=tuple(reasons),
+            relevant=relevant,
+            relevance_class=relevance_class,
+            critical=critical,
+            contextual=relevance_class == "contextual",
+            selection_priority=(),
+        )
+        metadata_map[str(vehicle_id)] = replace(
+            normalized,
+            selection_priority=_priority(normalized),
+        )
+    ordered = sorted(
+        metadata_map.values(),
+        key=lambda item: (*item.selection_priority, item.vehicle_id),
+    )
+    critical = [item for item in ordered if item.critical]
+    contextual = [item for item in ordered if item.contextual]
+    relevant = [*critical, *contextual]
+    selected = ordered[: max(0, int(max_actors))]
+    selected_ids = tuple(item.vehicle_id for item in selected)
+    dropped_critical = tuple(
+        item.vehicle_id
+        for item in critical
+        if item.vehicle_id not in selected_ids
+    )
+    dropped_relevant = tuple(
+        item.vehicle_id
+        for item in relevant
+        if item.vehicle_id not in selected_ids
+    )
+    return ActorSelectionResult(
+        selected_actor_ids=selected_ids,
+        relevant_actor_ids=tuple(item.vehicle_id for item in relevant),
+        dropped_relevant_ids=dropped_relevant,
+        relevant_count=len(relevant),
+        overflow=bool(dropped_relevant),
+        actor_metadata=metadata_map,
+        version=ACTOR_SELECTION_VERSION_V4,
+        config_hash=actor_selection_config_hash(
+            cfg, selector_scope="accvp"
+        ),
+        critical_actor_ids=tuple(item.vehicle_id for item in critical),
+        contextual_actor_ids=tuple(item.vehicle_id for item in contextual),
+        dropped_critical_ids=dropped_critical,
+        contextual_truncated_ids=tuple(
+            item.vehicle_id
+            for item in contextual
+            if item.vehicle_id not in selected_ids
+        ),
+        critical_count=len(critical),
+        contextual_count=len(contextual),
+        critical_overflow=bool(dropped_critical),
+        legal_candidate_ids=tuple(
+            int(value)
+            for value in selector_payload.get("legal_candidate_ids", ())
+        ),
+        conflict_oracle_version=CANDIDATE_CONFLICT_ORACLE_VERSION,
+    )
+
+
+@with_cached_scenario_semantics
 def select_merge_relevant_actors(
     cfg: Any,
     ego: VehicleState,
@@ -271,10 +426,12 @@ def select_merge_relevant_actors(
     """Select merge-relevant actors using only the current decision state.
 
     ``merge_relevance_v2`` is intentionally retained byte-for-byte at the
-    semantic decision boundary for historical reproduction.  Selector-v3
+    semantic decision boundary for historical reproduction. Selector-v3
     restricts the critical class to the merge conflict surface; global
     gap/TTC heuristics may make an unrelated actor contextual, but never
-    critical unless it is the true nearest geometric conflict.
+    critical unless it is the true nearest geometric conflict. Selector-v4
+    preserves that candidate-union rule while restricting
+    ``auxiliary_local`` to the configured auxiliary lane.
     """
 
     settings = actor_relevance_config(
@@ -300,7 +457,10 @@ def select_merge_relevant_actors(
     ego_taper_distance = float(distance_to_taper(cfg, ego))
     conflict_evidence = {}
     legal_candidate_ids: tuple[int, ...] = ()
-    if settings["version"] == ACTOR_SELECTION_VERSION_V3:
+    if settings["version"] in {
+        ACTOR_SELECTION_VERSION_V3,
+        ACTOR_SELECTION_VERSION_V4,
+    }:
         conflict_evidence, legal_candidate_ids = (
             candidate_union_conflict_oracle(
                 cfg,
@@ -343,7 +503,15 @@ def select_merge_relevant_actors(
         if ttc < lowest_ttc:
             lowest_ttc = float(ttc)
             lowest_ttc_id = str(actor.vehicle_id)
-        role = _role(cfg, actor, target_front_id, target_rear_id)
+        role = _role(
+            cfg,
+            actor,
+            target_front_id,
+            target_rear_id,
+            lane_aware_auxiliary=(
+                settings["version"] == ACTOR_SELECTION_VERSION_V4
+            ),
+        )
         conflict = conflict_evidence.get(str(actor.vehicle_id))
         reasons: list[str] = []
         if surface_gap <= settings["current_gap_distance"]:
@@ -431,7 +599,10 @@ def select_merge_relevant_actors(
             }
         )
 
-    if settings["version"] == ACTOR_SELECTION_VERSION_V3:
+    if settings["version"] in {
+        ACTOR_SELECTION_VERSION_V3,
+        ACTOR_SELECTION_VERSION_V4,
+    }:
         lowest_ttc_id = ""
         lowest_ttc = INF_TTC
         conflict_surface = [
@@ -464,7 +635,10 @@ def select_merge_relevant_actors(
     metadata_map: dict[str, ActorRelevance] = {}
     for vehicle_id, item in base.items():
         reasons = set(item.relevance_reasons)
-        if settings["version"] == ACTOR_SELECTION_VERSION_V3:
+        if settings["version"] in {
+            ACTOR_SELECTION_VERSION_V3,
+            ACTOR_SELECTION_VERSION_V4,
+        }:
             critical = bool(
                 item.critical
                 or item.role in {"target_front", "target_rear"}
@@ -548,7 +722,11 @@ def select_merge_relevant_actors(
         legal_candidate_ids=legal_candidate_ids,
         conflict_oracle_version=(
             CANDIDATE_CONFLICT_ORACLE_VERSION
-            if settings["version"] == ACTOR_SELECTION_VERSION_V3
+            if settings["version"]
+            in {
+                ACTOR_SELECTION_VERSION_V3,
+                ACTOR_SELECTION_VERSION_V4,
+            }
             else ""
         ),
     )

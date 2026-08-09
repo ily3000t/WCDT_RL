@@ -1,0 +1,28 @@
+extends: safe_rl/config/active/accvp_vnext_selector3/selector_audit.yaml
+
+# Selector4 shadow audit only. It reads full states from Selector3 formal data
+# and reproduces frozen Selector3 policy trajectories without creating branch
+# labels or treating old artifacts as formal evidence.
+run:
+  run_id: "accvp_vnext_selector4_audit"
+
+evaluation_protocol:
+  protocol_id: "accvp-vnext-correctness-v3-selector4"
+  seed_ledger: "safe_rl/config/accvp_vnext_selector4_seed_ledger.json"
+  revocation_manifest: "safe_rl/config/artifact_revocation_manifest_selector4.json"
+  cohort_roles:
+    selector_diagnostic: "selector_historical_development"
+    selector_historical_development: "selector_historical_development"
+    selector_stress_development: "selector_stress_development"
+
+accvp:
+  actor_relevance:
+    version: "merge_conflict_relevance_v4_lane_aware"
+    candidate_conflict_horizon_s: 3.0
+    candidate_conflict_surface_gap: 30.0
+    actor_longitudinal_accel_bound: 2.0
+    local_actor_distance: 45.0
+    critical_taper_distance: 120.0
+  data_contract_version: "accvp_240_v4_lane_aware_capacity_audit"
+  selector_contract:
+    require_capacity_lock: false

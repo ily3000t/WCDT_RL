@@ -15,6 +15,7 @@ from safe_rl.accvp.contracts.schema import (
 )
 from safe_rl.prediction.actor_selector import (
     ACTOR_SELECTION_VERSION_V3,
+    ACTOR_SELECTION_VERSION_V4,
     actor_relevance_config,
     actor_selection_config_hash,
 )
@@ -29,9 +30,33 @@ from safe_rl.utils.sumo_installation import (
 ACCVP_EVENT_DEFINITION_VERSION = "accvp_v2_proxy_safety_taper_viability"
 ACCVP_DATA_CONTRACT_VERSION = "accvp_240_v2"
 ACCVP_SELECTOR3_DATA_CONTRACT_VERSION = "accvp_240_v3_conflict_selector"
-SUPPORTED_ACCVP_DATA_CONTRACT_VERSIONS = frozenset(
-    {ACCVP_DATA_CONTRACT_VERSION, ACCVP_SELECTOR3_DATA_CONTRACT_VERSION}
+ACCVP_SELECTOR4_DATA_CONTRACT_VERSION = (
+    "accvp_240_v4_lane_aware_capacity_audit"
 )
+SUPPORTED_ACCVP_DATA_CONTRACT_VERSIONS = frozenset(
+    {
+        ACCVP_DATA_CONTRACT_VERSION,
+        ACCVP_SELECTOR3_DATA_CONTRACT_VERSION,
+        ACCVP_SELECTOR4_DATA_CONTRACT_VERSION,
+    }
+)
+STRICT_SELECTOR_DATA_CONTRACT_VERSIONS = frozenset(
+    {
+        ACCVP_SELECTOR3_DATA_CONTRACT_VERSION,
+        ACCVP_SELECTOR4_DATA_CONTRACT_VERSION,
+    }
+)
+
+
+def is_strict_selector_data_contract(protocol_version: Any) -> bool:
+    """Return whether selector coverage and capacity are fail-closed.
+
+    Selector-v4 is a strict successor of selector-v3.  Keeping this predicate
+    centralized prevents new selector generations from silently bypassing
+    collection, merge, split, validation, or training gates.
+    """
+
+    return str(protocol_version) in STRICT_SELECTOR_DATA_CONTRACT_VERSIONS
 
 # ``accvp_240_v2`` was frozen while this retired, runtime-inert key still
 # existed in the default scenario mapping.  Removing the no-op configuration
@@ -146,6 +171,14 @@ def counterfactual_data_contract(config: Any, risk_model_fingerprint: str) -> di
             f"{ACCVP_SELECTOR3_DATA_CONTRACT_VERSION} requires "
             f"accvp.actor_relevance.version={ACTOR_SELECTION_VERSION_V3!r}"
         )
+    if (
+        configured_version == ACCVP_SELECTOR4_DATA_CONTRACT_VERSION
+        and selection_version != ACTOR_SELECTION_VERSION_V4
+    ):
+        raise ValueError(
+            f"{ACCVP_SELECTOR4_DATA_CONTRACT_VERSION} requires "
+            f"accvp.actor_relevance.version={ACTOR_SELECTION_VERSION_V4!r}"
+        )
     selector_contract = dict(config.accvp.get("selector_contract", {}) or {})
     contract = {
         "protocol_version": configured_version,
@@ -176,14 +209,17 @@ def counterfactual_data_contract(config: Any, risk_model_fingerprint: str) -> di
         "event_definition_version": ACCVP_EVENT_DEFINITION_VERSION,
         "risk_model_fingerprint": str(risk_model_fingerprint),
     }
-    if configured_version == ACCVP_SELECTOR3_DATA_CONTRACT_VERSION:
+    if configured_version in {
+        ACCVP_SELECTOR3_DATA_CONTRACT_VERSION,
+        ACCVP_SELECTOR4_DATA_CONTRACT_VERSION,
+    }:
         if not bool(selector_contract.get("require_capacity_lock", False)):
             raise ValueError(
-                "selector3 data contract requires a frozen selector capacity audit"
+                "selector data contract requires a frozen selector capacity audit"
             )
         audit_report = selector_contract.get("audit_report")
         if not audit_report:
-            raise ValueError("selector3 data contract requires selector audit_report")
+            raise ValueError("selector data contract requires selector audit_report")
         audit_path = Path(str(audit_report))
         if not audit_path.is_file():
             raise FileNotFoundError(audit_path)

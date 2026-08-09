@@ -1,0 +1,28 @@
+extends: safe_rl/config/active/accvp_vnext_selector3/train.yaml
+
+run:
+  run_id: "accvp_vnext_selector4_train"
+
+evaluation_protocol:
+  protocol_id: "accvp-vnext-correctness-v3-selector4"
+  seed_ledger: "safe_rl/config/accvp_vnext_selector4_seed_ledger.json"
+  revocation_manifest: "safe_rl/config/artifact_revocation_manifest_selector4.json"
+  cohort_roles:
+    selector_diagnostic: "selector_historical_development"
+    selector_historical_development: "selector_historical_development"
+    selector_stress_development: "selector_stress_development"
+
+accvp:
+  actor_relevance:
+    version: "merge_conflict_relevance_v4_lane_aware"
+  data_contract_version: "accvp_240_v4_lane_aware_capacity_audit"
+  selector_contract:
+    require_capacity_lock: true
+    audit_report: "safe_rl_output/runs/accvp_vnext_selector4_audit/selector_capacity_audit.json"
+  dataset_dir: "safe_rl_output/runs/accvp_vnext_selector4_formal_dataset"
+  oracle_report: "safe_rl_output/runs/accvp_vnext_selector4_oracle_regression/oracle_report.json"
+  formal_validation_report: "safe_rl_output/runs/accvp_vnext_selector4_formal/formal_validation.json"
+  checkpoint: "safe_rl_output/runs/accvp_vnext_selector4_train/accvp/accvp_vnext_schema3_predictor.pt"
+  calibration_bundle: "safe_rl_output/runs/accvp_vnext_selector4_train/accvp/accvp_vnext_schema3_calibration.json"
+  operating_point: "safe_rl_output/runs/accvp_vnext_selector4_train/accvp/accvp_vnext_schema3_operating_point.json"
+  artifact_manifest: "safe_rl_output/runs/accvp_vnext_selector4_train/accvp/accvp_vnext_schema3_candidate_manifest.json"

@@ -1,0 +1,21 @@
+{
+  "schema_version": 1,
+  "artifact_kind": "safe_rl_artifact_revocation_manifest_v1",
+  "protocol_id": "accvp-vnext-correctness-v3-selector4",
+  "status": "superseded",
+  "deployable": false,
+  "allowed_usage": "diagnostic_only",
+  "reason": "Selector-v3 promoted every lane on main_aux as auxiliary_local and its 8-row policy runtime evidence overflowed. All Selector-v3 data, predictors, Candidate PPO checkpoints and runtime reports remain available only as diagnostic state sources; Selector-v4 uses a new data contract and new output roots.",
+  "path_base": "../..",
+  "artifacts": [
+    {"path": "safe_rl_output/runs/accvp_vnext_selector3_", "match": "path_prefix", "status": "superseded", "deployable": false, "allowed_usage": "diagnostic_only"},
+    {"path": "safe_rl_output/runs/ppo_accvp_vnext_selector3_", "match": "path_prefix", "status": "superseded", "deployable": false, "allowed_usage": "diagnostic_only"}
+  ],
+  "metadata": {
+    "replacement_protocol": "accvp-vnext-correctness-v3-selector4",
+    "deletion_required": false,
+    "formal_lineage_loading_allowed": false,
+    "selector_audit_state_source_exception": true,
+    "historical_failure_seeds_are_development_only": true
+  }
+}

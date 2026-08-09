@@ -1,0 +1,153 @@
+schema_version: 1
+artifact_kind: accvp_vnext_workflow_contract_v1
+protocol_id: accvp-vnext-correctness-v3-selector4
+
+automation:
+  default_run_until: pilot_validation
+  stop_on_closed_gate: true
+  execute_at_most_one_phase_without_run_until: true
+  final_holdout_requires_explicit_flag: true
+  blocked_phases: {}
+
+selector_audit:
+  # Selector-only development/stress replay is cache-resumable and independent
+  # of immutable formal branch collection. Eight workers fit the 16-core audit
+  # host and do not change the frozen seed schedule or capacity decision.
+  workers: 8
+  capacities: [8, 10, 12]
+  minimum_capacity_headroom: 2
+  scorer_latency_gate_deferred_until_new_model: true
+
+paths:
+  selector_audit_config: safe_rl/config/active/accvp_vnext_selector4/selector_audit.yaml
+  selector_source_dataset: safe_rl_output/runs/accvp_vnext_selector3_formal_dataset
+  selector_source_factorial_manifest: safe_rl_output/runs/accvp_vnext_selector3_factorial/ppo_factorial_manifest.json
+  selector_historical_overflow_report: safe_rl_output/runs/accvp_vnext_selector3_runtime/diagnostics/reward_v2_commitment_seed1005_lane_aware_capacity_sweep.json
+  selector_replay_cache: safe_rl_output/runs/accvp_vnext_selector4_audit/replay_cache
+  selector_audit_report: safe_rl_output/runs/accvp_vnext_selector4_audit/selector_capacity_audit.json
+  pilot_config: safe_rl/config/active/accvp_vnext_selector4/pilot.yaml
+  pilot_latency_smoke_train_config: safe_rl/config/active/accvp_vnext_selector4/pilot_latency_smoke_train.yaml
+  pilot_latency_smoke_runtime_config: safe_rl/config/active/accvp_vnext_selector4/pilot_latency_smoke_runtime.yaml
+  oracle_config: safe_rl/config/active/accvp_vnext_selector4/oracle_regression.yaml
+  formal_config: safe_rl/config/active/accvp_vnext_selector4/formal.yaml
+  train_config: safe_rl/config/active/accvp_vnext_selector4/train.yaml
+  ppo_config: safe_rl/config/active/accvp_vnext_selector4/ppo_candidate_table_full.yaml
+  baseline_ppo_config: safe_rl/config/baselines/wcdt/ppo_wcdt_v3_reward_v2.yaml
+  matrix_config: safe_rl/config/active/accvp_vnext_selector4/ppo_ablation_matrix.yaml
+  protocol_config: safe_rl/config/examples/vnext/evaluation_protocol_selector4.example.yaml
+  pilot_shard_root: safe_rl_output/runs/accvp_vnext_selector4_pilot/stage1_counterfactual/accvp_vnext_selector4_schema3_pilot/shards
+  oracle_shard_root: safe_rl_output/runs/accvp_vnext_selector4_oracle_regression/stage1_counterfactual/accvp_vnext_selector4_schema3_oracle_regression/shards
+  formal_shard_root: safe_rl_output/runs/accvp_vnext_selector4_formal/stage1_counterfactual/accvp_vnext_selector4_schema3_formal/shards
+  pilot_dataset: safe_rl_output/runs/accvp_vnext_selector4_pilot_dataset
+  oracle_dataset: safe_rl_output/runs/accvp_vnext_selector4_oracle_regression_dataset
+  formal_dataset: safe_rl_output/runs/accvp_vnext_selector4_formal_dataset
+  oracle_report: safe_rl_output/runs/accvp_vnext_selector4_oracle_regression/oracle_report.json
+  pilot_report: safe_rl_output/runs/accvp_vnext_selector4_pilot/pilot_report.json
+  pilot_latency_smoke_report: safe_rl_output/runs/accvp_vnext_selector4_pilot_latency_smoke/feasibility_report.json
+  formal_validation_report: safe_rl_output/runs/accvp_vnext_selector4_formal/formal_validation.json
+  predictor_manifest: safe_rl_output/runs/accvp_vnext_selector4_train/accvp/accvp_vnext_schema3_candidate_manifest.json
+  scorer_report: safe_rl_output/runs/accvp_vnext_selector4_runtime/scorer_preflight.json
+  factorial_manifest: safe_rl_output/runs/accvp_vnext_selector4_factorial/ppo_factorial_manifest.json
+  baseline_manifest: safe_rl_output/runs/wcdt_vnext_replicates/ppo_replicate_manifest.json
+  baseline_lineage_audit: safe_rl_output/runs/accvp_vnext_selector4_baseline_audit/wcdt_baseline_report.json
+  runtime_factorial_report: safe_rl_output/runs/accvp_vnext_selector4_runtime/factorial_runtime_report.json
+  stage5_request: safe_rl_output/runs/accvp_vnext_selector4_stage5/generated/factorial_request.json
+  stage5_report: safe_rl_output/runs/accvp_vnext_selector4_stage5/factorial_report.json
+  holdout_report: safe_rl_output/runs/accvp_vnext_selector4_final_holdout/accvp_vnext_schema3_final_test_diagnostics.json
+
+seeds:
+  optimizer_replicates: [1001, 1002, 1003, 1004, 1005]
+  selector_historical_development: [50021, 50027, 55027]
+  selector_stress_development: {start: 65001, count: 15}
+  runtime: {start: 56001, count: 60}
+  pilot_latency_smoke_development: [66001, 66002, 66003, 66004, 66005]
+
+phase_order:
+  - selector_contract_audit
+  - pilot_collection
+  - pilot_merge
+  - oracle_collection
+  - oracle_merge
+  - oracle_regression
+  - pilot_validation
+  - pilot_latency_feasibility_smoke
+  - formal_collection
+  - formal_merge
+  - formal_validation
+  - accvp_training
+  - scorer_runtime_preflight
+  - candidate_ppo_replicates
+  - baseline_ppo_replicates
+  - baseline_lineage_audit
+  - policy_runtime_replicates
+  - stage5_generate
+  - stage5_replicates_and_aggregate
+  - one_shot_final_holdout
+
+phase_gates:
+  selector_contract_audit:
+    report_field: audit_state
+    accepted_values: [pass]
+  oracle_regression:
+    report_field: oracle_state
+    accepted_values: [go]
+  pilot_validation:
+    report_field: pilot_state
+    accepted_values: [pass]
+  pilot_latency_feasibility_smoke:
+    report_field: smoke_state
+    accepted_values: [pass]
+  formal_validation:
+    report_field: formal_state
+    accepted_values: [pass]
+  scorer_runtime_preflight:
+    report_field: gate.pass
+    accepted_values: [true]
+  policy_runtime_replicates:
+    report_field: gate.pass
+    accepted_values: [true]
+  stage5_replicates_and_aggregate:
+    report_field: gate.pass
+    accepted_values: [true]
+  one_shot_final_holdout:
+    sealed_one_shot: true
+
+method_roles:
+  candidate_table_reward_v2: candidate_table_single_factor_ablation
+  candidate_table_reward_v2_commitment: commitment_factor_at_reward_v2
+  candidate_table_reward_v3_1: persistence_factor_without_commitment
+  candidate_table_reward_v3_1_commitment: final_complete_method_candidate
+  wcdt_reward_v2: action_independent_forecast_baseline
+
+final_method_id: candidate_table_reward_v3_1_commitment
+
+freeze_before_stage5:
+  selector_definition: merge_conflict_relevance_v4_lane_aware
+  actor_capacity_source: safe_rl_output/runs/accvp_vnext_selector4_audit/selector_capacity_audit.json
+  role_priority: frozen
+  candidate_union_definition: frozen
+  reward: factorial_matrix
+  commitment: factorial_matrix
+  risk_threshold: frozen
+  post_runtime_capacity_fallback_allowed: false
+
+factorial:
+  candidate_method_ids:
+    - candidate_table_reward_v2
+    - candidate_table_reward_v2_commitment
+    - candidate_table_reward_v3_1
+    - candidate_table_reward_v3_1_commitment
+  runtime_scope: all_candidate_methods
+  final_comparison_id: wcdt_reward_v2__vs__candidate_table_reward_v3_1_commitment
+  stage5_evaluation:
+    secondary_simulator_seed_count: 100
+    primary_simulator_seed_count: 300
+    nested_seed_prefix: true
+    episode_cache_enabled: true
+  comparisons:
+    - {comparison_id: wcdt_reward_v2__vs__candidate_table_reward_v2, left_method_id: wcdt_reward_v2, right_method_id: candidate_table_reward_v2, family: candidate_table_attribution, role: candidate_table_single_factor}
+    - {comparison_id: candidate_table_reward_v2__vs__candidate_table_reward_v2_commitment, left_method_id: candidate_table_reward_v2, right_method_id: candidate_table_reward_v2_commitment, family: candidate_factorial_attribution, role: commitment_at_reward_v2}
+    - {comparison_id: candidate_table_reward_v2__vs__candidate_table_reward_v3_1, left_method_id: candidate_table_reward_v2, right_method_id: candidate_table_reward_v3_1, family: candidate_factorial_attribution, role: persistence_without_commitment}
+    - {comparison_id: candidate_table_reward_v2_commitment__vs__candidate_table_reward_v3_1_commitment, left_method_id: candidate_table_reward_v2_commitment, right_method_id: candidate_table_reward_v3_1_commitment, family: candidate_factorial_attribution, role: persistence_with_commitment}
+    - {comparison_id: candidate_table_reward_v3_1__vs__candidate_table_reward_v3_1_commitment, left_method_id: candidate_table_reward_v3_1, right_method_id: candidate_table_reward_v3_1_commitment, family: candidate_factorial_attribution, role: commitment_at_reward_v3_1}
+    - {comparison_id: wcdt_reward_v2__vs__candidate_table_reward_v3_1_commitment, left_method_id: wcdt_reward_v2, right_method_id: candidate_table_reward_v3_1_commitment, family: final_method_confirmatory, role: primary_final}

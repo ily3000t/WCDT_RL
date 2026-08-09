@@ -1,0 +1,19 @@
+extends: safe_rl/config/active/accvp_vnext_selector4/train.yaml
+
+run:
+  run_id: "accvp_vnext_selector4_pilot_latency_smoke_train"
+
+# This artifact exists only to exercise the exact 12-actor, three-member
+# inference structure before formal collection. One epoch is not accuracy
+# evidence and the bundle remains lifecycle_state=shadow.
+accvp:
+  dataset_dir: "safe_rl_output/runs/accvp_vnext_selector4_pilot_dataset"
+  formal_validation_report: null
+  checkpoint: "safe_rl_output/runs/accvp_vnext_selector4_pilot_latency_smoke_train/accvp/accvp_vnext_schema3_predictor.pt"
+  calibration_bundle: "safe_rl_output/runs/accvp_vnext_selector4_pilot_latency_smoke_train/accvp/accvp_vnext_schema3_calibration.json"
+  operating_point: null
+  artifact_manifest: "safe_rl_output/runs/accvp_vnext_selector4_pilot_latency_smoke_train/accvp/accvp_vnext_schema3_shadow_manifest.json"
+  training:
+    epochs: 1
+  warm_start:
+    freeze_encoder_epochs: 0

@@ -13,9 +13,13 @@ def main() -> None:
     parser.add_argument("--run-id", default=None, help="Existing or new run id.")
     parser.add_argument(
         "--mode",
-        choices=["shadow", "deployable"],
+        choices=["shadow", "deployable", "diagnostic_latency_smoke"],
         default="deployable",
-        help="shadow writes a non-deployable shadow artifact; deployable requires operating-point tuning.",
+        help=(
+            "shadow writes a non-deployable artifact from formal data; "
+            "diagnostic_latency_smoke permits pilot data only for pre-formal "
+            "latency feasibility; deployable requires operating-point tuning."
+        ),
     )
     args = parser.parse_args()
     cfg = load_stage_config(args)

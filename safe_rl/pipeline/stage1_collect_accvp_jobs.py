@@ -11,6 +11,12 @@ from safe_rl.accvp.contracts.protocol import (
     counterfactual_data_contract_candidates,
     data_contract_hash,
     effective_activation_distance,
+    is_strict_selector_data_contract,
+)
+from safe_rl.accvp.evaluation.pilot import PILOT_VALIDATION_IMPLEMENTATION_VERSION
+from safe_rl.pipeline.accvp_pilot_latency_smoke import (
+    SMOKE_ARTIFACT_KIND,
+    SMOKE_IMPLEMENTATION_VERSION,
 )
 from safe_rl.accvp.contracts.schema import file_sha256, read_json, write_json_atomic
 from safe_rl.stage1_counterfactual.collector import collect
@@ -264,6 +270,56 @@ def validate_required_pilot(cfg) -> None:
     report = read_json(report_path)
     if str(report.get("pilot_state", "")) != "pass":
         raise ValueError("formal ACCVP collection requires a pilot report with pilot_state='pass'")
+    protocol_version = str(
+        cfg.accvp.get("data_contract_version", "")
+    )
+    if is_strict_selector_data_contract(protocol_version):
+        conditions = dict(report.get("conditions", {}) or {})
+        required = {
+            "rejected_root_count_zero",
+            "critical_actor_overflow_zero",
+            "task_actor_coverage_complete",
+            "risk_safety_actor_coverage_complete",
+            "actor_mapping_mismatch_zero",
+            "root_observation_fingerprint_mismatch_zero",
+            "protected_actor_coverage_complete",
+            "branch_success_rate",
+            "oracle_regression",
+        }
+        if (
+            str(report.get("validation_implementation_version", ""))
+            != PILOT_VALIDATION_IMPLEMENTATION_VERSION
+            or not bool(report.get("strict_selector_contract", False))
+            or not required.issubset(conditions)
+            or not all(bool(conditions[name]) for name in required)
+        ):
+            raise ValueError(
+                "formal strict-selector collection requires the current "
+                "fail-closed pilot validation report"
+            )
+        smoke_path = cfg.accvp.counterfactual.get(
+            "required_latency_smoke_report"
+        )
+        if not smoke_path:
+            raise FileNotFoundError(
+                "formal strict-selector collection requires "
+                "counterfactual.required_latency_smoke_report"
+            )
+        smoke = read_json(smoke_path)
+        smoke_conditions = dict(smoke.get("conditions", {}) or {})
+        if (
+            str(smoke.get("artifact_kind", "")) != SMOKE_ARTIFACT_KIND
+            or str(smoke.get("implementation_version", ""))
+            != SMOKE_IMPLEMENTATION_VERSION
+            or str(smoke.get("smoke_state", "")) != "pass"
+            or not smoke_conditions
+            or not all(bool(value) for value in smoke_conditions.values())
+            or bool(smoke.get("formal_runtime_evidence", True))
+        ):
+            raise ValueError(
+                "formal strict-selector collection requires a passing, "
+                "diagnostic-only pilot latency feasibility smoke"
+            )
     activation = effective_activation_distance(cfg)
     if abs(float(report.get("accvp_activation_distance_m", -1.0)) - activation) > 1.0e-9:
         raise ValueError("pilot report activation window does not match formal ACCVP collection")

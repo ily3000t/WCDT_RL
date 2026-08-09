@@ -1,4 +1,4 @@
-"""Fail-closed validation for a merged selector-v3 formal dataset."""
+"""Fail-closed validation for a merged strict-selector formal dataset."""
 
 from __future__ import annotations
 
@@ -9,8 +9,10 @@ from typing import Any, Iterable
 
 from safe_rl.accvp.contracts.protocol import (
     ACCVP_SELECTOR3_DATA_CONTRACT_VERSION,
+    ACCVP_SELECTOR4_DATA_CONTRACT_VERSION,
     counterfactual_data_contract_candidates,
     data_contract_hash,
+    is_strict_selector_data_contract,
 )
 from safe_rl.accvp.contracts.schema import (
     file_sha256,
@@ -21,6 +23,9 @@ from safe_rl.accvp.contracts.schema import (
 from safe_rl.accvp.data.dataset import (
     SPLIT_ALGORITHM_VERSION,
     build_split_manifest,
+)
+from safe_rl.accvp.evaluation.dataset_integrity import (
+    audit_dataset_actor_contract,
 )
 
 
@@ -75,10 +80,10 @@ def validate_formal_dataset(
         if str(row.get("branch_status", "")) == "completed"
     ]
     contract = dict(dataset_manifest.get("data_contract", {}) or {})
-    selector3_contract = (
-        str(contract.get("protocol_version", ""))
-        == ACCVP_SELECTOR3_DATA_CONTRACT_VERSION
-    )
+    protocol_version = str(contract.get("protocol_version", ""))
+    selector3_contract = protocol_version == ACCVP_SELECTOR3_DATA_CONTRACT_VERSION
+    selector4_contract = protocol_version == ACCVP_SELECTOR4_DATA_CONTRACT_VERSION
+    strict_selector_contract = is_strict_selector_data_contract(protocol_version)
     contract_matches = _configured_contract_matches(
         config,
         dataset_manifest,
@@ -133,6 +138,11 @@ def validate_formal_dataset(
             or bool(list(row.get("dropped_critical_actor_ids", []) or []))
         )
     ]
+    actor_contract_audit = (
+        audit_dataset_actor_contract(dataset)
+        if strict_selector_contract
+        else None
+    )
     preliminary = {
         "artifact_kind": (
             str(dataset_manifest.get("artifact_kind", ""))
@@ -141,7 +151,10 @@ def validate_formal_dataset(
         "formal_collection_phase": (
             str(dataset_manifest.get("collection_phase", "")) == "formal"
         ),
-        "selector3_data_contract": selector3_contract,
+        # Compatibility key retained for existing report consumers. Its gate
+        # semantics now mean any strict selector generation (v3 or v4).
+        "selector3_data_contract": strict_selector_contract,
+        "strict_selector_data_contract": strict_selector_contract,
         "configured_data_contract_match": contract_matches,
         "minimum_root_count": len(roots) >= int(minimum_root_count),
         "rejected_root_count_zero": (
@@ -190,6 +203,31 @@ def validate_formal_dataset(
         ),
         "branch_success_rate": (
             branch_success_rate >= float(minimum_branch_success_rate)
+        ),
+        "actor_mapping_mismatch_zero": bool(
+            actor_contract_audit is not None
+            and int(actor_contract_audit["actor_mapping_mismatch_count"]) == 0
+        ),
+        "root_observation_fingerprint_mismatch_zero": bool(
+            actor_contract_audit is not None
+            and int(
+                actor_contract_audit[
+                    "root_observation_fingerprint_mismatch_count"
+                ]
+            )
+            == 0
+        ),
+        "protected_actor_coverage_complete": bool(
+            actor_contract_audit is not None
+            and int(actor_contract_audit["selector_metadata_missing_count"]) == 0
+            and int(
+                actor_contract_audit[
+                    "protected_actor_coverage_incomplete_count"
+                ]
+            )
+            == 0
+            and float(actor_contract_audit["protected_actor_coverage_rate"])
+            == 1.0
         ),
     }
 
@@ -261,6 +299,10 @@ def validate_formal_dataset(
         "data_contract_hash": str(
             dataset_manifest.get("data_contract_hash", "")
         ),
+        "data_contract_version": protocol_version,
+        "selector3_contract": selector3_contract,
+        "selector4_contract": selector4_contract,
+        "strict_selector_contract": strict_selector_contract,
         "root_count": len(roots),
         "branch_count": len(branches),
         "minimum_root_count": int(minimum_root_count),
@@ -277,6 +319,26 @@ def validate_formal_dataset(
         ),
         "task_actor_coverage_incomplete_root_ids": incomplete_roots[:20],
         "task_actor_coverage_incomplete_branch_ids": incomplete_branches[:20],
+        "actor_mapping_mismatch_count": (
+            None
+            if actor_contract_audit is None
+            else int(actor_contract_audit["actor_mapping_mismatch_count"])
+        ),
+        "root_observation_fingerprint_mismatch_count": (
+            None
+            if actor_contract_audit is None
+            else int(
+                actor_contract_audit[
+                    "root_observation_fingerprint_mismatch_count"
+                ]
+            )
+        ),
+        "protected_actor_coverage_rate": (
+            None
+            if actor_contract_audit is None
+            else float(actor_contract_audit["protected_actor_coverage_rate"])
+        ),
+        "actor_contract_audit": actor_contract_audit,
         "conditions": conditions,
         "formal_state": "pass" if all(conditions.values()) else "fail",
     }

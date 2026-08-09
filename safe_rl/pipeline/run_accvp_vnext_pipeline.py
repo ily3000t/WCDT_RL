@@ -10,10 +10,23 @@ from typing import Any
 import yaml
 
 from safe_rl.accvp.contracts.schema import file_sha256, read_json
+from safe_rl.accvp.evaluation.pilot import (
+    PILOT_VALIDATION_IMPLEMENTATION_VERSION,
+)
+from safe_rl.accvp.evaluation.selector_capacity_v4 import (
+    validate_selector4_capacity_report,
+)
 from safe_rl.evaluation_protocol import stable_hash
 from safe_rl.pipeline.accvp_runtime_benchmark_factorial import (
     FACTORIAL_RUNTIME_REPORT_KIND,
     validate_factorial_runtime_report,
+)
+from safe_rl.pipeline.accvp_runtime_benchmark import (
+    RUNTIME_IMPLEMENTATION_VERSION,
+)
+from safe_rl.pipeline.accvp_pilot_latency_smoke import (
+    SMOKE_ARTIFACT_KIND,
+    SMOKE_IMPLEMENTATION_VERSION,
 )
 from safe_rl.pipeline.audit_ppo_replicate_lineage import (
     LINEAGE_AUDIT_IMPLEMENTATION_VERSION,
@@ -42,7 +55,7 @@ BASELINE_PPO_CONFIG = "safe_rl/config/baselines/wcdt/ppo_wcdt_v3_reward_v2.yaml"
 MATRIX_CONFIG = "safe_rl/config/active/accvp_vnext/ppo_ablation_matrix.yaml"
 PROTOCOL_CONFIG = "safe_rl/config/examples/vnext/evaluation_protocol_vnext.example.yaml"
 WORKFLOW_CONFIG = (
-    "safe_rl/config/active/accvp_vnext_selector3/workflow.yaml"
+    "safe_rl/config/active/accvp_vnext_selector4/workflow.yaml"
 )
 OPTIMIZER_SEEDS = [1001, 1002, 1003, 1004, 1005]
 # The first 30 development seeds produced only 608 activation-window
@@ -106,6 +119,16 @@ def _artifact_ok(
     return True
 
 
+def _selector4_capacity_audit_ok(path: Path) -> bool:
+    if not path.is_file():
+        return False
+    try:
+        validate_selector4_capacity_report(read_json(path))
+    except (KeyError, TypeError, ValueError):
+        return False
+    return True
+
+
 def _oracle_report_ok(path: Path) -> bool:
     """Accept only the scoped oracle artifact required by pilot/training gates."""
 
@@ -122,6 +145,76 @@ def _oracle_report_ok(path: Path) -> bool:
         and bool(payload.get("oracle_only", False))
         and bool(payload.get("exclude_from_model_splits", False))
         and [int(value) for value in payload.get("required_seeds", [])] == [2, 5]
+    )
+
+
+def _pilot_validation_ok(path: Path) -> bool:
+    """Reject pre-fix selector-v4 reports that bypassed strict gates."""
+
+    if not _artifact_ok(
+        path,
+        artifact_kind="accvp_pilot_validation_v2",
+        state_field="pilot_state",
+    ):
+        return False
+    try:
+        payload = read_json(path)
+    except (OSError, ValueError, json.JSONDecodeError):
+        return False
+    conditions = dict(payload.get("conditions", {}) or {})
+    required_conditions = {
+        "rejected_root_count_zero",
+        "critical_actor_overflow_zero",
+        "task_actor_coverage_complete",
+        "risk_safety_actor_coverage_complete",
+        "actor_mapping_mismatch_zero",
+        "root_observation_fingerprint_mismatch_zero",
+        "protected_actor_coverage_complete",
+        "branch_success_rate",
+        "oracle_regression",
+    }
+    return bool(
+        str(payload.get("validation_implementation_version", ""))
+        == PILOT_VALIDATION_IMPLEMENTATION_VERSION
+        and bool(payload.get("strict_selector_contract", False))
+        and required_conditions.issubset(conditions)
+        and all(bool(conditions[name]) for name in required_conditions)
+        and int(payload.get("critical_actor_overflow_count", -1)) == 0
+        and int(payload.get("rejected_root_count", -1)) == 0
+        and int(payload.get("coverage_incomplete_count", -1)) == 0
+        and int(payload.get("actor_mapping_mismatch_count", -1)) == 0
+        and int(
+            payload.get(
+                "root_observation_fingerprint_mismatch_count", -1
+            )
+        )
+        == 0
+        and float(payload.get("protected_actor_coverage_rate", -1.0)) == 1.0
+        and float(payload.get("branch_success_rate", 0.0)) >= 0.99
+    )
+
+
+def _pilot_latency_smoke_ok(path: Path) -> bool:
+    if not _artifact_ok(
+        path,
+        artifact_kind=SMOKE_ARTIFACT_KIND,
+        state_field="smoke_state",
+    ):
+        return False
+    try:
+        payload = read_json(path)
+    except (OSError, ValueError, json.JSONDecodeError):
+        return False
+    conditions = dict(payload.get("conditions", {}) or {})
+    return bool(
+        str(payload.get("implementation_version", ""))
+        == SMOKE_IMPLEMENTATION_VERSION
+        and str(payload.get("evidence_role", ""))
+        == "diagnostic_only_pre_formal_feasibility"
+        and not bool(payload.get("formal_runtime_evidence", True))
+        and not bool(payload.get("hard_realtime_claim", True))
+        and conditions
+        and all(bool(value) for value in conditions.values())
     )
 
 
@@ -218,6 +311,101 @@ def _factorial_runtime_ok(
     return (
         str(payload.get("artifact_kind", "")) == FACTORIAL_RUNTIME_REPORT_KIND
         and bool(dict(payload.get("gate", {}) or {}).get("pass", False))
+    )
+
+
+def _failed_gate_summary(payload: dict[str, Any]) -> str:
+    gate = dict(payload.get("gate", {}) or {})
+    failed = sorted(
+        str(name)
+        for name, value in dict(gate.get("checks", {}) or {}).items()
+        if not bool(value)
+    )
+    metrics = dict(payload.get("metrics", {}) or {})
+    details: list[str] = []
+    for name in (
+        "accvp_table_latency_p95",
+        "accvp_table_latency_p99",
+        "accvp_table_latency_max",
+        "accvp_table_timeout_rate_activation_window",
+        "accvp_table_valid_rate_activation_window",
+        "accvp_table_critical_actor_overflow_count",
+    ):
+        if name in metrics:
+            details.append(f"{name}={metrics[name]}")
+    return (
+        f"failed_checks={failed}"
+        + (f" metrics=({', '.join(details)})" if details else "")
+    )
+
+
+def _scorer_runtime_failure_reason(
+    path: Path,
+    *,
+    expected_seed_count: int,
+) -> str | None:
+    """Block an identical complete failed runtime request from being rerun.
+
+    A report from an older implementation remains eligible for the benchmark's
+    audited archive-and-rerun path.  A shorter prefix remains eligible only for
+    the preregistered sample-size extension path.
+    """
+
+    if not path.is_file():
+        return None
+    try:
+        payload = read_json(path)
+    except (OSError, ValueError, json.JSONDecodeError):
+        return None
+    if bool(dict(payload.get("gate", {}) or {}).get("pass", False)):
+        return None
+    if str(payload.get("runtime_implementation_version", "")) != (
+        RUNTIME_IMPLEMENTATION_VERSION
+    ):
+        return None
+    workload = dict(payload.get("workload", {}) or {})
+    if int(workload.get("requested_episode_seed_count", -1)) < int(
+        expected_seed_count
+    ):
+        return None
+    if str(workload.get("requested_episode_seed_sha256", "")) != str(
+        workload.get("observed_episode_seed_sha256", "")
+    ):
+        return None
+    return (
+        "the complete scorer runtime request already produced an immutable "
+        "failed report under the current implementation; change/fix the "
+        "implementation and bump its version before a clean rerun. "
+        + _failed_gate_summary(payload)
+    )
+
+
+def _factorial_runtime_failure_reason(
+    path: Path,
+    *,
+    factorial_manifest: Path,
+    runtime_seeds: list[int],
+) -> str | None:
+    if not path.is_file() or not factorial_manifest.is_file():
+        return None
+    try:
+        payload = validate_factorial_runtime_report(
+            path,
+            factorial_manifest=factorial_manifest,
+            seeds=runtime_seeds,
+            backend="vectorized",
+            device="auto",
+        )
+    except (OSError, ValueError, json.JSONDecodeError):
+        return None
+    if bool(dict(payload.get("gate", {}) or {}).get("pass", False)):
+        return None
+    return (
+        "the complete factorial policy-runtime request already produced an "
+        "immutable failed report under the current implementation; inspect "
+        "the per-method/per-replicate gates before changing code and bumping "
+        "the runtime implementation version. "
+        + _failed_gate_summary(payload)
     )
 
 
@@ -426,6 +614,13 @@ def workflow_status(
             "safe_rl_output/runs/accvp_vnext_pilot/pilot_report.json",
         )
     )
+    pilot_latency_smoke_report = _resolve(
+        _workflow_path_value(
+            workflow,
+            "pilot_latency_smoke_report",
+            "safe_rl_output/runs/accvp_vnext_selector4_pilot_latency_smoke/feasibility_report.json",
+        )
+    )
     formal_validation_report = _resolve(
         _workflow_path_value(
             workflow,
@@ -553,36 +748,78 @@ def workflow_status(
             "safe_rl_output/runs/accvp_vnext_factorial/"
             "ppo_factorial_manifest.json",
         )
-        selector_optimizer_seeds = _workflow_seed_values(
-            workflow, "selector_optimizer_replicates", [1002, 1004]
-        )
-        selector_simulator_seeds = _workflow_seed_values(
-            workflow, "selector_diagnostic", [50021, 50027]
-        )
-        add(
-            "selector_contract_audit",
-            _artifact_ok(
+        if str(workflow.get("protocol_id", "")) == (
+            "accvp-vnext-correctness-v3-selector4"
+        ):
+            selector_cache = _workflow_path_value(
+                workflow,
+                "selector_replay_cache",
+                "safe_rl_output/runs/accvp_vnext_selector4_audit/"
+                "replay_cache",
+            )
+            selector_historical_overflow = _workflow_path_value(
+                workflow,
+                "selector_historical_overflow_report",
+                "safe_rl_output/runs/accvp_vnext_selector3_runtime/"
+                "diagnostics/reward_v2_commitment_seed1005_"
+                "lane_aware_capacity_sweep.json",
+            )
+            selector_workers = int(
+                workflow.get("selector_audit", {}).get("workers", 2)
+            )
+            add(
+                "selector_contract_audit",
+                _selector4_capacity_audit_ok(selector_audit_report),
+                _module_command(
+                    "safe_rl.pipeline.accvp_selector4_capacity_audit",
+                    "--config",
+                    selector_audit_config,
+                    "--dataset",
+                    selector_source_dataset,
+                    "--factorial-manifest",
+                    selector_source_factorial,
+                    "--historical-overflow-report",
+                    selector_historical_overflow,
+                    "--cache-root",
+                    selector_cache,
+                    "--workers",
+                    selector_workers,
+                    "--output",
+                    selector_audit_report,
+                ),
                 selector_audit_report,
-                artifact_kind="accvp_selector_contract_audit_v1",
-                state_field="audit_state",
-            ),
-            _module_command(
-                "safe_rl.pipeline.accvp_selector_contract_audit",
-                "--config",
-                selector_audit_config,
-                "--dataset",
-                selector_source_dataset,
-                "--factorial-manifest",
-                selector_source_factorial,
-                "--optimizer-seeds",
-                *selector_optimizer_seeds,
-                "--simulator-seeds",
-                *selector_simulator_seeds,
-                "--output",
+            )
+        else:
+            selector_optimizer_seeds = _workflow_seed_values(
+                workflow, "selector_optimizer_replicates", [1002, 1004]
+            )
+            selector_simulator_seeds = _workflow_seed_values(
+                workflow, "selector_diagnostic", [50021, 50027]
+            )
+            add(
+                "selector_contract_audit",
+                _artifact_ok(
+                    selector_audit_report,
+                    artifact_kind="accvp_selector_contract_audit_v1",
+                    state_field="audit_state",
+                ),
+                _module_command(
+                    "safe_rl.pipeline.accvp_selector_contract_audit",
+                    "--config",
+                    selector_audit_config,
+                    "--dataset",
+                    selector_source_dataset,
+                    "--factorial-manifest",
+                    selector_source_factorial,
+                    "--optimizer-seeds",
+                    *selector_optimizer_seeds,
+                    "--simulator-seeds",
+                    *selector_simulator_seeds,
+                    "--output",
+                    selector_audit_report,
+                ),
                 selector_audit_report,
-            ),
-            selector_audit_report,
-        )
+            )
 
     add(
         "pilot_collection",
@@ -656,7 +893,7 @@ def workflow_status(
     )
     add(
         "pilot_validation",
-        _artifact_ok(pilot_report, state_field="pilot_state"),
+        _pilot_validation_ok(pilot_report),
         _module_command(
             "safe_rl.pipeline.stage1_validate_accvp_pilot",
             "--config",
@@ -670,6 +907,38 @@ def workflow_status(
         ),
         pilot_report,
     )
+    if "pilot_latency_feasibility_smoke" in declared_phase_names:
+        pilot_latency_train_config = _workflow_path_value(
+            workflow,
+            "pilot_latency_smoke_train_config",
+            "safe_rl/config/active/accvp_vnext_selector4/pilot_latency_smoke_train.yaml",
+        )
+        pilot_latency_runtime_config = _workflow_path_value(
+            workflow,
+            "pilot_latency_smoke_runtime_config",
+            "safe_rl/config/active/accvp_vnext_selector4/pilot_latency_smoke_runtime.yaml",
+        )
+        pilot_latency_seeds = _workflow_seed_values(
+            workflow,
+            "pilot_latency_smoke_development",
+            [66001, 66002, 66003, 66004, 66005],
+        )
+        add(
+            "pilot_latency_feasibility_smoke",
+            _pilot_latency_smoke_ok(pilot_latency_smoke_report),
+            _module_command(
+                "safe_rl.pipeline.accvp_pilot_latency_smoke",
+                "--train-config",
+                pilot_latency_train_config,
+                "--runtime-config",
+                pilot_latency_runtime_config,
+                "--seeds",
+                *pilot_latency_seeds,
+                "--output",
+                pilot_latency_smoke_report,
+            ),
+            pilot_latency_smoke_report,
+        )
     add(
         "formal_collection",
         len(formal_shards) >= 50,
@@ -912,6 +1181,18 @@ def workflow_status(
         if first_incomplete is None
         else blocked_phases.get(str(first_incomplete["name"]))
     )
+    if first_incomplete is not None and blocked_reason is None:
+        if str(first_incomplete["name"]) == "scorer_runtime_preflight":
+            blocked_reason = _scorer_runtime_failure_reason(
+                scorer_report,
+                expected_seed_count=len(runtime_seeds),
+            )
+        elif str(first_incomplete["name"]) == "policy_runtime_replicates":
+            blocked_reason = _factorial_runtime_failure_reason(
+                runtime_factorial,
+                factorial_manifest=factorial_manifest,
+                runtime_seeds=runtime_seeds,
+            )
     return {
         "artifact_kind": "accvp_vnext_pipeline_status_v1",
         "schema_version": 1,
@@ -1014,8 +1295,14 @@ def main() -> None:
             workflow_config=args.workflow_config,
         )
         if str(updated.get("next_phase")) == previous_phase:
+            detail = (
+                f": {updated.get('blocked_reason')}"
+                if updated.get("blocked_reason")
+                else ""
+            )
             raise RuntimeError(
-                f"phase {previous_phase!r} command returned but its artifact gate remains closed"
+                f"phase {previous_phase!r} command returned but its artifact "
+                f"gate remains closed{detail}"
             )
         if previous_phase == target:
             print(f"[accvp_vnext_pipeline] reached target phase={target}")

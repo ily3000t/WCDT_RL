@@ -8,7 +8,17 @@ from pathlib import Path
 from typing import Any, Iterable, Mapping
 
 from safe_rl.accvp.contracts.schema import file_sha256, read_json, write_json_atomic
-from safe_rl.accvp.contracts.protocol import ACCVP_SELECTOR3_DATA_CONTRACT_VERSION
+from safe_rl.accvp.contracts.protocol import (
+    ACCVP_SELECTOR3_DATA_CONTRACT_VERSION,
+    ACCVP_SELECTOR4_DATA_CONTRACT_VERSION,
+    is_strict_selector_data_contract,
+)
+from safe_rl.accvp.evaluation.dataset_integrity import (
+    audit_dataset_actor_contract,
+)
+
+
+PILOT_VALIDATION_IMPLEMENTATION_VERSION = "pilot_gate_selector4_strict_v2"
 
 
 def _jsonl(path: Path) -> list[dict[str, Any]]:
@@ -39,14 +49,14 @@ def validate_pilot_dataset(
         raise ValueError("ACCVP pilot validation requires a dataset merged from pilot shards")
     roots = [row for row in _jsonl(manifests / "roots.jsonl") if bool(row.get("complete", False))]
     branches = [row for row in _jsonl(manifests / "branches.jsonl") if row.get("branch_status") == "completed"]
-    selector3_contract = (
-        str(
-            dict(manifest.get("data_contract", {}) or {}).get(
-                "protocol_version", ""
-            )
+    protocol_version = str(
+        dict(manifest.get("data_contract", {}) or {}).get(
+            "protocol_version", ""
         )
-        == ACCVP_SELECTOR3_DATA_CONTRACT_VERSION
     )
+    selector3_contract = protocol_version == ACCVP_SELECTOR3_DATA_CONTRACT_VERSION
+    selector4_contract = protocol_version == ACCVP_SELECTOR4_DATA_CONTRACT_VERSION
+    strict_selector_contract = is_strict_selector_data_contract(protocol_version)
     coverage_incomplete_root_ids = [
         str(row.get("root_id", ""))
         for row in roots
@@ -134,10 +144,19 @@ def validate_pilot_dataset(
         "branch_success_rate": branch_success_rate >= float(min_branch_success_rate),
         "observed_viability_fraction": observed_viability_fraction >= float(min_observed_viability_fraction),
     }
-    if selector3_contract:
+    actor_contract_audit = (
+        audit_dataset_actor_contract(dataset)
+        if strict_selector_contract
+        else None
+    )
+    if strict_selector_contract:
+        assert actor_contract_audit is not None
         conditions.update(
             {
-                "rejected_root_count_zero": rejected_root_count == 0,
+                "rejected_root_count_zero": (
+                    rejected_root_count == 0
+                    and int(manifest.get("rejected_root_count", -1)) == 0
+                ),
                 "critical_actor_overflow_zero": (
                     critical_actor_overflow_count == 0
                     and int(manifest.get("critical_actor_overflow_count", -1))
@@ -170,6 +189,36 @@ def validate_pilot_dataset(
                         )
                         for row in roots
                     )
+                ),
+                "actor_mapping_mismatch_zero": int(
+                    actor_contract_audit["actor_mapping_mismatch_count"]
+                )
+                == 0,
+                "root_observation_fingerprint_mismatch_zero": int(
+                    actor_contract_audit[
+                        "root_observation_fingerprint_mismatch_count"
+                    ]
+                )
+                == 0,
+                "protected_actor_coverage_complete": (
+                    int(
+                        actor_contract_audit[
+                            "selector_metadata_missing_count"
+                        ]
+                    )
+                    == 0
+                    and int(
+                        actor_contract_audit[
+                            "protected_actor_coverage_incomplete_count"
+                        ]
+                    )
+                    == 0
+                    and float(
+                        actor_contract_audit[
+                            "protected_actor_coverage_rate"
+                        ]
+                    )
+                    == 1.0
                 ),
             }
         )
@@ -263,6 +312,8 @@ def validate_pilot_dataset(
             and exclusion_matches
         )
     return {
+        "artifact_kind": "accvp_pilot_validation_v2",
+        "validation_implementation_version": PILOT_VALIDATION_IMPLEMENTATION_VERSION,
         "dataset_dir": str(dataset),
         "dataset_fingerprint": str(manifest.get("dataset_fingerprint", "")),
         "data_contract_hash": str(manifest.get("data_contract_hash", "")),
@@ -271,7 +322,10 @@ def validate_pilot_dataset(
         "branch_success_rate": branch_success_rate,
         "observed_viability_fraction": observed_viability_fraction,
         "activation_branch_count": len(activation_branches),
+        "data_contract_version": protocol_version,
         "selector3_contract": selector3_contract,
+        "selector4_contract": selector4_contract,
+        "strict_selector_contract": strict_selector_contract,
         "rejected_root_count": rejected_root_count,
         "critical_actor_overflow_count": critical_actor_overflow_count,
         "task_actor_coverage_incomplete_count": (
@@ -280,6 +334,34 @@ def validate_pilot_dataset(
         "task_actor_coverage_incomplete_root_ids": (
             coverage_incomplete_root_ids[:20]
         ),
+        "coverage_incomplete_count": sum(
+            1
+            for row in roots
+            if not bool(row.get("task_actor_coverage_complete", False))
+            or not bool(
+                row.get("risk_safety_actor_coverage_complete", False)
+            )
+        ),
+        "actor_mapping_mismatch_count": (
+            None
+            if actor_contract_audit is None
+            else int(actor_contract_audit["actor_mapping_mismatch_count"])
+        ),
+        "root_observation_fingerprint_mismatch_count": (
+            None
+            if actor_contract_audit is None
+            else int(
+                actor_contract_audit[
+                    "root_observation_fingerprint_mismatch_count"
+                ]
+            )
+        ),
+        "protected_actor_coverage_rate": (
+            None
+            if actor_contract_audit is None
+            else float(actor_contract_audit["protected_actor_coverage_rate"])
+        ),
+        "actor_contract_audit": actor_contract_audit,
         "source_manifests": source_manifests,
         "oracle_report": None if oracle is None else str(Path(oracle_report_path).resolve()),
         "conditions": conditions,

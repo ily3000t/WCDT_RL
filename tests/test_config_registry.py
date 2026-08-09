@@ -31,18 +31,18 @@ def test_config_registry_resolves_every_explicit_entry_and_canonical_vnext_set()
     assert all((CONFIG_ROOT / path).is_file() for path in paths)
     canonical = {name for name, record in configs.items() if record["status"] == "canonical"}
     assert canonical == {
-        "accvp_vnext_selector3_selector_audit",
-        "accvp_vnext_selector3_pilot",
-        "accvp_vnext_selector3_oracle_regression",
-        "accvp_vnext_selector3_formal",
-        "accvp_vnext_selector3_train",
-        "accvp_vnext_selector3_ppo_ablation_matrix",
-        "accvp_vnext_selector3_workflow",
-        "ppo_accvp_candidate_table_selector3_full",
+        "accvp_vnext_selector4_selector_audit",
+        "accvp_vnext_selector4_pilot",
+        "accvp_vnext_selector4_oracle_regression",
+        "accvp_vnext_selector4_formal",
+        "accvp_vnext_selector4_train",
+        "accvp_vnext_selector4_ppo_ablation_matrix",
+        "accvp_vnext_selector4_workflow",
+        "ppo_accvp_candidate_table_selector4_full",
     }
     assert all(
         configs[name]["protocol"]
-        == "accvp-vnext-correctness-v2-selector3"
+        == "accvp-vnext-correctness-v3-selector4"
         for name in canonical
     )
     assert all(
@@ -56,6 +56,14 @@ def test_config_registry_resolves_every_explicit_entry_and_canonical_vnext_set()
             "accvp_vnext_workflow",
             "ppo_accvp_candidate_table_vnext_dev",
             "ppo_accvp_candidate_table_vnext_full",
+            "accvp_vnext_selector3_selector_audit",
+            "accvp_vnext_selector3_pilot",
+            "accvp_vnext_selector3_oracle_regression",
+            "accvp_vnext_selector3_formal",
+            "accvp_vnext_selector3_train",
+            "accvp_vnext_selector3_ppo_ablation_matrix",
+            "accvp_vnext_selector3_workflow",
+            "ppo_accvp_candidate_table_selector3_full",
         )
     )
 
@@ -85,7 +93,7 @@ def test_all_public_yaml_configs_parse_and_supported_overlays_load():
         CONFIG_ROOT / "archive",
     )
     yaml_paths = sorted(path for root in public_roots for path in root.rglob("*.yaml"))
-    assert len(yaml_paths) == 73
+    assert len(yaml_paths) == 84
     for path in yaml_paths:
         payload = yaml.safe_load(path.read_text(encoding="utf-8"))
         assert isinstance(payload, dict), path
@@ -97,8 +105,14 @@ def test_all_public_yaml_configs_parse_and_supported_overlays_load():
             try:
                 cfg = load_config(path)
             except FileNotFoundError as exc:
-                assert "accvp_vnext_selector3" in path.parts
-                assert "selector_contract_audit.json" in str(exc)
+                assert any(
+                    value in path.parts
+                    for value in (
+                        "accvp_vnext_selector3",
+                        "accvp_vnext_selector4",
+                    )
+                )
+                assert "selector_" in str(exc) and "audit.json" in str(exc)
                 continue
             assert cfg.run
 

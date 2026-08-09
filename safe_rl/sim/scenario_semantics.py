@@ -1,14 +1,15 @@
 from __future__ import annotations
 
 import math
-from dataclasses import dataclass, replace
-from functools import lru_cache
+from contextvars import ContextVar
+from dataclasses import dataclass
+from functools import lru_cache, wraps
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable, TypeVar
 import xml.etree.ElementTree as ET
 
 from safe_rl.sim.metrics import INF_TTC
-from safe_rl.sim.types import VehicleState
+from safe_rl.sim.types import VehicleState, copy_vehicle_state
 
 
 EDGE_ROLE_UNKNOWN = 0
@@ -30,11 +31,88 @@ class RouteProjection:
     failure_reason: str = ""
 
 
-def _scenario_list(config: Any, key: str, default: list[str]) -> list[str]:
+_SCENARIO_SEMANTICS_CACHE: ContextVar[dict[str, Any] | None] = (
+    ContextVar("scenario_semantics_cache", default=None)
+)
+_ReturnT = TypeVar("_ReturnT")
+
+
+def with_cached_scenario_semantics(
+    function: Callable[..., _ReturnT],
+) -> Callable[..., _ReturnT]:
+    """Cache immutable scenario lookups for one deterministic hot-path call.
+
+    The cache is context-local and discarded as soon as the decorated call
+    returns.  This preserves support for tests/tools that mutate a loaded
+    configuration between calls while avoiding millions of repeated ConfigDict
+    conversions inside a single candidate-conflict oracle invocation.
+    """
+
+    @wraps(function)
+    def wrapped(*args: Any, **kwargs: Any) -> _ReturnT:
+        if _SCENARIO_SEMANTICS_CACHE.get() is not None:
+            return function(*args, **kwargs)
+        config = args[0] if args else kwargs.get("config")
+        token = _SCENARIO_SEMANTICS_CACHE.set(
+            {
+                "config_id": id(config),
+                "lists": {},
+                "members": {},
+                "lane_mappings": {},
+            }
+        )
+        try:
+            return function(*args, **kwargs)
+        finally:
+            _SCENARIO_SEMANTICS_CACHE.reset(token)
+
+    return wrapped
+
+
+def _scenario_values(
+    config: Any,
+    key: str,
+    default: list[str] | tuple[str, ...],
+) -> tuple[str, ...]:
+    cache = _SCENARIO_SEMANTICS_CACHE.get()
+    cache_values = (
+        cache["lists"]
+        if cache is not None and cache["config_id"] == id(config)
+        else None
+    )
+    if cache_values is not None and key in cache_values:
+        return cache_values[key]
     value = config.scenario.get(key, default)
     if isinstance(value, str):
-        return [value]
-    return [str(item) for item in value]
+        result = (value,)
+    else:
+        result = tuple(str(item) for item in value)
+    if cache_values is not None:
+        cache_values[key] = result
+    return result
+
+
+def _scenario_members(
+    config: Any,
+    key: str,
+    default: list[str] | tuple[str, ...],
+) -> frozenset[str]:
+    cache = _SCENARIO_SEMANTICS_CACHE.get()
+    cache_values = (
+        cache["members"]
+        if cache is not None and cache["config_id"] == id(config)
+        else None
+    )
+    if cache_values is not None and key in cache_values:
+        return cache_values[key]
+    result = frozenset(_scenario_values(config, key, default))
+    if cache_values is not None:
+        cache_values[key] = result
+    return result
+
+
+def _scenario_list(config: Any, key: str, default: list[str]) -> list[str]:
+    return list(_scenario_values(config, key, default))
 
 
 def ramp_edges(config: Any) -> list[str]:
@@ -50,11 +128,14 @@ def mainline_edges(config: Any) -> list[str]:
 
 
 def target_lane_edges(config: Any) -> list[str]:
-    return _scenario_list(config, "target_lane_edges", mainline_edges(config))
+    return list(_target_lane_edge_values(config))
 
 
 def merge_zone_edges(config: Any) -> list[str]:
-    return _scenario_list(config, "merge_zone_edges", [*ramp_edges(config), *auxiliary_edges(config)])
+    configured = config.scenario.get("merge_zone_edges")
+    if configured is None:
+        return [*ramp_edges(config), *auxiliary_edges(config)]
+    return _scenario_list(config, "merge_zone_edges", [])
 
 
 def merge_target_lane(config: Any) -> int:
@@ -70,10 +151,49 @@ def auxiliary_lane(config: Any) -> int:
 
 
 def _scenario_lane_mapping(config: Any, key: str) -> dict[str, int]:
+    cache = _SCENARIO_SEMANTICS_CACHE.get()
+    cache_values = (
+        cache["lane_mappings"]
+        if cache is not None and cache["config_id"] == id(config)
+        else None
+    )
+    if cache_values is not None and key in cache_values:
+        return cache_values[key]
     raw = config.scenario.get(key, {})
     if not isinstance(raw, dict):
         return {}
-    return {str(edge_id): int(lane_index) for edge_id, lane_index in raw.items()}
+    result = {
+        str(edge_id): int(lane_index)
+        for edge_id, lane_index in raw.items()
+    }
+    if cache_values is not None:
+        cache_values[key] = result
+    return result
+
+
+def _target_lane_edge_values(config: Any) -> tuple[str, ...]:
+    cache = _SCENARIO_SEMANTICS_CACHE.get()
+    cache_values = (
+        cache["lists"]
+        if cache is not None and cache["config_id"] == id(config)
+        else None
+    )
+    cache_key = "__resolved_target_lane_edges__"
+    if cache_values is not None and cache_key in cache_values:
+        return cache_values[cache_key]
+    configured = config.scenario.get("target_lane_edges")
+    result = (
+        _scenario_values(
+            config,
+            "mainline_edges",
+            ("main_in", "main_aux", "main_out"),
+        )
+        if configured is None
+        else _scenario_values(config, "target_lane_edges", ())
+    )
+    if cache_values is not None:
+        cache_values[cache_key] = result
+    return result
 
 
 def target_lane_mapping(config: Any) -> dict[str, int]:
@@ -515,19 +635,23 @@ def target_lane_center_at_x(config: Any, x: float, *, edge_ids: list[str] | None
 
 
 def is_ramp_edge(config: Any, edge_id: str) -> bool:
-    return str(edge_id) in set(ramp_edges(config))
+    return str(edge_id) in _scenario_members(config, "ramp_edges", ("ramp_in",))
 
 
 def is_auxiliary_edge(config: Any, edge_id: str) -> bool:
-    return str(edge_id) in set(auxiliary_edges(config))
+    return str(edge_id) in _scenario_members(config, "auxiliary_edges", ("main_aux",))
 
 
 def is_mainline_edge(config: Any, edge_id: str) -> bool:
-    return str(edge_id) in set(mainline_edges(config))
+    return str(edge_id) in _scenario_members(
+        config,
+        "mainline_edges",
+        ("main_in", "main_aux", "main_out"),
+    )
 
 
 def is_target_lane_edge(config: Any, edge_id: str) -> bool:
-    return str(edge_id) in set(target_lane_edges(config))
+    return str(edge_id) in _target_lane_edge_values(config)
 
 
 def is_target_lane(config: Any, edge_id: str, lane_index: int) -> bool:
@@ -640,7 +764,7 @@ def advance_route_state(
 ) -> tuple[VehicleState, bool]:
     """Advance a CV rollout across configured edges and flag an unrecoverable taper miss."""
 
-    current = replace(state)
+    current = copy_vehicle_state(state)
     current.lane_index = int(state.lane_index if lane_index is None else lane_index)
     current.lane_pos = float(state.lane_pos)
     remaining = max(0.0, float(distance))

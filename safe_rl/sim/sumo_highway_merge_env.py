@@ -668,7 +668,7 @@ class SumoHighwayMergeEnv(gym.Env):
 
     def _sumo_load_args(self) -> list[str]:
         sumocfg = str(Path(self.config.scenario.sumocfg).resolve())
-        return [
+        arguments = [
             "-c",
             sumocfg,
             "--seed",
@@ -680,6 +680,15 @@ class SumoHighwayMergeEnv(gym.Env):
             "--collision.action",
             "warn",
         ]
+        # Optional traffic-flow multiplier used by explicit development/OOD
+        # stress configs. The default is omitted so every historical command
+        # and scenario fingerprint remains unchanged.
+        scale = float(self.config.scenario.get("sumo_scale", 1.0))
+        if scale <= 0.0:
+            raise ValueError("scenario.sumo_scale must be positive")
+        if scale != 1.0:
+            arguments.extend(["--scale", str(scale)])
+        return arguments
 
     def _reload_sumo(self) -> None:
         if self._traci is None or not hasattr(self._traci, "load"):

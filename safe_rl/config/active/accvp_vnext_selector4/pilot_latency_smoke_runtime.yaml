@@ -1,0 +1,14 @@
+extends: safe_rl/config/active/accvp_vnext_selector4/ppo_candidate_table_full.yaml
+
+run:
+  run_id: "accvp_vnext_selector4_pilot_latency_smoke_runtime"
+
+# Uses the one-epoch shadow model only to measure the complete CPU inference,
+# Risk-secondary, geometry, and table-packing path. It cannot open any formal
+# runtime, Stage5, or holdout gate.
+accvp:
+  mode: "off"
+  checkpoint: "safe_rl_output/runs/accvp_vnext_selector4_pilot_latency_smoke_train/accvp/accvp_vnext_schema3_predictor.pt"
+  calibration_bundle: "safe_rl_output/runs/accvp_vnext_selector4_pilot_latency_smoke_train/accvp/accvp_vnext_schema3_calibration.json"
+  operating_point: null
+  artifact_manifest: "safe_rl_output/runs/accvp_vnext_selector4_pilot_latency_smoke_train/accvp/accvp_vnext_schema3_shadow_manifest.json"

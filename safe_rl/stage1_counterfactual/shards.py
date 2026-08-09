@@ -14,6 +14,8 @@ import numpy as np
 from safe_rl.accvp.contracts.protocol import (
     ACCVP_DATA_CONTRACT_VERSION,
     ACCVP_SELECTOR3_DATA_CONTRACT_VERSION,
+    ACCVP_SELECTOR4_DATA_CONTRACT_VERSION,
+    is_strict_selector_data_contract,
 )
 from safe_rl.accvp.contracts.schema import (
     ACTOR_ROW_MAPPING_VERSION,
@@ -147,9 +149,10 @@ def merge_counterfactual_shards(
     strict_actor_rows = protocol_version in {
         ACCVP_DATA_CONTRACT_VERSION,
         ACCVP_SELECTOR3_DATA_CONTRACT_VERSION,
+        ACCVP_SELECTOR4_DATA_CONTRACT_VERSION,
     }
-    strict_selector_coverage = (
-        protocol_version == ACCVP_SELECTOR3_DATA_CONTRACT_VERSION
+    strict_selector_coverage = is_strict_selector_data_contract(
+        protocol_version
     )
     if stable_hash(baseline) != baseline_hash:
         raise ValueError(f"invalid counterfactual data_contract hash in shard {shards[0]}")
