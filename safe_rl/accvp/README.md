@@ -45,7 +45,7 @@ safe_rl/stage1_counterfactual/
 
 旧的 `safe_rl.accvp.<flat_module>` Python 导入路径已经迁移到上述子包；仓库内 pipeline 和测试
 已同步更新。CLI 名称、配置路径、run 目录和 generation-aware artifact 文件名均未改变，因此
-旧 Selector-v2/Selector-v3 schema3 数据与 checkpoint 不移动、不删除，但在 Selector-v4 协议下标为
+旧 Selector-v2 schema3 数据与 checkpoint 不移动、不删除，但在 Selector-v3 协议下标为
 `diagnostic_only`；新证据使用独立 run 目录重新采集和训练。
 
 常用导入迁移：
@@ -71,8 +71,8 @@ VNext 正式数据和模型必须同时满足：
 
 - `artifact_generation: vnext_schema3`
 - `schema_version: 3`
-- `data_contract_version: accvp_240_v4_lane_aware_capacity_audit`
-- `accvp.actor_relevance.version: merge_conflict_relevance_v4_lane_aware`
+- `data_contract_version: accvp_240_v3_conflict_selector`
+- `accvp.actor_relevance.version: candidate_union_conflict_relevance_v3`
 - `actor_row_mapping_version: selected_indices_v2`
 - `root_observation_fingerprint_version: model_input_fingerprint_v3`
 - `entry_time_label_version: conditional_entry_time_v1`
@@ -82,13 +82,13 @@ VNext 正式数据和模型必须同时满足：
 rows 的唯一映射，因此不能迁移为完整 VNext actor-response supervision。它只允许在明确
 标注的 diagnostic/migration audit 中使用。
 
-Selector-v2/V3 数据虽然是 schema3，但 actor-response rows 只覆盖旧 selector 选择的 actor，
-不能迁移成 Selector-v4 formal supervision。旧 predictor、Candidate PPO、runtime 和 Stage5
-报告只允许用于历史复现、失败诊断和明确标注的 selector state-source audit。
+Selector-v2 V1 数据虽然是 schema3，但 actor-response rows 只覆盖旧 selector 选择的 actor，
+也不能迁移成 Selector-v3 formal supervision。V1 的 predictor、Candidate PPO、runtime 和
+Stage5 报告同样只允许用于历史复现、失败诊断和明确标注的 selector state-source audit。
 
 `prediction.actor_relevance` 与 `prediction.wcdt_v3_max_agents` 属于既有 WcDT checkpoint
 契约；`accvp.actor_relevance` 与 `accvp.actor_count` 属于 Candidate Table 数据/推理契约。
-两者不得通过修改 checkpoint hash 校验来混用。Selector-v4 审计只冻结 ACCVP 容量，
+两者不得通过修改 checkpoint hash 校验来混用。Selector-v3 审计只冻结 ACCVP 容量，
 不会改变旧 WcDT 的 selector-v2、6-actor lineage。
 
 ## 2. Data semantics
@@ -109,17 +109,15 @@ response rows 和 token rows 必须共享 mapping hash。缺失或不一致时�
 诊断可以保存 `target_lane_entry_time_raw_s`，但不能把 failure/censored 的 raw late entry
 重新解释为训练标签。
 
-### Selector-v4 task actor contract
+### Selector-v3 task actor contract
 
-Selector-v4 不以 actor 当前 lane 直接推断“非冲突”。它对所有合法 ego candidate
+Selector-v3 不以 actor 当前 lane 直接推断“非冲突”。它对所有合法 ego candidate
 commitment plans 构造 swept tubes，并与每个 actor 的 route-aware keep-lane 和所有可达相邻
 lane hypotheses（含有界纵向加速度 envelope）求交。报告必须记录
 `conflict_candidate_ids`、`earliest_conflict_time_s`、
 `minimum_swept_obb_gap` 和 `conflict_surface_ids`。
 
-`auxiliary_local` 只适用于配置的 auxiliary lane。main auxiliary edge 上的其他 lane 不因 edge
-身份成为 critical；但 target front/rear、candidate conflict、nearest candidate conflict 和
-conflict-eligible lowest TTC 始终保留。排序固定为 relevance class → mandatory role → earliest conflict time → TTC →
+排序固定为 relevance class → mandatory role → earliest conflict time → TTC →
 effective/surface gap → vehicle ID。vehicle ID 只作最终 tie-break。
 
 coverage 分为两个职责：
@@ -174,7 +172,7 @@ python -m safe_rl.pipeline.run_accvp_vnext_pipeline --execute-next
 
 ```powershell
 python -m safe_rl.pipeline.run_accvp_vnext_pipeline `
-  --workflow-config safe_rl/config/active/accvp_vnext_selector4/workflow.yaml `
+  --workflow-config safe_rl/config/active/accvp_vnext_selector3/workflow.yaml `
   --run-until pilot_validation
 ```
 
@@ -190,29 +188,25 @@ python -m safe_rl.pipeline.run_accvp_vnext_pipeline `
 5. `oracle_merge`
 6. `oracle_regression`
 7. `pilot_validation`
-8. `pilot_latency_feasibility_smoke`
-9. `formal_collection`
-10. `formal_merge`
-11. `formal_validation`
-12. `accvp_training`
-13. `scorer_runtime_preflight`
-14. `candidate_ppo_replicates`
-15. `baseline_ppo_replicates`
-16. `baseline_lineage_audit`
-17. `policy_runtime_replicates`
-18. `stage5_generate`
-19. `stage5_replicates_and_aggregate`
-20. `one_shot_final_holdout`
+8. `formal_collection`
+9. `formal_merge`
+10. `formal_validation`
+11. `accvp_training`
+12. `scorer_runtime_preflight`
+13. `candidate_ppo_replicates`
+14. `baseline_ppo_replicates`
+15. `baseline_lineage_audit`
+16. `policy_runtime_replicates`
+17. `stage5_generate`
+18. `stage5_replicates_and_aggregate`
+19. `one_shot_final_holdout`
 
-`selector_contract_audit` 首先验证旧 formal roots 的 Selector-v3 telemetry 是否覆盖每个 root
-的全量 current actors；不完整时必须停止并做 selector-only root recollection。随后审计全部
-5,000 roots、四种 Candidate 方法 × 五个 optimizer seeds 的 development states、历史 overflow
-seeds 50021/50027/55027、原 runtime 捕获的不可变 overflow telemetry，以及
-dense/aggressive/late-taper development stress states。历史 seed 的孤立重放不能替代原 telemetry，
-因为复用环境中的 episode 顺序可能改变实际访问状态。容量
-8/10/12 同时计算，8/10 只作为诊断；只有容量 12 达到零 overflow、零 mandatory drop、
-100% protected coverage 且最大需求后至少保留 2 actors headroom 才能冻结。容量 12 失败则流程
-blocked，不得回退 10 掩盖 runtime 或容量风险。
+`selector_contract_audit` 先验证旧 formal roots 是否真的保存了全量 current/history
+vehicle state；若只有旧 selected rows，则必须停止并做 selector-only root recollection。
+当前协议只声明 intent-agnostic conservative reachable tubes，不把缺失的显式 future route
+intent 伪装成精确轨迹。审计随后在全部 5,000 roots 和
+1002/1004 × 50021/50027 四个 diagnostic replay 上比较 selector-v2/v3，严格按
+6 actors → 8 actors → blocked 冻结容量。
 
 factorial orchestration 已接入该 workflow：它分别生成、审计和评估所有预注册
 Reward/commitment 方法，并将最终方法绑定到 Reward-v3.1 + risk-gated commitment。阶段不再
@@ -222,11 +216,11 @@ Reward/commitment 方法，并将最终方法绑定到 Reward-v3.1 + risk-gated 
 
 ## 4. Pilot gate
 
-canonical Selector-v4 配置：
+canonical Selector-v3 配置：
 
-- `safe_rl/config/active/accvp_vnext_selector4/pilot.yaml`
-- `safe_rl/config/active/accvp_vnext_selector4/oracle_regression.yaml`
-- `safe_rl/config/active/accvp_vnext_selector4/formal.yaml`
+- `safe_rl/config/active/accvp_vnext_selector3/pilot.yaml`
+- `safe_rl/config/active/accvp_vnext_selector3/oracle_regression.yaml`
+- `safe_rl/config/active/accvp_vnext_selector3/formal.yaml`
 
 pilot validation 同时检查：
 
@@ -235,17 +229,6 @@ pilot validation 同时检查：
 - observed viability fraction；
 - schema/data contract 与 provenance；
 - oracle dataset/report 的 seed、policy、cohort 和 split exclusion；
-- critical overflow、rejected root、task/Risk coverage incomplete 均为 0；
-- 全部 root/branch 的 actor-row mapping 与 root model-input fingerprint mismatch 均为 0；
-- target front/rear、candidate conflict、nearest conflict、lowest conflict TTC protected actors
-  覆盖率为 100%。
-
-Pilot PASS 后、formal collection 前，workflow 会运行
-`pilot_latency_feasibility_smoke`。它用 Pilot split 短训 1 epoch 的 12-actor 三成员 shadow
-bundle，并在 66001--66005 development seeds 上执行真实 SUMO 的 ACCVP、Risk-secondary、
-几何与 table packing 全路径。该报告固定为 `diagnostic_only_pre_formal_feasibility`，不能替代
-60-seed 正式 scorer/policy runtime；但若 p95/p99/max 或 Risk p95 已明显超预算，会在耗时的
-5,000-root formal collection 前 fail closed。
 - pilot 数据本身没有混入 oracle seeds/rows。
 
 当 `pilot_report.json` 为 `pilot_state=fail` 时，读取 `conditions`。如果仅
@@ -319,19 +302,16 @@ optimizer seeds；optimizer seed 与 simulator seed cohort 不得混用。
 
 ```powershell
 python -m safe_rl.pipeline.stage3_train_ppo_factorial `
-  --config safe_rl/config/active/accvp_vnext_selector4/ppo_candidate_table_full.yaml `
-  --matrix safe_rl/config/active/accvp_vnext_selector4/ppo_ablation_matrix.yaml `
-  --workflow-config safe_rl/config/active/accvp_vnext_selector4/workflow.yaml `
+  --config safe_rl/config/active/accvp_vnext_selector3/ppo_candidate_table_full.yaml `
+  --matrix safe_rl/config/active/accvp_vnext_selector3/ppo_ablation_matrix.yaml `
+  --workflow-config safe_rl/config/active/accvp_vnext_selector3/workflow.yaml `
   --optimizer-seeds 1001 1002 1003 1004 1005 `
-  --output-root safe_rl_output/runs/accvp_vnext_selector4_factorial
+  --output-root safe_rl_output/runs/accvp_vnext_selector3_factorial
 ```
 
 `factorial_plan.json` 冻结全部 method/seed/config；每个训练完成后立即更新 child manifest。默认
 resume 只复用 hash 和 Stage3 report 都匹配的结果。启动失败后遗留的纯空目录树可以自动
 移除并重建；只要不完整 run 中已有任何文件或链接，协调器仍拒绝自动覆盖。
-在 Windows 上，factorial manifest 的原子 `Path.replace` 若遇到病毒扫描器/索引器造成的瞬时
-`PermissionError`，只执行五次以内的小幅退避重试；不会删除目标文件、覆盖部分 run 或绕过
-lineage 校验。持续文件锁仍然 fail closed。
 
 `run.seed` 是 simulator episode schedule 的起点，`rl.optimizer_seed` 是 PPO 网络与优化器
 随机种子。由于 Stable-Baselines3 默认会把模型 seed 传播给 VecEnv，训练器会在模型创建后、
@@ -356,16 +336,6 @@ synthetic fault audit 只证明 bounded-stale 状态机在 timeout、NaN、连�
 
 bounded stale 状态不得通过 Risk gate；连续故障、恢复和 stale age 必须进入 observation 与
 审计报告。
-
-Selector-v4 的 scorer 热路径实现版本为
-`accvp_runtime_conflict_selector_cached_geometry_v5`。性能修复限定为：单次 selector 调用内缓存
-冻结的 scenario list/mapping、显式复制纯标量 `VehicleState`、candidate-conflict OBB 批处理只
-返回 gap/overlap。selector parity 测试仍以 scalar reference 为权威，禁止为满足延迟而改变
-selector/capacity/reward/commitment/Risk threshold。
-
-旧 runtime implementation 的失败报告仅在 fingerprint 有效时归档，新实现不会复用其中的
-episodes。同一 implementation、同一完整 seed request 的失败报告是不可变证据，coordinator
-会显示具体 failed checks 并停止；只有实现发生实质修复并升级 version 后才能干净重跑。
 
 ## 9. Stage5 and holdout
 
