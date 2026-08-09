@@ -13,6 +13,7 @@ from safe_rl.pipeline import stage3_train_ppo_factorial as factorial_stage3
 from safe_rl.ppo_factorial import (
     EXPECTED_CANDIDATE_METHOD_ROLES,
     EXPECTED_FINAL_METHOD_ID,
+    atomic_write_json,
     build_factorial_manifest,
     fingerprint_payload,
     load_factorial_contract,
@@ -27,6 +28,30 @@ MATRIX = ROOT / "safe_rl/config/active/accvp_vnext/ppo_ablation_matrix.yaml"
 SEEDS = [1001, 1002, 1003, 1004, 1005]
 OBSERVATION_PAYLOAD = {"family": "candidate"}
 OBSERVATION_HASH = stable_hash(OBSERVATION_PAYLOAD)
+
+
+def test_factorial_atomic_manifest_write_retries_transient_windows_lock(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    output = tmp_path / "manifest.json"
+    output.write_text("{}", encoding="utf-8")
+    original_replace = Path.replace
+    attempts = 0
+
+    def flaky_replace(source: Path, target: Path) -> Path:
+        nonlocal attempts
+        attempts += 1
+        if attempts < 3:
+            raise PermissionError("transient Windows file lock")
+        return original_replace(source, target)
+
+    monkeypatch.setattr(Path, "replace", flaky_replace)
+    atomic_write_json(output, {"status": "complete"}, replace=True)
+    assert attempts == 3
+    assert json.loads(output.read_text(encoding="utf-8")) == {
+        "status": "complete"
+    }
 
 
 def test_factorial_contract_freezes_four_candidate_methods_and_final_role():
