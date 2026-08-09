@@ -15,16 +15,12 @@ from safe_rl.risk.merge_local import (
 from safe_rl.sim.action_space import ACTIONS, CandidateAction
 from safe_rl.sim.metrics import (
     INF_TTC,
-    batch_pairwise_obb_gap_overlap,
+    batch_pairwise_obb_metrics,
     bbox_gap,
     geometric_overlap,
 )
-from safe_rl.sim.scenario_semantics import (
-    advance_route_state,
-    lane_indices,
-    with_cached_scenario_semantics,
-)
-from safe_rl.sim.types import VehicleState, copy_vehicle_state
+from safe_rl.sim.scenario_semantics import advance_route_state, lane_indices
+from safe_rl.sim.types import VehicleState
 
 
 CANDIDATE_CONFLICT_ORACLE_VERSION = "candidate_union_swept_obb_v1"
@@ -124,10 +120,12 @@ def _commitment_rollout(
 
     source_lane = int(ego.lane_index)
     target_lane = source_lane + int(action.lateral_cmd)
-    current = copy_vehicle_state(ego)
-    target_current = copy_vehicle_state(ego)
-    target_current.lane_index = target_lane
-    target_current.lane_id = f"{ego.edge_id}_{target_lane}"
+    current = replace(ego)
+    target_current = replace(
+        ego,
+        lane_index=target_lane,
+        lane_id=f"{ego.edge_id}_{target_lane}",
+    )
     speed = max(0.0, float(ego.speed))
     command_accel = float(action.accel_cmd) * 1.5
     target_speed = max(0.0, speed + command_accel * 0.5)
@@ -169,17 +167,19 @@ def _commitment_rollout(
             if raw >= 1.0:
                 next_state = target_next
             else:
-                next_state = copy_vehicle_state(source_next)
-                next_state.x = float(
-                    source_next.x
-                    + progress * (target_next.x - source_next.x)
+                next_state = replace(
+                    source_next,
+                    x=float(
+                        source_next.x
+                        + progress * (target_next.x - source_next.x)
+                    ),
+                    y=float(
+                        source_next.y
+                        + progress * (target_next.y - source_next.y)
+                    ),
+                    lane_index=source_lane,
+                    lane_id=f"{source_next.edge_id}_{source_lane}",
                 )
-                next_state.y = float(
-                    source_next.y
-                    + progress * (target_next.y - source_next.y)
-                )
-                next_state.lane_index = source_lane
-                next_state.lane_id = f"{source_next.edge_id}_{source_lane}"
                 dx = float(next_state.x - current.x)
                 dy = float(next_state.y - current.y)
                 if math.hypot(dx, dy) > 1.0e-9:
@@ -231,13 +231,13 @@ def _expanded_actor(
     lateral_reach_m: float,
 ) -> VehicleState:
     reach = 0.5 * float(acceleration_bound) * float(elapsed_s) ** 2
-    expanded = copy_vehicle_state(state)
-    expanded.length = float(state.length + 2.0 * reach)
-    expanded.width = float(state.width + 2.0 * lateral_reach_m)
-    return expanded
+    return replace(
+        state,
+        length=float(state.length + 2.0 * reach),
+        width=float(state.width + 2.0 * lateral_reach_m),
+    )
 
 
-@with_cached_scenario_semantics
 def candidate_union_conflict_oracle_reference(
     config: Any,
     ego: VehicleState,
@@ -394,7 +394,6 @@ def candidate_union_conflict_oracle_reference(
     return result, tuple(sorted(ego_rollouts))
 
 
-@with_cached_scenario_semantics
 def candidate_union_conflict_oracle(
     config: Any,
     ego: VehicleState,
@@ -482,7 +481,7 @@ def candidate_union_conflict_oracle(
             flat_hypothesis_ids.append(hypothesis_id)
             actor_flat_indices.setdefault(actor_id, []).append(flat_index)
 
-    gap, overlap = batch_pairwise_obb_gap_overlap(
+    pairwise = batch_pairwise_obb_metrics(
         ego_rollouts,
         flat_actor_rollouts,
     )
@@ -517,17 +516,17 @@ def candidate_union_conflict_oracle(
         ego_lanes[:, :, None] == actor_lanes.T[None, :, :]
     )
     surface_conflict = same_surface & (
-        gap <= float(settings["surface_gap_m"])
+        pairwise.gap <= float(settings["surface_gap_m"])
     )
-    conflict = overlap | surface_conflict
+    conflict = pairwise.overlap | surface_conflict
 
     result: dict[str, ActorConflictEvidence] = {}
     for actor in vehicles:
         actor_id = str(actor.vehicle_id)
         flat_indices = actor_flat_indices[actor_id]
         actor_conflict = conflict[:, :, flat_indices]
-        actor_overlap = overlap[:, :, flat_indices]
-        actor_gaps = gap[:, :, flat_indices]
+        actor_overlap = pairwise.overlap[:, :, flat_indices]
+        actor_gaps = pairwise.gap[:, :, flat_indices]
         conflict_candidates = {
             action_ids[action_index]
             for action_index in range(len(action_ids))

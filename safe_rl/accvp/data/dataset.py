@@ -11,7 +11,7 @@ from typing import Any, Iterable
 import numpy as np
 
 from safe_rl.accvp.planning.candidate_plan import build_commitment_plan
-from safe_rl.accvp.contracts.protocol import is_strict_selector_data_contract
+from safe_rl.accvp.contracts.protocol import ACCVP_SELECTOR3_DATA_CONTRACT_VERSION
 from safe_rl.accvp.contracts.schema import (
     COUNTERFACTUAL_SCHEMA_VERSION,
     ENTRY_TIME_LABEL_VERSION,
@@ -212,10 +212,13 @@ def build_split_manifest(
         raise ValueError("ACCVP model split has no roots after excluding oracle-only cohorts")
     dataset_manifest_path = dataset / "manifests" / "dataset_manifest.json"
     dataset_manifest = read_json(dataset_manifest_path) if dataset_manifest_path.exists() else {}
-    strict_selector_contract = is_strict_selector_data_contract(
-        dict(dataset_manifest.get("data_contract", {}) or {}).get(
-            "protocol_version", ""
+    selector3_contract = (
+        str(
+            dict(dataset_manifest.get("data_contract", {}) or {}).get(
+                "protocol_version", ""
+            )
         )
+        == ACCVP_SELECTOR3_DATA_CONTRACT_VERSION
     )
     incomplete_coverage_roots = [
         str(row.get("root_id", ""))
@@ -226,7 +229,7 @@ def build_split_manifest(
             or bool(list(row.get("dropped_critical_actor_ids", []) or []))
         )
     ]
-    if strict_selector_contract and incomplete_coverage_roots:
+    if selector3_contract and incomplete_coverage_roots:
         raise ValueError(
             "selector3 ACCVP roots with incomplete task actor coverage cannot "
             f"enter any split: {incomplete_coverage_roots[:10]}"
@@ -572,10 +575,13 @@ class ACCVPBranchDataset:
             if bool(row.get("complete", False))
         ]
         dataset_manifest = read_json(manifest_dir / "dataset_manifest.json")
-        strict_selector_contract = is_strict_selector_data_contract(
-            dict(dataset_manifest.get("data_contract", {}) or {}).get(
-                "protocol_version", ""
+        selector3_contract = (
+            str(
+                dict(dataset_manifest.get("data_contract", {}) or {}).get(
+                    "protocol_version", ""
+                )
             )
+            == ACCVP_SELECTOR3_DATA_CONTRACT_VERSION
         )
         selected_incomplete_roots = [
             str(row.get("root_id", ""))
@@ -587,7 +593,7 @@ class ACCVPBranchDataset:
                 or bool(list(row.get("dropped_critical_actor_ids", []) or []))
             )
         ]
-        if strict_selector_contract and selected_incomplete_roots:
+        if selector3_contract and selected_incomplete_roots:
             raise ValueError(
                 "selector3 ACCVP split contains roots with incomplete safety "
                 f"actor coverage: {selected_incomplete_roots[:10]}"

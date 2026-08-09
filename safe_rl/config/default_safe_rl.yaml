@@ -178,7 +178,7 @@ prediction:
     cv_uncertainty_accel_scale: 0.05
     cv_uncertainty_closing_speed_scale: 0.02
     cv_uncertainty_merge_corridor_penalty: 0.10
-    # Selector-v3/v4 only. These keys are excluded from the frozen selector-v2
+    # Selector-v3 only. These keys are excluded from the frozen selector-v2
     # config hash and therefore do not alter historical V1 reproduction.
     candidate_conflict_horizon_s: 3.0
     candidate_conflict_surface_gap: 30.0
@@ -387,11 +387,11 @@ accvp:
   candidate_plan_horizon_steps: 80
   actor_count: 6
   ensemble_size: 3
-  # Selector-v3/v4 data collection/training must read a passing immutable audit;
+  # Selector-v3 data collection/training must read a passing immutable audit;
   # the loader replaces only ACCVP actor_count with its frozen capacity
   # (6 first, 8 only when the strict audit requires it). WcDT keeps its own
   # prediction.actor_relevance and wcdt_v3_max_agents checkpoint contract.
-  # Selector-v3/v4 overlays declare the independent accvp.actor_relevance block.
+  # Selector-v3 overlays declare the independent accvp.actor_relevance block.
   selector_contract:
     require_capacity_lock: false
     audit_report: null

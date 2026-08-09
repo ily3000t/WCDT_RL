@@ -43,8 +43,8 @@ from safe_rl.accvp.evaluation.oracle import validate_oracle_for_training
 from safe_rl.accvp.evaluation.formal import FORMAL_VALIDATION_KIND
 from safe_rl.accvp.contracts.protocol import (
     ACCVP_DATA_CONTRACT_VERSION,
+    ACCVP_SELECTOR3_DATA_CONTRACT_VERSION,
     SUPPORTED_ACCVP_DATA_CONTRACT_VERSIONS,
-    is_strict_selector_data_contract,
 )
 from safe_rl.accvp.training.reproducibility import configure_deterministic_training
 from safe_rl.accvp.contracts.runtime_contract import (
@@ -963,11 +963,8 @@ def _write_predictor_and_calibration(
 def train_accvp(config: Any, dataset_dir: str | Path, *, mode: str = "deployable") -> Path:
     training_started = perf_counter()
     mode = str(mode).strip().lower()
-    if mode not in {"shadow", "deployable", "diagnostic_latency_smoke"}:
-        raise ValueError(
-            "ACCVP training mode must be 'shadow', 'deployable', or "
-            "'diagnostic_latency_smoke'"
-        )
+    if mode not in {"shadow", "deployable"}:
+        raise ValueError("ACCVP training mode must be 'shadow' or 'deployable'")
     configured_artifact_generation = _configured_artifact_generation(config)
     if (
         mode == "deployable"
@@ -982,15 +979,7 @@ def train_accvp(config: Any, dataset_dir: str | Path, *, mode: str = "deployable
     training = config.accvp.training
     ensemble_size = validate_ensemble_configuration(int(config.accvp.ensemble_size), mode=mode)
     dataset_dir = Path(dataset_dir)
-    oracle_report = validate_oracle_for_training(
-        config,
-        dataset_dir,
-        allowed_model_collection_phases=(
-            ("pilot",)
-            if mode == "diagnostic_latency_smoke"
-            else ("formal",)
-        ),
-    )
+    oracle_report = validate_oracle_for_training(config, dataset_dir)
     dataset_manifest = read_json(dataset_dir / "manifests" / "dataset_manifest.json")
     if int(dataset_manifest.get("counterfactual_schema_version", -1)) != COUNTERFACTUAL_SCHEMA_VERSION:
         raise ValueError(
@@ -1020,9 +1009,8 @@ def train_accvp(config: Any, dataset_dir: str | Path, *, mode: str = "deployable
         dataset_manifest,
         required=(
             mode == "deployable"
-            and is_strict_selector_data_contract(
-                configured_contract_version
-            )
+            and configured_contract_version
+            == ACCVP_SELECTOR3_DATA_CONTRACT_VERSION
         ),
     )
     split_path = dataset_dir / "manifests" / "split_manifest.jsonl"
@@ -1421,7 +1409,7 @@ def train_accvp(config: Any, dataset_dir: str | Path, *, mode: str = "deployable
         "training_config_sha256": stable_hash(dict(training)),
         "members": member_histories,
     }
-    if mode in {"shadow", "diagnostic_latency_smoke"}:
+    if mode == "shadow":
         return _write_predictor_and_calibration(
             output_dir=output_dir,
             config=config,

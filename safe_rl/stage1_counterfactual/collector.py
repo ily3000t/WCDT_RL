@@ -10,13 +10,13 @@ import numpy as np
 
 from safe_rl.stage1_counterfactual.branch_worker import run_branch_job
 from safe_rl.accvp.contracts.protocol import (
+    ACCVP_SELECTOR3_DATA_CONTRACT_VERSION,
     activation_bin as _activation_bin,
     counterfactual_data_contract,
     data_contract_hash,
     effective_activation_distance,
     legacy_deadline_bin,
     scenario_config_hash,
-    is_strict_selector_data_contract,
 )
 from safe_rl.stage1_counterfactual.root_context import capture_root_context, synchronise_root_state
 from safe_rl.accvp.contracts.schema import (
@@ -350,9 +350,8 @@ def collect(
                                 )
                             )
                             if (
-                                is_strict_selector_data_contract(
-                                    contract.get("protocol_version", "")
-                                )
+                                str(contract.get("protocol_version", ""))
+                                == ACCVP_SELECTOR3_DATA_CONTRACT_VERSION
                                 and not (
                                     task_coverage_complete
                                     and risk_coverage_complete

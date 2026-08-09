@@ -32,7 +32,7 @@ from safe_rl.utils.config import REPO_ROOT, load_config
 
 
 RUNTIME_IMPLEMENTATION_VERSION = (
-    "accvp_runtime_conflict_selector_cached_geometry_v5"
+    "accvp_runtime_conflict_selector_shallow_state_copy_v4"
 )
 
 
@@ -194,7 +194,6 @@ def run(
     device: str = "auto",
     policy_type: str = "sb3_ppo",
     extend_failed_report: bool = False,
-    diagnostic_smoke: bool = False,
 ) -> Path:
     backend = str(backend).strip().lower()
     if backend not in {"reference", "vectorized"}:
@@ -211,15 +210,8 @@ def run(
             "scorer preflight uses rule_gap_acceptance and must not receive a policy model"
         )
     requested_seeds = [int(seed) for seed in seeds]
-    minimum_seed_count = 3 if diagnostic_smoke else 30
-    if (
-        len(requested_seeds) < minimum_seed_count
-        or len(set(requested_seeds)) != len(requested_seeds)
-    ):
-        scope = "diagnostic smoke" if diagnostic_smoke else "formal runtime benchmark"
-        raise ValueError(
-            f"{scope} requires at least {minimum_seed_count} distinct episode seeds"
-        )
+    if len(requested_seeds) < 30 or len(set(requested_seeds)) != len(requested_seeds):
+        raise ValueError("formal runtime benchmark requires at least 30 distinct episode seeds")
     cfg = load_config(config_path)
     output_path = _resolve(output)
     bundle_manifest, _bundle_files = apply_v2_bundle_paths(cfg)
@@ -260,11 +252,7 @@ def run(
         model_path = None
         model = None
         controller = RuleGapAcceptancePolicy(cfg)
-        benchmark_scope = (
-            "scorer_latency_feasibility_smoke"
-            if diagnostic_smoke
-            else "scorer_preflight"
-        )
+        benchmark_scope = "scorer_preflight"
     config_file = _resolve(config_path)
     feature_names_sha = stable_hash(
         {"feature_names": RiskGatedACCVPCandidateTableAugmentor.feature_names(cfg)}
@@ -409,8 +397,6 @@ def run(
     payload = {
         "artifact_kind": "accvp_runtime_benchmark_v1",
         "schema_version": 2,
-        "evidence_role": "diagnostic_only" if diagnostic_smoke else "formal_gate",
-        "hard_realtime_claim": False,
         "runtime_implementation_version": RUNTIME_IMPLEMENTATION_VERSION,
         "benchmark_scope": benchmark_scope,
         "policy_type": policy_type,
@@ -498,14 +484,6 @@ def parse_args() -> argparse.Namespace:
         choices=("sb3_ppo", "rule_gap_acceptance"),
         default="sb3_ppo",
     )
-    parser.add_argument(
-        "--diagnostic-smoke",
-        action="store_true",
-        help=(
-            "Run a small development-only latency feasibility sample. This "
-            "never satisfies or replaces the formal runtime gate."
-        ),
-    )
     parser.add_argument("--seeds", nargs="+", required=True, type=int)
     parser.add_argument("--output", required=True)
     parser.add_argument("--backend", choices=("reference", "vectorized"), default="vectorized")
@@ -532,7 +510,6 @@ def main() -> None:
         device=args.device,
         policy_type=args.policy_type,
         extend_failed_report=args.extend_failed_report,
-        diagnostic_smoke=args.diagnostic_smoke,
     )
     print(f"[accvp_runtime_benchmark] report={path}")
 

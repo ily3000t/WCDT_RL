@@ -202,65 +202,6 @@ def batch_pairwise_obb_metrics(
     return PairwiseBatchMetrics(gap=gap, ttc=ttc, drac=drac_values, overlap=overlap)
 
 
-def batch_pairwise_obb_gap_overlap(
-    ego_rollouts: Sequence[Sequence[VehicleState]],
-    other_rollouts: Sequence[Sequence[VehicleState]],
-) -> tuple[np.ndarray, np.ndarray]:
-    """Return only exact OBB gap/overlap for an action-time-actor batch.
-
-    Selector conflict tubes do not consume TTC or DRAC.  Keeping this as a
-    separate API avoids their velocity projections/divisions while retaining
-    the exact float64 SAT and point-to-segment calculations used by
-    :func:`batch_pairwise_obb_metrics`.
-    """
-
-    ego_values = _state_batch(ego_rollouts)
-    other_values = _state_batch(other_rollouts)
-    action_count, horizon = ego_values["x"].shape
-    actor_count = int(other_values["x"].shape[0])
-    if actor_count and int(other_values["x"].shape[1]) != horizon:
-        raise ValueError("ego and surrounding rollout horizons must match")
-    shape = (action_count, horizon, actor_count)
-    if actor_count == 0:
-        return (
-            np.full(shape, INF_TTC, dtype=np.float64),
-            np.zeros(shape, dtype=np.bool_),
-        )
-
-    ego_points, ego_axes = _batch_box_geometry(ego_values)
-    other_points, other_axes = _batch_box_geometry(other_values)
-    ego_points = np.broadcast_to(
-        ego_points[:, :, None, :, :],
-        (action_count, horizon, actor_count, 4, 2),
-    )
-    other_points = np.broadcast_to(
-        other_points[None, :, :, :, :].transpose(0, 2, 1, 3, 4),
-        (action_count, horizon, actor_count, 4, 2),
-    )
-    ego_axes = np.broadcast_to(
-        ego_axes[:, :, None, :, :],
-        (action_count, horizon, actor_count, 2, 2),
-    )
-    other_axes = np.broadcast_to(
-        other_axes[None, :, :, :, :].transpose(0, 2, 1, 3, 4),
-        (action_count, horizon, actor_count, 2, 2),
-    )
-    axes = np.concatenate([ego_axes, other_axes], axis=-2)
-
-    ego_projection = np.einsum("...pi,...ki->...pk", ego_points, axes)
-    other_projection = np.einsum("...pi,...ki->...pk", other_points, axes)
-    ego_min = np.min(ego_projection, axis=-2)
-    ego_max = np.max(ego_projection, axis=-2)
-    other_min = np.min(other_projection, axis=-2)
-    other_max = np.max(other_projection, axis=-2)
-    separated = (ego_max < other_min - _EPS) | (other_max < ego_min - _EPS)
-    overlap = ~np.any(separated, axis=-1)
-    ego_to_other = _batch_point_segment_minimum(ego_points, other_points)
-    other_to_ego = _batch_point_segment_minimum(other_points, ego_points)
-    gap = np.where(overlap, 0.0, np.minimum(ego_to_other, other_to_ego))
-    return gap, overlap
-
-
 def bbox_radius(state: VehicleState) -> float:
     """Legacy helper retained for callers that only need a conservative radius."""
 

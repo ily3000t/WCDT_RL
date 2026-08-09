@@ -165,22 +165,12 @@ def _apply_selector_capacity_lock(cfg: ConfigDict) -> ConfigDict:
         )
     with path.open("r", encoding="utf-8") as handle:
         report = json.load(handle)
-    report_kind = str(report.get("artifact_kind", ""))
-    protocol_id = str(report.get("protocol_id", ""))
-    supported_reports = {
-        "accvp_selector_contract_audit_v1": {
-            "protocol_id": "accvp-vnext-correctness-v2-selector3",
-            "capacities": {6, 8},
-        },
-        "accvp_selector_capacity_audit_v2": {
-            "protocol_id": "accvp-vnext-correctness-v3-selector4",
-            "capacities": {8, 10, 12},
-        },
-    }
-    if report_kind not in supported_reports:
+    if str(report.get("artifact_kind", "")) != "accvp_selector_contract_audit_v1":
         raise ValueError("unsupported selector capacity audit report")
-    expected = supported_reports[report_kind]
-    if protocol_id != str(expected["protocol_id"]):
+    if (
+        str(report.get("protocol_id", ""))
+        != "accvp-vnext-correctness-v2-selector3"
+    ):
         raise ValueError("selector capacity audit protocol_id mismatch")
     from safe_rl.accvp.contracts.schema import stable_hash
 
@@ -200,10 +190,8 @@ def _apply_selector_capacity_lock(cfg: ConfigDict) -> ConfigDict:
     if str(report.get("audit_state", "")) != "pass":
         raise ValueError("selector capacity audit is blocked")
     capacity = int(report.get("selected_capacity", -1))
-    if capacity not in set(expected["capacities"]):
-        raise ValueError(
-            "selector capacity audit selected an unsupported capacity"
-        )
+    if capacity not in {6, 8}:
+        raise ValueError("selector capacity audit must freeze capacity 6 or 8")
     # The audit freezes ACCVP task rows only. WcDT keeps the independent
     # selector/max-agent contract stored in its checkpoint.
     cfg.accvp["actor_count"] = capacity

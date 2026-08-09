@@ -30,35 +30,6 @@ class VehicleState:
         return [self.x, self.y, self.heading, self.speed, self.accel]
 
 
-def copy_vehicle_state(state: VehicleState) -> VehicleState:
-    """Return an exact, independent shallow copy without dataclass reflection.
-
-    ``VehicleState`` contains only scalar/string fields.  Hot route rollouts can
-    therefore use this explicit constructor instead of ``dataclasses.replace``;
-    the latter repeatedly reflects over all dataclass fields and is materially
-    slower in the selector's action x time x actor loop.
-    """
-
-    return VehicleState(
-        vehicle_id=state.vehicle_id,
-        x=state.x,
-        y=state.y,
-        heading=state.heading,
-        speed=state.speed,
-        lane_index=state.lane_index,
-        lane_id=state.lane_id,
-        lane_pos=state.lane_pos,
-        edge_id=state.edge_id,
-        length=state.length,
-        width=state.width,
-        accel=state.accel,
-        route_position_valid=state.route_position_valid,
-        projection_distance=state.projection_distance,
-        projection_ambiguity_margin=state.projection_ambiguity_margin,
-        projection_failure_reason=state.projection_failure_reason,
-    )
-
-
 @dataclass
 class StepMetrics:
     min_distance: float
