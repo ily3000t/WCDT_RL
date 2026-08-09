@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
-import time
 from typing import Any, Mapping
 
 import yaml
@@ -77,21 +76,8 @@ def atomic_write_json(path: str | Path, payload: Mapping[str, Any], *, replace: 
     with temporary.open("w", encoding="utf-8") as handle:
         json.dump(plain(payload), handle, indent=2, sort_keys=True, ensure_ascii=False)
         handle.write("\n")
-    last_error: PermissionError | None = None
-    for attempt in range(5):
-        try:
-            temporary.replace(output)
-            return output
-        except PermissionError as exc:
-            last_error = exc
-            if attempt == 4:
-                break
-            # Windows virus scanners/indexers may briefly retain a handle to
-            # the just-closed manifest. Keep the retry bounded and never
-            # delete or rewrite the existing destination as a workaround.
-            time.sleep(0.02 * (attempt + 1))
-    assert last_error is not None
-    raise last_error
+    temporary.replace(output)
+    return output
 
 
 def fingerprint_payload(payload: Mapping[str, Any], field: str) -> str:
