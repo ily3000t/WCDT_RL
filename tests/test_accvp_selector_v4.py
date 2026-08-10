@@ -9,6 +9,9 @@ import yaml
 from safe_rl.accvp.contracts.protocol import (
     ACCVP_SELECTOR4_DATA_CONTRACT_VERSION,
 )
+from safe_rl.accvp.contracts.runtime_contract import (
+    FORMAL_RUNTIME_FEATURE_VERSION,
+)
 from safe_rl.accvp.contracts.schema import file_sha256, stable_hash
 from safe_rl.accvp.evaluation.selector_capacity_v4 import (
     SELECTOR4_PROTOCOL_ID,
@@ -19,6 +22,7 @@ from safe_rl.pipeline.run_accvp_vnext_pipeline import (
     _load_workflow_contract,
     _workflow_seed_values,
 )
+from safe_rl.ppo_factorial import EXPECTED_CANDIDATE_METHOD_ROLES
 from safe_rl.pipeline.accvp_selector4_capacity_audit import (
     _recorded_overflow_rows,
 )
@@ -322,6 +326,19 @@ def test_selector4_workflow_uses_new_runtime_seeds_and_sources() -> None:
         workflow["paths"]["selector_source_dataset"]
     )
     assert workflow["freeze_before_stage5"]["post_runtime_capacity_fallback_allowed"] is False
+
+
+def test_selector4_factorial_keeps_the_frozen_ppo_feature_contract() -> None:
+    matrix_path = Path(
+        "safe_rl/config/active/accvp_vnext_selector4/"
+        "ppo_ablation_matrix.yaml"
+    )
+    matrix = yaml.safe_load(matrix_path.read_text(encoding="utf-8"))
+    variants = dict(matrix["variants"])
+    for method_id in EXPECTED_CANDIDATE_METHOD_ROLES:
+        declared = str(variants[method_id]["training_semantics_version"])
+        assert FORMAL_RUNTIME_FEATURE_VERSION in declared.split("+")
+        assert "risk_gated_candidate_table_v4_bounded_stale" not in declared
 
 
 def test_sumo_scale_is_explicit_and_validated() -> None:

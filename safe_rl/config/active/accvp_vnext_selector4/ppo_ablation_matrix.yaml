@@ -6,6 +6,8 @@ optimizer_seed_role: ppo_optimizer_replicates
 
 # Frozen Candidate Table Reward x commitment 2x2. Selector and actor capacity
 # come from the immutable Selector4 capacity report and are not method factors.
+# Selector-v4 changes the actor/data contract, not the PPO-visible 107D
+# bounded-stale observation feature contract, which remains feature-v3.
 variants:
   no_forecast_reward_v2:
     observation_family: no_forecast_52d
@@ -27,25 +29,25 @@ variants:
     forecast_source: null
     policy_lateral_commitment: false
     reward_version: opportunity_window_v2
-    training_semantics_version: reward_v2_mainline_001+risk_gated_candidate_table_v4_bounded_stale
+    training_semantics_version: reward_v2_mainline_001+risk_gated_candidate_table_v3_bounded_stale
   candidate_table_reward_v2_commitment:
     observation_family: accvp_candidate_table_107d
     candidate_table: true
     forecast_source: null
     policy_lateral_commitment: true
     reward_version: opportunity_window_v2
-    training_semantics_version: reward_v2_mainline_001+policy_lateral_commitment_left_intent_1s_risk_gated_v2+risk_gated_candidate_table_v4_bounded_stale
+    training_semantics_version: reward_v2_mainline_001+policy_lateral_commitment_left_intent_1s_risk_gated_v2+risk_gated_candidate_table_v3_bounded_stale
   candidate_table_reward_v3_1:
     observation_family: accvp_candidate_table_107d
     candidate_table: true
     forecast_source: null
     policy_lateral_commitment: false
     reward_version: opportunity_window_v3_1_risk_gated_persistence
-    training_semantics_version: reward_v3_1_persistence_001+risk_gated_candidate_table_v4_bounded_stale
+    training_semantics_version: reward_v3_1_persistence_001+risk_gated_candidate_table_v3_bounded_stale
   candidate_table_reward_v3_1_commitment:
     observation_family: accvp_candidate_table_107d
     candidate_table: true
     forecast_source: null
     policy_lateral_commitment: true
     reward_version: opportunity_window_v3_1_risk_gated_persistence
-    training_semantics_version: reward_v3_1_persistence_001+policy_lateral_commitment_left_intent_1s_risk_gated_v2+risk_gated_candidate_table_v4_bounded_stale
+    training_semantics_version: reward_v3_1_persistence_001+policy_lateral_commitment_left_intent_1s_risk_gated_v2+risk_gated_candidate_table_v3_bounded_stale
