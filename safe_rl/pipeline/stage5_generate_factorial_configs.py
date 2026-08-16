@@ -234,8 +234,6 @@ def _runtime_seed_reports(
 ) -> dict[int, dict[str, str]]:
     if str(runtime.get("artifact_kind", "")) != SINGLE_RUNTIME_KIND:
         raise ValueError(f"unsupported per-method runtime report: {runtime_path}")
-    if not bool((runtime.get("gate", {}) or {}).get("pass", False)):
-        raise ValueError(f"per-method runtime gate failed: {runtime_path}")
     recorded_manifest = _normalise_sha256(
         runtime.get("replicate_manifest_sha256"),
         field="runtime replicate_manifest_sha256",
@@ -295,6 +293,9 @@ def _runtime_coverage(
                 "runtime_report": str(source),
                 "runtime_report_sha256": file_sha256(source),
                 "replicate_manifest_sha256": manifest_sha,
+                "deployment_runtime_gate_pass": bool(
+                    (payload.get("gate", {}) or {}).get("pass", False)
+                ),
                 "reports": _runtime_seed_reports(
                     source,
                     payload,
@@ -307,8 +308,6 @@ def _runtime_coverage(
         raise ValueError("Stage5 factorial generation requires a factorial runtime report")
     if int(payload.get("schema_version", -1)) != 1 or payload.get("status") != "complete":
         raise ValueError("factorial runtime report is not complete")
-    if not bool((payload.get("gate", {}) or {}).get("pass", False)):
-        raise ValueError("factorial runtime gate did not pass")
     if str(payload.get("final_method_id", "")) != str(factorial.get("final_method_id", "")):
         raise ValueError("factorial runtime final_method_id mismatch")
     declared_factorial, _ = _verified_json_reference(
@@ -344,12 +343,13 @@ def _runtime_coverage(
             relative_to=source.parent,
             field=f"{method_id} runtime_report_sha256",
         )
-        if not bool((entry.get("gate", {}) or {}).get("pass", False)):
-            raise ValueError(f"factorial runtime method gate failed: {method_id}")
         coverage[str(method_id)] = {
             "runtime_report": str(runtime_path),
             "runtime_report_sha256": file_sha256(runtime_path),
             "replicate_manifest_sha256": expected_manifest_sha,
+            "deployment_runtime_gate_pass": bool(
+                (entry.get("gate", {}) or {}).get("pass", False)
+            ),
             "reports": _runtime_seed_reports(
                 runtime_path,
                 runtime,
@@ -369,9 +369,34 @@ def _candidate_binding(row: Mapping[str, Any]) -> dict[str, str]:
         "formal_runtime_contract_sha256": str(
             observation.get("formal_runtime_contract_sha256", "")
         ),
+        "deployment_runtime_contract_sha256": str(
+            observation.get(
+                "deployment_runtime_contract_sha256",
+                row.get("deployment_runtime_contract_sha256", ""),
+            )
+        ),
+        "candidate_table_semantic_contract_sha256": str(
+            observation.get(
+                "candidate_table_semantic_contract_sha256",
+                row.get("candidate_table_semantic_contract_sha256", ""),
+            )
+        ),
+        "closed_loop_execution_contract_sha256": str(
+            observation.get(
+                "closed_loop_execution_contract_sha256",
+                row.get("closed_loop_execution_contract_sha256", ""),
+            )
+        ),
     }
     if not all(binding.values()):
         raise ValueError("Candidate replicate record lacks complete ACCVP bundle binding")
+    if (
+        binding["deployment_runtime_contract_sha256"]
+        != binding["formal_runtime_contract_sha256"]
+    ):
+        raise ValueError(
+            "Candidate replicate deployment/formal runtime contract hashes disagree"
+        )
     return binding
 
 
@@ -703,9 +728,10 @@ def generate(
                 "episodes_per_group": len(comparison_simulator_seeds),
                 "seeds": comparison_simulator_seeds,
                 "risk_checkpoint": str(risk_binding["path"]),
-                "require_accvp_observation_runtime_gate": True,
-                "accvp_observation_preflight_reports": runtime_reports,
-                "accvp_observation_preflight_report_sha256s": runtime_report_hashes,
+                "execution_contract": "simulation_blocking_exact_v1",
+                "require_accvp_observation_runtime_gate": False,
+                "deployment_runtime_reports": runtime_reports,
+                "deployment_runtime_report_sha256s": runtime_report_hashes,
                 "statistics": {
                     "confidence": 0.95,
                     "bootstrap_replicates": 10000,
@@ -747,8 +773,8 @@ def generate(
                     "right_method_id": right_method,
                     "left_checkpoint_sha256": str(left["checkpoint_sha256"]),
                     "right_checkpoint_sha256": str(right["checkpoint_sha256"]),
-                    "runtime_preflight_reports": runtime_reports,
-                    "runtime_preflight_report_sha256s": runtime_report_hashes,
+                    "deployment_runtime_reports": runtime_reports,
+                    "deployment_runtime_report_sha256s": runtime_report_hashes,
                 }
             )
 
@@ -784,6 +810,15 @@ def generate(
             "source_acceptance_key": comparison_id,
             "formal_runtime_contract_sha256": right_binding[
                 "formal_runtime_contract_sha256"
+            ],
+            "deployment_runtime_contract_sha256": right_binding[
+                "deployment_runtime_contract_sha256"
+            ],
+            "candidate_table_semantic_contract_sha256": right_binding[
+                "candidate_table_semantic_contract_sha256"
+            ],
+            "closed_loop_execution_contract_sha256": right_binding[
+                "closed_loop_execution_contract_sha256"
             ],
             "statistics": {
                 # Episode rewards only have a common scale when the two policies

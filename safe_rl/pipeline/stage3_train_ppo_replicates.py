@@ -109,6 +109,21 @@ def build_replicate_plan(
                 "reward_semantics": reward["payload"],
                 "observation_contract_hash": observation["sha256"],
                 "observation_contract": observation["payload"],
+                "candidate_table_semantic_contract_sha256": str(
+                    observation["payload"].get(
+                        "candidate_table_semantic_contract_sha256", ""
+                    )
+                ),
+                "closed_loop_execution_contract_sha256": str(
+                    observation["payload"].get(
+                        "closed_loop_execution_contract_sha256", ""
+                    )
+                ),
+                "deployment_runtime_contract_sha256": str(
+                    observation["payload"].get(
+                        "deployment_runtime_contract_sha256", ""
+                    )
+                ),
                 "accvp_artifact_fingerprint": observation["accvp_artifact_fingerprint"],
             }
         )

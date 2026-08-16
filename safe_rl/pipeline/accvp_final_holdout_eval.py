@@ -28,6 +28,7 @@ from safe_rl.accvp.data.dataset import ACCVPBranchDataset
 from safe_rl.accvp.evaluation.diagnostics import final_test_diagnostics
 from safe_rl.accvp.contracts.schema import file_sha256, read_json, stable_hash, write_json_atomic
 from safe_rl.accvp.contracts.runtime_contract import (
+    candidate_table_semantic_contract_sha256,
     compare_formal_runtime_contracts,
     formal_runtime_contract_from_config,
     formal_runtime_contract_sha256,
@@ -146,6 +147,9 @@ def _validate_vnext_promotion_evidence(
         )
     except ValueError as exc:
         raise EvidenceProtocolError(str(exc)) from exc
+    bundle_semantic_contract_sha = candidate_table_semantic_contract_sha256(
+        bundle_runtime_contract
+    )
     if final_runtime_contract is None:
         raise EvidenceProtocolError(
             "VNext final holdout requires its canonical runtime contract"
@@ -167,13 +171,15 @@ def _validate_vnext_promotion_evidence(
     runtime_evidence_fingerprint = ""
     runtime_replicate_count = 1
     runtime_checkpoint_by_seed: dict[int, str] = {}
+    deployment_runtime_gate_pass = bool(
+        dict(runtime.get("gate", {}) or {}).get("pass", False)
+    )
     if str(runtime.get("artifact_kind", "")) == "accvp_runtime_benchmark_replicates_v1":
         runtime_evidence_fingerprint = _validate_report_fingerprint(
             runtime, name="replicated runtime benchmark"
         )
         aggregate_gate = dict(runtime.get("gate", {}) or {})
-        if not bool(aggregate_gate.get("pass", False)):
-            raise EvidenceProtocolError("replicated VNext runtime benchmark gate did not pass")
+        deployment_runtime_gate_pass = bool(aggregate_gate.get("pass", False))
         replicate_rows = list(runtime.get("replicates", []) or [])
         if len(replicate_rows) < 5:
             raise EvidenceProtocolError(
@@ -215,13 +221,20 @@ def _validate_vnext_promotion_evidence(
                 or str(individual.get("benchmark_scope", "")) != "policy_runtime"
                 or str(individual.get("policy_type", "")) != "sb3_ppo"
                 or str(individual.get("backend", "")) != "vectorized"
-                or not bool(dict(individual.get("gate", {}) or {}).get("pass", False))
                 or str(dict(individual.get("gate", {}) or {}).get("profile", ""))
                 != "bounded_stale_runtime_v3_strict"
                 or str(individual.get("policy_model_sha256", "")) != checkpoint_hash
-                or str(individual.get("formal_runtime_contract_sha256", ""))
-                != bundle_runtime_contract_sha
-                or str(
+                    or str(individual.get("formal_runtime_contract_sha256", ""))
+                    != bundle_runtime_contract_sha
+                    or str(individual.get("deployment_runtime_contract_sha256", ""))
+                    != bundle_runtime_contract_sha
+                    or str(
+                        individual.get(
+                            "candidate_table_semantic_contract_sha256", ""
+                        )
+                    )
+                    != bundle_semantic_contract_sha
+                    or str(
                     dict(
                         dict(individual.get("artifact_lineage", {}) or {}).get(
                             "accvp_manifest", {}
@@ -237,9 +250,9 @@ def _validate_vnext_promotion_evidence(
             _validate_report_fingerprint(individual, name="runtime benchmark replicate")
             individual_reports.append((individual_path, individual))
         runtime_replicate_count = len(individual_reports)
-        # The common detailed checks below validate one member. The loop above
-        # has already required every member to pass the same strict gate; the
-        # aggregate report additionally records the worst value across members.
+        # The common detailed checks below validate one member. Every member is
+        # immutable, complete and contract-bound; deployment pass/fail remains
+        # an independent conclusion and is not a method-effect prerequisite.
         runtime_path, runtime = individual_reports[0]
     if str(runtime.get("artifact_kind", "")) != "accvp_runtime_benchmark_v1":
         raise EvidenceProtocolError("invalid ACCVP runtime benchmark artifact_kind")
@@ -259,8 +272,6 @@ def _validate_vnext_promotion_evidence(
         runtime_evidence_fingerprint = runtime_fingerprint
     if str(runtime.get("backend", "")) != "vectorized":
         raise EvidenceProtocolError("VNext promotion requires vectorized runtime benchmark")
-    if not bool(dict(runtime.get("gate", {}) or {}).get("pass", False)):
-        raise EvidenceProtocolError("VNext runtime benchmark gate did not pass")
     if str(dict(runtime.get("gate", {}) or {}).get("profile", "")) != "bounded_stale_runtime_v3_strict":
         raise EvidenceProtocolError("VNext promotion requires the strict runtime gate profile")
     runtime_gate_checks = dict(dict(runtime.get("gate", {}) or {}).get("checks", {}) or {})
@@ -283,6 +294,22 @@ def _validate_vnext_promotion_evidence(
     ):
         raise EvidenceProtocolError(
             "runtime benchmark contract does not match the frozen bundle"
+        )
+    if (
+        str(runtime.get("deployment_runtime_contract_sha256", ""))
+        != bundle_runtime_contract_sha
+        or str(runtime.get("candidate_table_semantic_contract_sha256", ""))
+        != bundle_semantic_contract_sha
+    ):
+        raise EvidenceProtocolError(
+            "runtime benchmark layered contract does not match the frozen bundle"
+        )
+    runtime_method_effect_execution_sha = str(
+        runtime.get("policy_method_effect_execution_contract_sha256", "")
+    )
+    if re.fullmatch(r"[0-9a-f]{64}", runtime_method_effect_execution_sha) is None:
+        raise EvidenceProtocolError(
+            "runtime benchmark is missing the policy method-effect execution contract"
         )
     runtime_metrics = dict(runtime.get("metrics", {}) or {})
     if int(runtime_metrics.get("accvp_table_unique_episode_seed_count", 0)) < 30:
@@ -351,6 +378,19 @@ def _validate_vnext_promotion_evidence(
         != bundle_runtime_contract_sha
     ):
         raise EvidenceProtocolError("replicated Stage5 runtime contract mismatch")
+    if (
+        str(candidate_binding.get("deployment_runtime_contract_sha256", ""))
+        != bundle_runtime_contract_sha
+        or str(
+            candidate_binding.get("candidate_table_semantic_contract_sha256", "")
+        )
+        != bundle_semantic_contract_sha
+        or str(candidate_binding.get("closed_loop_execution_contract_sha256", ""))
+        != runtime_method_effect_execution_sha
+    ):
+        raise EvidenceProtocolError(
+            "replicated Stage5 layered method-effect contract mismatch"
+        )
     if str(candidate_binding.get("candidate_side", "")) not in {"left", "right"}:
         raise EvidenceProtocolError("replicated Stage5 candidate side is invalid")
     if not str(candidate_binding.get("source_acceptance_key", "")).strip():
@@ -466,6 +506,14 @@ def _validate_vnext_promotion_evidence(
             "optimizer_replicate_count": runtime_replicate_count,
             "bound_candidate_manifest_sha256": runtime_manifest_sha,
             "formal_runtime_contract_sha256": runtime_contract_sha,
+            "candidate_table_semantic_contract_sha256": (
+                bundle_semantic_contract_sha
+            ),
+            "policy_method_effect_execution_contract_sha256": (
+                runtime_method_effect_execution_sha
+            ),
+            "conclusion_scope": "deployment_runtime_only",
+            "deployment_runtime_gate_pass": deployment_runtime_gate_pass,
         },
         "stage5_replicated_report": {
             "path": str(stage5_path),
@@ -476,6 +524,14 @@ def _validate_vnext_promotion_evidence(
             "candidate_side": str(candidate_binding["candidate_side"]),
             "source_acceptance_key": str(candidate_binding["source_acceptance_key"]),
             "formal_runtime_contract_sha256": bundle_runtime_contract_sha,
+            "candidate_table_semantic_contract_sha256": (
+                bundle_semantic_contract_sha
+            ),
+            "closed_loop_execution_contract_sha256": (
+                runtime_method_effect_execution_sha
+            ),
+            "conclusion_scope": "method_effect",
+            "method_effect_gate_pass": bool(stage5_gate.get("pass", False)),
             "training_seed_count": int(statistics["training_seed_count"]),
             "simulator_seed_count": int(statistics.get("simulator_seed_count", 0)),
         },
@@ -838,7 +894,20 @@ def run_final_holdout(
         elif mode == "full":
             result = final_test_diagnostics(models, test_set, calibration, operating_point, torch)
             failures = ["full_viability_branch_not_authorized_for_deployment"]
-        decision = "go" if not failures else "no_go"
+        method_effect_decision = "go" if not failures else "no_go"
+        deployment_runtime_pass = bool(
+            dict(promotion_evidence.get("runtime_benchmark", {}) or {}).get(
+                "deployment_runtime_gate_pass", False
+            )
+        )
+        decision = (
+            "go"
+            if method_effect_decision == "go" and deployment_runtime_pass
+            else "no_go"
+        )
+        combined_failures = list(failures)
+        if not deployment_runtime_pass:
+            combined_failures.append("deployment_runtime_gate_failed")
         report = {
             "artifact_kind": "accvp_one_shot_final_holdout_report_v1",
             "mode": mode,
@@ -846,7 +915,17 @@ def run_final_holdout(
             "threshold_selection_split": "operating_point",
             "test_used_for_threshold_selection": False,
             "decision": decision,
-            "failures": failures,
+            "failures": combined_failures,
+            "conclusions": {
+                "offline_prediction_holdout_decision": method_effect_decision,
+                "closed_loop_method_effect_gate_pass": bool(
+                    dict(
+                        promotion_evidence.get("stage5_replicated_report", {}) or {}
+                    ).get("method_effect_gate_pass", False)
+                ),
+                "deployment_runtime_gate_pass": deployment_runtime_pass,
+                "combined_deployment_decision": decision,
+            },
             "result": result,
             "protocol": protocol,
             "promotion_evidence": promotion_evidence,

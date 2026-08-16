@@ -43,8 +43,6 @@ def _runtime_report_map(path: str | Path) -> tuple[Path, dict[int, str]]:
     payload = read_json(source)
     if str(payload.get("artifact_kind", "")) != "accvp_runtime_benchmark_replicates_v1":
         raise ValueError("Stage5 generation requires a replicated policy-runtime report")
-    if not bool(payload.get("gate", {}).get("pass", False)):
-        raise ValueError("replicated policy runtime gate did not pass")
     reports = {
         int(row["optimizer_seed"]): str(row["report"])
         for row in payload.get("replicates", []) or []
@@ -175,8 +173,14 @@ def generate(
             "replay_enabled": True,
             "episodes_per_group": len(simulator_seeds),
             "seeds": simulator_seeds,
-            "require_accvp_observation_runtime_gate": True,
-            "accvp_observation_preflight_report": runtime_reports[seed],
+            "execution_contract": "simulation_blocking_exact_v1",
+            "require_accvp_observation_runtime_gate": False,
+            "deployment_runtime_reports": {
+                right_name: runtime_reports[seed],
+            },
+            "deployment_runtime_report_sha256s": {
+                right_name: file_sha256(runtime_reports[seed]),
+            },
             "statistics": {
                 "confidence": 0.95,
                 "bootstrap_replicates": 10000,
@@ -226,6 +230,15 @@ def generate(
             "formal_runtime_contract_sha256": str(
                 observation.get("formal_runtime_contract_sha256", "")
             ),
+            "deployment_runtime_contract_sha256": str(
+                observation.get("deployment_runtime_contract_sha256", "")
+            ),
+            "candidate_table_semantic_contract_sha256": str(
+                observation.get("candidate_table_semantic_contract_sha256", "")
+            ),
+            "closed_loop_execution_contract_sha256": str(
+                observation.get("closed_loop_execution_contract_sha256", "")
+            ),
         }
         if candidate_binding is not None and current_binding != candidate_binding:
             raise ValueError("candidate optimizer replicates do not bind one frozen ACCVP artifact")
@@ -245,6 +258,15 @@ def generate(
         "candidate_side": "right",
         "source_acceptance_key": comparison_id,
         "formal_runtime_contract_sha256": candidate_binding["formal_runtime_contract_sha256"],
+        "deployment_runtime_contract_sha256": candidate_binding[
+            "deployment_runtime_contract_sha256"
+        ],
+        "candidate_table_semantic_contract_sha256": candidate_binding[
+            "candidate_table_semantic_contract_sha256"
+        ],
+        "closed_loop_execution_contract_sha256": candidate_binding[
+            "closed_loop_execution_contract_sha256"
+        ],
         "statistics": {
             "continuous_metrics": ["episode_reward"],
             "binary_metrics": ["proxy_collision", "safety_violation", "taper_miss", "merge_success"],

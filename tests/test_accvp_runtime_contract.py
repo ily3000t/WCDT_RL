@@ -3,8 +3,13 @@ from __future__ import annotations
 import pytest
 
 from safe_rl.accvp.contracts.runtime_contract import (
+    SIMULATION_BLOCKING_EXACT_CONTRACT,
+    SOFT_REALTIME_POST_RETURN_CONTRACT,
+    candidate_table_semantic_contract,
     canonical_formal_runtime_contract,
+    closed_loop_execution_contract,
     compare_formal_runtime_contracts,
+    deployment_observation_from_formal_runtime_contract,
     formal_runtime_contract_from_config,
     formal_runtime_contract_sha256,
 )
@@ -60,6 +65,36 @@ def test_formal_runtime_contract_binds_every_safety_relevant_runtime_field():
     comparison = compare_formal_runtime_contracts(contract, changed_risk_config)
     assert comparison["pass"] is False
     assert comparison["differing_fields"] == ["risk_module_config_sha256"]
+
+
+def test_method_effect_and_deployment_execution_contracts_share_frozen_semantics():
+    formal = canonical_formal_runtime_contract(
+        observation=_observation_contract(),
+        candidate_geometry_backend="vectorized",
+        risk_checkpoint_sha256="a" * 64,
+        risk_module_config_sha256="e" * 64,
+    )
+    blocking_observation = {
+        **_observation_contract(),
+        "execution_contract": SIMULATION_BLOCKING_EXACT_CONTRACT,
+        "deployment_deadline_s": 0.5,
+        "invalid_table_strategy": "fail_closed_v1",
+    }
+    deployment_observation = deployment_observation_from_formal_runtime_contract(
+        formal,
+        current_observation=blocking_observation,
+    )
+
+    semantic = candidate_table_semantic_contract(formal)
+    blocking = closed_loop_execution_contract(blocking_observation)
+    deployment = closed_loop_execution_contract(deployment_observation)
+
+    assert semantic["risk_checkpoint_sha256"] == "a" * 64
+    assert blocking["execution_contract"] == SIMULATION_BLOCKING_EXACT_CONTRACT
+    assert blocking["deadline_exceedance_changes_observation"] is False
+    assert deployment["execution_contract"] == SOFT_REALTIME_POST_RETURN_CONTRACT
+    assert deployment["deadline_exceedance_changes_observation"] is True
+    assert deployment_observation["invalid_table_strategy"] == "bounded_last_valid_v2"
 
 
 def test_formal_runtime_contract_rejects_disabled_risk_secondary():

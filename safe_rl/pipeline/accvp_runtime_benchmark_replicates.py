@@ -187,6 +187,26 @@ def _validate_single_runtime_report(
     config_path = _resolve(str(row.get("resolved_config", "")))
     if str(report.get("config_file_sha256", "")) != file_sha256(config_path):
         raise ValueError("existing runtime replicate resolved-config hash disagrees with the manifest")
+    for report_field, row_field in (
+        (
+            "candidate_table_semantic_contract_sha256",
+            "candidate_table_semantic_contract_sha256",
+        ),
+        (
+            "deployment_runtime_contract_sha256",
+            "deployment_runtime_contract_sha256",
+        ),
+        (
+            "policy_method_effect_execution_contract_sha256",
+            "closed_loop_execution_contract_sha256",
+        ),
+    ):
+        if str(report.get(report_field, "")) != str(row.get(row_field, "")):
+            raise ValueError(
+                f"existing runtime replicate {report_field} disagrees with the manifest"
+            )
+    if str(report.get("conclusion_scope", "")) != "deployment_runtime_only":
+        raise ValueError("existing runtime replicate has an invalid conclusion scope")
     workload = dict(report.get("workload", {}) or {})
     expected_seed_hash = stable_hash({"episode_seeds": requested_seeds})
     if int(workload.get("requested_episode_seed_count", -1)) != len(requested_seeds):
@@ -230,6 +250,34 @@ def validate_runtime_replicate_report(
     checkpoint_hashes = [str(row.get("checkpoint_sha256", "")) for row in rows]
     if list(report.get("checkpoint_sha256s", []) or []) != checkpoint_hashes:
         raise ValueError("replicated runtime benchmark checkpoint set mismatch")
+    expected_layered = {
+        report_field: {
+            str(row.get(row_field, "")) for row in rows
+        }
+        for report_field, row_field in (
+            (
+                "candidate_table_semantic_contract_sha256",
+                "candidate_table_semantic_contract_sha256",
+            ),
+            (
+                "deployment_runtime_contract_sha256",
+                "deployment_runtime_contract_sha256",
+            ),
+            (
+                "policy_method_effect_execution_contract_sha256",
+                "closed_loop_execution_contract_sha256",
+            ),
+        )
+    }
+    if str(report.get("conclusion_scope", "")) != "deployment_runtime_only":
+        raise ValueError("replicated runtime benchmark has an invalid conclusion scope")
+    for field, values in expected_layered.items():
+        if len(values) != 1 or "" in values or str(report.get(field, "")) != next(
+            iter(values)
+        ):
+            raise ValueError(
+                f"replicated runtime benchmark {field} disagrees with the manifest"
+            )
     lineage = list(report.get("replicates", []) or [])
     if len(lineage) != len(rows):
         raise ValueError("replicated runtime benchmark lineage is incomplete")
@@ -355,6 +403,24 @@ def run(
             }
         )
     gate = aggregate_runtime_reports(produced)
+    semantic_hashes = {
+        str(item.get("candidate_table_semantic_contract_sha256", ""))
+        for item in produced
+    }
+    deployment_hashes = {
+        str(item.get("deployment_runtime_contract_sha256", ""))
+        for item in produced
+    }
+    method_effect_execution_hashes = {
+        str(item.get("policy_method_effect_execution_contract_sha256", ""))
+        for item in produced
+    }
+    if any(len(values) != 1 or "" in values for values in (
+        semantic_hashes,
+        deployment_hashes,
+        method_effect_execution_hashes,
+    )):
+        raise ValueError("runtime replicates do not share the layered ACCVP contracts")
     payload = {
         "artifact_kind": RUNTIME_REPLICATE_REPORT_KIND,
         "schema_version": RUNTIME_REPLICATE_REPORT_SCHEMA_VERSION,
@@ -366,6 +432,12 @@ def run(
         "backend": backend,
         "device": str(device),
         "hard_real_time_claim": all(not bool(item.get("soft_realtime_contract", True)) for item in produced),
+        "conclusion_scope": "deployment_runtime_only",
+        "candidate_table_semantic_contract_sha256": next(iter(semantic_hashes)),
+        "deployment_runtime_contract_sha256": next(iter(deployment_hashes)),
+        "policy_method_effect_execution_contract_sha256": next(
+            iter(method_effect_execution_hashes)
+        ),
         "config_template": str(_resolve(config_template)),
         "config_template_sha256": file_sha256(_resolve(config_template)),
         "replicate_manifest": str(source),

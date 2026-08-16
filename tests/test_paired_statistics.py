@@ -13,7 +13,11 @@ from safe_rl.accvp.contracts.artifacts import (
     bundle_file_entry,
 )
 from safe_rl.accvp.contracts.runtime_contract import (
+    SIMULATION_BLOCKING_EXACT_CONTRACT,
+    candidate_table_semantic_contract_sha256,
     canonical_formal_runtime_contract,
+    closed_loop_execution_contract,
+    closed_loop_execution_contract_sha256,
     formal_runtime_contract_sha256,
 )
 from safe_rl.accvp.contracts.schema import file_sha256, stable_hash
@@ -378,6 +382,15 @@ def _candidate_bundle(tmp_path: Path):
 
 def _formal_replicated_request(tmp_path: Path, candidate_path: Path, candidate):
     training_seeds = (11, 22, 33, 44, 55)
+    execution_observation = {
+        "execution_contract": SIMULATION_BLOCKING_EXACT_CONTRACT,
+        "deployment_deadline_s": 0.5,
+        "profile_latency": True,
+        "use_inference_worker": False,
+        "invalid_table_strategy": "fail_closed_v1",
+        "fail_closed_defaults": True,
+        "invalid_table_dropout_rate": 0.0,
+    }
     request = {
         "artifact_kind": REQUEST_ARTIFACT_KIND,
         "comparison_id": "baseline_vs_candidate_formal",
@@ -395,6 +408,17 @@ def _formal_replicated_request(tmp_path: Path, candidate_path: Path, candidate):
         "formal_runtime_contract_sha256": candidate[
             "formal_runtime_contract_sha256"
         ],
+        "deployment_runtime_contract_sha256": candidate[
+            "formal_runtime_contract_sha256"
+        ],
+        "candidate_table_semantic_contract_sha256": (
+            candidate_table_semantic_contract_sha256(
+                candidate["formal_runtime_contract"]
+            )
+        ),
+        "closed_loop_execution_contract_sha256": (
+            closed_loop_execution_contract_sha256(execution_observation)
+        ),
         "statistics": {
             "continuous_metrics": ["episode_reward"],
             "binary_metrics": ["proxy_collision"],
@@ -536,12 +560,44 @@ def _write_formal_stage5_fixture(tmp_path: Path):
     }
     bundle_lineage["binding_fingerprint"] = stable_hash(bundle_lineage)
     source["evidence_lineage"]["accvp_group_bindings"] = {}
+    source["evidence_lineage"]["accvp_method_effect_contracts"] = {}
+    execution_observation = {
+        "execution_contract": SIMULATION_BLOCKING_EXACT_CONTRACT,
+        "deployment_deadline_s": 0.5,
+        "profile_latency": True,
+        "use_inference_worker": False,
+        "invalid_table_strategy": "fail_closed_v1",
+        "fail_closed_defaults": True,
+        "invalid_table_dropout_rate": 0.0,
+    }
+    method_contract = {
+        "candidate_table_semantic_contract_sha256": (
+            candidate_table_semantic_contract_sha256(
+                candidate["formal_runtime_contract"]
+            )
+        ),
+        "closed_loop_execution_contract": closed_loop_execution_contract(
+            execution_observation
+        ),
+        "closed_loop_execution_contract_sha256": (
+            closed_loop_execution_contract_sha256(execution_observation)
+        ),
+        "deployment_runtime_contract_sha256": candidate[
+            "formal_runtime_contract_sha256"
+        ],
+    }
     for training_seed in (11, 22, 33, 44, 55):
         group_name = f"candidate_seed_{training_seed}"
         source["groups"][group_name]["accvp_bundle_lineage"] = dict(bundle_lineage)
+        source["groups"][group_name]["accvp_method_effect_contract"] = dict(
+            method_contract
+        )
         source["evidence_lineage"]["accvp_group_bindings"][group_name] = dict(
             bundle_lineage
         )
+        source["evidence_lineage"]["accvp_method_effect_contracts"][
+            group_name
+        ] = dict(method_contract)
     source["evidence_lineage"].pop("lineage_fingerprint", None)
     source["evidence_lineage"]["lineage_fingerprint"] = stable_hash(
         source["evidence_lineage"]

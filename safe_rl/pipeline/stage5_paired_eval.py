@@ -7,6 +7,9 @@ from typing import Any
 
 from safe_rl.analysis.paired_statistics import build_pair_statistics
 from safe_rl.accvp.contracts.artifacts import resolve_v2_bundle
+from safe_rl.accvp.contracts.runtime_contract import (
+    SIMULATION_BLOCKING_EXACT_CONTRACT,
+)
 from safe_rl.accvp.serving.observation import RiskGatedACCVPCandidateTableAugmentor
 from safe_rl.evaluation_protocol import (
     EvidenceProtocolError,
@@ -21,6 +24,7 @@ from safe_rl.evaluation_protocol import (
 from safe_rl.pipeline.common import latest_stage_file, load_stage_config, parse_config_arg, write_report
 from safe_rl.pipeline.accvp_observation_preflight import _gate as _accvp_observation_runtime_gate
 from safe_rl.pipeline.stage5_episode_cache import evaluate_policy_cached
+from safe_rl.ppo_replicates import observation_contract as ppo_observation_contract
 from safe_rl.rl.evaluation import evaluate_policy
 from safe_rl.sim.metrics import SAFETY_METRIC_VERSION
 from safe_rl.utils.config import clone_with_overrides, prepare_run_dir
@@ -258,6 +262,44 @@ def _validate_stage5_observation_contract(
             "Stage3/Stage5 ACCVP observation feature contract mismatch: "
             f"stage3={recorded_hash} stage5={expected_hash}"
         )
+    expected_observation = ppo_observation_contract(
+        group_cfg,
+        require_artifacts=True,
+    )
+    recorded_observation = report.get("observation_contract")
+    recorded_observation_hash = str(report.get("observation_contract_hash", ""))
+    if not isinstance(recorded_observation, dict) or not recorded_observation_hash:
+        if protocol_strict:
+            raise EvidenceProtocolError(
+                "strict ACCVP Stage5 requires the complete Stage3 observation contract"
+            )
+        return {
+            "required": True,
+            "available": False,
+            "stage3_report": str(report_path.resolve()),
+            "reason": "missing_stage3_observation_contract",
+        }
+    if stable_hash(recorded_observation) != recorded_observation_hash:
+        raise EvidenceProtocolError("Stage3 observation_contract_hash mismatch")
+    if (
+        recorded_observation_hash != str(expected_observation["sha256"])
+        or recorded_observation != dict(expected_observation["payload"])
+    ):
+        raise EvidenceProtocolError(
+            "Stage3/Stage5 complete observation contract mismatch"
+        )
+    execution_contract = dict(
+        expected_observation["payload"].get("closed_loop_execution_contract", {})
+        or {}
+    )
+    if (
+        protocol_strict
+        and str(execution_contract.get("execution_contract", ""))
+        != SIMULATION_BLOCKING_EXACT_CONTRACT
+    ):
+        raise EvidenceProtocolError(
+            "formal Stage5 method-effect evaluation requires simulation_blocking_exact_v1"
+        )
     return {
         "required": True,
         "available": True,
@@ -266,6 +308,23 @@ def _validate_stage5_observation_contract(
         "feature_names_sha256": expected_hash,
         "accvp_bundle": expected_bundle,
         "stage3_bundle_lineage_match": True,
+        "observation_contract_hash": recorded_observation_hash,
+        "candidate_table_semantic_contract_sha256": str(
+            expected_observation["payload"].get(
+                "candidate_table_semantic_contract_sha256", ""
+            )
+        ),
+        "closed_loop_execution_contract": execution_contract,
+        "closed_loop_execution_contract_sha256": str(
+            expected_observation["payload"].get(
+                "closed_loop_execution_contract_sha256", ""
+            )
+        ),
+        "deployment_runtime_contract_sha256": str(
+            expected_observation["payload"].get(
+                "deployment_runtime_contract_sha256", ""
+            )
+        ),
     }
 
 
@@ -1096,6 +1155,13 @@ def run(cfg) -> Path:
         lineage_artifacts["accvp_observation_preflight_report"] = str(
             cfg.stage5.accvp_observation_preflight_report
         )
+    deployment_runtime_reports = dict(
+        cfg.stage5.get("deployment_runtime_reports", {}) or {}
+    )
+    for group_name, report_path in sorted(deployment_runtime_reports.items()):
+        lineage_artifacts[
+            f"deployment_runtime_report:{group_name}"
+        ] = str(report_path)
     frozen_runtime_preflight = _validate_frozen_runtime_preflight(
         cfg=cfg,
         group_model_paths=group_model_paths,
@@ -1124,6 +1190,7 @@ def run(cfg) -> Path:
     replay_dir = stage_dir / "replay"
     group_reports = {}
     accvp_group_bindings: dict[str, dict[str, Any]] = {}
+    accvp_method_effect_contracts: dict[str, dict[str, Any]] = {}
     episode_cache_bindings: dict[str, dict[str, Any]] = {}
     for group_idx, group in enumerate(cfg.stage5.groups):
         group_cfg = clone_with_overrides(cfg, _group_overrides(group))
@@ -1196,18 +1263,74 @@ def run(cfg) -> Path:
         if isinstance(bundle_lineage, dict):
             accvp_group_bindings[str(group.name)] = dict(bundle_lineage)
             group_reports[group.name]["accvp_bundle_lineage"] = dict(bundle_lineage)
+        method_effect_contract = {
+            key: observation_contract.get(key)
+            for key in (
+                "observation_contract_hash",
+                "candidate_table_semantic_contract_sha256",
+                "closed_loop_execution_contract",
+                "closed_loop_execution_contract_sha256",
+                "deployment_runtime_contract_sha256",
+            )
+            if observation_contract.get(key) is not None
+            and observation_contract.get(key) != ""
+        }
+        if method_effect_contract:
+            accvp_method_effect_contracts[str(group.name)] = method_effect_contract
+            group_reports[group.name]["accvp_method_effect_contract"] = dict(
+                method_effect_contract
+            )
         if bool(group_cfg.accvp.get("observation", {}).get("enabled", False)):
-            runtime_gate = _accvp_observation_runtime_gate(dict(group_reports[group.name].get("metrics", {}) or {}))
-            group_reports[group.name]["accvp_observation_preflight_pass"] = bool(runtime_gate.get("pass", False))
-            group_reports[group.name]["accvp_observation_runtime_gate"] = runtime_gate
-            group_reports[group.name]["accvp_table_runtime_gate_pass"] = bool(runtime_gate.get("pass", False))
-            if bool(cfg.stage5.get("require_accvp_observation_runtime_gate", False)) and not bool(
-                runtime_gate.get("pass", False)
-            ):
-                raise RuntimeError(
-                    f"Stage5 group '{group.name}' failed ACCVP observation runtime gate: "
-                    f"{runtime_gate.get('checks', {})}"
-                )
+            metrics = dict(group_reports[group.name].get("metrics", {}) or {})
+            execution_name = str(
+                dict(
+                    observation_contract.get("closed_loop_execution_contract", {})
+                    or {}
+                ).get("execution_contract", "")
+            )
+            if execution_name == SIMULATION_BLOCKING_EXACT_CONTRACT:
+                method_gate = {
+                    "profile": "simulation_blocking_exact_method_effect_v1",
+                    "pass": bool(
+                        metrics.get(
+                            "accvp_table_method_effect_observation_gate_pass",
+                            False,
+                        )
+                    ),
+                    "checks": {
+                        "content_failures_zero": bool(
+                            metrics.get(
+                                "accvp_table_method_effect_observation_gate_pass",
+                                False,
+                            )
+                        ),
+                        "deadline_exceedance_does_not_change_observation": True,
+                    },
+                }
+                group_reports[group.name][
+                    "accvp_method_effect_observation_gate"
+                ] = method_gate
+                group_reports[group.name][
+                    "accvp_table_method_effect_observation_gate_pass"
+                ] = bool(method_gate["pass"])
+                group_reports[group.name]["accvp_table_runtime_gate_pass"] = False
+                if not bool(method_gate["pass"]):
+                    raise RuntimeError(
+                        f"Stage5 group '{group.name}' failed blocking-exact observation "
+                        f"integrity gate: {method_gate.get('checks', {})}"
+                    )
+            else:
+                runtime_gate = _accvp_observation_runtime_gate(metrics)
+                group_reports[group.name]["accvp_observation_preflight_pass"] = bool(runtime_gate.get("pass", False))
+                group_reports[group.name]["accvp_observation_runtime_gate"] = runtime_gate
+                group_reports[group.name]["accvp_table_runtime_gate_pass"] = bool(runtime_gate.get("pass", False))
+                if bool(cfg.stage5.get("require_accvp_observation_runtime_gate", False)) and not bool(
+                    runtime_gate.get("pass", False)
+                ):
+                    raise RuntimeError(
+                        f"Stage5 group '{group.name}' failed ACCVP observation runtime gate: "
+                        f"{runtime_gate.get('checks', {})}"
+                    )
         if bool(group.forecast_features):
             group_reports[group.name]["forecast_source"] = str(
                 group.get("forecast_source", group_cfg.forecast_features.get("source", ""))
@@ -1236,6 +1359,10 @@ def run(cfg) -> Path:
     evidence_lineage["accvp_group_bindings"] = {
         name: accvp_group_bindings[name]
         for name in sorted(accvp_group_bindings)
+    }
+    evidence_lineage["accvp_method_effect_contracts"] = {
+        name: accvp_method_effect_contracts[name]
+        for name in sorted(accvp_method_effect_contracts)
     }
     evidence_lineage["stage5_episode_caches"] = {
         name: episode_cache_bindings[name]

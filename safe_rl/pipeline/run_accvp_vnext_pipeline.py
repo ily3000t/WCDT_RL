@@ -310,7 +310,17 @@ def _factorial_runtime_ok(
         return False
     return (
         str(payload.get("artifact_kind", "")) == FACTORIAL_RUNTIME_REPORT_KIND
-        and bool(dict(payload.get("gate", {}) or {}).get("pass", False))
+        and str(payload.get("status", "")) == "complete"
+        and bool(
+            dict(payload.get("gate", {}) or {})
+            .get("checks", {})
+            .get("complete_four_method_set", False)
+        )
+        and bool(
+            dict(payload.get("gate", {}) or {})
+            .get("checks", {})
+            .get("final_method_binding", False)
+        )
     )
 
 

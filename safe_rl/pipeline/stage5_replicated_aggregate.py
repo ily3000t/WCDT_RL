@@ -12,6 +12,10 @@ from safe_rl.accvp.contracts.artifacts import (
     ACCVP_BUNDLE_SCHEMA_VERSION,
     resolve_v2_bundle,
 )
+from safe_rl.accvp.contracts.runtime_contract import (
+    SIMULATION_BLOCKING_EXACT_CONTRACT,
+    candidate_table_semantic_contract_sha256,
+)
 from safe_rl.analysis.paired_statistics import (
     DEFAULT_BINARY_METRICS,
     DEFAULT_CONTINUOUS_METRICS,
@@ -134,6 +138,29 @@ def _formal_candidate_binding(
             "formal runtime contract SHA-256 does not match candidate bundle: "
             f"request={requested_contract_sha256} bundle={bundle_contract_sha256}"
         )
+    requested_deployment_contract_sha256 = _explicit_sha256(
+        request.get("deployment_runtime_contract_sha256"),
+        field="deployment_runtime_contract_sha256",
+    )
+    if requested_deployment_contract_sha256 != bundle_contract_sha256:
+        raise ValueError(
+            "deployment runtime contract SHA-256 does not match candidate bundle"
+        )
+    requested_semantic_contract_sha256 = _explicit_sha256(
+        request.get("candidate_table_semantic_contract_sha256"),
+        field="candidate_table_semantic_contract_sha256",
+    )
+    bundle_semantic_contract_sha256 = candidate_table_semantic_contract_sha256(
+        dict(bundle.get("formal_runtime_contract", {}) or {})
+    )
+    if requested_semantic_contract_sha256 != bundle_semantic_contract_sha256:
+        raise ValueError(
+            "Candidate Table semantic contract SHA-256 does not match candidate bundle"
+        )
+    requested_execution_contract_sha256 = _explicit_sha256(
+        request.get("closed_loop_execution_contract_sha256"),
+        field="closed_loop_execution_contract_sha256",
+    )
     predictor_path = resolved.get("predictor")
     if predictor_path is None:
         raise ValueError("formal candidate bundle is missing its predictor")
@@ -158,6 +185,15 @@ def _formal_candidate_binding(
         "candidate_side": candidate_side,
         "source_acceptance_key": acceptance_key,
         "formal_runtime_contract_sha256": requested_contract_sha256,
+        "deployment_runtime_contract_sha256": (
+            requested_deployment_contract_sha256
+        ),
+        "candidate_table_semantic_contract_sha256": (
+            requested_semantic_contract_sha256
+        ),
+        "closed_loop_execution_contract_sha256": (
+            requested_execution_contract_sha256
+        ),
     }
 
 
@@ -243,10 +279,59 @@ def _candidate_group_bundle_binding(
             "candidate-side Stage5 group did not use the request-bound ACCVP bundle: "
             f"group={candidate_group_name!r} fields={differing}"
         )
+    method_contracts = evidence.get("accvp_method_effect_contracts", {})
+    if not isinstance(method_contracts, Mapping):
+        raise ValueError(
+            f"source Stage5 method-effect contracts are not an object: {source_path}"
+        )
+    recorded_method_contract = method_contracts.get(candidate_group_name)
+    inline_method_contract = candidate_group.get("accvp_method_effect_contract")
+    if (
+        not isinstance(recorded_method_contract, Mapping)
+        or not isinstance(inline_method_contract, Mapping)
+        or dict(recorded_method_contract) != dict(inline_method_contract)
+    ):
+        raise ValueError(
+            "candidate-side Stage5 method-effect contract is missing or inconsistent: "
+            f"group={candidate_group_name!r}"
+        )
+    execution = dict(
+        recorded_method_contract.get("closed_loop_execution_contract", {}) or {}
+    )
+    method_expected = {
+        "candidate_table_semantic_contract_sha256": str(
+            candidate_binding.get("candidate_table_semantic_contract_sha256", "")
+        ),
+        "closed_loop_execution_contract_sha256": str(
+            candidate_binding.get("closed_loop_execution_contract_sha256", "")
+        ),
+        "deployment_runtime_contract_sha256": str(
+            candidate_binding.get("deployment_runtime_contract_sha256", "")
+        ),
+    }
+    method_differing = sorted(
+        key
+        for key, value in method_expected.items()
+        if recorded_method_contract.get(key) != value
+    )
+    if method_differing:
+        raise ValueError(
+            "candidate-side Stage5 method-effect contract does not match its request: "
+            f"group={candidate_group_name!r} fields={method_differing}"
+        )
+    if (
+        str(execution.get("execution_contract", ""))
+        != SIMULATION_BLOCKING_EXACT_CONTRACT
+        or bool(execution.get("deadline_exceedance_changes_observation", True))
+    ):
+        raise ValueError(
+            "candidate-side Stage5 did not use blocking-exact method-effect execution"
+        )
     return {
         "group": candidate_group_name,
         **expected,
         "binding_fingerprint": recorded_fingerprint,
+        **method_expected,
     }
 
 
@@ -901,6 +986,14 @@ def aggregate_manifest(manifest_path: str | Path) -> dict[str, Any]:
         "formal_runtime_contract_bound": (
             not formal_aggregation
             or bool(candidate_binding.get("formal_runtime_contract_sha256"))
+        ),
+        "candidate_semantic_contract_bound": (
+            not formal_aggregation
+            or bool(candidate_binding.get("candidate_table_semantic_contract_sha256"))
+        ),
+        "blocking_exact_execution_contract_bound": (
+            not formal_aggregation
+            or bool(candidate_binding.get("closed_loop_execution_contract_sha256"))
         ),
         "all_source_acceptance_passed": (
             not formal_aggregation

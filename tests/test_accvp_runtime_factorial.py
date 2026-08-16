@@ -236,6 +236,9 @@ def test_replicate_runtime_resume_validator_rejects_checkpoint_or_seed_drift(tmp
             "resolved_config": str(config),
             "resolved_config_sha256": file_sha256(config),
             "checkpoint_sha256": checkpoint_hash,
+            "candidate_table_semantic_contract_sha256": "a" * 64,
+            "deployment_runtime_contract_sha256": "b" * 64,
+            "closed_loop_execution_contract_sha256": "c" * 64,
         }
         rows.append(row)
         child_payload = {
@@ -248,6 +251,10 @@ def test_replicate_runtime_resume_validator_rejects_checkpoint_or_seed_drift(tmp
             "backend": "vectorized",
             "policy_model_sha256": checkpoint_hash,
             "config_file_sha256": file_sha256(config),
+            "conclusion_scope": "deployment_runtime_only",
+            "candidate_table_semantic_contract_sha256": "a" * 64,
+            "deployment_runtime_contract_sha256": "b" * 64,
+            "policy_method_effect_execution_contract_sha256": "c" * 64,
             "workload": {
                 "requested_episode_seed_count": len(SIMULATOR_SEEDS),
                 "requested_episode_seed_sha256": expected_seed_hash,
@@ -289,6 +296,10 @@ def test_replicate_runtime_resume_validator_rejects_checkpoint_or_seed_drift(tmp
         "replicate_manifest_sha256": file_sha256(manifest_path),
         "simulator_seeds": SIMULATOR_SEEDS,
         "checkpoint_sha256s": [row["checkpoint_sha256"] for row in rows],
+        "conclusion_scope": "deployment_runtime_only",
+        "candidate_table_semantic_contract_sha256": "a" * 64,
+        "deployment_runtime_contract_sha256": "b" * 64,
+        "policy_method_effect_execution_contract_sha256": "c" * 64,
         "replicates": lineage,
         "gate": {"pass": True},
     }

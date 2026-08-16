@@ -11,7 +11,10 @@ from safe_rl.accvp.serving.observation import RiskGatedACCVPCandidateTableAugmen
 from safe_rl.accvp.evaluation.risk_secondary import combine_audit_reports
 from safe_rl.accvp.serving.predictor import ACCVPRuntimePredictor
 from safe_rl.accvp.contracts.runtime_contract import (
+    SIMULATION_BLOCKING_EXACT_CONTRACT,
+    candidate_table_semantic_contract_sha256,
     canonical_formal_runtime_contract,
+    closed_loop_execution_contract_sha256,
     formal_runtime_contract_sha256,
 )
 from safe_rl.accvp.contracts.schema import file_sha256, stable_hash
@@ -317,6 +320,20 @@ def test_vnext_promotion_requires_bound_runtime_and_formal_five_seed_stage5(tmp_
         risk_module_config_sha256="3" * 64,
     )
     runtime_contract_sha = formal_runtime_contract_sha256(runtime_contract)
+    semantic_contract_sha = candidate_table_semantic_contract_sha256(
+        runtime_contract
+    )
+    method_effect_execution_sha = closed_loop_execution_contract_sha256(
+        {
+            "execution_contract": SIMULATION_BLOCKING_EXACT_CONTRACT,
+            "deployment_deadline_s": 0.5,
+            "profile_latency": True,
+            "use_inference_worker": False,
+            "invalid_table_strategy": "fail_closed_v1",
+            "fail_closed_defaults": True,
+            "invalid_table_dropout_rate": 0.0,
+        }
+    )
     manifest = {
         "artifact_kind": "accvp_artifact_bundle",
         "artifact_variant": "viability_lite_task_v1",
@@ -324,6 +341,11 @@ def test_vnext_promotion_requires_bound_runtime_and_formal_five_seed_stage5(tmp_
         "evidence_protocol_id": "protocol-vnext",
         "formal_runtime_contract": runtime_contract,
         "formal_runtime_contract_sha256": runtime_contract_sha,
+        "deployment_runtime_contract_sha256": runtime_contract_sha,
+        "candidate_table_semantic_contract_sha256": semantic_contract_sha,
+        "policy_method_effect_execution_contract_sha256": (
+            method_effect_execution_sha
+        ),
     }
     manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
     runtime = {
@@ -339,6 +361,11 @@ def test_vnext_promotion_requires_bound_runtime_and_formal_five_seed_stage5(tmp_
         },
         "formal_runtime_contract": runtime_contract,
         "formal_runtime_contract_sha256": runtime_contract_sha,
+        "deployment_runtime_contract_sha256": runtime_contract_sha,
+        "candidate_table_semantic_contract_sha256": semantic_contract_sha,
+        "policy_method_effect_execution_contract_sha256": (
+            method_effect_execution_sha
+        ),
         "metrics": {
             "accvp_table_unique_episode_seed_count": 30,
             "accvp_table_activation_window_decision_count": 1000,
@@ -388,6 +415,9 @@ def test_vnext_promotion_requires_bound_runtime_and_formal_five_seed_stage5(tmp_
         "candidate_side": "left",
         "source_acceptance_key": "candidate_vs_baseline",
         "formal_runtime_contract_sha256": runtime_contract_sha,
+        "deployment_runtime_contract_sha256": runtime_contract_sha,
+        "candidate_table_semantic_contract_sha256": semantic_contract_sha,
+        "closed_loop_execution_contract_sha256": method_effect_execution_sha,
         "candidate_checkpoint_records": candidate_checkpoint_records,
         "candidate_checkpoint_matrix_sha256": stable_hash(
             candidate_checkpoint_records
@@ -408,6 +438,8 @@ def test_vnext_promotion_requires_bound_runtime_and_formal_five_seed_stage5(tmp_
                 "candidate_bundle_binding_satisfied": True,
                 "candidate_side_bound": True,
                 "formal_runtime_contract_bound": True,
+                "candidate_semantic_contract_bound": True,
+                "blocking_exact_execution_contract_bound": True,
                 "all_source_acceptance_passed": True,
                 "preregistered_metric_output_nonempty": True,
                 "balanced_crossed_statistics": True,
@@ -531,19 +563,21 @@ def test_vnext_promotion_requires_bound_runtime_and_formal_five_seed_stage5(tmp_
         )
     stage5_path.write_text(json.dumps(stage5), encoding="utf-8")
 
-    runtime["gate"] = {"pass": False}
+    runtime["gate"]["pass"] = False
     runtime["report_fingerprint"] = stable_hash(
         {key: value for key, value in runtime.items() if key != "report_fingerprint"}
     )
     runtime_path.write_text(json.dumps(runtime), encoding="utf-8")
-    with pytest.raises(EvidenceProtocolError, match="gate did not pass"):
-        _validate_vnext_promotion_evidence(
-            manifest=manifest,
-            manifest_path=manifest_path,
-            runtime_benchmark_path=runtime_path,
-            stage5_replicated_report_path=stage5_path,
-            final_runtime_contract=runtime_contract,
-        )
+    failed_runtime_evidence = _validate_vnext_promotion_evidence(
+        manifest=manifest,
+        manifest_path=manifest_path,
+        runtime_benchmark_path=runtime_path,
+        stage5_replicated_report_path=stage5_path,
+        final_runtime_contract=runtime_contract,
+    )
+    assert failed_runtime_evidence["runtime_benchmark"][
+        "deployment_runtime_gate_pass"
+    ] is False
 
 
 def test_risk_secondary_combiner_never_selects_test_profile():

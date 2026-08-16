@@ -10,6 +10,9 @@ from safe_rl.accvp.serving.observation import (
     RiskGatedACCVPCandidateTableAugmentor,
     validate_accvp_observation_config,
 )
+from safe_rl.accvp.contracts.runtime_contract import (
+    SIMULATION_BLOCKING_EXACT_CONTRACT,
+)
 from safe_rl.accvp.serving.predictor import (
     ACCVPCriticalActorOverflow,
     validate_runtime_actor_rows,
@@ -178,6 +181,52 @@ def test_v3_feature_contract_is_107d_and_validates():
     names = RiskGatedACCVPCandidateTableAugmentor.feature_names(cfg)
     assert len(names) == 107
     assert names[-4:] == list(RiskGatedACCVPCandidateTableAugmentor.FRESHNESS_FEATURE_NAMES)
+
+
+def test_blocking_exact_profiles_deadline_without_replacing_completed_table():
+    blocking_cfg = clone_with_overrides(
+        _config(),
+        {
+            "accvp": {
+                "observation": {
+                    "execution_contract": SIMULATION_BLOCKING_EXACT_CONTRACT,
+                    "deployment_deadline_s": 1.0e-12,
+                    "invalid_table_strategy": "fail_closed_v1",
+                    "use_inference_worker": False,
+                    "profile_latency": True,
+                    "invalid_table_dropout_rate": 0.0,
+                }
+            }
+        },
+    )
+    soft_cfg = clone_with_overrides(
+        _config(),
+        {"accvp": {"observation": {"deployment_deadline_s": 1.0e-12}}},
+    )
+    blocking = RiskGatedACCVPCandidateTableAugmentor(
+        blocking_cfg,
+        predictor=_FlakyPredictor(),
+        shield=_AlwaysSafeShield(),
+    )
+    soft = RiskGatedACCVPCandidateTableAugmentor(
+        soft_cfg,
+        predictor=_FlakyPredictor(),
+        shield=_AlwaysSafeShield(),
+    )
+
+    blocking_table = blocking.extract(_context(0))
+    soft_table = soft.extract(_context(0))
+    blocking_summary = blocking.summary()
+    soft_summary = soft.summary()
+
+    assert np.all(_table(blocking_table)[:, 0] == 1.0)
+    assert np.all(_table(soft_table)[:, 0] == 0.0)
+    assert blocking_summary["accvp_table_deadline_exceedance_count"] == 1
+    assert blocking_summary["accvp_table_timeout_count"] == 0
+    assert blocking_summary["accvp_table_method_effect_observation_gate_pass"] is True
+    assert blocking_summary["accvp_table_runtime_gate_pass"] is False
+    assert soft_summary["accvp_table_deadline_exceedance_count"] == 1
+    assert soft_summary["accvp_table_timeout_count"] == 1
 
 
 def test_v3_environment_contract_derives_total_159d_without_hardcoded_overlay_dim():

@@ -85,7 +85,7 @@ python -m safe_rl.pipeline.run_accvp_vnext_pipeline --run-until scorer_runtime_p
 # 训练四个 Candidate factorial 方法，每个方法五个 optimizer seeds（共20个）
 python -m safe_rl.pipeline.run_accvp_vnext_pipeline --run-until candidate_ppo_replicates
 
-# 完成 WcDT baseline 与四个 Candidate 方法的 policy runtime gates
+# 完成四个 Candidate 方法的独立 deployment-runtime 覆盖（gate 可独立失败）
 python -m safe_rl.pipeline.run_accvp_vnext_pipeline --run-until policy_runtime_replicates
 
 # 生成、执行并聚合六个预注册 Stage5 比较
@@ -120,13 +120,20 @@ python -m safe_rl.pipeline.run_accvp_vnext_pipeline --run-until stage5_replicate
 | 11 | `formal_validation` | 在训练前强制检查 rejected/overflow/task coverage/Risk coverage、mapping/fingerprint、protected coverage、branch success 与无泄漏 split；`formal_state=pass`。|
 | 12 | `accvp_training` | 训练三成员 ensemble，在独立 split 上 calibration 与 operating-point selection，生成 sealed candidate bundle。|
 | 13 | `scorer_runtime_preflight` | 使用 rule policy 访问真实 SUMO state，只测 ACCVP/Risk Candidate Table；正式 runtime 使用未观察过的 56001–56060，且旧 implementation 的失败报告只归档、不复用 episodes。容量 12 延迟失败时不得回退容量 10。|
-| 14 | `candidate_ppo_replicates` | 冻结 factorial plan，顺序训练四个 Candidate 方法 × 五个 optimizer seeds，共 20 个唯一 checkpoints。|
+| 14 | `candidate_ppo_replicates` | 冻结 factorial plan，在 `simulation_blocking_exact_v1` 下顺序训练四个 Candidate 方法 × 五个 optimizer seeds，共 20 个唯一 checkpoints；计算超过 0.5s 只计入 profiling，不替换已完成的 observation。|
 | 15 | `baseline_ppo_replicates` | 复用已有五副本 WcDT manifest；不完整或有冲突时 fail closed，不覆盖现有目录。|
 | 16 | `baseline_lineage_audit` | 独立核验五个 WcDT checkpoint/config/report hash、Reward/observation/预算和 optimizer seed；只有 `status=reusable` 才放行。|
-| 17 | `policy_runtime_replicates` | 对四个 Candidate 方法的 20 个 PPO checkpoints 分别执行完整 policy runtime benchmark，总 gate 取所有方法最差结果。|
+| 17 | `policy_runtime_replicates` | 对四个 Candidate 方法的 20 个 PPO checkpoints 在冻结的 `soft_realtime_post_return_v1` 下执行独立 deployment runtime benchmark。阶段以完整覆盖为完成条件；总 runtime gate 仍取最差结果，但失败不再否定方法效果或阻止 Stage5。|
 | 18 | `stage5_generate` | 生成六个冻结比较及每个 training seed 的 paired 配置。|
-| 19 | `stage5_replicates_and_aggregate` | 可恢复地运行六组 Stage5 并进行 replicated aggregation。|
-| 20 | `one_shot_final_holdout` | 只绑定最终方法与主要 comparison；在全部冻结后显式打开一次。|
+| 19 | `stage5_replicates_and_aggregate` | 在 `simulation_blocking_exact_v1` 下可恢复地运行六组 Stage5 并进行 replicated aggregation；NaN、非法 bundle、模型异常和 critical overflow 仍 fail closed。|
+| 20 | `one_shot_final_holdout` | 只绑定最终方法与主要 comparison；在全部冻结后显式打开一次，并分别给出离线预测、闭环方法效果、deployment runtime 与组合部署决策。|
+
+### ACCVP 分层评估契约
+
+- 离线预测评估回答模型的 ADE/FDE、事件判别、viability calibration 和 action ranking 是否正确。
+- PPO 训练、checkpoint selection 与 Stage5 使用阻塞式同步闭环。SUMO 等待完整 Candidate Table；wall-clock 超过 0.5s 会被记录，但不会把正确结果替换为 stale/fail-closed。
+- deployment runtime 单独恢复 bundle 中冻结的软实时契约，报告 p50/p95/p99/max、timeout、fresh-valid、bounded-stale、hard fail-closed 与 overflow。
+- 两条结论相互独立：闭环方法效果通过不代表当前机器满足 0.5s 部署门槛；部署门槛失败也不再改变 PPO observation 或否定方法效果。
 
 当 `accvp_training` 已完成且状态显示 `next_phase=scorer_runtime_preflight` 时，下一步可以二选一：
 

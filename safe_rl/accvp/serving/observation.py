@@ -15,6 +15,13 @@ from typing import Any
 import numpy as np
 
 from safe_rl.accvp.contracts.protocol import effective_activation_distance
+from safe_rl.accvp.contracts.runtime_contract import (
+    SIMULATION_BLOCKING_EXACT_CONTRACT,
+    SOFT_REALTIME_POST_RETURN_CONTRACT,
+    closed_loop_execution_contract,
+    closed_loop_execution_contract_sha256,
+    observation_execution_contract,
+)
 from safe_rl.accvp.serving.predictor import (
     ACCVPCriticalActorOverflow,
     ACCVPRuntimeContextError,
@@ -76,6 +83,7 @@ class ACCVPObservationStats:
     valid_decisions: int = 0
     activation_window_valid_decisions: int = 0
     timeout_count: int = 0
+    deadline_exceedance_count: int = 0
     model_error_count: int = 0
     invalid_bundle_count: int = 0
     invalid_output_count: int = 0
@@ -165,6 +173,9 @@ class ACCVPObservationStats:
                 else 0.0
             ),
             "accvp_table_timeout_count": int(self.timeout_count),
+            "accvp_table_deadline_exceedance_count": int(
+                self.deadline_exceedance_count
+            ),
             "accvp_table_model_error_count": int(self.model_error_count),
             "accvp_table_invalid_bundle_count": int(self.invalid_bundle_count),
             "accvp_table_invalid_output_count": int(self.invalid_output_count),
@@ -207,6 +218,11 @@ class ACCVPObservationStats:
             "accvp_table_max_consecutive_timeout_count": int(self.max_consecutive_timeout_count),
             "accvp_table_timeout_rate": (
                 float(self.timeout_count / self.total_decisions) if self.total_decisions else 0.0
+            ),
+            "accvp_table_deadline_exceedance_rate": (
+                float(self.deadline_exceedance_count / self.total_decisions)
+                if self.total_decisions
+                else 0.0
             ),
             "accvp_table_timeout_rate_activation_window": (
                 float(self.timeout_count / self.activation_window_decisions)
@@ -363,7 +379,17 @@ class RiskGatedACCVPCandidateTableAugmentor:
                 f"or {self.BOUNDED_STALE_FEATURE_VERSION!r}"
             )
         self.feature_version = feature_version
-        self.timeout_s = float(obs_cfg.get("timeout_s", config.accvp.get("max_decision_latency_s", 0.5)))
+        self.execution_contract = observation_execution_contract(obs_cfg)
+        self.deployment_deadline_s = float(
+            obs_cfg.get(
+                "deployment_deadline_s",
+                obs_cfg.get(
+                    "timeout_s", config.accvp.get("max_decision_latency_s", 0.5)
+                ),
+            )
+        )
+        # Keep the legacy attribute for predictor-worker calls and older tests.
+        self.timeout_s = self.deployment_deadline_s
         self.use_inference_worker = bool(obs_cfg.get("use_inference_worker", False))
         self.profile_latency = bool(obs_cfg.get("profile_latency", True))
         self.fail_closed_defaults = bool(obs_cfg.get("fail_closed_defaults", True))
@@ -515,6 +541,15 @@ class RiskGatedACCVPCandidateTableAugmentor:
                 "accvp_observation_activation_distance_m": float(self.activation_distance),
                 "accvp_observation_use_inference_worker": bool(self.use_inference_worker),
                 "accvp_observation_profile_latency": bool(self.profile_latency),
+                "accvp_observation_execution_contract": str(
+                    self.execution_contract
+                ),
+                "accvp_observation_deployment_deadline_s": float(
+                    self.deployment_deadline_s
+                ),
+                "accvp_observation_deadline_exceedance_changes_observation": bool(
+                    self.execution_contract == SOFT_REALTIME_POST_RETURN_CONTRACT
+                ),
                 "accvp_observation_invalid_table_strategy": str(self.invalid_table_strategy),
                 "accvp_observation_invalid_table_dropout_rate": float(self.invalid_table_dropout_rate),
                 "accvp_observation_warmup_enabled": bool(self.warmup_enabled),
@@ -532,11 +567,51 @@ class RiskGatedACCVPCandidateTableAugmentor:
                 "accvp_observation_risk_checkpoint": str(self.config.accvp.get("risk_checkpoint", "")),
             }
         )
-        payload["accvp_table_runtime_gate_profile"] = "bounded_stale_runtime_v3_strict"
-        payload["accvp_table_runtime_gate_pass"] = bool(
-            payload.get("accvp_table_runtime_gate_pass", False)
-            and (not self.warmup_enabled or self._warmup_state == "ready")
+        execution = closed_loop_execution_contract(
+            dict(self.config.accvp.get("observation", {}) or {})
         )
+        payload["closed_loop_execution_contract"] = execution
+        payload["closed_loop_execution_contract_sha256"] = (
+            closed_loop_execution_contract_sha256(
+                dict(self.config.accvp.get("observation", {}) or {})
+            )
+        )
+        if self.execution_contract == SIMULATION_BLOCKING_EXACT_CONTRACT:
+            payload["accvp_table_runtime_gate_profile"] = (
+                "simulation_blocking_exact_method_effect_v1"
+            )
+            payload["accvp_table_deployment_runtime_gate_pass"] = False
+            payload["accvp_table_method_effect_observation_gate_pass"] = bool(
+                int(payload.get("accvp_table_model_error_count", 0)) == 0
+                and int(payload.get("accvp_table_invalid_bundle_count", 0)) == 0
+                and int(payload.get("accvp_table_invalid_output_count", 0)) == 0
+                and int(payload.get("accvp_table_runtime_context_error_count", 0)) == 0
+                and int(payload.get("accvp_table_critical_actor_overflow_count", 0)) == 0
+                and int(
+                    payload.get(
+                        "accvp_table_risk_safety_actor_coverage_incomplete_count", 0
+                    )
+                )
+                == 0
+                and int(payload.get("accvp_table_unexpected_value_error_count", 0))
+                == 0
+                and int(payload.get("accvp_table_warmup_error_count", 0)) == 0
+                and (not self.warmup_enabled or self._warmup_state == "ready")
+            )
+            # This legacy field is deployment-only; never present a blocking
+            # method-effect run as evidence that a wall-clock deadline passed.
+            payload["accvp_table_runtime_gate_pass"] = False
+        else:
+            payload["accvp_table_runtime_gate_profile"] = (
+                "bounded_stale_runtime_v3_strict"
+            )
+            payload["accvp_table_runtime_gate_pass"] = bool(
+                payload.get("accvp_table_runtime_gate_pass", False)
+                and (not self.warmup_enabled or self._warmup_state == "ready")
+            )
+            payload["accvp_table_deployment_runtime_gate_pass"] = bool(
+                payload["accvp_table_runtime_gate_pass"]
+            )
         for key, path in (
             ("accvp_artifact_manifest_sha256", self.config.accvp.get("artifact_manifest")),
             ("risk_checkpoint_sha256", self.config.accvp.get("risk_checkpoint")),
@@ -707,9 +782,11 @@ class RiskGatedACCVPCandidateTableAugmentor:
             stage_latencies["table_pack"] = time.perf_counter() - pack_started
             elapsed = time.perf_counter() - started
             self._record_latency(elapsed, stage_latencies)
-            if elapsed > self.timeout_s:
-                self._record_timeout()
-                return self._invalid_table_rows(context, base)
+            if elapsed > self.deployment_deadline_s:
+                self.stats.deadline_exceedance_count += 1
+                if self.execution_contract == SOFT_REALTIME_POST_RETURN_CONTRACT:
+                    self._record_timeout()
+                    return self._invalid_table_rows(context, base)
             self.stats.valid_decisions += 1
             self.stats.activation_window_valid_decisions += 1
             self.stats.consecutive_timeout_count = 0
@@ -1380,6 +1457,12 @@ def validate_accvp_observation_config(config: Any) -> None:
     }:
         raise ValueError("unsupported ACCVP observation feature_version")
     feature_version = str(obs_cfg.get("feature_version", RISK_GATED_ACCVP_OBSERVATION_VERSION))
+    execution_contract = observation_execution_contract(obs_cfg)
+    if execution_contract not in {
+        SOFT_REALTIME_POST_RETURN_CONTRACT,
+        SIMULATION_BLOCKING_EXACT_CONTRACT,
+    }:
+        raise ValueError("unsupported ACCVP observation execution_contract")
     default_strategy = (
         "bounded_last_valid_v2"
         if feature_version == RISK_GATED_ACCVP_OBSERVATION_BOUNDED_STALE_VERSION
@@ -1392,14 +1475,24 @@ def validate_accvp_observation_config(config: Any) -> None:
         "bounded_last_valid_v2",
     }:
         raise ValueError("unsupported ACCVP observation invalid_table_strategy")
-    if (
-        feature_version == RISK_GATED_ACCVP_OBSERVATION_BOUNDED_STALE_VERSION
-        and invalid_strategy != "bounded_last_valid_v2"
-    ):
-        raise ValueError("bounded-stale observation requires bounded_last_valid_v2")
-    if (
-        invalid_strategy == "bounded_last_valid_v2"
-        and feature_version != RISK_GATED_ACCVP_OBSERVATION_BOUNDED_STALE_VERSION
+    if feature_version == RISK_GATED_ACCVP_OBSERVATION_BOUNDED_STALE_VERSION:
+        expected_strategy = (
+            "fail_closed_v1"
+            if execution_contract == SIMULATION_BLOCKING_EXACT_CONTRACT
+            else "bounded_last_valid_v2"
+        )
+        if invalid_strategy != expected_strategy:
+            if execution_contract == SOFT_REALTIME_POST_RETURN_CONTRACT:
+                raise ValueError(
+                    "bounded-stale observation requires bounded_last_valid_v2"
+                )
+            raise ValueError(
+                "bounded-stale feature schema has an invalid strategy for its "
+                f"execution contract; expected {expected_strategy}"
+            )
+    if invalid_strategy == "bounded_last_valid_v2" and (
+        feature_version != RISK_GATED_ACCVP_OBSERVATION_BOUNDED_STALE_VERSION
+        or execution_contract == SIMULATION_BLOCKING_EXACT_CONTRACT
     ):
         raise ValueError("bounded_last_valid_v2 requires the bounded-stale feature contract")
     last_valid_ttl_s = float(obs_cfg.get("last_valid_ttl_s", 0.5))
@@ -1425,6 +1518,14 @@ def validate_accvp_observation_config(config: Any) -> None:
                 raise ValueError(
                     f"accvp.observation.{key} must be in [0, {upper_bound}] for bounded stale"
                 )
+    # Validate the canonical execution payload after the feature/strategy
+    # compatibility checks above so configuration errors remain actionable.
+    execution_payload = dict(obs_cfg)
+    execution_payload.setdefault(
+        "deployment_deadline_s",
+        float(config.accvp.get("max_decision_latency_s", 0.5)),
+    )
+    closed_loop_execution_contract(execution_payload)
     dropout_rate = float(obs_cfg.get("invalid_table_dropout_rate", 0.0) or 0.0)
     if not 0.0 <= dropout_rate <= 1.0:
         raise ValueError("unsupported ACCVP observation invalid_table_dropout_rate")

@@ -13,7 +13,10 @@ import numpy as np
 from safe_rl.accvp.contracts.artifacts import apply_v2_bundle_paths
 from safe_rl.accvp.serving.observation import RiskGatedACCVPCandidateTableAugmentor
 from safe_rl.accvp.contracts.runtime_contract import (
+    candidate_table_semantic_contract,
+    closed_loop_execution_contract,
     compare_formal_runtime_contracts,
+    deployment_observation_from_formal_runtime_contract,
     formal_runtime_contract_from_config,
     validate_manifest_runtime_contract,
 )
@@ -32,7 +35,7 @@ from safe_rl.utils.config import REPO_ROOT, load_config
 
 
 RUNTIME_IMPLEMENTATION_VERSION = (
-    "accvp_runtime_conflict_selector_array_geometry_v7"
+    "accvp_runtime_layered_contract_array_geometry_v8"
 )
 
 
@@ -221,12 +224,24 @@ def run(
             f"{scope} requires at least {minimum_seed_count} distinct episode seeds"
         )
     cfg = load_config(config_path)
+    requested_observation = dict(cfg.accvp.get("observation", {}) or {})
+    requested_execution_contract = closed_loop_execution_contract(
+        requested_observation
+    )
     output_path = _resolve(output)
     bundle_manifest, _bundle_files = apply_v2_bundle_paths(cfg)
     if bundle_manifest is None:
         raise ValueError("formal runtime benchmark requires a bundle-v2 manifest")
     expected_runtime_contract, expected_runtime_contract_sha = (
         validate_manifest_runtime_contract(bundle_manifest)
+    )
+    # A Candidate PPO may be trained/evaluated under blocking-exact semantics.
+    # Deployment runtime must instead execute the immutable soft-realtime
+    # contract carried by the predictor bundle.  This overlay is local to this
+    # benchmark and never rewrites the generated PPO config.
+    cfg.accvp["observation"] = deployment_observation_from_formal_runtime_contract(
+        expected_runtime_contract,
+        current_observation=requested_observation,
     )
     if not RiskGatedACCVPCandidateTableAugmentor.enabled(cfg):
         raise ValueError("runtime benchmark requires accvp.observation.enabled=true")
@@ -411,6 +426,7 @@ def run(
         "schema_version": 2,
         "evidence_role": "diagnostic_only" if diagnostic_smoke else "formal_gate",
         "hard_realtime_claim": False,
+        "conclusion_scope": "deployment_runtime_only",
         "runtime_implementation_version": RUNTIME_IMPLEMENTATION_VERSION,
         "benchmark_scope": benchmark_scope,
         "policy_type": policy_type,
@@ -428,6 +444,24 @@ def run(
             runtime_contract_check.get("actual_sha256", "")
         ),
         "formal_runtime_contract_check": runtime_contract_check,
+        "deployment_runtime_contract": runtime_contract,
+        "deployment_runtime_contract_sha256": str(
+            runtime_contract_check.get("actual_sha256", "")
+        ),
+        "candidate_table_semantic_contract": (
+            None
+            if runtime_contract is None
+            else candidate_table_semantic_contract(runtime_contract)
+        ),
+        "candidate_table_semantic_contract_sha256": (
+            ""
+            if runtime_contract is None
+            else stable_hash(candidate_table_semantic_contract(runtime_contract))
+        ),
+        "policy_method_effect_execution_contract": requested_execution_contract,
+        "policy_method_effect_execution_contract_sha256": stable_hash(
+            requested_execution_contract
+        ),
         "config": str(config_file),
         "config_file_sha256": expected_extension_identity["config_file_sha256"],
         "config_hash": stable_hash(dict(cfg)),

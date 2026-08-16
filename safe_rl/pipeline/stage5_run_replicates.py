@@ -61,6 +61,33 @@ def _validate_resume_receipt(row: dict[str, Any], report_path: Path) -> None:
 
 def _validate_runtime_preflights(raw: dict[str, Any], groups: dict[str, dict[str, Any]]) -> None:
     stage5 = dict(raw.get("stage5", {}) or {})
+    required = bool(stage5.get("require_accvp_observation_runtime_gate", False))
+    deployment_reports = dict(stage5.get("deployment_runtime_reports", {}) or {})
+    deployment_hashes = dict(
+        stage5.get("deployment_runtime_report_sha256s", {}) or {}
+    )
+    if deployment_reports or deployment_hashes:
+        if set(deployment_reports) != set(deployment_hashes):
+            raise ValueError("deployment runtime reports/hashes do not match")
+        for group_name, source in sorted(deployment_reports.items()):
+            group = groups.get(str(group_name))
+            if group is None:
+                raise ValueError(
+                    f"deployment runtime evidence refers to unknown Stage5 group: {group_name}"
+                )
+            path = _resolve(source)
+            if file_sha256(path) != str(deployment_hashes[group_name]):
+                raise ValueError(
+                    f"deployment runtime report hash mismatch for Stage5 group {group_name!r}"
+                )
+            runtime = read_json(path)
+            if str(runtime.get("artifact_kind", "")) != "accvp_runtime_benchmark_v1":
+                raise ValueError(f"invalid deployment runtime evidence: {path}")
+            model_path = _resolve(group.get("model_path", ""))
+            if str(runtime.get("policy_model_sha256", "")) != file_sha256(model_path):
+                raise ValueError(
+                    f"deployment runtime checkpoint mismatch for Stage5 group {group_name!r}"
+                )
     single = stage5.get("accvp_observation_preflight_report")
     per_group = dict(stage5.get("accvp_observation_preflight_reports", {}) or {})
     per_group_hashes = dict(
@@ -68,6 +95,8 @@ def _validate_runtime_preflights(raw: dict[str, Any], groups: dict[str, dict[str
     )
     if single and per_group:
         raise ValueError("Stage5 config mixes legacy and per-group runtime preflights")
+    if not required and not single and not per_group:
+        return
     if per_group:
         if set(per_group_hashes) != set(per_group):
             raise ValueError("per-group runtime preflight reports/hashes do not match")
@@ -90,7 +119,7 @@ def _validate_runtime_preflights(raw: dict[str, Any], groups: dict[str, dict[str
                 )
         return
     if not single:
-        raise ValueError("formal Stage5 config is missing its policy runtime preflight")
+        raise ValueError("formal Stage5 config requires its policy runtime preflight")
     preflight = _resolve(single)
     runtime = read_json(preflight)
     if not bool(runtime.get("gate", {}).get("pass", False)):

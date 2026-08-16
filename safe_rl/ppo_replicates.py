@@ -9,6 +9,11 @@ from typing import Any, Mapping
 import yaml
 
 from safe_rl.accvp.contracts.artifacts import resolve_v2_bundle
+from safe_rl.accvp.contracts.runtime_contract import (
+    candidate_table_semantic_contract,
+    closed_loop_execution_contract,
+    formal_runtime_contract_sha256,
+)
 from safe_rl.accvp.serving.observation import RiskGatedACCVPCandidateTableAugmentor
 from safe_rl.evaluation_protocol import file_sha256, stable_hash
 from safe_rl.utils.config import REPO_ROOT
@@ -130,6 +135,12 @@ def observation_contract(config: Any, *, require_artifacts: bool = False) -> dic
             config.get("scenario", {}).get("vehicle_state_ordering_version", "")
         ),
     }
+    if accvp_enabled:
+        execution = closed_loop_execution_contract(
+            plain(accvp.get("observation", {}) or {})
+        )
+        payload["closed_loop_execution_contract"] = execution
+        payload["closed_loop_execution_contract_sha256"] = stable_hash(execution)
     forecast_checkpoint = _configured_file(forecast.get("checkpoint"))
     if forecast_checkpoint is not None:
         if require_artifacts and not forecast_checkpoint.is_file():
@@ -149,9 +160,22 @@ def observation_contract(config: Any, *, require_artifacts: bool = False) -> dic
             payload["accvp_artifact_manifest_sha256"] = file_sha256(path)
             payload["accvp_artifact_fingerprint"] = artifact_fingerprint
             payload["accvp_artifact_variant"] = str(bundle.get("artifact_variant", ""))
-            payload["formal_runtime_contract_sha256"] = str(
-                bundle.get("formal_runtime_contract_sha256", "")
+            deployment_contract = dict(bundle.get("formal_runtime_contract", {}) or {})
+            deployment_contract_sha = formal_runtime_contract_sha256(
+                deployment_contract
             )
+            if deployment_contract_sha != str(
+                bundle.get("formal_runtime_contract_sha256", "")
+            ):
+                raise ValueError("ACCVP bundle deployment runtime contract hash mismatch")
+            semantic_contract = candidate_table_semantic_contract(deployment_contract)
+            payload["candidate_table_semantic_contract"] = semantic_contract
+            payload["candidate_table_semantic_contract_sha256"] = stable_hash(
+                semantic_contract
+            )
+            payload["deployment_runtime_contract_sha256"] = deployment_contract_sha
+            # Backward-compatible alias retained for existing bundle consumers.
+            payload["formal_runtime_contract_sha256"] = deployment_contract_sha
     elif accvp_enabled and require_artifacts:
         raise ValueError("ACCVP replicate requires accvp.artifact_manifest")
     return {

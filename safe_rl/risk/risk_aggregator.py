@@ -79,6 +79,12 @@ def _accvp_observation_metrics(reports: list[dict]) -> dict:
         sum(int(report.get("accvp_table_activation_window_valid_decision_count", 0)) for report in reports)
     )
     timeout_count = int(sum(int(report.get("accvp_table_timeout_count", 0)) for report in reports))
+    deadline_exceedance_count = int(
+        sum(
+            int(report.get("accvp_table_deadline_exceedance_count", 0))
+            for report in reports
+        )
+    )
     fail_closed_count = int(sum(int(report.get("accvp_table_fail_closed_count", 0)) for report in reports))
     hard_fail_closed_count = int(sum(int(report.get("accvp_table_hard_fail_closed_count", 0)) for report in reports))
     last_valid_fallback_count = int(sum(int(report.get("accvp_table_last_valid_fallback_count", 0)) for report in reports))
@@ -222,6 +228,18 @@ def _accvp_observation_metrics(reports: list[dict]) -> dict:
         and risk_secondary_summary["p95"] is not None
         and float(risk_secondary_summary["p95"]) <= 0.15
     )
+    method_effect_observation_gate_pass = bool(
+        hard_fail_closed_count == 0
+        and model_error_count == 0
+        and invalid_bundle_count == 0
+        and invalid_output_count == 0
+        and runtime_context_error_count == 0
+        and critical_actor_overflow_count == 0
+        and risk_safety_actor_coverage_incomplete_count == 0
+        and unexpected_value_error_count == 0
+        and warmup_error_count == 0
+        and warmup_ready_rate >= 1.0
+    )
     return {
         "accvp_table_unique_episode_seed_count": int(len(observed_episode_seeds)),
         "accvp_table_missing_episode_seed_count": int(missing_episode_seed_count),
@@ -232,6 +250,12 @@ def _accvp_observation_metrics(reports: list[dict]) -> dict:
         "accvp_table_valid_rate_all_decisions": float(valid_count / decision_count) if decision_count else 0.0,
         "accvp_table_valid_rate_activation_window": valid_rate_activation,
         "accvp_table_timeout_count": timeout_count,
+        "accvp_table_deadline_exceedance_count": deadline_exceedance_count,
+        "accvp_table_deadline_exceedance_rate": (
+            float(deadline_exceedance_count / decision_count)
+            if decision_count
+            else 0.0
+        ),
         "accvp_table_timeout_rate": float(timeout_count / decision_count) if decision_count else 0.0,
         "accvp_table_timeout_rate_activation_window": timeout_rate_activation,
         "accvp_table_fail_closed_count": fail_closed_count,
@@ -284,6 +308,9 @@ def _accvp_observation_metrics(reports: list[dict]) -> dict:
         "accvp_table_warmup_latency_p99": warmup_latency_summary["p99"],
         "accvp_table_warmup_latency_max": warmup_latency_summary["max"],
         "accvp_table_runtime_gate_pass": runtime_gate_pass,
+        "accvp_table_method_effect_observation_gate_pass": (
+            method_effect_observation_gate_pass
+        ),
         "accvp_table_latency_per_stage": {
             name: _latency_quantiles(values) for name, values in stage_latencies.items()
         },

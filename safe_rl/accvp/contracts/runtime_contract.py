@@ -13,6 +13,10 @@ from safe_rl.utils.config import REPO_ROOT
 FORMAL_RUNTIME_CONTRACT_KIND = "accvp_formal_runtime_contract_v1"
 FORMAL_RUNTIME_CONTRACT_SCHEMA_VERSION = 1
 FORMAL_RUNTIME_FEATURE_VERSION = "risk_gated_candidate_table_v3_bounded_stale"
+CANDIDATE_TABLE_SEMANTIC_CONTRACT_KIND = "accvp_candidate_table_semantic_contract_v1"
+CLOSED_LOOP_EXECUTION_CONTRACT_KIND = "accvp_closed_loop_execution_contract_v1"
+SOFT_REALTIME_POST_RETURN_CONTRACT = "soft_realtime_post_return_v1"
+SIMULATION_BLOCKING_EXACT_CONTRACT = "simulation_blocking_exact_v1"
 _SHA256_PATTERN = re.compile(r"[0-9a-f]{64}")
 
 
@@ -110,7 +114,7 @@ def validate_formal_runtime_contract(contract: Mapping[str, Any]) -> None:
     timeout_s = float(value.get("timeout_s", 0.0))
     if timeout_s <= 0.0 or timeout_s > 0.5:
         raise ValueError("formal runtime contract timeout_s must be in (0, 0.5]")
-    if str(value.get("timeout_contract", "")) != "soft_realtime_post_return_v1":
+    if str(value.get("timeout_contract", "")) != SOFT_REALTIME_POST_RETURN_CONTRACT:
         raise ValueError("formal runtime contract timeout_contract mismatch")
     if bool(value.get("full_table_hard_deadline_worker", True)):
         raise ValueError("formal runtime contract must not claim a hard-deadline worker")
@@ -203,3 +207,164 @@ def compare_formal_runtime_contracts(
         "actual_sha256": actual_sha,
         "differing_fields": differing_fields,
     }
+
+
+def candidate_table_semantic_contract(
+    deployment_runtime_contract: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Extract CPU-independent Candidate-Table semantics from a deployment contract.
+
+    Deadline handling and bounded-stale policy are deliberately excluded.  The
+    resulting identity can therefore be shared by blocking closed-loop method
+    evaluation and a separate soft-realtime deployment benchmark.
+    """
+
+    value = dict(deployment_runtime_contract)
+    validate_formal_runtime_contract(value)
+    contract = {
+        "artifact_kind": CANDIDATE_TABLE_SEMANTIC_CONTRACT_KIND,
+        "schema_version": 1,
+        "candidate_geometry_backend": str(value["candidate_geometry_backend"]),
+        "observation_enabled": bool(value["observation_enabled"]),
+        "feature_version": str(value["feature_version"]),
+        "activation_distance_m": float(value["activation_distance_m"]),
+        "include_risk_secondary": bool(value["include_risk_secondary"]),
+        "secondary_safety_profile": str(value["secondary_safety_profile"]),
+        "risk_horizon_steps": int(value["risk_horizon_steps"]),
+        "fail_closed_defaults": bool(value["fail_closed_defaults"]),
+        "risk_checkpoint_sha256": str(value["risk_checkpoint_sha256"]),
+        "risk_module_config_sha256": str(value["risk_module_config_sha256"]),
+    }
+    return contract
+
+
+def candidate_table_semantic_contract_sha256(
+    deployment_runtime_contract: Mapping[str, Any],
+) -> str:
+    return stable_hash(candidate_table_semantic_contract(deployment_runtime_contract))
+
+
+def observation_execution_contract(observation: Mapping[str, Any]) -> str:
+    """Return the effective closed-loop execution contract with legacy fallback."""
+
+    value = dict(observation)
+    return str(
+        value.get("execution_contract")
+        or value.get("timeout_contract")
+        or SOFT_REALTIME_POST_RETURN_CONTRACT
+    )
+
+
+def closed_loop_execution_contract(observation: Mapping[str, Any]) -> dict[str, Any]:
+    """Build the wall-clock/observation contract used by PPO and Stage5."""
+
+    value = dict(observation)
+    execution = observation_execution_contract(value)
+    if execution not in {
+        SOFT_REALTIME_POST_RETURN_CONTRACT,
+        SIMULATION_BLOCKING_EXACT_CONTRACT,
+    }:
+        raise ValueError(f"unsupported ACCVP execution_contract={execution!r}")
+    deadline_s = float(
+        value.get("deployment_deadline_s", value.get("timeout_s", 0.0)) or 0.0
+    )
+    if deadline_s <= 0.0:
+        raise ValueError("ACCVP execution contract requires a positive deployment deadline")
+    contract = {
+        "artifact_kind": CLOSED_LOOP_EXECUTION_CONTRACT_KIND,
+        "schema_version": 1,
+        "execution_contract": execution,
+        "deployment_deadline_s": deadline_s,
+        "deadline_exceedance_changes_observation": (
+            execution == SOFT_REALTIME_POST_RETURN_CONTRACT
+        ),
+        "profile_latency": bool(value.get("profile_latency", False)),
+        "use_inference_worker": bool(value.get("use_inference_worker", False)),
+        "invalid_table_strategy": str(value.get("invalid_table_strategy", "")),
+        "fail_closed_defaults": bool(value.get("fail_closed_defaults", False)),
+        "invalid_table_dropout_rate": float(
+            value.get("invalid_table_dropout_rate", 0.0) or 0.0
+        ),
+    }
+    if execution == SIMULATION_BLOCKING_EXACT_CONTRACT:
+        if contract["deadline_exceedance_changes_observation"]:
+            raise ValueError("blocking-exact execution cannot discard a completed table")
+        if contract["invalid_table_strategy"] != "fail_closed_v1":
+            raise ValueError("blocking-exact execution requires fail_closed_v1")
+        if contract["use_inference_worker"]:
+            raise ValueError("blocking-exact execution requires the synchronous in-process backend")
+        if not contract["profile_latency"]:
+            raise ValueError("blocking-exact execution requires latency profiling")
+        if not contract["fail_closed_defaults"]:
+            raise ValueError("blocking-exact execution requires fail_closed defaults")
+        if contract["invalid_table_dropout_rate"] != 0.0:
+            raise ValueError("blocking-exact formal evaluation forbids observation dropout")
+    else:
+        contract.update(
+            {
+                "last_valid_max_decisions": int(
+                    value.get("last_valid_max_decisions", -1)
+                ),
+                "last_valid_ttl_s": float(value.get("last_valid_ttl_s", -1.0)),
+                "last_valid_max_merge_distance_delta_m": float(
+                    value.get("last_valid_max_merge_distance_delta_m", -1.0)
+                ),
+                "last_valid_max_ego_speed_delta_mps": float(
+                    value.get("last_valid_max_ego_speed_delta_mps", -1.0)
+                ),
+                "last_valid_max_gap_delta_m": float(
+                    value.get("last_valid_max_gap_delta_m", -1.0)
+                ),
+            }
+        )
+    return contract
+
+
+def closed_loop_execution_contract_sha256(observation: Mapping[str, Any]) -> str:
+    return stable_hash(closed_loop_execution_contract(observation))
+
+
+def deployment_observation_from_formal_runtime_contract(
+    contract: Mapping[str, Any],
+    *,
+    current_observation: Mapping[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Materialise the frozen deployment path without changing PPO config files."""
+
+    value = dict(contract)
+    validate_formal_runtime_contract(value)
+    observation = dict(current_observation or {})
+    observation.update(
+        {
+            "enabled": bool(value["observation_enabled"]),
+            "feature_version": str(value["feature_version"]),
+            "activation_distance": float(value["activation_distance_m"]),
+            "include_risk_secondary": bool(value["include_risk_secondary"]),
+            "secondary_safety_profile": str(value["secondary_safety_profile"]),
+            "risk_horizon_steps": int(value["risk_horizon_steps"]),
+            "invalid_table_strategy": str(value["invalid_table_strategy"]),
+            "fail_closed_defaults": bool(value["fail_closed_defaults"]),
+            "timeout_s": float(value["timeout_s"]),
+            "deployment_deadline_s": float(value["timeout_s"]),
+            "timeout_contract": str(value["timeout_contract"]),
+            "execution_contract": SOFT_REALTIME_POST_RETURN_CONTRACT,
+            "full_table_hard_deadline_worker": bool(
+                value["full_table_hard_deadline_worker"]
+            ),
+            "use_inference_worker": bool(value["use_inference_worker"]),
+            "profile_latency": bool(value["profile_latency"]),
+            "warmup_enabled": bool(value["warmup_enabled"]),
+            "warmup_max_attempts": int(value["warmup_max_attempts"]),
+            "invalid_table_dropout_rate": float(value["invalid_table_dropout_rate"]),
+            "last_valid_max_decisions": int(value["last_valid_max_decisions"]),
+            "last_valid_ttl_s": float(value["last_valid_ttl_s"]),
+            "last_valid_max_merge_distance_delta_m": float(
+                value["last_valid_max_merge_distance_delta_m"]
+            ),
+            "last_valid_max_ego_speed_delta_mps": float(
+                value["last_valid_max_ego_speed_delta_mps"]
+            ),
+            "last_valid_max_gap_delta_m": float(value["last_valid_max_gap_delta_m"]),
+        }
+    )
+    return observation

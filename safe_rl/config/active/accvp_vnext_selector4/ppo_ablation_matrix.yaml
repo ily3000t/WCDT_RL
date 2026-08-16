@@ -6,8 +6,10 @@ optimizer_seed_role: ppo_optimizer_replicates
 
 # Frozen Candidate Table Reward x commitment 2x2. Selector and actor capacity
 # come from the immutable Selector4 capacity report and are not method factors.
-# Selector-v4 changes the actor/data contract, not the PPO-visible 107D
-# bounded-stale observation feature contract, which remains feature-v3.
+# Selector-v4 keeps the PPO-visible 107D feature-v3 schema. Method-effect runs
+# use simulation_blocking_exact_v1, so freshness channels remain available for
+# content-error fail-closed provenance but CPU deadline misses never create
+# bounded-stale observations. Deployment runtime is evaluated separately.
 variants:
   no_forecast_reward_v2:
     observation_family: no_forecast_52d

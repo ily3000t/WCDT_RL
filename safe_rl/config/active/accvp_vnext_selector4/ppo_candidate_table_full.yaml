@@ -1,10 +1,11 @@
 extends: safe_rl/config/active/accvp_vnext_selector3/ppo_candidate_table_full.yaml
 
 run:
-  run_id: "ppo_accvp_vnext_selector4_template"
+  run_id: "ppo_accvp_vnext_selector4_blocking_exact_template"
 
 experiment:
-  replicate_run_id_prefix: "ppo_accvp_vnext_selector4"
+  replicate_run_id_prefix: "ppo_accvp_vnext_selector4_blocking_exact"
+  closed_loop_execution_protocol: "simulation_blocking_exact_v1"
 
 evaluation_protocol:
   protocol_id: "accvp-vnext-correctness-v3-selector4"
@@ -26,3 +27,15 @@ accvp:
   calibration_bundle: "safe_rl_output/runs/accvp_vnext_selector4_train/accvp/accvp_vnext_schema3_calibration.json"
   operating_point: "safe_rl_output/runs/accvp_vnext_selector4_train/accvp/accvp_vnext_schema3_operating_point.json"
   artifact_manifest: "safe_rl_output/runs/accvp_vnext_selector4_train/accvp/accvp_vnext_schema3_candidate_manifest.json"
+  observation:
+    # PPO training, checkpoint selection and Stage5 run with SUMO blocked until
+    # the complete Candidate Table is available. The 0.5 s value remains a
+    # profiled deployment deadline and cannot replace a correctly computed
+    # observation in this method-effect contract.
+    execution_contract: "simulation_blocking_exact_v1"
+    deployment_deadline_s: 0.5
+    invalid_table_strategy: "fail_closed_v1"
+    use_inference_worker: false
+    profile_latency: true
+    fail_closed_defaults: true
+    invalid_table_dropout_rate: 0.0

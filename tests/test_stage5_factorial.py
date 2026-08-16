@@ -252,6 +252,9 @@ def test_generate_writes_group_specific_runtime_bindings(
         "accvp_artifact_fingerprint": "b" * 64,
         "accvp_artifact_variant": "full_candidate_gate_v1",
         "formal_runtime_contract_sha256": "c" * 64,
+        "deployment_runtime_contract_sha256": "c" * 64,
+        "candidate_table_semantic_contract_sha256": "8" * 64,
+        "closed_loop_execution_contract_sha256": "9" * 64,
     }
     manifests: dict[str, Path] = {}
     runtime_coverage: dict[str, dict] = {}
@@ -402,7 +405,9 @@ def test_generate_writes_group_specific_runtime_bindings(
 
     single_dir = output / "comparisons" / DEFAULT_COMPARISONS[0]["comparison_id"]
     single_cfg = yaml.safe_load((single_dir / "stage5_seed_1001.yaml").read_text(encoding="utf-8"))
-    assert len(single_cfg["stage5"]["accvp_observation_preflight_reports"]) == 1
+    assert single_cfg["stage5"]["execution_contract"] == "simulation_blocking_exact_v1"
+    assert single_cfg["stage5"]["require_accvp_observation_runtime_gate"] is False
+    assert len(single_cfg["stage5"]["deployment_runtime_reports"]) == 1
     assert "accvp_observation_preflight_report" not in single_cfg["stage5"]
     assert single_cfg["stage5"]["episodes_per_group"] == 100
     assert len(single_cfg["stage5"]["seeds"]) == 100
@@ -417,7 +422,7 @@ def test_generate_writes_group_specific_runtime_bindings(
             encoding="utf-8"
         )
     )
-    assert len(crossed_cfg["stage5"]["accvp_observation_preflight_reports"]) == 2
+    assert len(crossed_cfg["stage5"]["deployment_runtime_reports"]) == 2
     assert "accvp_observation_preflight_report" not in crossed_cfg["stage5"]
     final_cfg = yaml.safe_load(
         (
