@@ -213,10 +213,12 @@ artifact。不要因为 report 为 `fail` 就删除数据、放宽阈值或跳�
 `conditions`/`gate` 定位唯一关闭项。
 
 Selector-v4 scorer 当前使用
-`accvp_runtime_conflict_selector_cached_geometry_v5`：它只缓存单次 selector 调用内的冻结
-scenario semantics，以显式字段复制替代热循环中的 dataclass 反射复制，并在 candidate-conflict
-路径只计算实际使用的 OBB gap/overlap。上述修改不改变 actor 分类、排序、冲突 tube、模型输入
-或 Risk 阈值。旧 implementation 的失败报告会在 fingerprint 校验后归档且不复用 episode；同一
+`accvp_runtime_conflict_selector_array_geometry_v7`：它保留单次 selector 调用内的冻结
+scenario semantics，并在 candidate-conflict 热路径中用等价的 float64 长宽扩展数组替代逐状态
+`VehicleState` 复制；OBB 点到线段距离先在平方空间归约再开方，同一 surface 只在本次调用内编码
+为整数。上述修改不改变 actor 分类、排序、冲突 tube、模型输入或 Risk 阈值，优化输出由标量
+reference 和显式旧对象路径进行等价性验证。旧 implementation 的失败报告会在 fingerprint 校验后
+归档且不复用 episode；同一
 implementation、同一完整 seed request 已经失败时，workflow 会明确 `blocked` 并列出失败
 checks，不允许靠原样重跑或追加 seeds 稀释失败。
 

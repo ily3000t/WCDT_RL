@@ -85,9 +85,12 @@ def _batch_point_segment_minimum(
         where=length_sq > _EPS,
     )
     ratio = np.clip(ratio, 0.0, 1.0)
-    closest = start + ratio[..., None] * delta
-    distances = np.linalg.norm(point - closest, axis=-1)
-    return np.min(distances, axis=(-2, -1))
+    # Distance ordering is unchanged in squared space.  Reducing before the
+    # square root avoids materialising the closest-point array and computes
+    # one square root per box pair instead of one per corner/edge pair.
+    residual = (point - start) - ratio[..., None] * delta
+    distance_sq = np.sum(residual * residual, axis=-1)
+    return np.sqrt(np.min(distance_sq, axis=(-2, -1)))
 
 
 def batch_pairwise_obb_metrics(
@@ -205,6 +208,9 @@ def batch_pairwise_obb_metrics(
 def batch_pairwise_obb_gap_overlap(
     ego_rollouts: Sequence[Sequence[VehicleState]],
     other_rollouts: Sequence[Sequence[VehicleState]],
+    *,
+    other_length_expansion: np.ndarray | None = None,
+    other_width_expansion: np.ndarray | None = None,
 ) -> tuple[np.ndarray, np.ndarray]:
     """Return only exact OBB gap/overlap for an action-time-actor batch.
 
@@ -216,6 +222,20 @@ def batch_pairwise_obb_gap_overlap(
 
     ego_values = _state_batch(ego_rollouts)
     other_values = _state_batch(other_rollouts)
+    if other_length_expansion is not None:
+        expansion = np.asarray(other_length_expansion, dtype=np.float64)
+        if expansion.shape != other_values["length"].shape:
+            raise ValueError(
+                "other length expansion must match the actor-time batch"
+            )
+        other_values["length"] = other_values["length"] + expansion
+    if other_width_expansion is not None:
+        expansion = np.asarray(other_width_expansion, dtype=np.float64)
+        if expansion.shape != other_values["width"].shape:
+            raise ValueError(
+                "other width expansion must match the actor-time batch"
+            )
+        other_values["width"] = other_values["width"] + expansion
     action_count, horizon = ego_values["x"].shape
     actor_count = int(other_values["x"].shape[0])
     if actor_count and int(other_values["x"].shape[1]) != horizon:

@@ -358,10 +358,11 @@ bounded stale 状态不得通过 Risk gate；连续故障、恢复和 stale age 
 审计报告。
 
 Selector-v4 的 scorer 热路径实现版本为
-`accvp_runtime_conflict_selector_cached_geometry_v5`。性能修复限定为：单次 selector 调用内缓存
-冻结的 scenario list/mapping、显式复制纯标量 `VehicleState`、candidate-conflict OBB 批处理只
-返回 gap/overlap。selector parity 测试仍以 scalar reference 为权威，禁止为满足延迟而改变
-selector/capacity/reward/commitment/Risk threshold。
+`accvp_runtime_conflict_selector_array_geometry_v7`。性能修复限定为：单次 selector 调用内缓存
+冻结的 scenario list/mapping、用等价的 float64 长宽扩展数组替代冲突 tube 中逐状态复制、在
+squared-distance 空间完成 OBB 距离归约后再开方，并以本次调用内的整数 ID 比较 surface。
+selector parity 测试仍以 scalar reference 和显式旧对象路径为权威，禁止为满足延迟而改变
+selector/capacity/reward/commitment/Risk threshold；不引入跨决策缓存。
 
 旧 runtime implementation 的失败报告仅在 fingerprint 有效时归档，新实现不会复用其中的
 episodes。同一 implementation、同一完整 seed request 的失败报告是不可变证据，coordinator

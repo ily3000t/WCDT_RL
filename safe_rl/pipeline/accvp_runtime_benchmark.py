@@ -32,7 +32,7 @@ from safe_rl.utils.config import REPO_ROOT, load_config
 
 
 RUNTIME_IMPLEMENTATION_VERSION = (
-    "accvp_runtime_conflict_selector_cached_geometry_v5"
+    "accvp_runtime_conflict_selector_array_geometry_v7"
 )
 
 

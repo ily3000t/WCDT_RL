@@ -435,7 +435,8 @@ def candidate_union_conflict_oracle(
     ]
 
     flat_actor_rollouts: list[list[VehicleState]] = []
-    flat_actor_ids: list[str] = []
+    flat_length_expansion: list[list[float]] = []
+    flat_width_expansion: list[list[float]] = []
     flat_hypothesis_ids: list[str] = []
     actor_flat_indices: dict[str, list[int]] = {}
     for actor in vehicles:
@@ -448,8 +449,9 @@ def candidate_union_conflict_oracle(
             dt,
         )
         for hypothesis_id, rollout in hypotheses.items():
-            expanded: list[VehicleState] = []
-            for step, state in enumerate(rollout):
+            length_expansion: list[float] = []
+            width_expansion: list[float] = []
+            for step, _state in enumerate(rollout):
                 elapsed = float(step + 1) * dt
                 lateral_reach = (
                     min(
@@ -468,23 +470,35 @@ def candidate_union_conflict_oracle(
                     if unknown_topology
                     else 0.0
                 )
-                expanded.append(
-                    _expanded_actor(
-                        state,
-                        elapsed,
-                        settings["actor_longitudinal_accel_bound"],
-                        lateral_reach,
+                # Preserve _expanded_actor's exact dimensions without copying
+                # thousands of otherwise unchanged VehicleState instances.
+                length_expansion.append(
+                    float(
+                        2.0
+                        * 0.5
+                        * settings["actor_longitudinal_accel_bound"]
+                        * elapsed**2
                     )
                 )
+                width_expansion.append(float(2.0 * lateral_reach))
             flat_index = len(flat_actor_rollouts)
-            flat_actor_rollouts.append(expanded)
-            flat_actor_ids.append(actor_id)
+            flat_actor_rollouts.append(rollout)
+            flat_length_expansion.append(length_expansion)
+            flat_width_expansion.append(width_expansion)
             flat_hypothesis_ids.append(hypothesis_id)
             actor_flat_indices.setdefault(actor_id, []).append(flat_index)
 
     gap, overlap = batch_pairwise_obb_gap_overlap(
         ego_rollouts,
         flat_actor_rollouts,
+        other_length_expansion=np.asarray(
+            flat_length_expansion,
+            dtype=np.float64,
+        ),
+        other_width_expansion=np.asarray(
+            flat_width_expansion,
+            dtype=np.float64,
+        ),
     )
     ego_edges = np.asarray(
         [[str(state.edge_id) for state in rollout] for rollout in ego_rollouts],
@@ -511,10 +525,23 @@ def candidate_union_conflict_oracle(
         ],
         dtype=np.int64,
     )
+    # Exact (edge, lane) equality is cheaper on compact integer IDs than on a
+    # broadcast object array.  The mapping is local to this oracle invocation,
+    # so no state can leak across decisions or lane changes.
+    surface_ids: dict[tuple[str, int], int] = {}
+
+    def encode_surfaces(edges: np.ndarray, lanes: np.ndarray) -> np.ndarray:
+        encoded = np.empty(edges.shape, dtype=np.int64)
+        for index in np.ndindex(edges.shape):
+            key = (str(edges[index]), int(lanes[index]))
+            encoded[index] = surface_ids.setdefault(key, len(surface_ids))
+        return encoded
+
+    ego_surface_ids = encode_surfaces(ego_edges, ego_lanes)
+    actor_surface_ids = encode_surfaces(actor_edges, actor_lanes)
     same_surface = (
-        ego_edges[:, :, None] == actor_edges.T[None, :, :]
-    ) & (
-        ego_lanes[:, :, None] == actor_lanes.T[None, :, :]
+        ego_surface_ids[:, :, None]
+        == actor_surface_ids.T[None, :, :]
     )
     surface_conflict = same_surface & (
         gap <= float(settings["surface_gap_m"])
@@ -567,11 +594,8 @@ def candidate_union_conflict_oracle(
             if overlap_time_indices.size
             else INF_TTC
         )
-        minimum_gap = min(
-            float(bbox_gap(ego, actor)),
-            float(np.min(actor_gaps)),
-        )
-
+        current_gap = float(bbox_gap(ego, actor))
+        minimum_gap = min(current_gap, float(np.min(actor_gaps)))
         current_overlap = bool(geometric_overlap(ego, actor))
         current_same_surface = bool(
             str(ego.edge_id) == str(actor.edge_id)
@@ -579,8 +603,7 @@ def candidate_union_conflict_oracle(
         )
         current_surface_conflict = bool(
             current_same_surface
-            and float(bbox_gap(ego, actor))
-            <= settings["surface_gap_m"]
+            and current_gap <= settings["surface_gap_m"]
         )
         if current_overlap or current_surface_conflict:
             conflict_candidates.update(action_ids)

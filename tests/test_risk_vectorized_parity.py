@@ -16,6 +16,7 @@ from safe_rl.shield.safety_shield import SafetyShield
 from safe_rl.sim.action_space import ACTIONS
 from safe_rl.sim.metrics import (
     INF_TTC,
+    batch_pairwise_obb_gap_overlap,
     batch_pairwise_obb_metrics,
     bbox_gap,
     drac,
@@ -137,6 +138,106 @@ def test_pairwise_batch_geometry_handles_empty_actor_set():
     assert batch.ttc.shape == (1, 3, 0)
     assert batch.drac.shape == (1, 3, 0)
     assert batch.overlap.shape == (1, 3, 0)
+
+
+def test_gap_overlap_batch_matches_scalar_geometry_at_tight_tolerance():
+    rng = np.random.default_rng(20260816)
+    ego_rollouts = []
+    other_rollouts = []
+    for action_idx in range(4):
+        state = _state(
+            f"ego_{action_idx}",
+            x=float(rng.uniform(80.0, 120.0)),
+            y=float(rng.uniform(-2.0, 2.0)),
+            heading=float(rng.uniform(-0.2, 0.2)),
+            speed=float(rng.uniform(5.0, 25.0)),
+        )
+        ego_rollouts.append([_advanced(state, step) for step in range(6)])
+    for actor_idx in range(7):
+        state = _state(
+            f"actor_{actor_idx}",
+            x=float(rng.uniform(70.0, 140.0)),
+            y=float(rng.uniform(-5.0, 5.0)),
+            heading=float(rng.uniform(-0.3, 0.3)),
+            speed=float(rng.uniform(3.0, 28.0)),
+        )
+        other_rollouts.append([_advanced(state, step) for step in range(6)])
+
+    gap, overlap = batch_pairwise_obb_gap_overlap(
+        ego_rollouts,
+        other_rollouts,
+    )
+
+    for action_idx, ego_rollout in enumerate(ego_rollouts):
+        for step_idx, ego in enumerate(ego_rollout):
+            for actor_idx, actor_rollout in enumerate(other_rollouts):
+                actor = actor_rollout[step_idx]
+                assert float(gap[action_idx, step_idx, actor_idx]) == (
+                    pytest.approx(bbox_gap(ego, actor), abs=1.0e-12)
+                )
+                assert bool(overlap[action_idx, step_idx, actor_idx]) is (
+                    geometric_overlap(ego, actor)
+                )
+
+
+def test_gap_overlap_array_expansion_matches_explicit_vehicle_boxes():
+    ego_rollouts = [
+        [_advanced(_state("ego", x=100.0, y=0.0), step) for step in range(4)]
+    ]
+    other_rollouts = [
+        [_advanced(_state("other", x=112.0, y=0.2), step) for step in range(4)]
+    ]
+    length_expansion = np.asarray([[0.0, 0.4, 1.2, 2.4]], dtype=np.float64)
+    width_expansion = np.asarray([[0.0, 0.1, 0.2, 0.3]], dtype=np.float64)
+    explicit = [
+        [
+            VehicleState(
+                **{
+                    **state.to_dict(),
+                    "length": float(state.length + length_expansion[0, step]),
+                    "width": float(state.width + width_expansion[0, step]),
+                }
+            )
+            for step, state in enumerate(other_rollouts[0])
+        ]
+    ]
+
+    expanded_gap, expanded_overlap = batch_pairwise_obb_gap_overlap(
+        ego_rollouts,
+        other_rollouts,
+        other_length_expansion=length_expansion,
+        other_width_expansion=width_expansion,
+    )
+    explicit_gap, explicit_overlap = batch_pairwise_obb_gap_overlap(
+        ego_rollouts,
+        explicit,
+    )
+
+    np.testing.assert_allclose(
+        expanded_gap,
+        explicit_gap,
+        rtol=0.0,
+        atol=1.0e-12,
+    )
+    np.testing.assert_array_equal(expanded_overlap, explicit_overlap)
+
+
+def test_gap_overlap_array_expansion_rejects_shape_mismatch():
+    ego_rollouts = [[_state("ego", x=100.0, y=0.0)]]
+    other_rollouts = [[_state("other", x=112.0, y=0.0)]]
+
+    with pytest.raises(ValueError, match="length expansion"):
+        batch_pairwise_obb_gap_overlap(
+            ego_rollouts,
+            other_rollouts,
+            other_length_expansion=np.zeros((2, 1), dtype=np.float64),
+        )
+    with pytest.raises(ValueError, match="width expansion"):
+        batch_pairwise_obb_gap_overlap(
+            ego_rollouts,
+            other_rollouts,
+            other_width_expansion=np.zeros((1, 2), dtype=np.float64),
+        )
 
 
 def _candidate_context():

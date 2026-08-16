@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
+import numpy as np
 import pytest
 import yaml
 
@@ -33,7 +34,12 @@ from safe_rl.prediction.actor_selector import (
     actor_selection_config_hash,
     select_merge_relevant_actors,
 )
-from safe_rl.prediction.candidate_conflict import ActorConflictEvidence
+from safe_rl.prediction.candidate_conflict import (
+    ActorConflictEvidence,
+    candidate_union_conflict_oracle_reference,
+)
+from safe_rl.prediction.wcdt_v3_predictor import build_v3_runtime_batch
+from safe_rl.sim.history_buffer import HistoryBuffer
 from safe_rl.sim.types import VehicleState
 from safe_rl.utils.config import clone_with_overrides, load_config
 
@@ -339,6 +345,147 @@ def test_selector4_factorial_keeps_the_frozen_ppo_feature_contract() -> None:
         declared = str(variants[method_id]["training_semantics_version"])
         assert FORMAL_RUNTIME_FEATURE_VERSION in declared.split("+")
         assert "risk_gated_candidate_table_v4_bounded_stale" not in declared
+
+
+def _assert_semantically_equal(actual, expected) -> None:
+    if isinstance(expected, float):
+        assert float(actual) == pytest.approx(expected, abs=1.0e-9)
+        return
+    if isinstance(expected, dict):
+        assert set(actual) == set(expected)
+        for key in expected:
+            _assert_semantically_equal(actual[key], expected[key])
+        return
+    if isinstance(expected, (list, tuple)):
+        assert type(actual) is type(expected)
+        assert len(actual) == len(expected)
+        for actual_item, expected_item in zip(actual, expected):
+            _assert_semantically_equal(actual_item, expected_item)
+        return
+    assert actual == expected
+
+
+@pytest.mark.parametrize(
+    ("ego", "vehicles"),
+    [
+        (
+            _vehicle("ego", 100.0, lane_index=0),
+            [
+                _vehicle("front", 114.0, lane_index=1),
+                _vehicle("rear", 87.0, lane_index=1),
+                _vehicle("adjacent", 104.0, lane_index=2),
+            ],
+        ),
+        (
+            _vehicle("ego", 106.0, lane_index=1),
+            [
+                _vehicle("front", 121.0, lane_index=1),
+                _vehicle("rear", 92.0, lane_index=1),
+                _vehicle("changed_lane", 108.0, lane_index=0),
+            ],
+        ),
+        (
+            _vehicle("ego", 112.0, lane_index=0),
+            [
+                _vehicle("moved_front", 150.0, lane_index=1),
+                _vehicle("moved_rear", 109.0, lane_index=1),
+                _vehicle(
+                    "other_edge",
+                    116.0,
+                    lane_index=2,
+                    edge_id="unrelated_edge",
+                ),
+            ],
+        ),
+    ],
+)
+def test_selector_v4_optimized_geometry_matches_scalar_reference_across_state_changes(
+    monkeypatch: pytest.MonkeyPatch,
+    ego: VehicleState,
+    vehicles: list[VehicleState],
+) -> None:
+    cfg = _config(ACTOR_SELECTION_VERSION_V4)
+    current = [ego, *vehicles]
+
+    optimized = select_merge_relevant_actors(
+        cfg,
+        ego,
+        current,
+        max_actors=12,
+        selector_scope="accvp",
+    )
+    monkeypatch.setattr(
+        actor_selector,
+        "candidate_union_conflict_oracle",
+        candidate_union_conflict_oracle_reference,
+    )
+    reference = select_merge_relevant_actors(
+        cfg,
+        ego,
+        current,
+        max_actors=12,
+        selector_scope="accvp",
+    )
+
+    _assert_semantically_equal(optimized.to_dict(), reference.to_dict())
+
+
+def test_selector_v4_optimized_geometry_preserves_runtime_model_inputs(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    cfg = _config(ACTOR_SELECTION_VERSION_V4)
+    ego = _vehicle("ego", 106.0, lane_index=1)
+    current = [
+        ego,
+        _vehicle("front", 121.0, lane_index=1),
+        _vehicle("rear", 92.0, lane_index=1),
+        _vehicle("changed_lane", 108.0, lane_index=0),
+        _vehicle("adjacent", 114.0, lane_index=2),
+    ]
+    history = HistoryBuffer(
+        history_steps=int(cfg.scenario.history_steps),
+        max_agents=13,
+    )
+    history.append(current)
+
+    optimized = build_v3_runtime_batch(
+        cfg,
+        history,
+        "ego",
+        max_actors_override=12,
+        selector_scope="accvp",
+    )
+    monkeypatch.setattr(
+        actor_selector,
+        "candidate_union_conflict_oracle",
+        candidate_union_conflict_oracle_reference,
+    )
+    reference = build_v3_runtime_batch(
+        cfg,
+        history,
+        "ego",
+        max_actors_override=12,
+        selector_scope="accvp",
+    )
+
+    assert optimized["actor_row_ids"] == reference["actor_row_ids"]
+    assert optimized["runtime_agent_ids"] == reference["runtime_agent_ids"]
+    _assert_semantically_equal(
+        optimized["actor_selection"].to_dict(),
+        reference["actor_selection"].to_dict(),
+    )
+    for name in (
+        "history_features",
+        "history_valid_mask",
+        "history_lane_ids",
+        "history_edge_role_ids",
+        "role_ids",
+        "lane_ids",
+        "edge_role_ids",
+        "mask",
+        "selected_indices",
+    ):
+        np.testing.assert_array_equal(optimized[name], reference[name])
 
 
 def test_sumo_scale_is_explicit_and_validated() -> None:
