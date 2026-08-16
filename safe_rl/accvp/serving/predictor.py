@@ -16,7 +16,11 @@ from safe_rl.accvp.contracts.artifacts import (
 )
 from safe_rl.accvp.planning.candidate_plan import build_commitment_plan, profile_from_config
 from safe_rl.accvp.planning.controller import ACCVPController
-from safe_rl.accvp.modeling.model import ACCVP_ARCHITECTURE_VERSION, ACCVPPredictor, model_kwargs_from_config
+from safe_rl.accvp.modeling.model import (
+    ACCVPPredictor,
+    architecture_version_from_config,
+    model_kwargs_from_config,
+)
 from safe_rl.accvp.contracts.protocol import counterfactual_data_contract, data_contract_hash, effective_activation_distance
 from safe_rl.accvp.contracts.schema import COUNTERFACTUAL_SCHEMA_VERSION, file_sha256, read_json
 from safe_rl.prediction.wcdt_v3_predictor import build_v3_runtime_batch
@@ -221,13 +225,23 @@ class ACCVPRuntimePredictor:
             weights_only=True,
         )
         metadata = dict(payload.get("metadata", {}))
-        if metadata.get("architecture_version") != ACCVP_ARCHITECTURE_VERSION:
+        if metadata.get("architecture_version") != architecture_version_from_config(
+            config
+        ):
             raise ValueError("ACCVP checkpoint architecture_version mismatch")
         if int(metadata.get("counterfactual_schema_version", -1)) != COUNTERFACTUAL_SCHEMA_VERSION:
             raise ValueError("ACCVP checkpoint counterfactual schema mismatch")
         expected = model_kwargs_from_config(config)
         checkpoint_kwargs = dict(metadata.get("model_kwargs", {}))
-        for key in ("history_steps", "response_horizon_steps", "candidate_plan_horizon_steps"):
+        for key in (
+            "history_steps",
+            "response_horizon_steps",
+            "candidate_plan_horizon_steps",
+            "omitted_actor_summary_feature_dim",
+            "omitted_actor_summary_group_count",
+        ):
+            if key not in expected:
+                continue
             if int(checkpoint_kwargs.get(key, -1)) != int(expected[key]):
                 raise ValueError(f"ACCVP checkpoint {key} is incompatible with runtime config")
         states = payload.get("model_state_dicts")
@@ -387,17 +401,35 @@ class ACCVPRuntimePredictor:
             ],
             axis=0,
         )
+        root_inputs = {
+            "history_features": np.asarray(
+                runtime["history_features"], dtype=np.float32
+            ),
+            "history_valid_mask": np.asarray(
+                runtime["history_valid_mask"], dtype=np.float32
+            ),
+            "history_lane_ids": np.asarray(
+                runtime["history_lane_ids"], dtype=np.int64
+            ),
+            "history_edge_role_ids": np.asarray(
+                runtime["history_edge_role_ids"], dtype=np.int64
+            ),
+            "role_ids": np.asarray(runtime["role_ids"], dtype=np.int64),
+            "lane_ids": np.asarray(runtime["lane_ids"], dtype=np.int64),
+            "edge_role_ids": np.asarray(
+                runtime["edge_role_ids"], dtype=np.int64
+            ),
+            "actor_mask": np.asarray(runtime["mask"], dtype=np.float32),
+        }
+        for name in (
+            "omitted_actor_summary_features",
+            "omitted_actor_summary_group_mask",
+            "omitted_actor_summary_mask",
+        ):
+            if name in runtime:
+                root_inputs[name] = np.asarray(runtime[name], dtype=np.float32)
         return {
-            "root_inputs": {
-                "history_features": np.asarray(runtime["history_features"], dtype=np.float32),
-                "history_valid_mask": np.asarray(runtime["history_valid_mask"], dtype=np.float32),
-                "history_lane_ids": np.asarray(runtime["history_lane_ids"], dtype=np.int64),
-                "history_edge_role_ids": np.asarray(runtime["history_edge_role_ids"], dtype=np.int64),
-                "role_ids": np.asarray(runtime["role_ids"], dtype=np.int64),
-                "lane_ids": np.asarray(runtime["lane_ids"], dtype=np.int64),
-                "edge_role_ids": np.asarray(runtime["edge_role_ids"], dtype=np.int64),
-                "actor_mask": np.asarray(runtime["mask"], dtype=np.float32),
-            },
+            "root_inputs": root_inputs,
             "candidate_plans": candidate_plans.astype(np.float32),
             "action_ids": np.asarray([action.index for action in legal_actions], dtype=np.int64),
         }
@@ -421,7 +453,18 @@ class ACCVPRuntimePredictor:
                 scene = model.encode_scene(**root_inputs)
                 expanded_scene = scene.expand(candidate_count, -1, -1)
                 expanded_mask = root_inputs["actor_mask"].expand(candidate_count, -1)
-                output = model.forward_from_scene(expanded_scene, expanded_mask, plans, action_ids)
+                expanded_summary_mask = None
+                if "omitted_actor_summary_mask" in root_inputs:
+                    expanded_summary_mask = root_inputs[
+                        "omitted_actor_summary_mask"
+                    ].expand(candidate_count, -1)
+                output = model.forward_from_scene(
+                    expanded_scene,
+                    expanded_mask,
+                    plans,
+                    action_ids,
+                    expanded_summary_mask,
+                )
                 event_members.append(torch.sigmoid(output["event_logits"]).cpu().numpy())
                 geometry_members.append(output["geometry"].cpu().numpy())
         events = np.stack(event_members, axis=0)

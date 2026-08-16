@@ -1,13 +1,13 @@
 extends: safe_rl/config/active/accvp_vnext_selector3/oracle_regression.yaml
 
 run:
-  run_id: "accvp_vnext_selector4_oracle_regression"
-  cache_root: "safe_rl_output/.cache/accvp_vnext_selector4_oracle_regression"
+  run_id: "accvp_vnext_selector4_hybrid_oracle_regression"
+  cache_root: "safe_rl_output/.cache/accvp_vnext_selector4_hybrid_oracle_regression"
 
 evaluation_protocol:
-  protocol_id: "accvp-vnext-correctness-v3-selector4"
-  seed_ledger: "safe_rl/config/accvp_vnext_selector4_seed_ledger.json"
-  revocation_manifest: "safe_rl/config/artifact_revocation_manifest_selector4.json"
+  protocol_id: "accvp-vnext-correctness-v4-selector4-hybrid"
+  seed_ledger: "safe_rl/config/accvp_vnext_selector4_hybrid_seed_ledger.json"
+  revocation_manifest: "safe_rl/config/artifact_revocation_manifest_selector4_hybrid.json"
   cohort_roles:
     selector_diagnostic: "selector_historical_development"
     selector_historical_development: "selector_historical_development"
@@ -16,10 +16,15 @@ evaluation_protocol:
 accvp:
   actor_relevance:
     version: "merge_conflict_relevance_v4_lane_aware"
-  data_contract_version: "accvp_240_v4_lane_aware_capacity_audit"
+  data_contract_version: "accvp_240_v5_hybrid_actor_summary"
+  root_observation_fingerprint_version: "model_input_fingerprint_v4_hybrid_actor_summary"
+  omitted_actor_summary:
+    enabled: true
+    contract_version: "accvp_omitted_actor_summary_v1"
+    physical_actor_capacity: 12
   selector_contract:
     require_capacity_lock: true
     audit_report: "safe_rl_output/runs/accvp_vnext_selector4_audit/selector_capacity_audit.json"
   counterfactual:
-    output_name: "accvp_vnext_selector4_schema3_oracle_regression"
-    cache_root: "safe_rl_output/.cache/accvp_vnext_selector4_oracle_regression"
+    output_name: "accvp_vnext_selector4_hybrid_schema3_oracle_regression"
+    cache_root: "safe_rl_output/.cache/accvp_vnext_selector4_hybrid_oracle_regression"

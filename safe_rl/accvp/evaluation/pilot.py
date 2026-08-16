@@ -10,8 +10,8 @@ from typing import Any, Iterable, Mapping
 from safe_rl.accvp.contracts.schema import file_sha256, read_json, write_json_atomic
 from safe_rl.accvp.contracts.protocol import (
     ACCVP_SELECTOR3_DATA_CONTRACT_VERSION,
-    ACCVP_SELECTOR4_DATA_CONTRACT_VERSION,
     is_strict_selector_data_contract,
+    is_selector4_data_contract,
 )
 from safe_rl.accvp.evaluation.dataset_integrity import (
     audit_dataset_actor_contract,
@@ -55,7 +55,7 @@ def validate_pilot_dataset(
         )
     )
     selector3_contract = protocol_version == ACCVP_SELECTOR3_DATA_CONTRACT_VERSION
-    selector4_contract = protocol_version == ACCVP_SELECTOR4_DATA_CONTRACT_VERSION
+    selector4_contract = is_selector4_data_contract(protocol_version)
     strict_selector_contract = is_strict_selector_data_contract(protocol_version)
     coverage_incomplete_root_ids = [
         str(row.get("root_id", ""))

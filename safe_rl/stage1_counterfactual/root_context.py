@@ -86,6 +86,13 @@ def _tensor_fields(runtime_batch: dict[str, Any]) -> dict[str, np.ndarray]:
         "selected_indices",
     )
     tensors = {name: np.asarray(runtime_batch[name]) for name in fields}
+    for name in (
+        "omitted_actor_summary_features",
+        "omitted_actor_summary_group_mask",
+        "omitted_actor_summary_mask",
+    ):
+        if name in runtime_batch:
+            tensors[name] = np.asarray(runtime_batch[name])
     if tensors["selected_indices"].ndim == 1:
         tensors["selected_indices"] = tensors["selected_indices"][None, :]
     return tensors
@@ -146,6 +153,12 @@ def capture_root_context(
     contract = dict(data_contract or {})
     tensors = _tensor_fields(runtime)
     contract_hash = stable_hash(contract) if contract else ""
+    fingerprint_version = str(
+        contract.get(
+            "root_observation_fingerprint_version",
+            ROOT_OBSERVATION_FINGERPRINT_VERSION,
+        )
+    )
     scenario_route_hash = str(contract.get("scenario_route_hash", ""))
     scenario_key = (
         scenario_episode_key(
@@ -161,6 +174,7 @@ def capture_root_context(
         root_ego=ego.to_dict(),
         data_contract_hash=contract_hash,
         tensors=tensors,
+        fingerprint_version=fingerprint_version,
     )
     metadata = {
         "counterfactual_schema_version": COUNTERFACTUAL_SCHEMA_VERSION,
@@ -229,8 +243,11 @@ def capture_root_context(
             str(value) for value in selection.get("dropped_critical_ids", [])
         ],
         "selector": selection,
+        "omitted_actor_summary": dict(
+            runtime.get("omitted_actor_summary_metadata", {}) or {}
+        ),
         "root_ego": ego.to_dict(),
-        "root_observation_fingerprint_version": ROOT_OBSERVATION_FINGERPRINT_VERSION,
+        "root_observation_fingerprint_version": fingerprint_version,
         "root_observation_fingerprint": observation_fingerprint,
         # Retained as a compatibility alias for manifest diagnostics. Schema-v3
         # split logic uses root_observation_fingerprint explicitly.

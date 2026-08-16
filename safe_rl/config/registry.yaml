@@ -136,39 +136,39 @@ configs:
   accvp_vnext_selector4_pilot:
     path: active/accvp_vnext_selector4/pilot.yaml
     status: canonical
-    protocol: accvp-vnext-correctness-v3-selector4
+    protocol: accvp-vnext-correctness-v4-selector4-hybrid
     entrypoint: safe_rl.pipeline.stage1_collect_accvp_jobs
   accvp_vnext_selector4_oracle_regression:
     path: active/accvp_vnext_selector4/oracle_regression.yaml
     status: canonical
-    protocol: accvp-vnext-correctness-v3-selector4
+    protocol: accvp-vnext-correctness-v4-selector4-hybrid
     entrypoint: safe_rl.pipeline.stage1_collect_accvp_jobs
   accvp_vnext_selector4_formal:
     path: active/accvp_vnext_selector4/formal.yaml
     status: canonical
-    protocol: accvp-vnext-correctness-v3-selector4
+    protocol: accvp-vnext-correctness-v4-selector4-hybrid
     entrypoint: safe_rl.pipeline.stage1_collect_accvp_jobs
   accvp_vnext_selector4_train:
     path: active/accvp_vnext_selector4/train.yaml
     status: canonical
-    protocol: accvp-vnext-correctness-v3-selector4
+    protocol: accvp-vnext-correctness-v4-selector4-hybrid
     entrypoint: safe_rl.pipeline.stage2_train_accvp
   accvp_vnext_selector4_pilot_latency_smoke_train:
     path: active/accvp_vnext_selector4/pilot_latency_smoke_train.yaml
     status: supported
-    protocol: accvp-vnext-correctness-v3-selector4
+    protocol: accvp-vnext-correctness-v4-selector4-hybrid
     entrypoint: safe_rl.pipeline.accvp_pilot_latency_smoke
     usage: diagnostic_only_pre_formal_latency_feasibility
   accvp_vnext_selector4_pilot_latency_smoke_runtime:
     path: active/accvp_vnext_selector4/pilot_latency_smoke_runtime.yaml
     status: supported
-    protocol: accvp-vnext-correctness-v3-selector4
+    protocol: accvp-vnext-correctness-v4-selector4-hybrid
     entrypoint: safe_rl.pipeline.accvp_pilot_latency_smoke
     usage: diagnostic_only_pre_formal_latency_feasibility
   ppo_accvp_candidate_table_selector4_full:
     path: active/accvp_vnext_selector4/ppo_candidate_table_full.yaml
     status: canonical
-    protocol: accvp-vnext-correctness-v3-selector4
+    protocol: accvp-vnext-correctness-v4-selector4-hybrid
     entrypoint: safe_rl.pipeline.stage3_train_ppo_factorial
     usage: canonical_factorial_template
     minimum_optimizer_replicates: 5
@@ -177,13 +177,13 @@ configs:
   accvp_vnext_selector4_ppo_ablation_matrix:
     path: active/accvp_vnext_selector4/ppo_ablation_matrix.yaml
     status: canonical
-    protocol: accvp-vnext-correctness-v3-selector4
+    protocol: accvp-vnext-correctness-v4-selector4-hybrid
     entrypoint: safe_rl.pipeline.stage3_train_ppo_factorial
     usage: frozen_factorial_method_definition
   accvp_vnext_selector4_workflow:
     path: active/accvp_vnext_selector4/workflow.yaml
     status: canonical
-    protocol: accvp-vnext-correctness-v3-selector4
+    protocol: accvp-vnext-correctness-v4-selector4-hybrid
     entrypoint: safe_rl.pipeline.run_accvp_vnext_pipeline
     usage: workflow_contract
 

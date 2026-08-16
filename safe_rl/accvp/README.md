@@ -39,9 +39,10 @@ safe_rl/stage1_counterfactual/
 - `evaluation` 只读取冻结产物并生成审计/实验报告；
 - `verification` 注入 synthetic failure，不能提升部署声明。
 
-`modeling/model.py` 暂时保留 architecture、loss 和 checkpoint metadata 三者共置，因为它们
-共享同一个 architecture/loss version。待出现第二种模型实现时再按 `predictor.py`、`losses.py`
-和 `checkpoint.py` 拆分，避免本次纯结构迁移同时改变数值逻辑。
+`modeling/model.py` 保留 architecture、loss 和 checkpoint metadata 三者共置；
+`modeling/omitted_actor_summary.py` 单独拥有 hybrid actor 的固定聚合契约与 ACCVP adapter。
+共享的 `WcDTV3TemporalInteractionPredictor` 不包含 summary 参数，因此旧 WcDT checkpoint
+warm-start 边界保持不变。
 
 旧的 `safe_rl.accvp.<flat_module>` Python 导入路径已经迁移到上述子包；仓库内 pipeline 和测试
 已同步更新。CLI 名称、配置路径、run 目录和 generation-aware artifact 文件名均未改变，因此
@@ -71,10 +72,12 @@ VNext 正式数据和模型必须同时满足：
 
 - `artifact_generation: vnext_schema3`
 - `schema_version: 3`
-- `data_contract_version: accvp_240_v4_lane_aware_capacity_audit`
+- `data_contract_version: accvp_240_v5_hybrid_actor_summary`
 - `accvp.actor_relevance.version: merge_conflict_relevance_v4_lane_aware`
+- `accvp.omitted_actor_summary.contract_version: accvp_omitted_actor_summary_v1`
+- `accvp.omitted_actor_summary.physical_actor_capacity: 12`
 - `actor_row_mapping_version: selected_indices_v2`
-- `root_observation_fingerprint_version: model_input_fingerprint_v3`
+- `root_observation_fingerprint_version: model_input_fingerprint_v4_hybrid_actor_summary`
 - `entry_time_label_version: conditional_entry_time_v1`
 - `loss_version: accvp_loss_v2`
 
@@ -97,6 +100,24 @@ Selector-v2/V3 数据虽然是 schema3，但 actor-response rows 只覆盖旧 se
 
 `selected_indices` 是 actor row 的唯一权威来源。root tensor、selected actor IDs、branch
 response rows 和 token rows 必须共享 mapping hash。缺失或不一致时应立即拒绝样本。
+
+### Hybrid actor input
+
+模型仍使用固定 12 个非 ego 物理 actor rows，物理行继续由 Selector-v4 排序并承担
+actor-response supervision。target front/rear、candidate conflict、nearest conflict、lowest TTC
+等 critical actors 必须全部进入物理行；critical overflow 仍然 fail closed。
+
+没有物理行的车辆按固定的 conflict-surface/target-lane/auxiliary/ramp/other 组聚合。每组包含
+actor count、minimum TTC、minimum surface/effective gap、earliest conflict time、mean/max
+relative speed、maximum closing speed 和 overflow indicator。group mask 进入 ACCVP 专用 adapter，
+adapter 只生成一个 summary scene token；summary token 参与 actor attention、event head 和
+geometry head，但不增加 response row。没有 omitted actor 时 summary mask 为 0，并通过
+physical-only 等价性测试。
+
+collection 与 runtime 调用同一个 deterministic summary builder；三个 summary tensors 及其
+hash 都进入 root observation fingerprint。Risk/Shield 仍读取完整车辆集合，不读取 summary
+token，也不受 12-row 上限约束。v5 因此需要新的 collection/data split、ACCVP training、
+calibration、Candidate PPO 和 runtime evidence；旧 v4 数据与 checkpoint 不得改名冒充 v5。
 
 ### Entry-time labels
 

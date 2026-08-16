@@ -35,6 +35,15 @@ def _tensor_batch(batch: dict[str, np.ndarray], torch: Any) -> dict[str, Any]:
 
 
 def _model_output(model: Any, batch: dict[str, Any]) -> dict[str, Any]:
+    summary_inputs = {
+        name: batch[name]
+        for name in (
+            "omitted_actor_summary_features",
+            "omitted_actor_summary_group_mask",
+            "omitted_actor_summary_mask",
+        )
+        if name in batch
+    }
     return model(
         batch["history_features"],
         batch["history_valid_mask"],
@@ -46,6 +55,7 @@ def _model_output(model: Any, batch: dict[str, Any]) -> dict[str, Any]:
         batch["actor_mask"],
         batch["candidate_plan"],
         batch["candidate_action_ids"],
+        **summary_inputs,
     )
 
 

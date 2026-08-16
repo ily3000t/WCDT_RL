@@ -758,9 +758,10 @@ def workflow_status(
             "safe_rl_output/runs/accvp_vnext_factorial/"
             "ppo_factorial_manifest.json",
         )
-        if str(workflow.get("protocol_id", "")) == (
-            "accvp-vnext-correctness-v3-selector4"
-        ):
+        if str(workflow.get("protocol_id", "")) in {
+            "accvp-vnext-correctness-v3-selector4",
+            "accvp-vnext-correctness-v4-selector4-hybrid",
+        }:
             selector_cache = _workflow_path_value(
                 workflow,
                 "selector_replay_cache",

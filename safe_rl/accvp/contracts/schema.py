@@ -17,6 +17,9 @@ COUNTERFACTUAL_SHARD_MANIFEST_VERSION = 3
 COUNTERFACTUAL_DATASET_MANIFEST_VERSION = 3
 ACTOR_ROW_MAPPING_VERSION = "selected_indices_v2"
 ROOT_OBSERVATION_FINGERPRINT_VERSION = "model_input_fingerprint_v3"
+HYBRID_ROOT_OBSERVATION_FINGERPRINT_VERSION = (
+    "model_input_fingerprint_v4_hybrid_actor_summary"
+)
 SCENARIO_EPISODE_KEY_VERSION = "scenario_route_traffic_seed_v1"
 ENTRY_TIME_LABEL_VERSION = "conditional_entry_time_v1"
 VIABILITY_STATUSES = frozenset({"observed_success", "observed_failure", "censored"})
@@ -58,6 +61,12 @@ ROOT_MODEL_INPUT_FIELDS = (
     "mask",
 )
 
+OPTIONAL_HYBRID_ROOT_MODEL_INPUT_FIELDS = (
+    "omitted_actor_summary_features",
+    "omitted_actor_summary_group_mask",
+    "omitted_actor_summary_mask",
+)
+
 _ROOT_MODEL_INPUT_NDIMS = {
     "history_features": 3,
     "history_valid_mask": 2,
@@ -67,6 +76,9 @@ _ROOT_MODEL_INPUT_NDIMS = {
     "lane_ids": 1,
     "edge_role_ids": 1,
     "mask": 1,
+    "omitted_actor_summary_features": 2,
+    "omitted_actor_summary_group_mask": 1,
+    "omitted_actor_summary_mask": 1,
 }
 
 
@@ -194,6 +206,7 @@ def root_observation_fingerprint(
     root_ego: Mapping[str, Any],
     data_contract_hash: str,
     tensors: Mapping[str, Any],
+    fingerprint_version: str = ROOT_OBSERVATION_FINGERPRINT_VERSION,
 ) -> str:
     """Hash exactly the immutable root inputs consumed by the ACCVP model.
 
@@ -212,8 +225,29 @@ def root_observation_fingerprint(
     missing = [name for name in ROOT_MODEL_INPUT_FIELDS if name not in tensors]
     if missing:
         raise ValueError(f"root observation fingerprint is missing model inputs: {missing}")
+    present_hybrid = [
+        name for name in OPTIONAL_HYBRID_ROOT_MODEL_INPUT_FIELDS if name in tensors
+    ]
+    if present_hybrid and len(present_hybrid) != len(
+        OPTIONAL_HYBRID_ROOT_MODEL_INPUT_FIELDS
+    ):
+        missing_hybrid = [
+            name
+            for name in OPTIONAL_HYBRID_ROOT_MODEL_INPUT_FIELDS
+            if name not in tensors
+        ]
+        raise ValueError(
+            "root observation fingerprint has an incomplete hybrid actor "
+            f"summary: missing={missing_hybrid}"
+        )
+    model_input_fields = (
+        ROOT_MODEL_INPUT_FIELDS
+        + OPTIONAL_HYBRID_ROOT_MODEL_INPUT_FIELDS
+        if present_hybrid
+        else ROOT_MODEL_INPUT_FIELDS
+    )
     canonical_tensors: dict[str, Any] = {}
-    for name in ROOT_MODEL_INPUT_FIELDS:
+    for name in model_input_fields:
         value = tensors[name]
         ndim = int(getattr(value, "ndim", -1))
         expected_ndim = _ROOT_MODEL_INPUT_NDIMS[name]
@@ -233,7 +267,7 @@ def root_observation_fingerprint(
     }
     return stable_hash(
         {
-            "version": ROOT_OBSERVATION_FINGERPRINT_VERSION,
+            "version": str(fingerprint_version),
             "data_contract_hash": str(data_contract_hash),
             "ego_candidate_plan_seed": ego_plan_seed,
             "model_inputs": canonical_tensors,

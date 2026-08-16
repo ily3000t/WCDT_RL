@@ -1,6 +1,6 @@
 schema_version: 1
 artifact_kind: accvp_vnext_ppo_ablation_matrix_v1
-protocol_id: accvp-vnext-correctness-v3-selector4
+protocol_id: accvp-vnext-correctness-v4-selector4-hybrid
 minimum_optimizer_replicates: 5
 optimizer_seed_role: ppo_optimizer_replicates
 

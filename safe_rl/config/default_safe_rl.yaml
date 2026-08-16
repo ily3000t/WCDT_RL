@@ -390,6 +390,13 @@ accvp:
   candidate_plan_horizon_steps: 80
   actor_count: 6
   ensemble_size: 3
+  # ACCVP-only bounded side channel for vehicles outside the fixed physical
+  # actor rows. Disabled by default so historical WcDT/ACCVP checkpoints keep
+  # their exact architecture and input contract.
+  omitted_actor_summary:
+    enabled: false
+    contract_version: "accvp_omitted_actor_summary_v1"
+    physical_actor_capacity: 6
   # Selector-v3/v4 data collection/training must read a passing immutable audit;
   # the loader replaces only ACCVP actor_count with its frozen capacity
   # (6 first, 8 only when the strict audit requires it). WcDT keeps its own

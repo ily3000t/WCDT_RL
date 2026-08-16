@@ -115,9 +115,15 @@ def audit_dataset_actor_contract(dataset_dir: str | Path) -> dict[str, Any]:
             mapping_by_root[root_id] = (recorded, actor_ids, source_indices)
 
             try:
+                expected_fingerprint_version = str(
+                    dict(metadata.get("data_contract", {}) or {}).get(
+                        "root_observation_fingerprint_version",
+                        ROOT_OBSERVATION_FINGERPRINT_VERSION,
+                    )
+                )
                 if str(
                     metadata.get("root_observation_fingerprint_version", "")
-                ) != ROOT_OBSERVATION_FINGERPRINT_VERSION:
+                ) != expected_fingerprint_version:
                     raise ValueError("root observation fingerprint version mismatch")
                 expected_fingerprint = root_observation_fingerprint(
                     actor_row_ids=actor_ids,
@@ -132,6 +138,7 @@ def audit_dataset_actor_contract(dataset_dir: str | Path) -> dict[str, Any]:
                         )
                         for name, value in root_tensors.items()
                     },
+                    fingerprint_version=expected_fingerprint_version,
                 )
                 recorded_fingerprint = str(
                     metadata.get("root_observation_fingerprint", "")

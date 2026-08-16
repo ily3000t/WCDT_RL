@@ -15,6 +15,7 @@ from safe_rl.accvp.contracts.protocol import (
     ACCVP_DATA_CONTRACT_VERSION,
     ACCVP_SELECTOR3_DATA_CONTRACT_VERSION,
     ACCVP_SELECTOR4_DATA_CONTRACT_VERSION,
+    ACCVP_HYBRID_ACTOR_DATA_CONTRACT_VERSION,
     is_strict_selector_data_contract,
 )
 from safe_rl.accvp.contracts.schema import (
@@ -33,6 +34,10 @@ from safe_rl.accvp.contracts.schema import (
     stable_hash,
     validate_branch_row,
     write_json_atomic,
+)
+from safe_rl.accvp.modeling.omitted_actor_summary import (
+    OMITTED_ACTOR_SUMMARY_TENSOR_FIELDS,
+    validate_omitted_actor_summary_tensors,
 )
 
 
@@ -146,10 +151,17 @@ def merge_counterfactual_shards(
     baseline = dict(manifests[0]["data_contract"])
     baseline_hash = str(manifests[0]["data_contract_hash"])
     protocol_version = str(baseline.get("protocol_version", ""))
+    expected_fingerprint_version = str(
+        baseline.get(
+            "root_observation_fingerprint_version",
+            ROOT_OBSERVATION_FINGERPRINT_VERSION,
+        )
+    )
     strict_actor_rows = protocol_version in {
         ACCVP_DATA_CONTRACT_VERSION,
         ACCVP_SELECTOR3_DATA_CONTRACT_VERSION,
         ACCVP_SELECTOR4_DATA_CONTRACT_VERSION,
+        ACCVP_HYBRID_ACTOR_DATA_CONTRACT_VERSION,
     }
     strict_selector_coverage = is_strict_selector_data_contract(
         protocol_version
@@ -278,6 +290,20 @@ def merge_counterfactual_shards(
                     actor_mask = np.asarray(tensors["mask"], dtype=np.float32)[0].reshape(-1)
                     tensor_indices = np.asarray(tensors["selected_indices"], dtype=np.int64)[0].reshape(-1).tolist()
                     root_tensor_values = {name: np.asarray(tensors[name]) for name in tensors.files}
+                if protocol_version == ACCVP_HYBRID_ACTOR_DATA_CONTRACT_VERSION:
+                    summary_metadata = dict(
+                        root_metadata.get("omitted_actor_summary", {}) or {}
+                    )
+                    validate_omitted_actor_summary_tensors(
+                        {
+                            name: np.asarray(root_tensor_values[name])[0]
+                            for name in OMITTED_ACTOR_SUMMARY_TENSOR_FIELDS
+                            if name in root_tensor_values
+                        },
+                        expected_hash=str(
+                            summary_metadata.get("tensor_hash", "")
+                        ),
+                    )
                 if tensor_indices != source_indices:
                     raise ValueError(f"root selected_indices mismatch in shard {shard}: {root_id}")
                 mapping_hash = actor_row_mapping_hash(actor_row_ids, source_indices, actor_mask)
@@ -288,13 +314,14 @@ def merge_counterfactual_shards(
                 observation_fingerprint = str(root_metadata.get("root_observation_fingerprint", ""))
                 if not observation_fingerprint:
                     raise ValueError(f"root observation fingerprint missing in shard {shard}: {root_id}")
-                if str(root_metadata.get("root_observation_fingerprint_version", "")) != ROOT_OBSERVATION_FINGERPRINT_VERSION:
+                if str(root_metadata.get("root_observation_fingerprint_version", "")) != expected_fingerprint_version:
                     raise ValueError(f"root observation fingerprint version mismatch in shard {shard}: {root_id}")
                 recomputed_fingerprint = root_observation_fingerprint(
                     actor_row_ids=actor_row_ids,
                     root_ego=dict(root_metadata.get("root_ego", {})),
                     data_contract_hash=str(root_metadata.get("data_contract_hash", "")),
                     tensors=root_tensor_values,
+                    fingerprint_version=expected_fingerprint_version,
                 )
                 if recomputed_fingerprint != observation_fingerprint:
                     raise ValueError(f"root observation fingerprint content mismatch in shard {shard}: {root_id}")
@@ -399,7 +426,7 @@ def merge_counterfactual_shards(
                         "actor_row_source_indices": source_indices,
                         "actor_row_mapping_version": ACTOR_ROW_MAPPING_VERSION,
                         "actor_row_mapping_hash": mapping_hash,
-                        "root_observation_fingerprint_version": ROOT_OBSERVATION_FINGERPRINT_VERSION,
+                        "root_observation_fingerprint_version": expected_fingerprint_version,
                         "root_observation_fingerprint": observation_fingerprint,
                         "root_state_fingerprint": observation_fingerprint,
                         "scenario_episode_key_version": SCENARIO_EPISODE_KEY_VERSION,

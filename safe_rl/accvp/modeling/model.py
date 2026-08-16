@@ -2,12 +2,13 @@
 
 from __future__ import annotations
 
-from pathlib import Path
 from typing import Any
 
-import numpy as np
-
 from safe_rl.accvp.contracts.schema import COUNTERFACTUAL_SCHEMA_VERSION
+from safe_rl.accvp.modeling.omitted_actor_summary import (
+    ACCVPOmittedActorSummaryAdapter,
+    omitted_actor_summary_config,
+)
 from safe_rl.prediction.wcdt_v3_predictor import (
     ARCHITECTURE_VERSION as WCDT_V3_ARCHITECTURE_VERSION,
     WcDTV3TemporalInteractionPredictor,
@@ -15,6 +16,9 @@ from safe_rl.prediction.wcdt_v3_predictor import (
 
 
 ACCVP_ARCHITECTURE_VERSION = "accvp_v1_conditional_response_transformer"
+ACCVP_HYBRID_ARCHITECTURE_VERSION = (
+    "accvp_v2_hybrid_omitted_actor_summary_adapter"
+)
 ACCVP_LOSS_VERSION = "accvp_loss_v2"
 EVENT_NAMES = (
     "proxy_collision",
@@ -55,12 +59,20 @@ class ACCVPPredictor(_ModuleBase):
         actor_attention_layers: int = 2,
         num_heads: int = 4,
         dropout: float = 0.1,
+        omitted_actor_summary_feature_dim: int = 0,
+        omitted_actor_summary_group_count: int = 0,
     ):
         torch, nn, _functional = _require_torch()
         super().__init__()
         self.hidden_dim = int(hidden_dim)
         self.response_horizon_steps = int(response_horizon_steps)
         self.candidate_plan_horizon_steps = int(candidate_plan_horizon_steps)
+        self.omitted_actor_summary_feature_dim = int(
+            omitted_actor_summary_feature_dim
+        )
+        self.omitted_actor_summary_group_count = int(
+            omitted_actor_summary_group_count
+        )
         # The legacy decoder exists only to make WcDT-v3 state loading simple;
         # ACCVP never calls it for inference.
         self.scene = WcDTV3TemporalInteractionPredictor(
@@ -99,6 +111,19 @@ class ACCVPPredictor(_ModuleBase):
             nn.ReLU(inplace=True),
             nn.Linear(self.hidden_dim, 5),
         )
+        self.omitted_actor_summary_adapter = None
+        if self.omitted_actor_summary_feature_dim > 0:
+            if self.omitted_actor_summary_group_count <= 0:
+                raise ValueError(
+                    "hybrid omitted-actor model requires a positive group count"
+                )
+            self.omitted_actor_summary_adapter = (
+                ACCVPOmittedActorSummaryAdapter(
+                    feature_dim=self.omitted_actor_summary_feature_dim,
+                    group_count=self.omitted_actor_summary_group_count,
+                    hidden_dim=self.hidden_dim,
+                )
+            )
         self.scene_encode_calls = 0
 
     def encode_scene(
@@ -111,6 +136,9 @@ class ACCVPPredictor(_ModuleBase):
         lane_ids,
         edge_role_ids,
         actor_mask,
+        omitted_actor_summary_features=None,
+        omitted_actor_summary_group_mask=None,
+        omitted_actor_summary_mask=None,
     ):
         """Encode root scene once; callers may fan it out to all candidates."""
 
@@ -152,14 +180,41 @@ class ACCVPPredictor(_ModuleBase):
             )
         )
         actor_tokens = temporal + static
-        padding = actor_mask <= 0.0
+        scene_mask = actor_mask
+        if self.omitted_actor_summary_adapter is not None:
+            if (
+                omitted_actor_summary_features is None
+                or omitted_actor_summary_group_mask is None
+                or omitted_actor_summary_mask is None
+            ):
+                raise ValueError(
+                    "hybrid ACCVP scene encoding requires omitted-actor "
+                    "summary features and masks"
+                )
+            summary_token = self.omitted_actor_summary_adapter(
+                omitted_actor_summary_features,
+                omitted_actor_summary_group_mask,
+                omitted_actor_summary_mask,
+            )
+            actor_tokens = torch.cat([actor_tokens, summary_token], dim=1)
+            scene_mask = torch.cat(
+                [actor_mask, omitted_actor_summary_mask], dim=1
+            )
+        padding = scene_mask <= 0.0
         safe_actor_padding = padding.clone()
         all_actor_padding = safe_actor_padding.all(dim=1)
         if bool(all_actor_padding.any()):
             safe_actor_padding[all_actor_padding, 0] = False
         return self.scene.actor_encoder(actor_tokens, src_key_padding_mask=safe_actor_padding)
 
-    def forward_from_scene(self, scene_tokens, actor_mask, candidate_plan, candidate_action_ids):
+    def forward_from_scene(
+        self,
+        scene_tokens,
+        actor_mask,
+        candidate_plan,
+        candidate_action_ids,
+        omitted_actor_summary_mask=None,
+    ):
         """Score a batch of candidate plans using previously encoded root scenes."""
 
         torch, _nn, _functional = _require_torch()
@@ -171,11 +226,30 @@ class ACCVPPredictor(_ModuleBase):
         candidate_tokens = candidate[:, None, :].expand(-1, scene_tokens.shape[1], -1)
         relation = self.relation_bias(torch.cat([scene_tokens, candidate_tokens], dim=-1))
         conditioned = scene_tokens + relation
-        response = self.response_decoder(conditioned).view(
-            conditioned.shape[0], conditioned.shape[1], self.response_horizon_steps, 5
+        physical_actor_count = int(actor_mask.shape[1])
+        if int(conditioned.shape[1]) == physical_actor_count + 1:
+            if omitted_actor_summary_mask is None:
+                raise ValueError(
+                    "hybrid ACCVP candidate scoring requires the summary mask"
+                )
+            scene_mask = torch.cat(
+                [actor_mask, omitted_actor_summary_mask], dim=1
+            )
+        elif int(conditioned.shape[1]) == physical_actor_count:
+            scene_mask = actor_mask
+        else:
+            raise ValueError(
+                "ACCVP scene token count does not match physical actor rows"
+            )
+        physical_conditioned = conditioned[:, :physical_actor_count]
+        response = self.response_decoder(physical_conditioned).view(
+            physical_conditioned.shape[0],
+            physical_actor_count,
+            self.response_horizon_steps,
+            5,
         )
         response = response * actor_mask[:, :, None, None]
-        weights = actor_mask / actor_mask.sum(dim=1, keepdim=True).clamp_min(1.0)
+        weights = scene_mask / scene_mask.sum(dim=1, keepdim=True).clamp_min(1.0)
         pooled = (conditioned * weights[:, :, None]).sum(dim=1)
         return {
             "actor_response": response,
@@ -195,6 +269,9 @@ class ACCVPPredictor(_ModuleBase):
         actor_mask,
         candidate_plan,
         candidate_action_ids,
+        omitted_actor_summary_features=None,
+        omitted_actor_summary_group_mask=None,
+        omitted_actor_summary_mask=None,
     ):
         scene = self.encode_scene(
             history_features,
@@ -205,13 +282,22 @@ class ACCVPPredictor(_ModuleBase):
             lane_ids,
             edge_role_ids,
             actor_mask,
+            omitted_actor_summary_features,
+            omitted_actor_summary_group_mask,
+            omitted_actor_summary_mask,
         )
-        return self.forward_from_scene(scene, actor_mask, candidate_plan, candidate_action_ids)
+        return self.forward_from_scene(
+            scene,
+            actor_mask,
+            candidate_plan,
+            candidate_action_ids,
+            omitted_actor_summary_mask,
+        )
 
 
 def model_kwargs_from_config(config: Any) -> dict[str, Any]:
     prediction = config.prediction
-    return {
+    result = {
         "history_steps": int(config.scenario.history_steps),
         "response_horizon_steps": int(config.accvp.response_horizon_steps),
         "candidate_plan_horizon_steps": int(config.accvp.candidate_plan_horizon_steps),
@@ -221,6 +307,27 @@ def model_kwargs_from_config(config: Any) -> dict[str, Any]:
         "num_heads": int(prediction.get("wcdt_v3_num_heads", 4)),
         "dropout": float(prediction.get("wcdt_v3_dropout", 0.1)),
     }
+    summary = omitted_actor_summary_config(config)
+    if bool(summary["enabled"]):
+        result.update(
+            {
+                "omitted_actor_summary_feature_dim": int(
+                    summary["feature_dim"]
+                ),
+                "omitted_actor_summary_group_count": int(
+                    summary["group_count"]
+                ),
+            }
+        )
+    return result
+
+
+def architecture_version_from_config(config: Any) -> str:
+    return (
+        ACCVP_HYBRID_ARCHITECTURE_VERSION
+        if bool(omitted_actor_summary_config(config)["enabled"])
+        else ACCVP_ARCHITECTURE_VERSION
+    )
 
 
 def warm_start_scene_encoder(model: ACCVPPredictor, v3_state_dict: dict[str, Any]) -> dict[str, list[str]]:
@@ -420,10 +527,11 @@ def accvp_loss(output: dict[str, Any], batch: dict[str, Any], weights: dict[str,
 
 def checkpoint_metadata(config: Any, *, warm_start: dict[str, Any]) -> dict[str, Any]:
     return {
-        "architecture_version": ACCVP_ARCHITECTURE_VERSION,
+        "architecture_version": architecture_version_from_config(config),
         "loss_version": ACCVP_LOSS_VERSION,
         "counterfactual_schema_version": COUNTERFACTUAL_SCHEMA_VERSION,
         "wcdt_v3_architecture_version": WCDT_V3_ARCHITECTURE_VERSION,
         "model_kwargs": model_kwargs_from_config(config),
+        "omitted_actor_summary": omitted_actor_summary_config(config),
         "warm_start": warm_start,
     }

@@ -5,6 +5,10 @@ from typing import Any
 
 import numpy as np
 
+from safe_rl.accvp.modeling.omitted_actor_summary import (
+    build_omitted_actor_summary,
+    omitted_actor_summary_config,
+)
 from safe_rl.prediction.merge_safety_loss import LOSS_VERSION, merge_safety_loss
 from safe_rl.prediction.actor_selector import (
     ACTOR_SELECTION_VERSION,
@@ -284,6 +288,16 @@ def build_v3_runtime_batch(
             cfg.prediction.max_pred_num,
         )
     )
+    summary_contract = omitted_actor_summary_config(cfg)
+    if (
+        selector_scope == "accvp"
+        and bool(summary_contract["enabled"])
+        and max_actors != int(summary_contract["physical_actor_capacity"])
+    ):
+        raise ValueError(
+            "hybrid ACCVP runtime actor capacity differs from its frozen "
+            "physical_actor_capacity"
+        )
     selection = select_merge_relevant_actors(
         cfg,
         ego,
@@ -333,6 +347,15 @@ def build_v3_runtime_batch(
         output["mask"][0],
     )
     output["actor_selection"] = selection
+    if selector_scope == "accvp" and bool(summary_contract["enabled"]):
+        summary = build_omitted_actor_summary(
+            selection,
+            actor_capacity=max_actors,
+            latest_states=latest,
+            ego_state=ego,
+        )
+        output.update(summary.tensors(leading_batch=True))
+        output["omitted_actor_summary_metadata"] = summary.metadata()
     return output
 
 

@@ -83,6 +83,8 @@ checkpoint metadata 和 manifest。
 | `training.max_parallel_optimizer_replicates` | factorial 父进程同时运行的独立 PPO replicates，限定 1 或 2 | 1 |
 | `stage3.checkpoint_selection_workers` | 每个 checkpoint 的独立 selection-seed SUMO workers | 1 |
 | `stage3.checkpoint_selection_worker_torch_threads` | 每个 selection worker 的 Torch 线程数 | 1 |
+| `accvp.omitted_actor_summary.enabled` | 启用 ACCVP 专用 omitted-actor summary token | false |
+| `accvp.omitted_actor_summary.physical_actor_capacity` | 保留 actor-response supervision 的固定物理行数 | 与 `accvp.actor_count` 一致 |
 
 Canonical Candidate PPO 把 `ppo_expected_rollout_size` 固定为 1024。若从 1 个环境改为 2 个，
 必须同时把 `rl.n_steps` 从 1024 改为 512；4 个环境对应 256。否则程序会在启动 SUMO rollout
@@ -97,6 +99,13 @@ Checkpoint selection 的 worker 只生成逐 seed episode report；父进程按 
 Optimizer replicate 外层并行必须使用独立 spawn 子进程，factorial/child manifests 仍只由父进程
 写入。能力上限固定为 2；在完成同工作量的 `1 replicate × 4 envs` 与
 `2 replicates × 2 envs` 本机基准前，正式配置保持 1。
+
+Hybrid actor 正式配置保持 12 个物理 actor rows，并增加一个不属于 response rows 的 summary
+scene token。summary 由 collection/runtime 共享 builder 从完整 Selector-v4 metadata 生成，使用
+独立 group mask 和 summary mask；Risk/Shield 的全车辆输入不变。该输入被
+`accvp_240_v5_hybrid_actor_summary` 和
+`model_input_fingerprint_v4_hybrid_actor_summary` 同时锁定，因此不能复用旧 v4 数据、ACCVP
+checkpoint、calibration 或 Candidate PPO 作为正式证据。
 
 反事实 formal collection 的 `workers` 和 `shard_roots` 属于已生成数据的采集 lineage。不要
 为了应用新默认值重跑已完成 shard，也不要在正在执行的 collection 中修改它们。

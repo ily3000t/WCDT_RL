@@ -11,7 +11,10 @@ from typing import Any, Iterable
 import numpy as np
 
 from safe_rl.accvp.planning.candidate_plan import build_commitment_plan
-from safe_rl.accvp.contracts.protocol import is_strict_selector_data_contract
+from safe_rl.accvp.contracts.protocol import (
+    ACCVP_HYBRID_ACTOR_DATA_CONTRACT_VERSION,
+    is_strict_selector_data_contract,
+)
 from safe_rl.accvp.contracts.schema import (
     COUNTERFACTUAL_SCHEMA_VERSION,
     ENTRY_TIME_LABEL_VERSION,
@@ -24,6 +27,10 @@ from safe_rl.accvp.contracts.schema import (
 )
 from safe_rl.sim.action_space import decode_action
 from safe_rl.sim.types import VehicleState
+from safe_rl.accvp.modeling.omitted_actor_summary import (
+    OMITTED_ACTOR_SUMMARY_TENSOR_FIELDS,
+    validate_omitted_actor_summary_tensors,
+)
 
 
 SPLIT_RATIOS = {
@@ -521,13 +528,20 @@ def _validate_root_fingerprint(
 ) -> None:
     if int(root_metadata.get("counterfactual_schema_version", -1)) < COUNTERFACTUAL_SCHEMA_VERSION:
         return
-    if str(root_metadata.get("root_observation_fingerprint_version", "")) != ROOT_OBSERVATION_FINGERPRINT_VERSION:
+    expected_version = str(
+        dict(root_metadata.get("data_contract", {}) or {}).get(
+            "root_observation_fingerprint_version",
+            ROOT_OBSERVATION_FINGERPRINT_VERSION,
+        )
+    )
+    if str(root_metadata.get("root_observation_fingerprint_version", "")) != expected_version:
         raise ValueError(f"ACCVP root observation fingerprint version mismatch: {root_metadata.get('root_id')}")
     expected = root_observation_fingerprint(
         actor_row_ids=[str(value) for value in root_metadata.get("actor_row_ids", [])],
         root_ego=dict(root_metadata.get("root_ego", {})),
         data_contract_hash=str(root_metadata.get("data_contract_hash", "")),
         tensors=root_tensors,
+        fingerprint_version=expected_version,
     )
     recorded = str(root_metadata.get("root_observation_fingerprint", ""))
     if expected != recorded or str(root_row.get("root_observation_fingerprint", "")) != recorded:
@@ -572,10 +586,16 @@ class ACCVPBranchDataset:
             if bool(row.get("complete", False))
         ]
         dataset_manifest = read_json(manifest_dir / "dataset_manifest.json")
-        strict_selector_contract = is_strict_selector_data_contract(
+        protocol_version = str(
             dict(dataset_manifest.get("data_contract", {}) or {}).get(
                 "protocol_version", ""
             )
+        )
+        self.hybrid_summary_required = (
+            protocol_version == ACCVP_HYBRID_ACTOR_DATA_CONTRACT_VERSION
+        )
+        strict_selector_contract = is_strict_selector_data_contract(
+            protocol_version
         )
         selected_incomplete_roots = [
             str(row.get("root_id", ""))
@@ -673,6 +693,14 @@ class ACCVPBranchDataset:
         with np.load(row["tensor_path"], allow_pickle=False) as values:
             branch = {key: np.asarray(values[key]) for key in values.files}
         _validate_actor_row_mapping(metadata, row, root, branch)
+        if self.hybrid_summary_required:
+            summary_metadata = dict(
+                metadata.get("omitted_actor_summary", {}) or {}
+            )
+            validate_omitted_actor_summary_tensors(
+                root,
+                expected_hash=str(summary_metadata.get("tensor_hash", "")),
+            )
         _validate_root_fingerprint(metadata, root_row, root)
         ego = VehicleState(**metadata["root_ego"])
         plan = build_commitment_plan(
@@ -684,7 +712,7 @@ class ACCVPBranchDataset:
         event_mask = event_supervision_mask(row, root_row)
         viability_eligible = float(event_mask[3])
         entry_target, entry_mask, entry_observed, entry_censor_time, _entry_censor_reason = _validate_entry_time_row(row)
-        return {
+        item = {
             "history_features": root["history_features"].astype(np.float32),
             "history_valid_mask": root["history_valid_mask"].astype(np.float32),
             "history_lane_ids": root["history_lane_ids"].astype(np.int64),
@@ -723,6 +751,14 @@ class ACCVPBranchDataset:
             "entry_time_censor_time_s": np.asarray(entry_censor_time, dtype=np.float32),
             "viability_eligible": np.asarray(viability_eligible, dtype=np.float32),
         }
+        if self.hybrid_summary_required:
+            item.update(
+                {
+                    name: root[name].astype(np.float32)
+                    for name in OMITTED_ACTOR_SUMMARY_TENSOR_FIELDS
+                }
+            )
+        return item
 
 
 def collate_numpy(items: Iterable[dict[str, np.ndarray]]) -> dict[str, np.ndarray]:

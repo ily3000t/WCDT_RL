@@ -40,10 +40,13 @@ def test_config_registry_resolves_every_explicit_entry_and_canonical_vnext_set()
         "accvp_vnext_selector4_workflow",
         "ppo_accvp_candidate_table_selector4_full",
     }
+    assert configs["accvp_vnext_selector4_selector_audit"]["protocol"] == (
+        "accvp-vnext-correctness-v3-selector4"
+    )
     assert all(
         configs[name]["protocol"]
-        == "accvp-vnext-correctness-v3-selector4"
-        for name in canonical
+        == "accvp-vnext-correctness-v4-selector4-hybrid"
+        for name in canonical - {"accvp_vnext_selector4_selector_audit"}
     )
     assert all(
         configs[name]["status"] == "diagnostic_only"
@@ -93,7 +96,7 @@ def test_all_public_yaml_configs_parse_and_supported_overlays_load():
         CONFIG_ROOT / "archive",
     )
     yaml_paths = sorted(path for root in public_roots for path in root.rglob("*.yaml"))
-    assert len(yaml_paths) == 84
+    assert len(yaml_paths) == 85
     for path in yaml_paths:
         payload = yaml.safe_load(path.read_text(encoding="utf-8"))
         assert isinstance(payload, dict), path

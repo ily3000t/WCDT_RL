@@ -9,10 +9,10 @@ from typing import Any, Iterable
 
 from safe_rl.accvp.contracts.protocol import (
     ACCVP_SELECTOR3_DATA_CONTRACT_VERSION,
-    ACCVP_SELECTOR4_DATA_CONTRACT_VERSION,
     counterfactual_data_contract_candidates,
     data_contract_hash,
     is_strict_selector_data_contract,
+    is_selector4_data_contract,
 )
 from safe_rl.accvp.contracts.schema import (
     file_sha256,
@@ -82,7 +82,7 @@ def validate_formal_dataset(
     contract = dict(dataset_manifest.get("data_contract", {}) or {})
     protocol_version = str(contract.get("protocol_version", ""))
     selector3_contract = protocol_version == ACCVP_SELECTOR3_DATA_CONTRACT_VERSION
-    selector4_contract = protocol_version == ACCVP_SELECTOR4_DATA_CONTRACT_VERSION
+    selector4_contract = is_selector4_data_contract(protocol_version)
     strict_selector_contract = is_strict_selector_data_contract(protocol_version)
     contract_matches = _configured_contract_matches(
         config,

@@ -14,7 +14,9 @@ from safe_rl.utils.config import REPO_ROOT, load_config
 
 
 SMOKE_ARTIFACT_KIND = "accvp_pilot_latency_feasibility_smoke_v1"
-SMOKE_IMPLEMENTATION_VERSION = "selector4_actor12_shadow_full_path_v1"
+SMOKE_IMPLEMENTATION_VERSION = (
+    "selector4_actor12_hybrid_summary_shadow_full_path_v2"
+)
 
 
 def _resolve(value: str | Path) -> Path:

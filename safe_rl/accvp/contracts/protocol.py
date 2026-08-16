@@ -9,9 +9,13 @@ from typing import Any
 from safe_rl.accvp.contracts.schema import (
     ACTOR_ROW_MAPPING_VERSION,
     ENTRY_TIME_LABEL_VERSION,
+    HYBRID_ROOT_OBSERVATION_FINGERPRINT_VERSION,
     ROOT_OBSERVATION_FINGERPRINT_VERSION,
     file_sha256,
     stable_hash,
+)
+from safe_rl.accvp.modeling.omitted_actor_summary import (
+    omitted_actor_summary_config,
 )
 from safe_rl.prediction.actor_selector import (
     ACTOR_SELECTION_VERSION_V3,
@@ -33,17 +37,22 @@ ACCVP_SELECTOR3_DATA_CONTRACT_VERSION = "accvp_240_v3_conflict_selector"
 ACCVP_SELECTOR4_DATA_CONTRACT_VERSION = (
     "accvp_240_v4_lane_aware_capacity_audit"
 )
+ACCVP_HYBRID_ACTOR_DATA_CONTRACT_VERSION = (
+    "accvp_240_v5_hybrid_actor_summary"
+)
 SUPPORTED_ACCVP_DATA_CONTRACT_VERSIONS = frozenset(
     {
         ACCVP_DATA_CONTRACT_VERSION,
         ACCVP_SELECTOR3_DATA_CONTRACT_VERSION,
         ACCVP_SELECTOR4_DATA_CONTRACT_VERSION,
+        ACCVP_HYBRID_ACTOR_DATA_CONTRACT_VERSION,
     }
 )
 STRICT_SELECTOR_DATA_CONTRACT_VERSIONS = frozenset(
     {
         ACCVP_SELECTOR3_DATA_CONTRACT_VERSION,
         ACCVP_SELECTOR4_DATA_CONTRACT_VERSION,
+        ACCVP_HYBRID_ACTOR_DATA_CONTRACT_VERSION,
     }
 )
 
@@ -57,6 +66,13 @@ def is_strict_selector_data_contract(protocol_version: Any) -> bool:
     """
 
     return str(protocol_version) in STRICT_SELECTOR_DATA_CONTRACT_VERSIONS
+
+
+def is_selector4_data_contract(protocol_version: Any) -> bool:
+    return str(protocol_version) in {
+        ACCVP_SELECTOR4_DATA_CONTRACT_VERSION,
+        ACCVP_HYBRID_ACTOR_DATA_CONTRACT_VERSION,
+    }
 
 # ``accvp_240_v2`` was frozen while this retired, runtime-inert key still
 # existed in the default scenario mapping.  Removing the no-op configuration
@@ -172,11 +188,15 @@ def counterfactual_data_contract(config: Any, risk_model_fingerprint: str) -> di
             f"accvp.actor_relevance.version={ACTOR_SELECTION_VERSION_V3!r}"
         )
     if (
-        configured_version == ACCVP_SELECTOR4_DATA_CONTRACT_VERSION
+        configured_version
+        in {
+            ACCVP_SELECTOR4_DATA_CONTRACT_VERSION,
+            ACCVP_HYBRID_ACTOR_DATA_CONTRACT_VERSION,
+        }
         and selection_version != ACTOR_SELECTION_VERSION_V4
     ):
         raise ValueError(
-            f"{ACCVP_SELECTOR4_DATA_CONTRACT_VERSION} requires "
+            f"{configured_version} requires "
             f"accvp.actor_relevance.version={ACTOR_SELECTION_VERSION_V4!r}"
         )
     selector_contract = dict(config.accvp.get("selector_contract", {}) or {})
@@ -193,7 +213,11 @@ def counterfactual_data_contract(config: Any, risk_model_fingerprint: str) -> di
         "candidate_plan_horizon_steps": int(config.accvp.candidate_plan_horizon_steps),
         "actor_count": int(config.accvp.actor_count),
         "actor_row_mapping_version": ACTOR_ROW_MAPPING_VERSION,
-        "root_observation_fingerprint_version": ROOT_OBSERVATION_FINGERPRINT_VERSION,
+        "root_observation_fingerprint_version": (
+            HYBRID_ROOT_OBSERVATION_FINGERPRINT_VERSION
+            if configured_version == ACCVP_HYBRID_ACTOR_DATA_CONTRACT_VERSION
+            else ROOT_OBSERVATION_FINGERPRINT_VERSION
+        ),
         "entry_time_label_version": ENTRY_TIME_LABEL_VERSION,
         "response_feature_order": ["x", "y", "heading", "speed", "accel"],
         "wcdt_trajectory_schema_version": int(TRAJECTORY_SCHEMA_VERSION),
@@ -212,6 +236,7 @@ def counterfactual_data_contract(config: Any, risk_model_fingerprint: str) -> di
     if configured_version in {
         ACCVP_SELECTOR3_DATA_CONTRACT_VERSION,
         ACCVP_SELECTOR4_DATA_CONTRACT_VERSION,
+        ACCVP_HYBRID_ACTOR_DATA_CONTRACT_VERSION,
     }:
         if not bool(selector_contract.get("require_capacity_lock", False)):
             raise ValueError(
@@ -229,6 +254,29 @@ def counterfactual_data_contract(config: Any, risk_model_fingerprint: str) -> di
         contract["selector_capacity_audit_report_fingerprint"] = str(
             selector_contract.get("audit_report_fingerprint", "")
         )
+    if configured_version == ACCVP_HYBRID_ACTOR_DATA_CONTRACT_VERSION:
+        configured_fingerprint_version = str(
+            config.accvp.get(
+                "root_observation_fingerprint_version",
+                HYBRID_ROOT_OBSERVATION_FINGERPRINT_VERSION,
+            )
+        )
+        if (
+            configured_fingerprint_version
+            != HYBRID_ROOT_OBSERVATION_FINGERPRINT_VERSION
+        ):
+            raise ValueError(
+                "hybrid actor data contract requires "
+                f"root_observation_fingerprint_version="
+                f"{HYBRID_ROOT_OBSERVATION_FINGERPRINT_VERSION!r}"
+            )
+        summary_contract = omitted_actor_summary_config(config)
+        if not bool(summary_contract["enabled"]):
+            raise ValueError(
+                "hybrid actor data contract requires "
+                "accvp.omitted_actor_summary.enabled=true"
+            )
+        contract["omitted_actor_summary"] = summary_contract
     return contract
 
 
