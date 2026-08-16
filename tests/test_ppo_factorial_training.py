@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import copy
+import concurrent.futures
 import json
 from pathlib import Path
 
@@ -191,6 +192,31 @@ def _template(path: Path) -> Path:
     return path
 
 
+def test_factorial_plan_records_bounded_optimizer_parallelism(
+    tmp_path: Path, monkeypatch
+):
+    monkeypatch.setattr(factorial_stage3, "build_replicate_plan", _fake_replicate_plan)
+    template = tmp_path / "template_parallel.yaml"
+    template.write_text(
+        "run:\n  run_id: template\n"
+        "training:\n  max_parallel_optimizer_replicates: 2\n",
+        encoding="utf-8",
+    )
+    plan = factorial_stage3.build_factorial_plan(
+        config_path=template,
+        matrix_path=MATRIX,
+        workflow_path=WORKFLOW,
+        optimizer_seeds=SEEDS,
+        output_root=tmp_path / "factorial_parallel",
+        require_artifacts=False,
+    )
+    assert plan["execution_parallelism"] == {
+        "max_parallel_optimizer_replicates": 2,
+        "start_method": "spawn",
+        "manifest_writer": "parent_only",
+    }
+
+
 def _first_generated_run_dir(output_root: Path) -> Path:
     method_id = next(iter(EXPECTED_CANDIDATE_METHOD_ROLES))
     child = read_json_mapping(
@@ -239,6 +265,56 @@ def test_factorial_coordinator_trains_twenty_unique_checkpoints_and_resumes(
     )
     assert resumed == output
     assert calls == []
+
+
+def test_factorial_bounded_parallel_parent_captures_all_worker_records(
+    tmp_path: Path, monkeypatch
+):
+    calls: list[tuple[str, int]] = []
+    _install_fast_training_fakes(monkeypatch, calls=calls)
+
+    class ImmediateExecutor:
+        def __init__(self, *, max_workers, mp_context):
+            assert max_workers == 2
+            assert mp_context.get_start_method() == "spawn"
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, traceback):
+            return False
+
+        def submit(self, function, *args):
+            future: concurrent.futures.Future = concurrent.futures.Future()
+            try:
+                future.set_result(function(*args))
+            except Exception as exc:  # pragma: no cover - asserted by result()
+                future.set_exception(exc)
+            return future
+
+    monkeypatch.setattr(
+        factorial_stage3.concurrent.futures,
+        "ProcessPoolExecutor",
+        ImmediateExecutor,
+    )
+    template = tmp_path / "parallel_template.yaml"
+    template.write_text(
+        "run:\n  run_id: template\n"
+        "training:\n  max_parallel_optimizer_replicates: 2\n",
+        encoding="utf-8",
+    )
+    output = factorial_stage3.run(
+        config_path=template,
+        matrix_path=MATRIX,
+        workflow_path=WORKFLOW,
+        optimizer_seeds=SEEDS,
+        output_root=tmp_path / "parallel_factorial",
+    )
+    assert len(calls) == 20
+    manifest = validate_factorial_manifest(output)
+    assert manifest["status"] == "complete"
+    plan = read_json_mapping(manifest["factorial_plan"])
+    assert plan["execution_parallelism"]["max_parallel_optimizer_replicates"] == 2
 
 
 def test_factorial_resume_removes_only_an_empty_run_directory_shell(

@@ -18,7 +18,13 @@ from safe_rl.pipeline.stage1_risk_probe import (
     run as run_stage1,
 )
 from safe_rl.prediction.forecast_rollout_bundle import build_forecast_rollout_bundle
-from safe_rl.rl.ppo import _ppo_parallelism_config, _worker_model_memory_estimate
+from safe_rl.rl.ppo import (
+    _aggregate_checkpoint_selection_rows,
+    _checkpoint_selection_parallelism,
+    _checkpoint_selection_seed_batches,
+    _ppo_parallelism_config,
+    _worker_model_memory_estimate,
+)
 from safe_rl.risk.merge_local import (
     candidate_action_risk_samples,
     prepare_candidate_rollout_context,
@@ -138,6 +144,49 @@ def test_ppo_parallelism_preserves_explicit_rollout_contract():
     cfg.rl["n_steps"] = 1024
     with np.testing.assert_raises_regex(ValueError, "rollout-size contract changed"):
         _ppo_parallelism_config(cfg)
+
+
+def test_checkpoint_selection_parallelism_partitions_and_aggregates_by_seed(
+    monkeypatch,
+):
+    cfg = load_config()
+    cfg.stage3["checkpoint_selection_workers"] = 4
+    cfg.stage3["checkpoint_selection_worker_torch_threads"] = 1
+    cfg.stage3["checkpoint_selection_start_method"] = "spawn"
+    parallelism = _checkpoint_selection_parallelism(cfg)
+    assert parallelism == {
+        "workers": 4,
+        "worker_threads": 1,
+        "start_method": "spawn",
+    }
+    batches = _checkpoint_selection_seed_batches([5, 1, 4, 2, 3], 4)
+    assert batches == [[5, 3], [1], [4], [2]]
+
+    observed: list[int] = []
+
+    def fake_aggregate(reports):
+        observed.extend(int(report["seed_marker"]) for report in reports)
+        return {"episodes": len(reports)}
+
+    monkeypatch.setattr(
+        "safe_rl.risk.risk_aggregator.aggregate_episode_reports",
+        fake_aggregate,
+    )
+    metrics = _aggregate_checkpoint_selection_rows(
+        [
+            {
+                "seed": seed,
+                "report": {"seed_marker": seed},
+                "episode_reward": float(seed),
+                "merge_success": seed % 2 == 0,
+            }
+            for seed in [5, 1, 4, 2, 3]
+        ]
+    )
+    assert observed == [1, 2, 3, 4, 5]
+    assert metrics["checkpoint_selection_episode_seeds"] == [1, 2, 3, 4, 5]
+    assert metrics["average_reward"] == 3.0
+    assert metrics["merge_success_rate"] == 0.4
 
 
 def test_explicit_reset_seed_does_not_apply_parallel_schedule(monkeypatch):

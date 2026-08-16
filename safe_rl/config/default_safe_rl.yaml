@@ -33,6 +33,9 @@ training:
   ppo_start_method: "spawn"
   ppo_worker_torch_threads: 1
   ppo_main_torch_threads: 4
+  # Factorial coordination may run two fully isolated optimizer replicates.
+  # Keep one until a machine-specific 1x4-vs-2x2 throughput smoke passes.
+  max_parallel_optimizer_replicates: 1
   # Optional semantic guard. Formal templates set 1024; when num_envs changes,
   # change rl.n_steps so num_envs * n_steps remains equal to this value.
   ppo_expected_rollout_size: null
@@ -568,6 +571,11 @@ stage3:
   eval_enabled: true
   eval_freq: 10000
   eval_seeds: [1, 2, 3, 4, 5, 6, 7, 8, 9, 10]
+  # Checkpoint-selection episodes are independent, deterministic SUMO runs.
+  # Workers return per-seed reports; only the parent aggregates and selects.
+  checkpoint_selection_workers: 1
+  checkpoint_selection_worker_torch_threads: 1
+  checkpoint_selection_start_method: "spawn"
   checkpoint_selection_profile: "safety"
   checkpoint_selection_weights:
     reward: 1.0

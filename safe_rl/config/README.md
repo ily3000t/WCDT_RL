@@ -80,11 +80,23 @@ checkpoint metadata 和 manifest。
 | `training.ppo_worker_torch_threads` | 每个 PPO environment worker 的 Torch 线程数 | 1 |
 | `training.ppo_main_torch_threads` | PPO 主进程更新网络的 Torch 线程数 | 4 |
 | `training.ppo_expected_rollout_size` | 可选的 `num_envs × n_steps` 语义门槛 | null |
+| `training.max_parallel_optimizer_replicates` | factorial 父进程同时运行的独立 PPO replicates，限定 1 或 2 | 1 |
+| `stage3.checkpoint_selection_workers` | 每个 checkpoint 的独立 selection-seed SUMO workers | 1 |
+| `stage3.checkpoint_selection_worker_torch_threads` | 每个 selection worker 的 Torch 线程数 | 1 |
 
 Canonical Candidate PPO 把 `ppo_expected_rollout_size` 固定为 1024。若从 1 个环境改为 2 个，
 必须同时把 `rl.n_steps` 从 1024 改为 512；4 个环境对应 256。否则程序会在启动 SUMO rollout
 前拒绝配置。每个 PPO worker 都独立加载 ACCVP/Risk checkpoint，因此先测试 2 个环境，并用
 内存、TraCI 稳定性和 steps/s 报告决定是否增加，不要把单纯增加进程数当作等价加速。
+
+Checkpoint selection 的 worker 只生成逐 seed episode report；父进程按 seed 排序后统一聚合、
+评分和写 best-checkpoint 证据。`simulation_blocking_exact_v1` 下 CPU 竞争不会改变 observation，
+但并行运行产生的 wall-clock latency telemetry 不是 deployment runtime 证据。正式 Selector-v4
+配置使用 4 个 selection workers，selection seeds、checkpoint 数量和评分公式不变。
+
+Optimizer replicate 外层并行必须使用独立 spawn 子进程，factorial/child manifests 仍只由父进程
+写入。能力上限固定为 2；在完成同工作量的 `1 replicate × 4 envs` 与
+`2 replicates × 2 envs` 本机基准前，正式配置保持 1。
 
 反事实 formal collection 的 `workers` 和 `shard_roots` 属于已生成数据的采集 lineage。不要
 为了应用新默认值重跑已完成 shard，也不要在正在执行的 collection 中修改它们。

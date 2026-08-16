@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import argparse
+import concurrent.futures
 import copy
+import multiprocessing
 from pathlib import Path
 from typing import Any, Mapping
 
@@ -78,6 +80,15 @@ def build_factorial_plan(
     root = resolve_path(output_root)
     config_source = resolve_path(config_path)
     template_cfg = load_config(config_source)
+    max_parallel_replicates = int(
+        template_cfg.get("training", {}).get(
+            "max_parallel_optimizer_replicates", 1
+        )
+    )
+    if max_parallel_replicates not in {1, 2}:
+        raise ValueError(
+            "training.max_parallel_optimizer_replicates must be 1 or 2"
+        )
     replicate_run_id_prefix = str(
         dict(template_cfg.get("experiment", {}) or {}).get(
             "replicate_run_id_prefix",
@@ -154,6 +165,11 @@ def build_factorial_plan(
         "final_method_id": contract["final_method_id"],
         "training_budget_hash": next(iter(budget_hashes)),
         "observation_contract_hash": next(iter(observation_hashes)),
+        "execution_parallelism": {
+            "max_parallel_optimizer_replicates": max_parallel_replicates,
+            "start_method": "spawn",
+            "manifest_writer": "parent_only",
+        },
         "methods": methods,
     }
     plan["plan_fingerprint"] = stable_hash(_plan_without_fingerprint(plan))
@@ -190,6 +206,15 @@ def _validate_frozen_plan(
         "optimizer_seeds": seeds,
         "method_roles": contract["method_roles"],
         "final_method_id": contract["final_method_id"],
+        "execution_parallelism": {
+            "max_parallel_optimizer_replicates": int(
+                load_config(resolve_path(config_path))
+                .get("training", {})
+                .get("max_parallel_optimizer_replicates", 1)
+            ),
+            "start_method": "spawn",
+            "manifest_writer": "parent_only",
+        },
     }
     for field, expected in expected_inputs.items():
         if payload.get(field) != expected:
@@ -442,6 +467,29 @@ def _recover_or_train_record(
     return "trained"
 
 
+def _recover_or_train_record_worker(
+    method_id: str,
+    record: Mapping[str, Any],
+    config_path: str,
+    config_payload: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Spawn-safe optimizer-replicate worker with no shared manifest writes."""
+
+    mutable_record = copy.deepcopy(plain(record))
+    action = _recover_or_train_record(
+        method_id=str(method_id),
+        record=mutable_record,
+        config_path=Path(config_path),
+        config_payload=plain(config_payload),
+    )
+    return {
+        "method_id": str(method_id),
+        "optimizer_seed": int(mutable_record["optimizer_seed"]),
+        "action": str(action),
+        "record": mutable_record,
+    }
+
+
 def _write_total_manifest(
     *,
     output: Path,
@@ -521,35 +569,109 @@ def run(
         child_paths=child_paths,
         status="planned" if not all(child.get("status") == "complete" for child in children.values()) else "complete",
     )
+    max_parallel_replicates = int(
+        dict(plan.get("execution_parallelism", {}) or {}).get(
+            "max_parallel_optimizer_replicates", 1
+        )
+    )
+    pending: list[tuple[str, int, Path, dict[str, Any]]] = []
     for method_id in EXPECTED_CANDIDATE_METHOD_ROLES:
         child = children[method_id]
-        configs = configs_by_method[method_id]
         if child.get("status") == "complete":
-            print(f"[ppo_factorial] method={method_id} status=complete action=skip", flush=True)
+            print(
+                f"[ppo_factorial] method={method_id} status=complete action=skip",
+                flush=True,
+            )
             continue
         child["status"] = "planned"
         _write_child_manifest(child_paths[method_id], child)
-        for index, (config_path, config_payload) in enumerate(configs):
-            seed = int(child["records"][index]["optimizer_seed"])
-            print(f"[ppo_factorial] method={method_id} optimizer_seed={seed} start", flush=True)
+        for index, (config_path, config_payload) in enumerate(
+            configs_by_method[method_id]
+        ):
+            pending.append((method_id, index, config_path, config_payload))
+
+    def capture_result(
+        method_id: str,
+        index: int,
+        result: Mapping[str, Any],
+    ) -> None:
+        child = children[method_id]
+        expected_seed = int(child["records"][index]["optimizer_seed"])
+        if str(result.get("method_id", "")) != method_id:
+            raise ValueError("optimizer worker returned the wrong method_id")
+        if int(result.get("optimizer_seed", -1)) != expected_seed:
+            raise ValueError("optimizer worker returned the wrong seed")
+        child["records"][index] = copy.deepcopy(plain(result["record"]))
+        _write_child_manifest(child_paths[method_id], child)
+        _write_total_manifest(
+            output=output,
+            plan_path=plan_path,
+            plan=plan,
+            child_paths=child_paths,
+            status="planned",
+        )
+        print(
+            f"[ppo_factorial] method={method_id} optimizer_seed={expected_seed} "
+            f"done action={result['action']}",
+            flush=True,
+        )
+
+    if max_parallel_replicates == 1:
+        for method_id, index, config_path, config_payload in pending:
+            seed = int(children[method_id]["records"][index]["optimizer_seed"])
+            print(
+                f"[ppo_factorial] method={method_id} optimizer_seed={seed} start",
+                flush=True,
+            )
+            record = children[method_id]["records"][index]
             action = _recover_or_train_record(
                 method_id=method_id,
-                record=child["records"][index],
+                record=record,
                 config_path=config_path,
                 config_payload=config_payload,
             )
-            _write_child_manifest(child_paths[method_id], child)
-            _write_total_manifest(
-                output=output,
-                plan_path=plan_path,
-                plan=plan,
-                child_paths=child_paths,
-                status="planned",
+            capture_result(
+                method_id,
+                index,
+                {
+                    "method_id": method_id,
+                    "optimizer_seed": seed,
+                    "action": action,
+                    "record": record,
+                },
             )
-            print(
-                f"[ppo_factorial] method={method_id} optimizer_seed={seed} done action={action}",
-                flush=True,
-            )
+    elif pending:
+        context = multiprocessing.get_context("spawn")
+        with concurrent.futures.ProcessPoolExecutor(
+            max_workers=max_parallel_replicates,
+            mp_context=context,
+        ) as executor:
+            futures: dict[
+                concurrent.futures.Future[dict[str, Any]], tuple[str, int]
+            ] = {}
+            for method_id, index, config_path, config_payload in pending:
+                record = children[method_id]["records"][index]
+                seed = int(record["optimizer_seed"])
+                print(
+                    f"[ppo_factorial] method={method_id} optimizer_seed={seed} start",
+                    flush=True,
+                )
+                future = executor.submit(
+                    _recover_or_train_record_worker,
+                    method_id,
+                    record,
+                    str(config_path),
+                    config_payload,
+                )
+                futures[future] = (method_id, index)
+            for future in concurrent.futures.as_completed(futures):
+                method_id, index = futures[future]
+                capture_result(method_id, index, future.result())
+
+    for method_id in EXPECTED_CANDIDATE_METHOD_ROLES:
+        child = children[method_id]
+        if child.get("status") == "complete":
+            continue
         child["status"] = "complete"
         _write_child_manifest(child_paths[method_id], child)
         print(f"[ppo_factorial] method={method_id} status=complete", flush=True)

@@ -7,6 +7,28 @@ experiment:
   replicate_run_id_prefix: "ppo_accvp_vnext_selector4_blocking_exact"
   closed_loop_execution_protocol: "simulation_blocking_exact_v1"
 
+training:
+  # Four independent SUMO workers preserve the frozen 1024-sample rollout
+  # budget while removing the single-environment throughput bottleneck.
+  ppo_num_envs: 4
+  ppo_start_method: "spawn"
+  ppo_worker_torch_threads: 1
+  ppo_main_torch_threads: 4
+  ppo_expected_rollout_size: 1024
+  # Bounded outer parallelism is implemented, but this machine-specific choice
+  # remains serial until the 1x4-vs-2x2 throughput smoke is accepted.
+  max_parallel_optimizer_replicates: 1
+
+rl:
+  n_steps: 256
+
+stage3:
+  # The 50 frozen selection seeds are evaluated independently. The parent
+  # process sorts per-seed reports before computing the unchanged aggregate.
+  checkpoint_selection_workers: 4
+  checkpoint_selection_worker_torch_threads: 1
+  checkpoint_selection_start_method: "spawn"
+
 evaluation_protocol:
   protocol_id: "accvp-vnext-correctness-v3-selector4"
   seed_ledger: "safe_rl/config/accvp_vnext_selector4_seed_ledger.json"

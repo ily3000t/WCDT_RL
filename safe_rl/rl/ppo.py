@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import concurrent.futures
+import multiprocessing
 import os
 import shutil
 import time
@@ -158,6 +160,35 @@ def _checkpoint_selection_seeds(config: Any) -> list[int]:
     return seeds
 
 
+def _checkpoint_selection_parallelism(config: Any) -> dict[str, Any]:
+    """Return the bounded, spawn-safe checkpoint-selection worker contract."""
+
+    stage3 = config.get("stage3", {}) or {}
+    workers = int(stage3.get("checkpoint_selection_workers", 1))
+    worker_threads = int(
+        stage3.get("checkpoint_selection_worker_torch_threads", 1)
+    )
+    start_method = str(
+        stage3.get("checkpoint_selection_start_method", "spawn")
+    ).strip()
+    if workers <= 0:
+        raise ValueError("stage3.checkpoint_selection_workers must be positive")
+    if worker_threads <= 0:
+        raise ValueError(
+            "stage3.checkpoint_selection_worker_torch_threads must be positive"
+        )
+    if start_method not in multiprocessing.get_all_start_methods():
+        raise ValueError(
+            "stage3.checkpoint_selection_start_method is unavailable: "
+            f"{start_method!r}"
+        )
+    return {
+        "workers": workers,
+        "worker_threads": worker_threads,
+        "start_method": start_method,
+    }
+
+
 def _validate_stage3_seed_preflight(config: Any) -> dict[str, Any]:
     selection = _checkpoint_selection_seeds(config)
     training_start = [int(config.run.seed)]
@@ -203,13 +234,26 @@ def _validate_stage3_seed_preflight(config: Any) -> dict[str, Any]:
     }
 
 
-def _evaluate_model_for_safety(model: Any, config: Any, seeds: list[int]) -> dict[str, Any]:
+def _evaluate_model_seed_batch(
+    model: Any,
+    config: Any,
+    seeds: list[int],
+    *,
+    worker_rank: int = 0,
+    worker_count: int = 1,
+) -> list[dict[str, Any]]:
     from safe_rl.pipeline.common import make_env
-    from safe_rl.risk.risk_aggregator import aggregate_episode_reports
 
-    reports: list[dict[str, Any]] = []
-    rewards: list[float] = []
-    env = make_env(config, seed=int(seeds[0] if seeds else config.run.seed), shield_enabled=False)
+    rows: list[dict[str, Any]] = []
+    if not seeds:
+        return rows
+    env = make_env(
+        config,
+        seed=int(seeds[0]),
+        shield_enabled=False,
+        worker_rank=int(worker_rank),
+        num_envs=max(1, int(worker_count)),
+    )
     try:
         for seed in seeds:
             total_reward = 0.0
@@ -222,13 +266,136 @@ def _evaluate_model_for_safety(model: Any, config: Any, seeds: list[int]) -> dic
             report = env.episode_report()
             report["episode_reward"] = total_reward
             report["merge_success"] = _info.get("done_reason") == "merge_success"
-            reports.append(report)
-            rewards.append(total_reward)
+            rows.append(
+                {
+                    "seed": int(seed),
+                    "report": report,
+                    "episode_reward": float(total_reward),
+                    "merge_success": bool(report["merge_success"]),
+                }
+            )
     finally:
         env.close()
+    return rows
+
+
+def _aggregate_checkpoint_selection_rows(
+    rows: Iterable[Mapping[str, Any]],
+) -> dict[str, Any]:
+    from safe_rl.risk.risk_aggregator import aggregate_episode_reports
+
+    ordered = sorted(
+        (dict(row) for row in rows),
+        key=lambda row: int(row["seed"]),
+    )
+    observed_seeds = [int(row["seed"]) for row in ordered]
+    if len(observed_seeds) != len(set(observed_seeds)):
+        raise RuntimeError("checkpoint selection produced duplicate simulator seeds")
+    reports = [dict(row["report"]) for row in ordered]
+    rewards = [float(row["episode_reward"]) for row in ordered]
     metrics = aggregate_episode_reports(reports)
     metrics["average_reward"] = float(np.mean(rewards)) if rewards else 0.0
-    metrics["merge_success_rate"] = float(np.mean([float(item.get("merge_success", False)) for item in reports])) if reports else 0.0
+    metrics["merge_success_rate"] = (
+        float(
+            np.mean(
+                [float(bool(row.get("merge_success", False))) for row in ordered]
+            )
+        )
+        if ordered
+        else 0.0
+    )
+    metrics["checkpoint_selection_episode_seeds"] = observed_seeds
+    metrics["checkpoint_selection_episode_seed_sha256"] = stable_hash(
+        observed_seeds
+    )
+    return metrics
+
+
+def _evaluate_model_for_safety(
+    model: Any,
+    config: Any,
+    seeds: list[int],
+) -> dict[str, Any]:
+    return _aggregate_checkpoint_selection_rows(
+        _evaluate_model_seed_batch(model, config, seeds)
+    )
+
+
+def _checkpoint_selection_seed_batches(
+    seeds: list[int], workers: int
+) -> list[list[int]]:
+    worker_count = min(max(1, int(workers)), max(1, len(seeds)))
+    batches = [[] for _ in range(worker_count)]
+    for index, seed in enumerate(seeds):
+        batches[index % worker_count].append(int(seed))
+    return [batch for batch in batches if batch]
+
+
+def _evaluate_checkpoint_seed_batch(
+    checkpoint_path: str,
+    config: Any,
+    seeds: list[int],
+    worker_rank: int,
+    worker_count: int,
+    worker_threads: int,
+) -> list[dict[str, Any]]:
+    """Spawn-safe evaluation entry point; workers never write shared reports."""
+
+    _configure_torch_threads(int(worker_threads))
+    PPO = _require_sb3()
+    model = PPO.load(str(checkpoint_path), device="cpu")
+    return _evaluate_model_seed_batch(
+        model,
+        config,
+        seeds,
+        worker_rank=int(worker_rank),
+        worker_count=int(worker_count),
+    )
+
+
+def _evaluate_checkpoint_for_safety_parallel(
+    checkpoint_path: Path,
+    config: Any,
+    seeds: list[int],
+    parallelism: Mapping[str, Any],
+) -> dict[str, Any]:
+    batches = _checkpoint_selection_seed_batches(
+        seeds,
+        int(parallelism["workers"]),
+    )
+    if len(batches) <= 1:
+        PPO = _require_sb3()
+        model = PPO.load(str(checkpoint_path), device="cpu")
+        return _aggregate_checkpoint_selection_rows(
+            _evaluate_model_seed_batch(model, config, seeds)
+        )
+    context = multiprocessing.get_context(str(parallelism["start_method"]))
+    rows: list[dict[str, Any]] = []
+    with concurrent.futures.ProcessPoolExecutor(
+        max_workers=len(batches),
+        mp_context=context,
+    ) as executor:
+        futures = [
+            executor.submit(
+                _evaluate_checkpoint_seed_batch,
+                str(checkpoint_path),
+                config,
+                batch,
+                rank,
+                len(batches),
+                int(parallelism["worker_threads"]),
+            )
+            for rank, batch in enumerate(batches)
+        ]
+        for future in concurrent.futures.as_completed(futures):
+            rows.extend(future.result())
+    metrics = _aggregate_checkpoint_selection_rows(rows)
+    if metrics["checkpoint_selection_episode_seeds"] != sorted(
+        int(seed) for seed in seeds
+    ):
+        raise RuntimeError(
+            "parallel checkpoint selection did not return the complete seed cohort"
+        )
     return metrics
 
 
@@ -255,6 +422,7 @@ class _SafetyEvalCallback:
                 self._last_eval_step = 0
                 self.selection_profile = _checkpoint_selection_profile(cfg)
                 self.selection_weights = _checkpoint_selection_weights(cfg)
+                self.selection_parallelism = _checkpoint_selection_parallelism(cfg)
 
             def _on_step(self) -> bool:
                 if self.eval_freq <= 0 or not self.eval_seeds:
@@ -272,7 +440,21 @@ class _SafetyEvalCallback:
                 timesteps = int(self.num_timesteps)
                 checkpoint_path = self.checkpoint_dir / f"{self.model_output.stem}_step_{timesteps:08d}.zip"
                 self.model.save(str(checkpoint_path))
-                metrics = _evaluate_model_for_safety(self.model, self.cfg, self.eval_seeds)
+                evaluation_started = time.perf_counter()
+                if int(self.selection_parallelism["workers"]) > 1:
+                    metrics = _evaluate_checkpoint_for_safety_parallel(
+                        checkpoint_path,
+                        self.cfg,
+                        self.eval_seeds,
+                        self.selection_parallelism,
+                    )
+                else:
+                    metrics = _evaluate_model_for_safety(
+                        self.model,
+                        self.cfg,
+                        self.eval_seeds,
+                    )
+                evaluation_wall_time = time.perf_counter() - evaluation_started
                 score = _checkpoint_selection_score(metrics, self.cfg)
                 selected_best = self.best_score is None or score > self.best_score
                 record = {
@@ -284,6 +466,12 @@ class _SafetyEvalCallback:
                     "safety_score": score,
                     "checkpoint_selection_profile": self.selection_profile,
                     "checkpoint_selection_weights": self.selection_weights,
+                    "checkpoint_selection_parallelism": dict(
+                        self.selection_parallelism
+                    ),
+                    "checkpoint_selection_wall_time_s": float(
+                        evaluation_wall_time
+                    ),
                     "selected_best": bool(selected_best),
                 }
                 if selected_best:
@@ -434,6 +622,13 @@ def _worker_model_memory_estimate(config: Any, num_envs: int) -> dict[str, Any]:
     configured_paths = {
         "forecast_checkpoint": config.get("forecast_features", {}).get("checkpoint"),
         "reward_risk_checkpoint": config.get("rl", {}).get("shield_guided_reward", {}).get("risk_checkpoint"),
+        "accvp_checkpoint": config.get("accvp", {}).get("checkpoint"),
+        "accvp_calibration_bundle": config.get("accvp", {}).get(
+            "calibration_bundle"
+        ),
+        "accvp_operating_point": config.get("accvp", {}).get(
+            "operating_point"
+        ),
     }
     payloads: dict[str, dict[str, Any]] = {}
     per_worker_bytes = 0
@@ -532,6 +727,7 @@ def train_ppo(
     selection_profile = _checkpoint_selection_profile(config)
     selection_weights = _checkpoint_selection_weights(config)
     selection_metric = _checkpoint_selection_formula(selection_weights)
+    selection_parallelism = _checkpoint_selection_parallelism(config)
     safety_callback = None
     allowed_training_seeds = (
         seeds_for_role(config, "stage3_training", fallback=[int(config.run.seed)])
@@ -592,6 +788,7 @@ def train_ppo(
             "selection_profile": selection_profile,
             "selection_weights": selection_weights,
             "selection_metric": selection_metric,
+            "parallelism": selection_parallelism,
         }
     else:
         shutil.copyfile(final_path, output_path)
@@ -605,6 +802,7 @@ def train_ppo(
             "selection_profile": selection_profile,
             "selection_weights": selection_weights,
             "selection_metric": selection_metric if bool(config.stage3.get("eval_enabled", False)) else None,
+            "parallelism": selection_parallelism,
         }
     write_json(selection_report_path, checkpoint_selection)
     accvp_observation_runtime_summary = _accvp_observation_summary_from_env(env)
@@ -644,6 +842,7 @@ def train_ppo(
         "checkpoint_selection_profile": selection_profile,
         "checkpoint_selection_weights": selection_weights,
         "checkpoint_selection_metric": selection_metric,
+        "checkpoint_selection_parallelism": selection_parallelism,
         "checkpoint_selection_seeds": selection_seeds,
         "checkpoint_selection_seed_sha256": stable_hash(sorted(selection_seeds)),
         "tensorboard": str(tensorboard_dir) if tensorboard_dir else None,
