@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import os
+import tempfile
 import time
 from pathlib import Path
 from typing import Any
@@ -125,18 +126,33 @@ class CounterfactualSnapshotStore:
 
     def _write_root_manifest(self, root_id: str, row: dict[str, Any]) -> None:
         path = self._manifest_path(root_id)
-        temporary = path.with_name(f"{path.stem}.{os.getpid()}.{time.time_ns()}.json.tmp")
-        with temporary.open("w", encoding="utf-8") as handle:
-            handle.write(canonical_json(row))
-        last_error: Exception | None = None
-        for attempt in range(10):
-            try:
-                temporary.replace(path)
-                return
-            except PermissionError as exc:
-                last_error = exc
-                time.sleep(0.05 * (attempt + 1))
-        raise last_error if last_error is not None else PermissionError(path)
+        # Keep the atomic temporary basename independent of ``root_id``.  The
+        # immutable Selector-v4 hybrid shard path is already long enough that
+        # appending PID and nanosecond fields to the final basename crosses the
+        # traditional Windows MAX_PATH boundary even though the final manifest
+        # itself is valid.  mkstemp preserves same-directory atomic replacement
+        # and process-safe uniqueness with a bounded basename.
+        descriptor, temporary_name = tempfile.mkstemp(
+            dir=path.parent,
+            prefix=".rm-",
+            suffix=".tmp",
+        )
+        temporary = Path(temporary_name)
+        try:
+            with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
+                handle.write(canonical_json(row))
+            last_error: Exception | None = None
+            for attempt in range(10):
+                try:
+                    temporary.replace(path)
+                    return
+                except PermissionError as exc:
+                    last_error = exc
+                    time.sleep(0.05 * (attempt + 1))
+            raise last_error if last_error is not None else PermissionError(path)
+        finally:
+            if temporary.exists():
+                temporary.unlink()
 
     def _load_root_manifest(self, root_id: str) -> dict[str, Any]:
         with self._manifest_path(root_id).open("r", encoding="utf-8") as handle:

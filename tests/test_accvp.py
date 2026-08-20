@@ -44,6 +44,7 @@ from safe_rl.accvp.evaluation.online_trigger import audit_online_triggers, write
 from safe_rl.accvp.planning.selection import select_viability_action, select_viability_lite_action
 from safe_rl.stage1_counterfactual.shards import merge_counterfactual_shards
 from safe_rl.stage1_counterfactual.snapshot_store import CounterfactualSnapshotStore
+from safe_rl.stage1_counterfactual import snapshot_store as snapshot_store_module
 from safe_rl.accvp.evaluation.targeted_benchmark import build_replacement_case_table, build_targeted_benchmark_summary
 from safe_rl.accvp.planning.viability_lite import (
     collapse_vnext_lite_records,
@@ -739,6 +740,29 @@ def test_snapshot_is_deleted_only_after_all_expected_branches_complete(tmp_path:
     store.write_branch({**base, "branch_id": "root_action1", "action_id": 1})
     assert store.finalise_root_if_complete("root") is True
     assert not snapshot.exists()
+
+
+def test_snapshot_manifest_atomic_temp_name_is_bounded(tmp_path: Path, monkeypatch):
+    store = CounterfactualSnapshotStore(tmp_path / "data")
+    root_id = "seed2_decision18_7159666a8cdc"
+    temporary_names: list[str] = []
+    original_mkstemp = snapshot_store_module.tempfile.mkstemp
+
+    def tracked_mkstemp(*args, **kwargs):
+        descriptor, name = original_mkstemp(*args, **kwargs)
+        temporary_names.append(Path(name).name)
+        return descriptor, name
+
+    monkeypatch.setattr(snapshot_store_module.tempfile, "mkstemp", tracked_mkstemp)
+    store._write_root_manifest(root_id, {"root_id": root_id, "complete": False})
+
+    assert temporary_names
+    assert root_id not in temporary_names[0]
+    assert len(temporary_names[0]) <= 20
+    assert json.loads(store._manifest_path(root_id).read_text(encoding="utf-8")) == {
+        "complete": False,
+        "root_id": root_id,
+    }
 
 
 def test_calibration_and_selected_action_metrics_are_decision_level():

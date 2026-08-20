@@ -544,7 +544,7 @@ def ensemble_predict_v3(models: list[Any], tensor_batch: dict[str, Any]):
 def load_v3_ensemble(config: Any, checkpoint: str | Path, device: Any | None = None):
     torch, _nn = _require_torch()
     device = device or _resolve_device(config, torch)
-    payload = torch.load(checkpoint, map_location=device)
+    payload = torch.load(checkpoint, map_location=device, weights_only=True)
     architecture = payload.get("architecture_version")
     if architecture != ARCHITECTURE_VERSION:
         raise ValueError(f"unsupported WcDT v3 architecture_version={architecture!r}; expected {ARCHITECTURE_VERSION!r}")

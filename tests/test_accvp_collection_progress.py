@@ -3,9 +3,11 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
+import pytest
 import torch
 
 from safe_rl.pipeline import stage1_collect_accvp_jobs as collection_pipeline
+from safe_rl.prediction.wcdt_v3_predictor import load_v3_ensemble
 from safe_rl.risk.risk_module import RiskModule, RiskModuleWrapper
 from safe_rl.utils.config import load_config
 
@@ -38,6 +40,26 @@ def test_risk_checkpoint_uses_restricted_weights_only_loader(tmp_path: Path, mon
     monkeypatch.setattr(torch, "load", tracked_load)
     RiskModuleWrapper(cfg, checkpoint=str(checkpoint))
     assert seen["map_location"] == "cpu"
+    assert seen["weights_only"] is True
+
+
+def test_wcdt_v3_checkpoint_uses_restricted_weights_only_loader(
+    tmp_path: Path, monkeypatch
+) -> None:
+    cfg = load_config()
+    checkpoint = tmp_path / "wcdt_v3.pt"
+    torch.save({"architecture_version": "wrong", "model_state_dicts": []}, checkpoint)
+    original_load = torch.load
+    seen: dict[str, object] = {}
+
+    def tracked_load(*args, **kwargs):
+        seen.update(kwargs)
+        return original_load(*args, **kwargs)
+
+    monkeypatch.setattr(torch, "load", tracked_load)
+    with pytest.raises(ValueError, match="architecture_version"):
+        load_v3_ensemble(cfg, checkpoint, torch.device("cpu"))
+    assert seen["map_location"] == torch.device("cpu")
     assert seen["weights_only"] is True
 
 
