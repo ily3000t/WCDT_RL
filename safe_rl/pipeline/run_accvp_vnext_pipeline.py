@@ -22,7 +22,11 @@ from safe_rl.pipeline.accvp_runtime_benchmark_factorial import (
     validate_factorial_runtime_report,
 )
 from safe_rl.pipeline.accvp_runtime_benchmark import (
+    METHOD_EFFECT_ADMISSION_PROFILE,
     RUNTIME_IMPLEMENTATION_VERSION,
+)
+from safe_rl.accvp.contracts.runtime_contract import (
+    SIMULATION_BLOCKING_EXACT_CONTRACT,
 )
 from safe_rl.pipeline.accvp_pilot_latency_smoke import (
     SMOKE_ARTIFACT_KIND,
@@ -324,8 +328,12 @@ def _factorial_runtime_ok(
     )
 
 
-def _failed_gate_summary(payload: dict[str, Any]) -> str:
-    gate = dict(payload.get("gate", {}) or {})
+def _failed_gate_summary(
+    payload: dict[str, Any],
+    *,
+    gate_field: str = "gate",
+) -> str:
+    gate = dict(payload.get(gate_field, {}) or {})
     failed = sorted(
         str(name)
         for name, value in dict(gate.get("checks", {}) or {}).items()
@@ -349,6 +357,53 @@ def _failed_gate_summary(payload: dict[str, Any]) -> str:
     )
 
 
+def _scorer_preflight_ok(path: Path, *, runtime_seeds: list[int]) -> bool:
+    """Admit blocking-exact experiments without erasing deployment misses."""
+
+    if not path.is_file():
+        return False
+    try:
+        payload = read_json(path)
+    except (OSError, ValueError, json.JSONDecodeError):
+        return False
+    expected_seed_hash = stable_hash(
+        {"episode_seeds": [int(seed) for seed in runtime_seeds]}
+    )
+    workload = dict(payload.get("workload", {}) or {})
+    method_contract = dict(
+        payload.get("policy_method_effect_execution_contract", {}) or {}
+    )
+    admission = dict(payload.get("method_effect_admission_gate", {}) or {})
+    declared_fingerprint = str(payload.get("report_fingerprint", ""))
+    fingerprint_payload = {
+        key: value for key, value in payload.items() if key != "report_fingerprint"
+    }
+    return bool(
+        str(payload.get("artifact_kind", ""))
+        == "accvp_runtime_benchmark_v1"
+        and str(payload.get("status", "")) == "complete"
+        and str(payload.get("runtime_implementation_version", ""))
+        == RUNTIME_IMPLEMENTATION_VERSION
+        and str(payload.get("benchmark_scope", "")) == "scorer_preflight"
+        and str(payload.get("policy_type", "")) == "rule_gap_acceptance"
+        and str(payload.get("backend", "")) == "vectorized"
+        and str(payload.get("conclusion_scope", ""))
+        == "deployment_runtime_only"
+        and not bool(payload.get("hard_realtime_claim", True))
+        and str(method_contract.get("execution_contract", ""))
+        == SIMULATION_BLOCKING_EXACT_CONTRACT
+        and str(admission.get("profile", ""))
+        == METHOD_EFFECT_ADMISSION_PROFILE
+        and bool(admission.get("pass", False))
+        and int(workload.get("requested_episode_seed_count", -1))
+        == len(runtime_seeds)
+        and str(workload.get("requested_episode_seed_sha256", ""))
+        == expected_seed_hash
+        and str(workload.get("observed_episode_seed_sha256", ""))
+        == expected_seed_hash
+        and bool(declared_fingerprint)
+        and stable_hash(fingerprint_payload) == declared_fingerprint
+    )
 def _scorer_runtime_failure_reason(
     path: Path,
     *,
@@ -373,6 +428,9 @@ def _scorer_runtime_failure_reason(
         RUNTIME_IMPLEMENTATION_VERSION
     ):
         return None
+    admission = dict(payload.get("method_effect_admission_gate", {}) or {})
+    if bool(admission.get("pass", False)):
+        return None
     workload = dict(payload.get("workload", {}) or {})
     if int(workload.get("requested_episode_seed_count", -1)) < int(
         expected_seed_count
@@ -383,10 +441,14 @@ def _scorer_runtime_failure_reason(
     ):
         return None
     return (
-        "the complete scorer runtime request already produced an immutable "
-        "failed report under the current implementation; change/fix the "
-        "implementation and bump its version before a clean rerun. "
-        + _failed_gate_summary(payload)
+        "the complete scorer preflight request already produced an immutable "
+        "method-effect admission failure under the current implementation; "
+        "fix the deadline-independent scorer integrity failure and bump the "
+        "runtime implementation version before a clean rerun. "
+        + _failed_gate_summary(
+            payload,
+            gate_field="method_effect_admission_gate",
+        )
     )
 
 
@@ -1008,10 +1070,9 @@ def workflow_status(
     )
     add(
         "scorer_runtime_preflight",
-        _artifact_ok(
+        _scorer_preflight_ok(
             scorer_report,
-            artifact_kind="accvp_runtime_benchmark_v1",
-            gate_pass=True,
+            runtime_seeds=runtime_seeds,
         ),
         _module_command(
             "safe_rl.pipeline.accvp_runtime_benchmark",

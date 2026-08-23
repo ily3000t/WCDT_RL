@@ -3,15 +3,23 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
+from safe_rl.accvp.contracts.schema import stable_hash
 from safe_rl.pipeline.run_accvp_vnext_pipeline import (
     WORKFLOW_CONFIG,
     _load_workflow_contract,
     _oracle_report_ok,
     _pilot_latency_smoke_ok,
     _pilot_validation_ok,
+    _scorer_preflight_ok,
     _scorer_runtime_failure_reason,
 )
-from safe_rl.pipeline.accvp_runtime_benchmark import RUNTIME_IMPLEMENTATION_VERSION
+from safe_rl.pipeline.accvp_runtime_benchmark import (
+    METHOD_EFFECT_ADMISSION_PROFILE,
+    RUNTIME_IMPLEMENTATION_VERSION,
+)
+from safe_rl.accvp.contracts.runtime_contract import (
+    SIMULATION_BLOCKING_EXACT_CONTRACT,
+)
 from safe_rl.accvp.evaluation.pilot import PILOT_VALIDATION_IMPLEMENTATION_VERSION
 from safe_rl.pipeline.accvp_pilot_latency_smoke import (
     SMOKE_ARTIFACT_KIND,
@@ -151,14 +159,60 @@ def test_complete_same_implementation_runtime_failure_blocks_identical_retry(
                     "pass": False,
                     "checks": {"latency_p95_within_0_30s": False},
                 },
+                "method_effect_admission_gate": {
+                    "pass": False,
+                    "checks": {"model_error_count_zero": False},
+                },
             }
         ),
         encoding="utf-8",
     )
     reason = _scorer_runtime_failure_reason(report, expected_seed_count=60)
     assert reason is not None
-    assert "latency_p95_within_0_30s" in reason
-    assert "0.301" in reason
+    assert "model_error_count_zero" in reason
+
+
+def test_deployment_gate_failure_does_not_block_blocking_exact_admission(
+    tmp_path: Path,
+) -> None:
+    seeds = list(range(56001, 56061))
+    seed_hash = stable_hash({"episode_seeds": seeds})
+    payload = {
+        "artifact_kind": "accvp_runtime_benchmark_v1",
+        "status": "complete",
+        "runtime_implementation_version": RUNTIME_IMPLEMENTATION_VERSION,
+        "benchmark_scope": "scorer_preflight",
+        "policy_type": "rule_gap_acceptance",
+        "backend": "vectorized",
+        "conclusion_scope": "deployment_runtime_only",
+        "hard_realtime_claim": False,
+        "policy_method_effect_execution_contract": {
+            "execution_contract": SIMULATION_BLOCKING_EXACT_CONTRACT,
+        },
+        "workload": {
+            "requested_episode_seed_count": len(seeds),
+            "requested_episode_seed_sha256": seed_hash,
+            "observed_episode_seed_sha256": seed_hash,
+        },
+        "gate": {
+            "pass": False,
+            "checks": {"latency_max_within_0_50s": False},
+        },
+        "method_effect_admission_gate": {
+            "profile": METHOD_EFFECT_ADMISSION_PROFILE,
+            "pass": True,
+            "checks": {"model_error_count_zero": True},
+        },
+    }
+    payload["report_fingerprint"] = stable_hash(payload)
+    report = tmp_path / "runtime.json"
+    report.write_text(json.dumps(payload), encoding="utf-8")
+
+    assert _scorer_preflight_ok(report, runtime_seeds=seeds)
+    assert _scorer_runtime_failure_reason(
+        report,
+        expected_seed_count=len(seeds),
+    ) is None
 
 
 def test_old_or_incomplete_runtime_failure_remains_eligible_for_audited_retry(

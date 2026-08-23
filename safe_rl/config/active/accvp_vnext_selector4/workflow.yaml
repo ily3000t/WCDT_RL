@@ -101,7 +101,10 @@ phase_gates:
     report_field: formal_state
     accepted_values: [pass]
   scorer_runtime_preflight:
-    report_field: gate.pass
+    # The report's `gate` remains the independent soft-deployment conclusion.
+    # Candidate PPO is admitted only by deadline-independent scorer integrity
+    # because its observation contract is simulation_blocking_exact_v1.
+    report_field: method_effect_admission_gate.pass
     accepted_values: [true]
   policy_runtime_replicates:
     # Deployment performance is a separate conclusion. Completion and full

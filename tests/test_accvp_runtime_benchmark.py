@@ -6,10 +6,62 @@ import pytest
 
 from safe_rl.accvp.contracts.schema import stable_hash
 from safe_rl.pipeline.accvp_runtime_benchmark import (
+    _method_effect_admission_gate,
     _software_hardware,
     _validate_failed_report_extension,
     run,
 )
+from safe_rl.accvp.contracts.runtime_contract import (
+    SIMULATION_BLOCKING_EXACT_CONTRACT,
+)
+
+
+def _admission_metrics() -> dict:
+    return {
+        "accvp_table_unique_episode_seed_count": 60,
+        "accvp_table_missing_episode_seed_count": 0,
+        "accvp_table_seed_schedule_match": True,
+        "accvp_table_activation_window_decision_count": 1204,
+        "accvp_table_model_error_count": 0,
+        "accvp_table_invalid_bundle_count": 0,
+        "accvp_table_invalid_output_count": 0,
+        "accvp_table_runtime_context_error_count": 0,
+        "accvp_table_critical_actor_overflow_count": 0,
+        "accvp_table_task_actor_overflow_count": 0,
+        "accvp_table_risk_safety_actor_coverage_incomplete_count": 0,
+        "accvp_table_unexpected_value_error_count": 0,
+        "accvp_table_warmup_error_count": 0,
+        "accvp_table_warmup_ready_rate": 1.0,
+        # These deployment-only misses must remain visible but non-blocking for
+        # a simulation-blocking-exact method-effect run.
+        "accvp_table_hard_fail_closed_count": 1,
+        "accvp_table_latency_max": 0.6218245,
+        "accvp_table_timeout_rate_activation_window": 0.0017,
+    }
+
+
+def test_method_effect_admission_separates_soft_runtime_outliers_from_integrity() -> None:
+    gate = _method_effect_admission_gate(
+        _admission_metrics(),
+        runtime_contract_check={"pass": True},
+        requested_execution_contract={
+            "execution_contract": SIMULATION_BLOCKING_EXACT_CONTRACT,
+        },
+    )
+    assert gate["pass"] is True
+    assert "latency_max_within_0_50s" in gate["excluded_deployment_only_checks"]
+
+    metrics = _admission_metrics()
+    metrics["accvp_table_model_error_count"] = 1
+    failed = _method_effect_admission_gate(
+        metrics,
+        runtime_contract_check={"pass": True},
+        requested_execution_contract={
+            "execution_contract": SIMULATION_BLOCKING_EXACT_CONTRACT,
+        },
+    )
+    assert failed["pass"] is False
+    assert failed["checks"]["model_error_count_zero"] is False
 
 
 def test_runtime_benchmark_rejects_nonformal_seed_schedule_before_loading_artifacts(tmp_path: Path):

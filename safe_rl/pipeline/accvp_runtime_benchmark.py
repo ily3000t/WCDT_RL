@@ -13,6 +13,7 @@ import numpy as np
 from safe_rl.accvp.contracts.artifacts import apply_v2_bundle_paths
 from safe_rl.accvp.serving.observation import RiskGatedACCVPCandidateTableAugmentor
 from safe_rl.accvp.contracts.runtime_contract import (
+    SIMULATION_BLOCKING_EXACT_CONTRACT,
     candidate_table_semantic_contract,
     closed_loop_execution_contract,
     compare_formal_runtime_contracts,
@@ -35,7 +36,11 @@ from safe_rl.utils.config import REPO_ROOT, load_config
 
 
 RUNTIME_IMPLEMENTATION_VERSION = (
-    "accvp_runtime_layered_contract_array_geometry_v8"
+    "accvp_runtime_layered_contract_array_geometry_v9"
+)
+
+METHOD_EFFECT_ADMISSION_PROFILE = (
+    "simulation_blocking_exact_scorer_admission_v1"
 )
 
 
@@ -185,6 +190,128 @@ def _failed_report_archive_path(output_path: Path, payload: dict[str, Any]) -> P
         / "failed_attempts"
         / f"{output_path.stem}.{fingerprint[:16]}.json"
     )
+
+
+def _method_effect_admission_gate(
+    metrics: dict[str, Any],
+    *,
+    runtime_contract_check: dict[str, Any],
+    requested_execution_contract: dict[str, Any],
+) -> dict[str, Any]:
+    """Separate scorer integrity from soft deployment deadline feasibility.
+
+    Candidate PPO and Stage5 use simulation-blocking-exact observations. A
+    deployment-only wall-clock miss therefore remains reportable evidence but
+    cannot change or reject their observations. Content, bundle, context,
+    actor-coverage and warmup failures still close this admission gate.
+    """
+
+    required_metric_fields = (
+        "accvp_table_unique_episode_seed_count",
+        "accvp_table_missing_episode_seed_count",
+        "accvp_table_seed_schedule_match",
+        "accvp_table_activation_window_decision_count",
+        "accvp_table_model_error_count",
+        "accvp_table_invalid_bundle_count",
+        "accvp_table_invalid_output_count",
+        "accvp_table_runtime_context_error_count",
+        "accvp_table_critical_actor_overflow_count",
+        "accvp_table_task_actor_overflow_count",
+        "accvp_table_risk_safety_actor_coverage_incomplete_count",
+        "accvp_table_unexpected_value_error_count",
+        "accvp_table_warmup_error_count",
+        "accvp_table_warmup_ready_rate",
+    )
+    checks = {
+        "blocking_exact_method_effect_contract": str(
+            requested_execution_contract.get("execution_contract", "")
+        )
+        == SIMULATION_BLOCKING_EXACT_CONTRACT,
+        "formal_runtime_contract_match": bool(
+            runtime_contract_check.get("pass", False)
+        ),
+        "required_metric_fields_present": all(
+            field in metrics for field in required_metric_fields
+        ),
+        "minimum_unique_episode_seeds": int(
+            metrics.get("accvp_table_unique_episode_seed_count", 0)
+        )
+        >= 30,
+        "episode_seed_metadata_complete": int(
+            metrics.get("accvp_table_missing_episode_seed_count", 1_000_000)
+        )
+        == 0,
+        "episode_seed_schedule_matches": bool(
+            metrics.get("accvp_table_seed_schedule_match", False)
+        ),
+        "minimum_activation_decisions": int(
+            metrics.get("accvp_table_activation_window_decision_count", 0)
+        )
+        >= 1000,
+        "model_error_count_zero": int(
+            metrics.get("accvp_table_model_error_count", 0)
+        )
+        == 0,
+        "invalid_bundle_count_zero": int(
+            metrics.get("accvp_table_invalid_bundle_count", 0)
+        )
+        == 0,
+        "invalid_output_count_zero": int(
+            metrics.get("accvp_table_invalid_output_count", 0)
+        )
+        == 0,
+        "runtime_context_error_count_zero": int(
+            metrics.get("accvp_table_runtime_context_error_count", 0)
+        )
+        == 0,
+        "critical_actor_overflow_count_zero": int(
+            metrics.get("accvp_table_critical_actor_overflow_count", 0)
+        )
+        == 0,
+        "task_actor_overflow_count_zero": int(
+            metrics.get("accvp_table_task_actor_overflow_count", 0)
+        )
+        == 0,
+        "risk_safety_actor_coverage_complete": int(
+            metrics.get(
+                "accvp_table_risk_safety_actor_coverage_incomplete_count", 0
+            )
+        )
+        == 0,
+        "unexpected_value_error_count_zero": int(
+            metrics.get("accvp_table_unexpected_value_error_count", 0)
+        )
+        == 0,
+        "warmup_error_count_zero": int(
+            metrics.get("accvp_table_warmup_error_count", 0)
+        )
+        == 0,
+        "warmup_ready": float(
+            metrics.get("accvp_table_warmup_ready_rate", 0.0)
+        )
+        >= 1.0,
+    }
+    return {
+        "profile": METHOD_EFFECT_ADMISSION_PROFILE,
+        "pass": bool(all(checks.values())),
+        "checks": checks,
+        "excluded_deployment_only_checks": [
+            "bounded_stale_rate_activation_window",
+            "fresh_valid_rate_activation_window",
+            "hard_fail_closed_count_zero",
+            "latency_max_within_0_50s",
+            "latency_p95_within_0_30s",
+            "latency_p99_within_0_40s",
+            "max_consecutive_timeouts",
+            "risk_secondary_p95_within_0_15s",
+            "timeout_rate_activation_window",
+        ],
+        "reason": (
+            "soft deployment latency remains a separate conclusion; only "
+            "deadline-independent scorer integrity admits blocking-exact "
+            "method-effect experiments"
+        ),
+    }
 
 
 def run(
@@ -421,9 +548,15 @@ def run(
         require_vnext=True,
         runtime_contract_check=runtime_contract_check,
     )
+    method_effect_admission_gate = _method_effect_admission_gate(
+        metrics,
+        runtime_contract_check=runtime_contract_check,
+        requested_execution_contract=requested_execution_contract,
+    )
     payload = {
         "artifact_kind": "accvp_runtime_benchmark_v1",
         "schema_version": 2,
+        "status": "complete",
         "evidence_role": "diagnostic_only" if diagnostic_smoke else "formal_gate",
         "hard_realtime_claim": False,
         "conclusion_scope": "deployment_runtime_only",
@@ -493,6 +626,7 @@ def run(
         "wall_time_s": float(time.perf_counter() - benchmark_started),
         "metrics": metrics,
         "gate": gate,
+        "method_effect_admission_gate": method_effect_admission_gate,
         "episodes": reports,
     }
     if extension_source is not None:
