@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import os
+import tempfile
 import traceback
 from pathlib import Path
 from typing import Any
@@ -32,10 +34,25 @@ def _config_dict(value: Any) -> Any:
 
 
 def _write_npz_atomic(path: Path, **arrays: np.ndarray) -> None:
-    temporary = path.with_suffix(".npz.tmp")
-    with temporary.open("wb") as handle:
-        np.savez_compressed(handle, **arrays)
-    temporary.replace(path)
+    # Branch tensor basenames are already near MAX_PATH in the hybrid oracle
+    # shard.  A temporary name derived from the final branch ID adds enough
+    # characters to cross the Windows limit.  Keep the unique atomic file in
+    # the same directory while bounding its basename independently of branch
+    # identity.
+    path.parent.mkdir(parents=True, exist_ok=True)
+    descriptor, temporary_name = tempfile.mkstemp(
+        dir=path.parent,
+        prefix=".bt-",
+        suffix=".tmp",
+    )
+    temporary = Path(temporary_name)
+    try:
+        with os.fdopen(descriptor, "wb") as handle:
+            np.savez_compressed(handle, **arrays)
+        temporary.replace(path)
+    finally:
+        if temporary.exists():
+            temporary.unlink()
 
 
 def _conditional_entry_time_fields(

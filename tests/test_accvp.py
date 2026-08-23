@@ -45,6 +45,7 @@ from safe_rl.accvp.planning.selection import select_viability_action, select_via
 from safe_rl.stage1_counterfactual.shards import merge_counterfactual_shards
 from safe_rl.stage1_counterfactual.snapshot_store import CounterfactualSnapshotStore
 from safe_rl.stage1_counterfactual import snapshot_store as snapshot_store_module
+from safe_rl.stage1_counterfactual import branch_worker as branch_worker_module
 from safe_rl.accvp.evaluation.targeted_benchmark import build_replacement_case_table, build_targeted_benchmark_summary
 from safe_rl.accvp.planning.viability_lite import (
     collapse_vnext_lite_records,
@@ -763,6 +764,39 @@ def test_snapshot_manifest_atomic_temp_name_is_bounded(tmp_path: Path, monkeypat
         "complete": False,
         "root_id": root_id,
     }
+
+
+def test_branch_tensor_atomic_temp_name_is_bounded(tmp_path: Path, monkeypatch):
+    branch_id = "seed2_decision18_1f403e91a5ad_action4"
+    padding_length = 215 - len(str(tmp_path)) - 1
+    if padding_length <= 0:
+        pytest.skip("pytest temporary root is too long for the MAX_PATH boundary fixture")
+    tensor_dir = tmp_path / ("p" * padding_length)
+    final = tensor_dir / f"{branch_id}.npz"
+    assert len(str(tensor_dir)) == 215
+    assert len(str(final)) == 257
+    assert len(str(final.with_suffix(".npz.tmp"))) == 261
+    temporary_names: list[str] = []
+    original_mkstemp = branch_worker_module.tempfile.mkstemp
+
+    def tracked_mkstemp(*args, **kwargs):
+        descriptor, name = original_mkstemp(*args, **kwargs)
+        temporary_names.append(Path(name).name)
+        return descriptor, name
+
+    monkeypatch.setattr(branch_worker_module.tempfile, "mkstemp", tracked_mkstemp)
+    branch_worker_module._write_npz_atomic(
+        final,
+        actor_response=np.zeros((12, 30, 5), dtype=np.float32),
+        actor_valid_mask=np.ones((12, 30), dtype=np.float32),
+    )
+
+    assert temporary_names
+    assert branch_id not in temporary_names[0]
+    assert len(temporary_names[0]) <= 20
+    with np.load(final, allow_pickle=False) as payload:
+        assert payload["actor_response"].shape == (12, 30, 5)
+        assert payload["actor_valid_mask"].shape == (12, 30)
 
 
 def test_calibration_and_selected_action_metrics_are_decision_level():
