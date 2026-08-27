@@ -1,12 +1,12 @@
 extends: safe_rl/config/active/accvp_vnext_selector3/train.yaml
 
 run:
-  # Preserve the sealed 20-epoch candidate and write the extended training
-  # result to an independent lineage.
-  run_id: "accvp_vnext_selector4_hybrid_train50"
+  # Preserve the sealed 20- and 50-epoch candidates and write the extended
+  # training result to an independent lineage.
+  run_id: "accvp_vnext_selector4_hybrid_train100"
 
 experiment:
-  note: "Selector4 hybrid ACCVP convergence extension: 50 epochs with frozen data, seeds, optimizer and WcDT warm start; proxy-collision remains diagnostic-only because the formal cohort contains no positive labels and hard safety remains owned by full-set Risk/Shield."
+  note: "Selector4 hybrid ACCVP convergence extension: 100 epochs with frozen data, seeds, optimizer and WcDT warm start; proxy-collision remains diagnostic-only because the formal cohort contains no positive labels and hard safety remains owned by full-set Risk/Shield."
 
 evaluation_protocol:
   protocol_id: "accvp-vnext-correctness-v4-selector4-hybrid"
@@ -30,17 +30,18 @@ accvp:
     require_capacity_lock: true
     audit_report: "safe_rl_output/runs/accvp_vnext_selector4_audit/selector_capacity_audit.json"
   training:
-    # The 20-epoch run selected its best checkpoint at epochs 20/19/20 for the
-    # three ensemble members.  Extend only the epoch budget so the dataset,
-    # seeds, optimizer and WcDT warm start remain unchanged.
+    # The 50-epoch run selected its best checkpoint at epochs 50/46/50 for the
+    # three ensemble members, with another 7-10% validation-total improvement
+    # from epoch 40. Extend only the epoch budget so the dataset, seeds,
+    # optimizer and WcDT warm start remain unchanged.
     # Targeted proxy-collision enrichment is intentionally deferred; more
     # epochs cannot create missing positive labels, and this head is not the
     # hard-safety authority.
-    epochs: 50
+    epochs: 100
   dataset_dir: "safe_rl_output/runs/accvp_vnext_selector4_hybrid_formal_dataset"
   oracle_report: "safe_rl_output/runs/accvp_vnext_selector4_hybrid_oracle_regression/oracle_report.json"
   formal_validation_report: "safe_rl_output/runs/accvp_vnext_selector4_hybrid_formal/formal_validation.json"
-  checkpoint: "safe_rl_output/runs/accvp_vnext_selector4_hybrid_train50/accvp/accvp_vnext_schema3_predictor.pt"
-  calibration_bundle: "safe_rl_output/runs/accvp_vnext_selector4_hybrid_train50/accvp/accvp_vnext_schema3_calibration.json"
-  operating_point: "safe_rl_output/runs/accvp_vnext_selector4_hybrid_train50/accvp/accvp_vnext_schema3_operating_point.json"
-  artifact_manifest: "safe_rl_output/runs/accvp_vnext_selector4_hybrid_train50/accvp/accvp_vnext_schema3_candidate_manifest.json"
+  checkpoint: "safe_rl_output/runs/accvp_vnext_selector4_hybrid_train100/accvp/accvp_vnext_schema3_predictor.pt"
+  calibration_bundle: "safe_rl_output/runs/accvp_vnext_selector4_hybrid_train100/accvp/accvp_vnext_schema3_calibration.json"
+  operating_point: "safe_rl_output/runs/accvp_vnext_selector4_hybrid_train100/accvp/accvp_vnext_schema3_operating_point.json"
+  artifact_manifest: "safe_rl_output/runs/accvp_vnext_selector4_hybrid_train100/accvp/accvp_vnext_schema3_candidate_manifest.json"

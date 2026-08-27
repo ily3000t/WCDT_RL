@@ -45,8 +45,8 @@ paths:
   pilot_report: safe_rl_output/runs/accvp_vnext_selector4_hybrid_pilot/pilot_report.json
   pilot_latency_smoke_report: safe_rl_output/runs/accvp_vnext_selector4_hybrid_pilot_latency_smoke/feasibility_report.json
   formal_validation_report: safe_rl_output/runs/accvp_vnext_selector4_hybrid_formal/formal_validation.json
-  predictor_manifest: safe_rl_output/runs/accvp_vnext_selector4_hybrid_train50/accvp/accvp_vnext_schema3_candidate_manifest.json
-  scorer_report: safe_rl_output/runs/accvp_vnext_selector4_hybrid_train50_runtime/scorer_preflight.json
+  predictor_manifest: safe_rl_output/runs/accvp_vnext_selector4_hybrid_train100/accvp/accvp_vnext_schema3_candidate_manifest.json
+  scorer_report: safe_rl_output/runs/accvp_vnext_selector4_hybrid_train100_runtime/scorer_preflight.json
   factorial_manifest: safe_rl_output/runs/accvp_vnext_selector4_hybrid_blocking_exact_factorial/ppo_factorial_manifest.json
   baseline_manifest: safe_rl_output/runs/wcdt_vnext_replicates/ppo_replicate_manifest.json
   baseline_lineage_audit: safe_rl_output/runs/accvp_vnext_selector4_hybrid_baseline_audit/wcdt_baseline_report.json

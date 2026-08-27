@@ -426,7 +426,7 @@ def test_hybrid_protocol_changes_lineage_but_not_any_seed_values() -> None:
     assert int(ppo.rl.optimizer_seed) == 1001
 
 
-def test_hybrid_extended_training_has_independent_fifty_epoch_lineage() -> None:
+def test_hybrid_extended_training_has_independent_hundred_epoch_lineage() -> None:
     train = load_config(
         "safe_rl/config/active/accvp_vnext_selector4/train.yaml"
     )
@@ -435,9 +435,9 @@ def test_hybrid_extended_training_has_independent_fifty_epoch_lineage() -> None:
         "ppo_candidate_table_full.yaml"
     )
 
-    assert train.run.run_id == "accvp_vnext_selector4_hybrid_train50"
-    assert int(train.accvp.training.epochs) == 50
-    assert "hybrid_train50" in str(train.accvp.artifact_manifest)
+    assert train.run.run_id == "accvp_vnext_selector4_hybrid_train100"
+    assert int(train.accvp.training.epochs) == 100
+    assert "hybrid_train100" in str(train.accvp.artifact_manifest)
     assert ppo.accvp.checkpoint == train.accvp.checkpoint
     assert ppo.accvp.calibration_bundle == train.accvp.calibration_bundle
     assert ppo.accvp.operating_point == train.accvp.operating_point
