@@ -1,0 +1,111 @@
+{
+  "schema_version": 1,
+  "artifact_kind": "safe_rl_artifact_revocation_manifest_v1",
+  "protocol_id": "accvp-vnext-correctness-v4-selector4-hybrid-posthoc-seed-amendment-v1",
+  "status": "superseded",
+  "deployable": false,
+  "allowed_usage": "diagnostic_only",
+  "reason": "Post-hoc optimizer-seed amendment replaces seed 1005 with seed 1000 after Stage5 observation. Original hybrid PPO/runtime/Stage5 outputs remain immutable diagnostic evidence and are not evidence for this amended cohort.",
+  "path_base": "../..",
+  "artifacts": [
+    {
+      "path": "safe_rl_output/runs/accvp_vnext_selector3_",
+      "match": "path_prefix",
+      "status": "superseded",
+      "deployable": false,
+      "allowed_usage": "diagnostic_only"
+    },
+    {
+      "path": "safe_rl_output/runs/ppo_accvp_vnext_selector3_",
+      "match": "path_prefix",
+      "status": "superseded",
+      "deployable": false,
+      "allowed_usage": "diagnostic_only"
+    },
+    {
+      "path": "safe_rl_output/runs/accvp_vnext_selector4_pilot",
+      "match": "path_prefix",
+      "status": "superseded",
+      "deployable": false,
+      "allowed_usage": "diagnostic_only"
+    },
+    {
+      "path": "safe_rl_output/runs/accvp_vnext_selector4_oracle_regression",
+      "match": "path_prefix",
+      "status": "superseded",
+      "deployable": false,
+      "allowed_usage": "diagnostic_only"
+    },
+    {
+      "path": "safe_rl_output/runs/accvp_vnext_selector4_formal",
+      "match": "path_prefix",
+      "status": "superseded",
+      "deployable": false,
+      "allowed_usage": "diagnostic_only"
+    },
+    {
+      "path": "safe_rl_output/runs/accvp_vnext_selector4_train",
+      "match": "path_prefix",
+      "status": "superseded",
+      "deployable": false,
+      "allowed_usage": "diagnostic_only"
+    },
+    {
+      "path": "safe_rl_output/runs/ppo_accvp_vnext_selector4_blocking_exact",
+      "match": "path_prefix",
+      "status": "superseded",
+      "deployable": false,
+      "allowed_usage": "diagnostic_only"
+    },
+    {
+      "path": "safe_rl_output/runs/accvp_vnext_selector4_deployment_runtime",
+      "match": "path_prefix",
+      "status": "superseded",
+      "deployable": false,
+      "allowed_usage": "diagnostic_only"
+    },
+    {
+      "path": "safe_rl_output/runs/accvp_vnext_selector4_blocking_exact_stage5",
+      "match": "path_prefix",
+      "status": "superseded",
+      "deployable": false,
+      "allowed_usage": "diagnostic_only"
+    },
+    {
+      "path": "safe_rl_output/runs/ppo_accvp_vnext_selector4_hybrid_blocking_exact_",
+      "match": "path_prefix",
+      "status": "superseded",
+      "deployable": false,
+      "allowed_usage": "diagnostic_only"
+    },
+    {
+      "path": "safe_rl_output/runs/accvp_vnext_selector4_hybrid_blocking_exact_factorial",
+      "match": "path_prefix",
+      "status": "superseded",
+      "deployable": false,
+      "allowed_usage": "diagnostic_only"
+    },
+    {
+      "path": "safe_rl_output/runs/accvp_vnext_selector4_hybrid_deployment_runtime",
+      "match": "path_prefix",
+      "status": "superseded",
+      "deployable": false,
+      "allowed_usage": "diagnostic_only"
+    },
+    {
+      "path": "safe_rl_output/runs/accvp_vnext_selector4_hybrid_blocking_exact_stage5",
+      "match": "path_prefix",
+      "status": "superseded",
+      "deployable": false,
+      "allowed_usage": "diagnostic_only"
+    }
+  ],
+  "metadata": {
+    "replacement_protocol": "accvp-vnext-correctness-v4-selector4-hybrid-posthoc-seed-amendment-v1",
+    "deletion_required": false,
+    "formal_lineage_loading_allowed": false,
+    "selector4_capacity_audit_reuse_allowed": true,
+    "seed_values_changed": true,
+    "posthoc_optimizer_seed_amendment": true
+  }
+}

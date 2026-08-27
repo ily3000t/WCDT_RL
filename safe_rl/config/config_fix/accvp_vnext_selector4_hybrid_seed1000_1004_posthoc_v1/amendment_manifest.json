@@ -1,0 +1,123 @@
+{
+  "artifact_kind": "safe_rl_posthoc_seed_amendment_config_bundle_v1",
+  "schema_version": 1,
+  "classification": "posthoc_optimizer_seed_amendment",
+  "protocol_id": "accvp-vnext-correctness-v4-selector4-hybrid-posthoc-seed-amendment-v1",
+  "frozen_bundle": {
+    "path": "safe_rl/config/config_fix/accvp_vnext_selector4_hybrid_v4_frozen",
+    "equivalence_manifest": "safe_rl/config/config_fix/accvp_vnext_selector4_hybrid_v4_frozen/equivalence_manifest.json",
+    "equivalence_manifest_sha256": "e1beaaa0ca39dde0cb3eea15ddafeda9ad12f22cd31fd753c0a321857ac0002e"
+  },
+  "optimizer_seed_change": {
+    "original": [
+      1001,
+      1002,
+      1003,
+      1004,
+      1005
+    ],
+    "removed": 1005,
+    "replacement": 1000,
+    "revised": [
+      1000,
+      1001,
+      1002,
+      1003,
+      1004
+    ]
+  },
+  "unchanged_upstream_configs": [
+    {
+      "name": "selector_audit.yaml",
+      "sha256": "1d89a293190520cc40b5ebec51bbab72ce79903dfa29d2823f9c5fdf7579eb18",
+      "frozen_sha256": "1d89a293190520cc40b5ebec51bbab72ce79903dfa29d2823f9c5fdf7579eb18"
+    },
+    {
+      "name": "pilot.yaml",
+      "sha256": "fde9b69610add32b9491f3c37f19090cfc95ce0b7e393b46a62b60d461233fda",
+      "frozen_sha256": "fde9b69610add32b9491f3c37f19090cfc95ce0b7e393b46a62b60d461233fda"
+    },
+    {
+      "name": "oracle_regression.yaml",
+      "sha256": "e058f488f5c1859133afee714aa72dda9301156a35354a3083f051a130156a9a",
+      "frozen_sha256": "e058f488f5c1859133afee714aa72dda9301156a35354a3083f051a130156a9a"
+    },
+    {
+      "name": "formal.yaml",
+      "sha256": "c48ea4d0a2ca8f5629575e2ca600e76bffbe01373cdf525307da87f30d15a5d8",
+      "frozen_sha256": "c48ea4d0a2ca8f5629575e2ca600e76bffbe01373cdf525307da87f30d15a5d8"
+    },
+    {
+      "name": "train.yaml",
+      "sha256": "4a0e497ea741295a034e4d6e06867c52078830f9efdff195a72e1c8a18a2502d",
+      "frozen_sha256": "4a0e497ea741295a034e4d6e06867c52078830f9efdff195a72e1c8a18a2502d"
+    },
+    {
+      "name": "pilot_latency_smoke_train.yaml",
+      "sha256": "0f4e0b6f74b08f51ffcb3ff656539920020cfa1bc338d464791e775fa565db3a",
+      "frozen_sha256": "0f4e0b6f74b08f51ffcb3ff656539920020cfa1bc338d464791e775fa565db3a"
+    },
+    {
+      "name": "pilot_latency_smoke_runtime.yaml",
+      "sha256": "73ab254703d48948c6017d93cc56ff6f748b5f6ef2ba350aa85a41c850a0826c",
+      "frozen_sha256": "73ab254703d48948c6017d93cc56ff6f748b5f6ef2ba350aa85a41c850a0826c"
+    }
+  ],
+  "amended_identity_configs": [
+    {
+      "name": "ppo_candidate_table_full.yaml",
+      "sha256": "061624b6c3a1b7fb6d5e95062e9ac6e9d36b897a7044eccc7cb2be817bee4d3c"
+    },
+    {
+      "name": "baseline_ppo_wcdt_v3_reward_v2.yaml",
+      "sha256": "4bde4e54406973d0f9b36abe44d2648dfbe42001ee51faa6d6909346c7586e5a"
+    },
+    {
+      "name": "evaluation_protocol.yaml",
+      "sha256": "73bcfd84009313efa8db23eca7265ffc3d008bd6edbaedf88573f2589734ee9c"
+    },
+    {
+      "name": "ppo_ablation_matrix.yaml",
+      "sha256": "8403b232875c0989a8231a80d36dbd367c8d1791c2091d79eb096024f85d80fb"
+    },
+    {
+      "name": "workflow.yaml",
+      "sha256": "805ad0d4f55db28df0969d792750a3bfa86ec499d878b475cc7c18c94fbdd166"
+    },
+    {
+      "name": "seed_ledger.json",
+      "sha256": "c35dff2137577ac299bea182ee80734a3ff467e18fe1b5be887e7e3ef63cb892"
+    },
+    {
+      "name": "artifact_revocation_manifest.json",
+      "sha256": "7208debe0f0500f5ba1ea341b9d533e938ada6185bea35a1b9d579631160f1db"
+    }
+  ],
+  "phase_config_map": {
+    "selector_contract_audit": "selector_audit.yaml",
+    "pilot_collection|pilot_merge|pilot_validation": "pilot.yaml",
+    "oracle_collection|oracle_merge": "oracle_regression.yaml",
+    "formal_collection|formal_merge|formal_validation": "formal.yaml",
+    "pilot_latency_feasibility_smoke.train": "pilot_latency_smoke_train.yaml",
+    "pilot_latency_feasibility_smoke.runtime": "pilot_latency_smoke_runtime.yaml",
+    "accvp_training|one_shot_final_holdout": "train.yaml",
+    "scorer_runtime_preflight|candidate_ppo_replicates": "ppo_candidate_table_full.yaml",
+    "baseline_ppo_replicates": "baseline_ppo_wcdt_v3_reward_v2.yaml",
+    "candidate_ppo_replicates|baseline_ppo_replicates.matrix": "ppo_ablation_matrix.yaml",
+    "stage5_generate.protocol": "evaluation_protocol.yaml",
+    "all_phases.coordinator": "workflow.yaml"
+  },
+  "intentionally_changed_fields": [
+    "workflow.protocol_id",
+    "workflow.amendment",
+    "workflow.seeds.optimizer_replicates",
+    "workflow.paths downstream PPO/runtime/Stage5/holdout identities",
+    "workflow.factorial.baseline_replicate_run_id_prefix",
+    "evaluation_protocol protocol_id/seed_ledger/revocation bindings for PPO and Stage5",
+    "ppo replicate run-id prefixes",
+    "ppo_ablation_matrix.protocol_id",
+    "seed_ledger.cohorts.ppo_optimizer_replicates",
+    "artifact revocation metadata"
+  ],
+  "bundle_fingerprint": "5d013863d18561adcc05e6012e1c4b1463e7c094ee8069b6d2521e621ff182ca"
+}

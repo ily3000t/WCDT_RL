@@ -63,9 +63,10 @@ BASELINE_PPO_CONFIG = "safe_rl/config/baselines/wcdt/ppo_wcdt_v3_reward_v2.yaml"
 MATRIX_CONFIG = "safe_rl/config/active/accvp_vnext/ppo_ablation_matrix.yaml"
 PROTOCOL_CONFIG = "safe_rl/config/examples/vnext/evaluation_protocol_vnext.example.yaml"
 WORKFLOW_CONFIG = (
-    "safe_rl/config/active/accvp_vnext_selector4/workflow.yaml"
+    "safe_rl/config/config_fix/"
+    "accvp_vnext_selector4_hybrid_seed1000_1004_posthoc_v1/workflow.yaml"
 )
-OPTIMIZER_SEEDS = [1001, 1002, 1003, 1004, 1005]
+OPTIMIZER_SEEDS = [1000, 1001, 1002, 1003, 1004]
 # The first 30 development seeds produced only 608 activation-window
 # decisions on the frozen rule-policy workload.  Sixty remain within the
 # preregistered development cohort and provide margin above the >=1000 gate.
@@ -636,6 +637,14 @@ def workflow_status(
     optimizer_seeds = _workflow_seed_values(
         workflow, "optimizer_replicates", OPTIMIZER_SEEDS
     )
+    baseline_replicate_run_id_prefix = str(
+        dict(workflow.get("factorial", {}) or {}).get(
+            "baseline_replicate_run_id_prefix",
+            "ppo_wcdt_vnext",
+        )
+    ).strip()
+    if not baseline_replicate_run_id_prefix:
+        raise ValueError("factorial.baseline_replicate_run_id_prefix cannot be empty")
     runtime_seeds = _workflow_seed_values(
         workflow, "runtime", RUNTIME_SEEDS
     )
@@ -831,10 +840,13 @@ def workflow_status(
             "safe_rl_output/runs/accvp_vnext_factorial/"
             "ppo_factorial_manifest.json",
         )
-        if str(workflow.get("protocol_id", "")) in {
+        workflow_protocol_id = str(workflow.get("protocol_id", ""))
+        if workflow_protocol_id in {
             "accvp-vnext-correctness-v3-selector4",
             "accvp-vnext-correctness-v4-selector4-hybrid",
-        }:
+        } or workflow_protocol_id.startswith(
+            "accvp-vnext-correctness-v4-selector4-hybrid-"
+        ):
             selector_cache = _workflow_path_value(
                 workflow,
                 "selector_replay_cache",
@@ -1139,7 +1151,7 @@ def workflow_status(
             "--optimizer-seeds",
             *optimizer_seeds,
             "--run-id-prefix",
-            "ppo_wcdt_vnext",
+            baseline_replicate_run_id_prefix,
             "--output-root",
             baseline_path.parent,
         ),

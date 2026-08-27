@@ -591,6 +591,35 @@ def test_audited_wcdt_parent_lineage_migration_is_hash_bound(tmp_path: Path) -> 
         )
 
 
+def test_stage5_generator_omits_migration_when_parent_lineage_matches(
+    tmp_path: Path,
+) -> None:
+    target = {
+        "protocol_id": "posthoc-seed-amendment-v1",
+        "seed_ledger_sha256": "4" * 64,
+    }
+    parent = {
+        "protocol_id": target["protocol_id"],
+        "protocol_enabled": True,
+        "protocol_strict": True,
+        "seed_ledger_sha256": target["seed_ledger_sha256"],
+    }
+    report = _json(
+        tmp_path / "stage3" / "stage3_training_report.json",
+        {"evidence_lineage": parent},
+    )
+    row = {"stage3_report": str(report)}
+    assert stage5_generate_factorial_configs._stage3_parent_matches_target_protocol(
+        row,
+        target,
+    )
+    target["seed_ledger_sha256"] = "5" * 64
+    assert not stage5_generate_factorial_configs._stage3_parent_matches_target_protocol(
+        row,
+        target,
+    )
+
+
 def test_stage5_model_lineage_requires_explicit_migration_for_protocol_change(
     tmp_path: Path,
 ) -> None:

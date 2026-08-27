@@ -1,0 +1,48 @@
+schema_version: 1
+artifact_kind: accvp_vnext_ppo_ablation_matrix_v1
+protocol_id: accvp-vnext-correctness-v4-selector4-hybrid-posthoc-seed-amendment-v1
+minimum_optimizer_replicates: 5
+optimizer_seed_role: ppo_optimizer_replicates
+variants:
+  no_forecast_reward_v2:
+    observation_family: no_forecast_52d
+    candidate_table: false
+    forecast_source: null
+    policy_lateral_commitment: false
+    reward_version: opportunity_window_v2
+    training_semantics_version: reward_v2_mainline_001
+  wcdt_reward_v2:
+    observation_family: wcdt_11d
+    candidate_table: false
+    forecast_source: wcdt_v3
+    policy_lateral_commitment: false
+    reward_version: opportunity_window_v2
+    training_semantics_version: reward_v2_mainline_001
+  candidate_table_reward_v2:
+    observation_family: accvp_candidate_table_107d
+    candidate_table: true
+    forecast_source: null
+    policy_lateral_commitment: false
+    reward_version: opportunity_window_v2
+    training_semantics_version: reward_v2_mainline_001+risk_gated_candidate_table_v3_bounded_stale
+  candidate_table_reward_v2_commitment:
+    observation_family: accvp_candidate_table_107d
+    candidate_table: true
+    forecast_source: null
+    policy_lateral_commitment: true
+    reward_version: opportunity_window_v2
+    training_semantics_version: reward_v2_mainline_001+policy_lateral_commitment_left_intent_1s_risk_gated_v2+risk_gated_candidate_table_v3_bounded_stale
+  candidate_table_reward_v3_1:
+    observation_family: accvp_candidate_table_107d
+    candidate_table: true
+    forecast_source: null
+    policy_lateral_commitment: false
+    reward_version: opportunity_window_v3_1_risk_gated_persistence
+    training_semantics_version: reward_v3_1_persistence_001+risk_gated_candidate_table_v3_bounded_stale
+  candidate_table_reward_v3_1_commitment:
+    observation_family: accvp_candidate_table_107d
+    candidate_table: true
+    forecast_source: null
+    policy_lateral_commitment: true
+    reward_version: opportunity_window_v3_1_risk_gated_persistence
+    training_semantics_version: reward_v3_1_persistence_001+policy_lateral_commitment_left_intent_1s_risk_gated_v2+risk_gated_candidate_table_v3_bounded_stale

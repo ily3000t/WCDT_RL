@@ -529,6 +529,29 @@ def _write_json_idempotent(path: Path, payload: Mapping[str, Any]) -> Path:
     return write_json_new(path, payload)
 
 
+def _stage3_parent_matches_target_protocol(
+    row: Mapping[str, Any],
+    target_protocol: Mapping[str, Any],
+) -> bool:
+    """Return true only when Stage3 can use strict direct Stage5 lineage."""
+
+    configured = str(row.get("stage3_report", "")).strip()
+    if not configured:
+        return False
+    report_path = _resolve(configured)
+    if not report_path.is_file():
+        return False
+    parent = dict(read_json(report_path).get("evidence_lineage", {}) or {})
+    return (
+        bool(parent.get("protocol_enabled", False))
+        and bool(parent.get("protocol_strict", False))
+        and str(parent.get("protocol_id", ""))
+        == str(target_protocol.get("protocol_id", ""))
+        and str(parent.get("seed_ledger_sha256", ""))
+        == str(target_protocol.get("seed_ledger_sha256", ""))
+    )
+
+
 def generate(
     *,
     baseline_manifest: str | Path,
@@ -724,15 +747,16 @@ def generate(
             ):
                 if method_id != "wcdt_reward_v2":
                     continue
-                group["comparative"]["parent_lineage_compatibility"] = (
-                    build_wcdt_parent_lineage_compatibility(
-                        group_name=str(group["name"]),
-                        optimizer_seed=seed,
-                        row=row,
-                        audit_binding=baseline_audit_binding,
-                        target_protocol=snapshot,
+                if not _stage3_parent_matches_target_protocol(row, snapshot):
+                    group["comparative"]["parent_lineage_compatibility"] = (
+                        build_wcdt_parent_lineage_compatibility(
+                            group_name=str(group["name"]),
+                            optimizer_seed=seed,
+                            row=row,
+                            audit_binding=baseline_audit_binding,
+                            target_protocol=snapshot,
+                        )
                     )
-                )
             if bool(evaluation_budget["episode_cache_enabled"]):
                 left_group["evaluation_cache"] = _episode_cache_binding(
                     output=output,
