@@ -467,7 +467,11 @@ def run(cfg, include_aggressive: bool = False, include_calibrated: bool = False)
     stage_log("stage5_sweep", f"groups={len(groups)} seeds={seeds}")
     for group_idx, group_dict in enumerate(groups):
         group = _to_config_dict(yaml.safe_load(yaml.safe_dump(group_dict)))
-        group_cfg = clone_with_overrides(cfg, _group_overrides(group))
+        group_cfg = clone_with_overrides(
+            cfg,
+            _group_overrides(group),
+            replace_blocks=("accvp",),
+        )
         model_path = _group_model_path(group, Path(_run_path(str(cfg.run.run_id), "stage3", "ppo_model.zip")))
         stage_log("stage5_sweep", f"group={group['name']} model={model_path}")
         report = evaluate_ppo(

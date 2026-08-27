@@ -536,7 +536,11 @@ def run(cfg, episodes: int = 50) -> Path:
     stage_log("stage5_confirmatory", f"episodes={episodes} seeds={seeds}")
     for group_idx, group_dict in enumerate(payload["stage5"]["groups"]):
         group = _to_config_dict(group_dict)
-        group_cfg = clone_with_overrides(cfg, _group_overrides(group))
+        group_cfg = clone_with_overrides(
+            cfg,
+            _group_overrides(group),
+            replace_blocks=("accvp",),
+        )
         model_path = _group_model_path(group, Path(_relative_run_path(run_id, "stage3", "ppo_model.zip")))
         stage_log(
             "stage5_confirmatory",

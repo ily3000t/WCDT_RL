@@ -8,6 +8,9 @@ import pytest
 import yaml
 
 from safe_rl.accvp.contracts.schema import file_sha256, stable_hash
+from safe_rl.accvp.modeling.omitted_actor_summary import (
+    omitted_actor_summary_config,
+)
 from safe_rl.evaluation_protocol import EvidenceProtocolError
 from safe_rl.pipeline import (
     stage5_factorial_aggregate,
@@ -18,11 +21,23 @@ from safe_rl.pipeline import (
 )
 from safe_rl.pipeline.stage5_generate_factorial_configs import (
     DEFAULT_COMPARISONS,
+    FACTORIAL_REQUEST_SCHEMA_VERSION,
     FACTORIAL_RUNTIME_KIND,
     FINAL_COMPARISON_ID,
 )
+from safe_rl.pipeline.audit_ppo_replicate_lineage import (
+    LINEAGE_AUDIT_IMPLEMENTATION_VERSION,
+    LINEAGE_AUDIT_KIND,
+)
+from safe_rl.pipeline.stage5_lineage_compatibility import (
+    PARENT_LINEAGE_COMPATIBILITY_VERSION,
+    build_wcdt_parent_lineage_compatibility,
+    validate_baseline_lineage_audit,
+    validate_wcdt_parent_lineage_compatibility,
+)
 from safe_rl.ppo_factorial import EXPECTED_FINAL_METHOD_ID
 from safe_rl.ppo_replicates import REPLICATE_MANIFEST_KIND
+from safe_rl.utils.config import clone_with_overrides
 
 
 CANDIDATE_METHODS = (
@@ -349,6 +364,30 @@ def test_generate_writes_group_specific_runtime_bindings(
         "audit_manifest",
         lambda *_args, **_kwargs: {"status": "reusable"},
     )
+    audit_path = _json(tmp_path / "baseline_lineage_audit.json", {"audit": True})
+    audit_binding = {
+        "path": str(audit_path.resolve()),
+        "sha256": file_sha256(audit_path),
+        "audit_fingerprint": "7" * 64,
+        "audit_implementation_version": LINEAGE_AUDIT_IMPLEMENTATION_VERSION,
+        "baseline_manifest": str(manifests["wcdt_reward_v2"].resolve()),
+        "baseline_manifest_sha256": file_sha256(manifests["wcdt_reward_v2"]),
+        "required_seeds": seeds,
+    }
+    monkeypatch.setattr(
+        stage5_generate_factorial_configs,
+        "validate_baseline_lineage_audit",
+        lambda *_args, **_kwargs: dict(audit_binding),
+    )
+    monkeypatch.setattr(
+        stage5_generate_factorial_configs,
+        "build_wcdt_parent_lineage_compatibility",
+        lambda **kwargs: {
+            "compatibility_version": PARENT_LINEAGE_COMPATIBILITY_VERSION,
+            "group_name": kwargs["group_name"],
+            "optimizer_seed": kwargs["optimizer_seed"],
+        },
+    )
     monkeypatch.setattr(
         stage5_generate_factorial_configs,
         "_runtime_coverage",
@@ -389,6 +428,7 @@ def test_generate_writes_group_specific_runtime_bindings(
     output = tmp_path / "generated"
     request_path = stage5_generate_factorial_configs.generate(
         baseline_manifest=manifests["wcdt_reward_v2"],
+        baseline_lineage_audit=audit_path,
         factorial_manifest=factorial_path,
         protocol=protocol_path,
         seed_role="stage5_confirmatory",
@@ -397,6 +437,8 @@ def test_generate_writes_group_specific_runtime_bindings(
         workflow_config=workflow,
     )
     request = json.loads(request_path.read_text(encoding="utf-8"))
+    assert request["schema_version"] == FACTORIAL_REQUEST_SCHEMA_VERSION
+    assert request["baseline_lineage_audit_sha256"] == file_sha256(audit_path)
     assert request["final_method_id"] == EXPECTED_FINAL_METHOD_ID
     assert len(request["comparisons"]) == 6
     assert request["evaluation_budget"]["naive_episode_count"] == 8000
@@ -412,6 +454,11 @@ def test_generate_writes_group_specific_runtime_bindings(
     assert single_cfg["stage5"]["episodes_per_group"] == 100
     assert len(single_cfg["stage5"]["seeds"]) == 100
     assert single_cfg["stage5"]["risk_checkpoint"] == str(risk_checkpoint.resolve())
+    assert (
+        single_cfg["stage5"]["groups"][0]["comparative"]
+        ["parent_lineage_compatibility"]["compatibility_version"]
+        == PARENT_LINEAGE_COMPATIBILITY_VERSION
+    )
     assert single_cfg["stage5"]["groups"][1]["evaluation_cache"]["artifact_kind"] == (
         "stage5_episode_cache_binding_v1"
     )
@@ -437,6 +484,173 @@ def test_generate_writes_group_specific_runtime_bindings(
     final_wcdt = final_cfg["stage5"]["groups"][0]["evaluation_cache"]
     assert first_wcdt["cache_dir"] == final_wcdt["cache_dir"]
     assert first_wcdt["execution_fingerprint"] == final_wcdt["execution_fingerprint"]
+
+
+def test_audited_wcdt_parent_lineage_migration_is_hash_bound(tmp_path: Path) -> None:
+    seed = 1001
+    stage3_dir = tmp_path / "wcdt_seed_1001" / "stage3"
+    model = stage3_dir / "ppo_model.zip"
+    model.parent.mkdir(parents=True)
+    model.write_bytes(b"legacy-wcdt-policy")
+    parent = {
+        "schema_version": 1,
+        "stage": "stage3",
+        "protocol_id": "accvp-vnext-correctness-v1",
+        "protocol_enabled": True,
+        "protocol_strict": True,
+        "seed_ledger_sha256": "1" * 64,
+        "role_usage": {
+            "stage3_training": {"seeds": [20001, 20002]},
+            "stage3_selection": {"seeds": [40001, 40002]},
+        },
+    }
+    parent["lineage_fingerprint"] = stable_hash(parent)
+    stage3_report = _json(
+        stage3_dir / "stage3_training_report.json",
+        {"evidence_lineage": parent},
+    )
+    row = {
+        "method_id": "wcdt_reward_v2",
+        "optimizer_seed": seed,
+        "training_seed": seed,
+        "checkpoint": str(model),
+        "checkpoint_sha256": file_sha256(model),
+        "stage3_report": str(stage3_report),
+        "stage3_report_sha256": file_sha256(stage3_report),
+    }
+    manifest = _json(
+        tmp_path / "baseline_manifest.json",
+        {
+            "artifact_kind": REPLICATE_MANIFEST_KIND,
+            "schema_version": 1,
+            "status": "complete",
+            "method_id": "wcdt_reward_v2",
+            "records": [row],
+        },
+    )
+    audit_core = {
+        "artifact_kind": LINEAGE_AUDIT_KIND,
+        "schema_version": 1,
+        "audit_implementation_version": LINEAGE_AUDIT_IMPLEMENTATION_VERSION,
+        "status": "reusable",
+        "manifest": str(manifest.resolve()),
+        "manifest_sha256": file_sha256(manifest),
+        "method_id": "wcdt_reward_v2",
+        "required_seeds": [seed],
+        "valid_seeds": [seed],
+        "missing_seeds": [],
+        "invalid_records": [],
+        "global_reasons": [],
+    }
+    audit_core["audit_fingerprint"] = stable_hash(audit_core)
+    audit = _json(tmp_path / "baseline_audit.json", audit_core)
+    audit_binding = validate_baseline_lineage_audit(
+        audit,
+        baseline_manifest=manifest,
+        required_seeds=[seed],
+    )
+    target = {
+        "enabled": True,
+        "strict": True,
+        "protocol_id": "accvp-vnext-correctness-v4-selector4-hybrid",
+        "seed_ledger_sha256": "4" * 64,
+    }
+    compatibility = build_wcdt_parent_lineage_compatibility(
+        group_name="wcdt_reward_v2_seed_1001",
+        optimizer_seed=seed,
+        row=row,
+        audit_binding=audit_binding,
+        target_protocol=target,
+    )
+    stage5_lineage = {
+        "protocol_id": target["protocol_id"],
+        "protocol_enabled": True,
+        "protocol_strict": True,
+        "seed_ledger_sha256": target["seed_ledger_sha256"],
+    }
+    validated = validate_wcdt_parent_lineage_compatibility(
+        compatibility,
+        group_name="wcdt_reward_v2_seed_1001",
+        model_path=model,
+        parent_lineage=parent,
+        stage5_lineage=stage5_lineage,
+    )
+    assert validated["applied"] is True
+    assert validated["parent_protocol_id"] == "accvp-vnext-correctness-v1"
+    assert validated["target_protocol_id"] == target["protocol_id"]
+
+    tampered = dict(compatibility)
+    tampered["optimizer_seed"] = 1002
+    with pytest.raises(EvidenceProtocolError, match="fingerprint mismatch"):
+        validate_wcdt_parent_lineage_compatibility(
+            tampered,
+            group_name="wcdt_reward_v2_seed_1001",
+            model_path=model,
+            parent_lineage=parent,
+            stage5_lineage=stage5_lineage,
+        )
+
+
+def test_stage5_model_lineage_requires_explicit_migration_for_protocol_change(
+    tmp_path: Path,
+) -> None:
+    seed = 1001
+    stage3_dir = tmp_path / "stage3"
+    model = stage3_dir / "ppo_model.zip"
+    stage3_dir.mkdir(parents=True)
+    model.write_bytes(b"policy")
+    parent = {
+        "protocol_id": "accvp-vnext-correctness-v1",
+        "protocol_enabled": True,
+        "protocol_strict": True,
+        "seed_ledger_sha256": "1" * 64,
+        "role_usage": {
+            "stage3_training": {"seeds": [20001]},
+            "stage3_selection": {"seeds": [40001]},
+        },
+    }
+    parent["lineage_fingerprint"] = stable_hash(parent)
+    _json(stage3_dir / "stage3_training_report.json", {"evidence_lineage": parent})
+    stage5_lineage = {
+        "protocol_id": "accvp-vnext-correctness-v4-selector4-hybrid",
+        "protocol_enabled": True,
+        "protocol_strict": True,
+        "seed_ledger_sha256": "4" * 64,
+    }
+    with pytest.raises(EvidenceProtocolError, match="parent lineage mismatch"):
+        stage5_paired_eval._validate_stage5_model_lineage(
+            group_name="wcdt_reward_v2_seed_1001",
+            model_path=model,
+            stage5_lineage=stage5_lineage,
+            stage5_seeds=[80001],
+        )
+
+
+def test_stage5_group_replaces_frozen_accvp_block_instead_of_inheriting_root() -> None:
+    root = {
+        "accvp": {
+            "actor_count": 12,
+            "omitted_actor_summary": {
+                "enabled": True,
+                "physical_actor_capacity": 12,
+            },
+        }
+    }
+    group = _AttrDict(
+        name="wcdt_reward_v2_seed_1001",
+        forecast_features=True,
+        shield=True,
+        accvp={"enabled": False, "mode": "off", "actor_count": 6},
+    )
+    group_cfg = clone_with_overrides(
+        root,
+        stage5_paired_eval._group_overrides(group),
+        replace_blocks=("accvp",),
+    )
+    assert "omitted_actor_summary" not in group_cfg.accvp
+    summary = omitted_actor_summary_config(group_cfg)
+    assert summary["enabled"] is False
+    assert summary["physical_actor_capacity"] == 6
 
 
 def test_factorial_aggregate_exposes_final_child_and_does_not_invent_pvalues(
@@ -618,7 +832,7 @@ def test_stage5_per_group_preflights_bind_each_checkpoint_and_report_hash(
     monkeypatch.setattr(
         stage5_paired_eval,
         "clone_with_overrides",
-        lambda config, _overrides: config,
+        lambda config, _overrides, **_kwargs: config,
     )
     monkeypatch.setattr(
         stage5_paired_eval.RiskGatedACCVPCandidateTableAugmentor,

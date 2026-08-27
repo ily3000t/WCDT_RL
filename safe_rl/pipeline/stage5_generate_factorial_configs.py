@@ -14,6 +14,11 @@ from safe_rl.pipeline.stage5_generate_replicated_configs import (
     _load_complete_manifest,
     _row_map,
 )
+from safe_rl.pipeline.stage5_lineage_compatibility import (
+    PARENT_LINEAGE_COMPATIBILITY_VERSION,
+    build_wcdt_parent_lineage_compatibility,
+    validate_baseline_lineage_audit,
+)
 from safe_rl.pipeline.stage5_replicated_aggregate import REQUEST_ARTIFACT_KIND
 from safe_rl.ppo_factorial import (
     EXPECTED_FINAL_METHOD_ID,
@@ -25,7 +30,7 @@ from safe_rl.utils.config import REPO_ROOT, load_config
 
 
 FACTORIAL_REQUEST_KIND = "stage5_factorial_request_v1"
-FACTORIAL_REQUEST_SCHEMA_VERSION = 1
+FACTORIAL_REQUEST_SCHEMA_VERSION = 2
 FACTORIAL_RUNTIME_KIND = "accvp_runtime_benchmark_factorial_v1"
 SINGLE_RUNTIME_KIND = "accvp_runtime_benchmark_replicates_v1"
 DEFAULT_SECONDARY_SIMULATOR_SEED_COUNT = 100
@@ -527,6 +532,7 @@ def _write_json_idempotent(path: Path, payload: Mapping[str, Any]) -> Path:
 def generate(
     *,
     baseline_manifest: str | Path,
+    baseline_lineage_audit: str | Path,
     factorial_manifest: str | Path,
     protocol: str | Path,
     seed_role: str,
@@ -577,6 +583,11 @@ def generate(
     for path, _payload in manifests.values():
         if audit_manifest(path, required_seeds=seeds)["status"] != "reusable":
             raise ValueError(f"replicate manifest is not reusable: {path}")
+    baseline_audit_binding = validate_baseline_lineage_audit(
+        baseline_lineage_audit,
+        baseline_manifest=baseline_path,
+        required_seeds=seeds,
+    )
     config_maps = {
         method_id: {
             seed: _read_resolved_config(rows[seed])
@@ -707,6 +718,21 @@ def generate(
             }
             left_group = _group(name=left_name, row=left, config=left_cfg)
             right_group = _group(name=right_name, row=right, config=right_cfg)
+            for group, method_id, row in (
+                (left_group, left_method, left),
+                (right_group, right_method, right),
+            ):
+                if method_id != "wcdt_reward_v2":
+                    continue
+                group["comparative"]["parent_lineage_compatibility"] = (
+                    build_wcdt_parent_lineage_compatibility(
+                        group_name=str(group["name"]),
+                        optimizer_seed=seed,
+                        row=row,
+                        audit_binding=baseline_audit_binding,
+                        target_protocol=snapshot,
+                    )
+                )
             if bool(evaluation_budget["episode_cache_enabled"]):
                 left_group["evaluation_cache"] = _episode_cache_binding(
                     output=output,
@@ -838,6 +864,10 @@ def generate(
             },
             "baseline_replicate_manifest": str(left_path),
             "candidate_replicate_manifest": str(right_path),
+            "baseline_lineage_audit": dict(baseline_audit_binding),
+            "parent_lineage_compatibility_version": (
+                PARENT_LINEAGE_COMPATIBILITY_VERSION
+            ),
             "runtime_factorial_report": str(runtime_path),
             "runtime_method_reports": {
                 method_id: {
@@ -884,6 +914,14 @@ def generate(
         "factorial_manifest_fingerprint": str(factorial.get("manifest_fingerprint", "")),
         "baseline_replicate_manifest": str(baseline_path),
         "baseline_replicate_manifest_sha256": file_sha256(baseline_path),
+        "baseline_lineage_audit": str(baseline_audit_binding["path"]),
+        "baseline_lineage_audit_sha256": str(baseline_audit_binding["sha256"]),
+        "baseline_lineage_audit_fingerprint": str(
+            baseline_audit_binding["audit_fingerprint"]
+        ),
+        "parent_lineage_compatibility_version": (
+            PARENT_LINEAGE_COMPATIBILITY_VERSION
+        ),
         "runtime_factorial_report": str(runtime_path),
         "runtime_factorial_report_sha256": file_sha256(runtime_path),
         "final_method_id": EXPECTED_FINAL_METHOD_ID,
@@ -924,6 +962,7 @@ def main() -> None:
         description="Generate the frozen six-comparison Stage5 factorial request"
     )
     parser.add_argument("--baseline-manifest", required=True)
+    parser.add_argument("--baseline-lineage-audit", required=True)
     parser.add_argument("--factorial-manifest", required=True)
     parser.add_argument("--protocol", required=True)
     parser.add_argument("--seed-role", required=True)
@@ -933,6 +972,7 @@ def main() -> None:
     args = parser.parse_args()
     path = generate(
         baseline_manifest=args.baseline_manifest,
+        baseline_lineage_audit=args.baseline_lineage_audit,
         factorial_manifest=args.factorial_manifest,
         protocol=args.protocol,
         seed_role=args.seed_role,

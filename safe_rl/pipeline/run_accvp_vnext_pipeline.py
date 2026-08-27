@@ -38,7 +38,11 @@ from safe_rl.pipeline.audit_ppo_replicate_lineage import (
 from safe_rl.pipeline.stage5_factorial_aggregate import FACTORIAL_REPORT_KIND
 from safe_rl.pipeline.stage5_generate_factorial_configs import (
     FACTORIAL_REQUEST_KIND,
+    FACTORIAL_REQUEST_SCHEMA_VERSION,
     FINAL_COMPARISON_ID,
+)
+from safe_rl.pipeline.stage5_lineage_compatibility import (
+    PARENT_LINEAGE_COMPATIBILITY_VERSION,
 )
 from safe_rl.ppo_factorial import (
     EXPECTED_CANDIDATE_METHOD_ROLES,
@@ -487,13 +491,16 @@ def _stage5_factorial_request_ok(
     factorial_manifest: Path,
     runtime_report: Path,
     baseline_manifest: Path,
+    baseline_lineage_audit: Path,
 ) -> bool:
-    if not path.is_file():
+    if not path.is_file() or not baseline_lineage_audit.is_file():
         return False
     try:
         payload = read_json(path)
         if (
             str(payload.get("artifact_kind", "")) != FACTORIAL_REQUEST_KIND
+            or int(payload.get("schema_version", -1))
+            != FACTORIAL_REQUEST_SCHEMA_VERSION
             or str(payload.get("status", "")) != "prepared"
             or str(payload.get("final_method_id", "")) != EXPECTED_FINAL_METHOD_ID
             or str(payload.get("final_comparison_id", "")) != FINAL_COMPARISON_ID
@@ -503,6 +510,10 @@ def _stage5_factorial_request_ok(
             != file_sha256(runtime_report)
             or str(payload.get("baseline_replicate_manifest_sha256", ""))
             != file_sha256(baseline_manifest)
+            or str(payload.get("baseline_lineage_audit_sha256", ""))
+            != file_sha256(baseline_lineage_audit)
+            or str(payload.get("parent_lineage_compatibility_version", ""))
+            != PARENT_LINEAGE_COMPATIBILITY_VERSION
         ):
             return False
         comparisons = list(payload.get("comparisons", []) or [])
@@ -1181,11 +1192,14 @@ def workflow_status(
             factorial_manifest=factorial_manifest,
             runtime_report=runtime_factorial,
             baseline_manifest=baseline_path,
+            baseline_lineage_audit=baseline_lineage_audit,
         ),
         _module_command(
             "safe_rl.pipeline.stage5_generate_factorial_configs",
             "--baseline-manifest",
             baseline_path,
+            "--baseline-lineage-audit",
+            baseline_lineage_audit,
             "--factorial-manifest",
             factorial_manifest,
             "--protocol",

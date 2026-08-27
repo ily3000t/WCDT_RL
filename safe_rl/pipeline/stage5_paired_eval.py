@@ -24,6 +24,9 @@ from safe_rl.evaluation_protocol import (
 from safe_rl.pipeline.common import latest_stage_file, load_stage_config, parse_config_arg, write_report
 from safe_rl.pipeline.accvp_observation_preflight import _gate as _accvp_observation_runtime_gate
 from safe_rl.pipeline.stage5_episode_cache import evaluate_policy_cached
+from safe_rl.pipeline.stage5_lineage_compatibility import (
+    validate_wcdt_parent_lineage_compatibility,
+)
 from safe_rl.ppo_replicates import observation_contract as ppo_observation_contract
 from safe_rl.rl.evaluation import evaluate_policy
 from safe_rl.sim.metrics import SAFETY_METRIC_VERSION
@@ -124,9 +127,11 @@ def _stage3_training_report(model_path: Path) -> Path:
 
 def _validate_stage5_model_lineage(
     *,
+    group_name: str,
     model_path: Path,
     stage5_lineage: dict[str, Any],
     stage5_seeds: list[int],
+    parent_lineage_compatibility: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     report_path = _stage3_training_report(model_path)
     strict = bool(stage5_lineage.get("protocol_strict", False))
@@ -139,7 +144,24 @@ def _validate_stage5_model_lineage(
     parent = dict(report.get("evidence_lineage", {}) or {})
     if strict or parent.get("lineage_fingerprint"):
         _validate_lineage_fingerprint(parent, name="Stage3 evidence lineage")
-    validate_parent_lineage(parent, stage5_lineage)
+    compatibility_validation: dict[str, Any] | None = None
+    try:
+        validate_parent_lineage(parent, stage5_lineage)
+    except EvidenceProtocolError:
+        if not parent_lineage_compatibility:
+            raise
+        compatibility_validation = validate_wcdt_parent_lineage_compatibility(
+            parent_lineage_compatibility,
+            group_name=group_name,
+            model_path=model_path,
+            parent_lineage=parent,
+            stage5_lineage=stage5_lineage,
+        )
+    else:
+        if parent_lineage_compatibility:
+            raise EvidenceProtocolError(
+                "Stage5 parent-lineage compatibility was supplied without a parent mismatch"
+            )
     role_usage = dict(parent.get("role_usage", {}) or {})
     training = [int(seed) for seed in role_usage.get("stage3_training", {}).get("seeds", [])]
     selection = [int(seed) for seed in role_usage.get("stage3_selection", {}).get("seeds", [])]
@@ -177,6 +199,7 @@ def _validate_stage5_model_lineage(
         "selection_seed_count": len(selection),
         "overlap_count": int(seed_audit.get("overlap_count", 0)),
         "seed_audit": seed_audit,
+        "parent_lineage_compatibility": compatibility_validation,
     }
 
 
@@ -350,7 +373,11 @@ def _validate_frozen_runtime_preflight(
 
     accvp_groups: list[tuple[str, Any, Path]] = []
     for group in cfg.stage5.groups:
-        group_cfg = clone_with_overrides(cfg, _group_overrides(group))
+        group_cfg = clone_with_overrides(
+            cfg,
+            _group_overrides(group),
+            replace_blocks=("accvp",),
+        )
         model_path = group_model_paths.get(str(group.name))
         if model_path is not None and RiskGatedACCVPCandidateTableAugmentor.enabled(group_cfg):
             accvp_groups.append((str(group.name), group_cfg, model_path))
@@ -1126,12 +1153,35 @@ def run(cfg) -> Path:
     stage5_role = str(protocol_cfg.get("stage5_role", "stage5_confirmatory"))
     lineage_artifacts: dict[str, str | Path | None] = {"risk_checkpoint": risk_checkpoint}
     group_model_paths: dict[str, Path] = {}
+    group_parent_lineage_compatibility: dict[str, dict[str, Any]] = {}
     for group in cfg.stage5.groups:
+        group_name = str(group.name)
+        comparative = dict(group.get("comparative", {}) or {})
+        compatibility = dict(
+            comparative.get("parent_lineage_compatibility", {}) or {}
+        )
+        if compatibility:
+            group_parent_lineage_compatibility[group_name] = compatibility
+            audit_binding = dict(compatibility.get("lineage_audit", {}) or {})
+            report_binding = dict(compatibility.get("stage3_report", {}) or {})
+            manifest_path = audit_binding.get("baseline_manifest")
+            audit_path = audit_binding.get("path")
+            report_path = report_binding.get("path")
+            if audit_path:
+                lineage_artifacts[f"baseline_lineage_audit:{group_name}"] = str(audit_path)
+            if manifest_path:
+                lineage_artifacts[f"baseline_manifest:{group_name}"] = str(manifest_path)
+            if report_path:
+                lineage_artifacts[f"stage3_report:{group_name}"] = str(report_path)
         model = _group_model_path(group, default_model)
         if model is not None:
-            group_model_paths[str(group.name)] = model
-            lineage_artifacts[f"ppo_model:{group.name}"] = model
-            group_cfg = clone_with_overrides(cfg, _group_overrides(group))
+            group_model_paths[group_name] = model
+            lineage_artifacts[f"ppo_model:{group_name}"] = model
+            group_cfg = clone_with_overrides(
+                cfg,
+                _group_overrides(group),
+                replace_blocks=("accvp",),
+            )
             if RiskGatedACCVPCandidateTableAugmentor.enabled(group_cfg):
                 manifest_source = group_cfg.accvp.get("artifact_manifest")
                 if not manifest_source:
@@ -1175,9 +1225,11 @@ def run(cfg) -> Path:
     )
     model_lineage = {
         name: _validate_stage5_model_lineage(
+            group_name=name,
             model_path=path,
             stage5_lineage=evidence_lineage,
             stage5_seeds=seeds,
+            parent_lineage_compatibility=group_parent_lineage_compatibility.get(name),
         )
         for name, path in group_model_paths.items()
     }
@@ -1193,7 +1245,11 @@ def run(cfg) -> Path:
     accvp_method_effect_contracts: dict[str, dict[str, Any]] = {}
     episode_cache_bindings: dict[str, dict[str, Any]] = {}
     for group_idx, group in enumerate(cfg.stage5.groups):
-        group_cfg = clone_with_overrides(cfg, _group_overrides(group))
+        group_cfg = clone_with_overrides(
+            cfg,
+            _group_overrides(group),
+            replace_blocks=("accvp",),
+        )
         if str(group_cfg.rl.get("reward_profile", "default")) in {"shield_guided_forecast", "merge_timing_forecast"}:
             group_cfg.rl.shield_guided_reward["risk_checkpoint"] = str(
                 group_cfg.rl.shield_guided_reward.get("risk_checkpoint") or risk_checkpoint

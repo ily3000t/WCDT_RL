@@ -51,7 +51,9 @@ paths:
   baseline_manifest: safe_rl_output/runs/wcdt_vnext_replicates/ppo_replicate_manifest.json
   baseline_lineage_audit: safe_rl_output/runs/accvp_vnext_selector4_hybrid_baseline_audit/wcdt_baseline_report.json
   runtime_factorial_report: safe_rl_output/runs/accvp_vnext_selector4_hybrid_deployment_runtime/factorial_runtime_report.json
-  stage5_request: safe_rl_output/runs/accvp_vnext_selector4_hybrid_blocking_exact_stage5/generated/factorial_request.json
+  # Schema-v2 requests bind the audited v1->v4 WcDT parent-lineage migration.
+  # Keep the pre-execution schema-v1 generation immutable in its original path.
+  stage5_request: safe_rl_output/runs/accvp_vnext_selector4_hybrid_blocking_exact_stage5/generated_lineage_v2/factorial_request.json
   stage5_report: safe_rl_output/runs/accvp_vnext_selector4_hybrid_blocking_exact_stage5/factorial_report.json
   holdout_report: safe_rl_output/runs/accvp_vnext_selector4_hybrid_layered_final_holdout/accvp_vnext_schema3_final_test_diagnostics.json
 

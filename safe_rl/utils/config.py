@@ -245,7 +245,15 @@ def prepare_run_dir(cfg: ConfigDict, stage_name: str | None = None) -> Path:
     return run_dir
 
 
-def clone_with_overrides(cfg: ConfigDict, overrides: Mapping[str, Any]) -> ConfigDict:
+def clone_with_overrides(
+    cfg: ConfigDict,
+    overrides: Mapping[str, Any],
+    *,
+    replace_blocks: tuple[str, ...] = (),
+) -> ConfigDict:
     _reject_retired_noop_keys(overrides)
     merged = _deep_merge(dict(cfg), overrides)
+    for key in replace_blocks:
+        if key in overrides:
+            merged[key] = copy.deepcopy(overrides[key])
     return _to_config_dict(merged)

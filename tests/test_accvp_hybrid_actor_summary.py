@@ -241,6 +241,43 @@ def test_runtime_batch_and_direct_builder_produce_identical_summary(
         np.testing.assert_array_equal(runtime[name], expected)
 
 
+def test_normal_wcdt_prediction_scope_ignores_accvp_only_summary_contract() -> None:
+    cfg = clone_with_overrides(
+        load_config(),
+        {
+            "accvp": {
+                "actor_count": 2,
+                "omitted_actor_summary": {
+                    "enabled": True,
+                    "contract_version": "accvp_omitted_actor_summary_v1",
+                    # Deliberately invalid for ACCVP scope. A normal WcDT
+                    # forecast must never parse this independent adapter.
+                    "physical_actor_capacity": 3,
+                },
+            }
+        },
+    )
+    history = HistoryBuffer(
+        history_steps=int(cfg.scenario.history_steps),
+        max_agents=3,
+    )
+    history.append(
+        [
+            _state("ego", 100.0, speed=20.0),
+            _state("front", 115.0, speed=18.0),
+            _state("rear", 85.0, speed=22.0),
+        ]
+    )
+    runtime = build_v3_runtime_batch(
+        cfg,
+        history,
+        "ego",
+        max_actors_override=2,
+        selector_scope="prediction",
+    )
+    assert "omitted_actor_summary_features" not in runtime
+
+
 def test_hybrid_adapter_adds_one_scene_token_but_no_response_row() -> None:
     cfg = load_config(
         "safe_rl/config/active/accvp_vnext_selector4/train.yaml"

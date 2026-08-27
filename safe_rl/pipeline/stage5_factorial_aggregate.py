@@ -19,6 +19,10 @@ from safe_rl.pipeline.stage5_replicated_aggregate import (
     REPORT_ARTIFACT_KIND as CHILD_REPORT_KIND,
     aggregate_manifest,
 )
+from safe_rl.pipeline.stage5_lineage_compatibility import (
+    PARENT_LINEAGE_COMPATIBILITY_VERSION,
+    validate_baseline_lineage_audit,
+)
 from safe_rl.ppo_factorial import (
     EXPECTED_FINAL_METHOD_ID,
     validate_factorial_manifest,
@@ -92,6 +96,20 @@ def load_factorial_request(request_path: str | Path) -> tuple[Path, dict[str, An
     )
     if not baseline_path.is_file() or file_sha256(baseline_path) != expected_baseline_sha:
         raise ValueError("Stage5 factorial request baseline-manifest binding mismatch")
+    audit_binding = validate_baseline_lineage_audit(
+        request.get("baseline_lineage_audit", ""),
+        baseline_manifest=baseline_path,
+        required_seeds=[int(seed) for seed in request.get("optimizer_seeds", []) or []],
+    )
+    if (
+        str(request.get("baseline_lineage_audit_sha256", ""))
+        != str(audit_binding["sha256"])
+        or str(request.get("baseline_lineage_audit_fingerprint", ""))
+        != str(audit_binding["audit_fingerprint"])
+        or str(request.get("parent_lineage_compatibility_version", ""))
+        != PARENT_LINEAGE_COMPATIBILITY_VERSION
+    ):
+        raise ValueError("Stage5 factorial request lineage-audit binding mismatch")
 
     runtime_path = _resolve(
         request.get("runtime_factorial_report", ""),

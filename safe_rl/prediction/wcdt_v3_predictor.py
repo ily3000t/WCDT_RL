@@ -288,7 +288,14 @@ def build_v3_runtime_batch(
             cfg.prediction.max_pred_num,
         )
     )
-    summary_contract = omitted_actor_summary_config(cfg)
+    # Omitted-actor aggregation is an ACCVPPredictor input adapter.  A normal
+    # WcDT forecast must not parse (or inherit) that independent ACCVP-only
+    # contract, especially for frozen WcDT configs created before it existed.
+    summary_contract = (
+        omitted_actor_summary_config(cfg)
+        if selector_scope == "accvp"
+        else {"enabled": False}
+    )
     if (
         selector_scope == "accvp"
         and bool(summary_contract["enabled"])
