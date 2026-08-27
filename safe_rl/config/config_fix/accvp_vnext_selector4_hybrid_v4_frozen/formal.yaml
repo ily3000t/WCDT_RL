@@ -1,0 +1,691 @@
+standalone_config: true
+run:
+  output_root: safe_rl_output/runs
+  cache_root: safe_rl_output/.cache/accvp_vnext_selector4_hybrid_formal
+  run_id: accvp_vnext_selector4_hybrid_formal
+  seed: 10001
+  episode_seed_schedule: incrementing_v1
+  tensorboard: false
+  replay: true
+training:
+  device: auto
+  stage2_device: auto
+  ppo_device: cpu
+  forecast_runtime_device: cpu
+  diagnostics_device: auto
+  ppo_num_envs: 1
+  ppo_start_method: spawn
+  ppo_worker_torch_threads: 1
+  ppo_main_torch_threads: 4
+  max_parallel_optimizer_replicates: 1
+  ppo_expected_rollout_size: null
+  pin_memory: true
+  num_workers: 0
+  persistent_workers: true
+  cuda_tf32: true
+scenario:
+  name: highway_merge
+  root: scenarios/highway_merge
+  sumocfg: scenarios/highway_merge/highway_merge.sumocfg
+  net_file: scenarios/highway_merge/highway_merge.net.xml
+  route_file: scenarios/highway_merge/highway_merge.rou.xml
+  ego_id: ego
+  ego_lane_change_mode: 512
+  sumo_binary: sumo
+  sumo_start_retries: 5
+  sumo_start_retry_delay: 0.25
+  traci_subscriptions_enabled: true
+  persistent_sumo_reset: false
+  persistent_sumo_restart_interval: 100
+  vehicle_state_ordering_version: lexicographic_id_v1
+  step_length: 0.1
+  episode_seconds: 80.0
+  control_interval_steps: 5
+  lane_change_duration: 1.0
+  action_execution_profile: current_v1
+  accvp_candidate_plan_profile: accvp_commitment_v1
+  top_k_neighbors: 5
+  history_steps: 11
+  forecast_horizon_steps: 30
+  ramp_edges:
+  - ramp_in
+  auxiliary_edges:
+  - main_aux
+  mainline_edges:
+  - main_in
+  - main_aux
+  - main_out
+  target_lane_edges:
+  - main_in
+  - main_aux
+  - main_out
+  merge_zone_edges:
+  - ramp_in
+  - main_aux
+  merge_side: right
+  auxiliary_lane: 0
+  auxiliary_lane_by_edge:
+    main_aux: 0
+  target_lane_by_edge:
+    main_in: 0
+    main_aux: 1
+    main_out: 0
+  taper_edge: main_aux
+  taper_warning_distance: 40.0
+  taper_miss_distance: 40.0
+  success_edge: main_out
+  success_min_lane_position: 40.0
+  edge_lengths:
+    main_in: 298.5
+    ramp_in: 193.79
+    main_aux: 214.5
+    main_out: 236.0
+  lane_centers:
+    '0': 53.8
+    '1': 57.0
+    '2': 60.2
+    '3': 63.4
+  merge_x: 516.0
+  merge_target_lane: 1
+  merge_zone_distance: 80.0
+  merge_conflict_gap: 8.0
+  merge_opportunity_min_front_gap: 12.0
+  merge_opportunity_min_rear_gap: 12.0
+prediction:
+  enabled: true
+  checkpoint: null
+  horizon_steps: 30
+  train_enabled: true
+  wcdt_v1_train_enabled: false
+  wcdt_v1_max_agents: 6
+  wcdt_v1_mode_aggregation:
+    version: per_actor_joint_world_v1
+    joint_world_count: 32
+  epochs: 50
+  batch_size: 16
+  wcdt_v1_batch_size: 16
+  wcdt_v2_batch_size: 32
+  learning_rate: 0.0001
+  validation_split: 0.15
+  target_lane_gap_metric_weight: 0.5
+  future_min_distance_metric_weight: 0.5
+  wcdt_v2_train_enabled: true
+  wcdt_v2_ensemble_size: 3
+  wcdt_v2_epochs: 30
+  wcdt_v2_learning_rate: 0.0003
+  wcdt_v2_hidden_dim: 128
+  wcdt_v2_horizon_steps: 30
+  wcdt_v2_max_agents: 5
+  wcdt_v2_loss_weights:
+    ade: 1.0
+    fde: 0.5
+    future_min_distance: 0.75
+    target_lane_front_gap: 0.4
+    target_lane_rear_gap: 0.4
+    ordering: 0.1
+    smoothness: 0.05
+  wcdt_v2_early_stopping:
+    enabled: true
+    patience: 10
+    min_delta: 0.0001
+    warmup_epochs: 5
+  wcdt_v3_train_enabled: false
+  wcdt_v3_batch_size: 16
+  wcdt_v3_ensemble_size: 3
+  wcdt_v3_epochs: 30
+  wcdt_v3_learning_rate: 0.0003
+  wcdt_v3_hidden_dim: 128
+  wcdt_v3_temporal_layers: 2
+  wcdt_v3_actor_attention_layers: 2
+  wcdt_v3_num_heads: 4
+  wcdt_v3_dropout: 0.1
+  wcdt_v3_horizon_steps: 30
+  wcdt_v3_max_agents: 6
+  wcdt_v3_early_stopping:
+    enabled: true
+    patience: 10
+    min_delta: 0.0001
+    warmup_epochs: 5
+  route_projection:
+    version: route_projection_v2
+    max_projection_distance: 2.5
+    ambiguity_margin: 0.25
+    low_motion_heading_distance: 0.05
+  actor_relevance:
+    version: merge_relevance_v2
+    current_gap_distance: 45.0
+    effective_gap_distance: 35.0
+    ttc_threshold: 5.0
+    local_actor_distance: 45.0
+    nearest_conflict_distance: 30.0
+    critical_taper_distance: 120.0
+    cv_fallback_max_actors: 12
+    cv_uncertainty_base: 0.25
+    cv_uncertainty_accel_scale: 0.05
+    cv_uncertainty_closing_speed_scale: 0.02
+    cv_uncertainty_merge_corridor_penalty: 0.1
+    candidate_conflict_horizon_s: 3.0
+    candidate_conflict_surface_gap: 30.0
+    actor_longitudinal_accel_bound: 2.0
+    unknown_topology_lateral_reach_m: 3.5
+  max_pred_num: 8
+  max_other_num: 6
+  max_traffic_light: 8
+  max_lane_num: 32
+  max_point_num: 128
+forecast_features:
+  enabled: false
+  use_for_ppo_observation: false
+  source: wcdt_v2
+  checkpoint: null
+  allow_heuristic_fallback: false
+  horizon_steps: 30
+  normalize: true
+rule_gap_acceptance:
+  idm_min_gap: 2.0
+  idm_time_headway: 1.5
+  idm_max_acceleration: 1.5
+  idm_comfortable_deceleration: 2.0
+  merge_min_front_gap: 8.0
+  merge_min_rear_gap: 8.0
+  merge_front_ttc_min: 3.0
+  merge_rear_ttc_min: 3.0
+  deadline_distance: 120.0
+risk_module:
+  enabled: true
+  safety_metric_version: oriented_box_v1
+  candidate_geometry_backend: vectorized
+  ranking_loss_enabled: true
+  calibration:
+    reliability_bins: 10
+    temperature_scaling_enabled: false
+    use_for_runtime: false
+    temperature_grid:
+    - 0.5
+    - 0.75
+    - 1.0
+    - 1.25
+    - 1.5
+    - 2.0
+    - 3.0
+    - 5.0
+  legal_candidates_only_for_training: true
+  illegal_candidate_sample_weight: 0.0
+  positive_traffic_risk_weight: 1.5
+  merge_conflict_weight: 1.25
+  validation_split: 0.15
+  epochs: 50
+  batch_size: 64
+  learning_rate: 0.0003
+  latent_dim: 256
+  hidden_dim: 128
+  explicit_feature_dim: 8
+  action_embedding_dim: 4
+  risk_type_count: 6
+  collision_horizon_steps: 30
+  collision_distance_threshold: 0.25
+  near_miss_distance_threshold: 0.75
+  ttc_threshold: 1.5
+  drac_threshold: 3.35
+  loss_weights:
+    prediction: 1.0
+    risk: 1.0
+    ranking: 0.5
+    calibration: 0.1
+rl:
+  backend: sb3
+  use_wcdt_forecast_features: false
+  training_semantics_version: reward_v2_mainline_001
+  reward_profile: merge_timing_forecast
+  total_timesteps: 20000
+  learning_rate: 0.0003
+  n_steps: 1024
+  batch_size: 64
+  gamma: 0.99
+  gae_lambda: 0.95
+  ent_coef: 0.0
+  vf_coef: 0.5
+  reward:
+    progress: 0.05
+    speed: 0.02
+    merge_success: 100.0
+    collision: -100.0
+    near_miss: -10.0
+    low_ttc: -3.0
+    high_drac: -2.0
+    hard_brake: -1.0
+    lane_oob: -5.0
+  safety_reward:
+    drac_cap: 20.0
+    distance_threshold: 5.0
+    distance_penalty_weight: -8.0
+    ttc_threshold: 2.0
+    ttc_penalty_weight: -4.0
+    drac_penalty_weight: -3.0
+    merge_gap_threshold: 8.0
+    merge_gap_penalty_weight: -4.0
+    merge_zone_margin: 30.0
+  shield_guided_reward:
+    risk_checkpoint: null
+    require_frozen_risk_model: true
+    raw_risk_threshold: 0.85
+    raw_risk_penalty_weight: -3.0
+    risk_margin_threshold: 0.15
+    risk_margin_penalty_weight: -4.0
+    would_replace_penalty_weight: -2.0
+    uncertainty_threshold: 0.4
+    use_calibrated_risk: false
+  merge_timing_reward:
+    reward_version: opportunity_window_v2
+    deadline_distance: 120.0
+    opportunity_window_start_distance: 240.0
+    opportunity_window_end_distance: 120.0
+    opportunity_accept_bonus: 2.0
+    missed_opportunity_weight: -2.0
+    taper_deadline_weight: -4.0
+    taper_miss_penalty: -35.0
+    early_safe_merge_bonus: 0.0
+    bonus_min_distance_to_taper: 60.0
+    consecutive_missed_grace: 2
+    merge_intent_abort_penalty: -3.0
+    merge_intent_continue_bonus: 0.5
+    merge_intent_commitment_window_s: 1.0
+  policy_lateral_commitment:
+    enabled: false
+    profile: left_intent_1s_v1
+    duration_s: 1.0
+    preserve_raw_accel: true
+shield:
+  enabled: false
+  activation_risk_threshold: 0.9
+  candidate_action_count: 9
+  risk_threshold: 0.65
+  uncertainty_threshold: 0.4
+  replacement_margin: 0.15
+  allow_fallback: false
+  fallback_min_ttc: 0.3
+  fallback_min_distance: 0.75
+  emergency_fallback_enabled: true
+  emergency_min_ttc: 0.3
+  emergency_min_distance: 1.0
+  emergency_watch_min_ttc: 0.75
+  emergency_watch_min_distance: 2.0
+  emergency_saturated_risk_threshold: 0.99
+  emergency_saturated_consecutive_enabled: false
+  emergency_saturated_consecutive_steps: 2
+  emergency_actions:
+  - keep_decelerate
+  - keep_hold
+  forecast_aware_candidate_ranking_mode: 'off'
+  forecast_aware_ranking_safety_weight: 1.0
+  forecast_aware_ranking_task_weight: 1.0
+  forecast_aware_ranking_uncertainty_weight: 0.5
+  forecast_aware_ranking_improvement_margin: 0.05
+  forecast_task_shadow_enabled: true
+  task_backstop_enabled: false
+  task_backstop_deadline_distance: 120.0
+  task_backstop_watch_urgency_threshold: 0.4
+  task_backstop_execute_urgency_threshold: 0.5
+  task_backstop_consecutive_steps: 2
+  task_backstop_task_risk_margin: 0.05
+  task_backstop_safety_risk_threshold: 0.35
+  task_backstop_uncertainty_threshold: 0.4
+  task_backstop_max_first_step_gap_jump: 20.0
+  filter_illegal_candidates: true
+  score_weights:
+    risk: 1.0
+    uncertainty: 0.2
+    action_distance: 0.1
+    progress: -0.05
+accvp:
+  enabled: false
+  mode: 'off'
+  artifact_generation: vnext_schema3
+  dataset_dir: null
+  oracle_report: null
+  formal_validation_report: null
+  checkpoint: null
+  calibration_bundle: null
+  operating_point: null
+  artifact_manifest: null
+  risk_checkpoint: null
+  schema_version: 3
+  data_contract_version: accvp_240_v5_hybrid_actor_summary
+  actor_row_mapping_version: selected_indices_v2
+  root_observation_fingerprint_version: model_input_fingerprint_v4_hybrid_actor_summary
+  entry_time_label_version: conditional_entry_time_v1
+  loss_version: accvp_loss_v2
+  candidate_plan_profile: accvp_commitment_v1
+  response_horizon_s: 3.0
+  viability_horizon_s: 8.0
+  response_horizon_steps: 30
+  candidate_plan_horizon_steps: 80
+  actor_count: 6
+  ensemble_size: 3
+  omitted_actor_summary:
+    enabled: true
+    contract_version: accvp_omitted_actor_summary_v1
+    physical_actor_capacity: 12
+  selector_contract:
+    require_capacity_lock: true
+    audit_report: safe_rl_output/runs/accvp_vnext_selector4_audit/selector_capacity_audit.json
+  activation_distance: 240.0
+  deadline_distance: 120.0
+  proxy_collision_upper_bound: 0.1
+  safety_violation_upper_bound: 0.15
+  merge_viability_lower_bound: 0.5
+  max_decision_latency_s: 0.5
+  lateral_commitment_s: 1.0
+  observation:
+    enabled: false
+    feature_version: risk_gated_candidate_table_v1
+    activation_distance: 240.0
+    timeout_s: 0.45
+    timeout_contract: soft_realtime_post_return_v1
+    full_table_hard_deadline_worker: false
+    use_inference_worker: false
+    profile_latency: true
+    fail_closed_defaults: true
+    invalid_table_strategy: fail_closed_v1
+    last_valid_max_decisions: 1
+    last_valid_ttl_s: 0.5
+    last_valid_max_merge_distance_delta_m: 15.0
+    last_valid_max_ego_speed_delta_mps: 3.0
+    last_valid_max_gap_delta_m: 8.0
+    warmup_enabled: false
+    warmup_max_attempts: 3
+    critical_actor_overflow_sample_limit: 20
+    include_risk_secondary: true
+    secondary_safety_profile: risk_model_rollout_v1
+    risk_horizon_steps: 0
+    allow_with_forecast_features: false
+  viability_lite:
+    min_p_merge_before_taper: 0.75
+    min_improvement_over_raw: 0.01
+    max_target_entry_time_s: 8.0
+    max_ensemble_disagreement: 0.2
+    max_secondary_risk_score: 1.0
+    max_replacement_rate: 0.5
+    min_left_p_merge_before_taper_grid:
+    - 0.7
+    - 0.75
+    - 0.78
+    - 0.8
+    min_improvement_over_raw_grid:
+    - 0.005
+    - 0.01
+    - 0.02
+    - 0.03
+    max_target_entry_time_s_grid:
+    - 4.0
+    - 6.0
+    - 8.0
+    max_ensemble_disagreement_grid:
+    - 0.05
+    - 0.1
+    - 0.2
+    max_secondary_risk_score_grid:
+    - 1.0
+  warm_start:
+    enabled: true
+    checkpoint: safe_rl_output/runs/safe_rl_comparison_schema9_validation_001/stage2/wcdt_v3_predictor.pt
+    freeze_encoder_epochs: 5
+    encoder_lr_multiplier: 0.1
+  calibration:
+    nominal_alpha: 0.05
+    bins: 20
+    bonferroni_signal_count: 3
+  inference_worker:
+    enabled: true
+    prewarm_on_init: true
+    startup_timeout_s: 15.0
+  training:
+    deterministic: false
+    deterministic_torch_threads: null
+    epochs: 20
+    batch_size: 32
+    learning_rate: 0.0003
+    weight_decay: 1.0e-05
+    ensemble_seed_offset: 1000
+    loss_weights:
+      trajectory: 1.0
+      events: 1.0
+      geometry: 0.25
+      ordering: 0.1
+      smoothness: 0.01
+      response_feature_scales:
+      - 1.0
+      - 1.0
+      - 1.0
+      - 1.0
+      - 1.0
+  tuning:
+    required_availability: 0.95
+    availability_denominator: risk_eligible_raw_or_merge_left_v1
+    proxy_collision_upper_bounds:
+    - 0.05
+    - 0.1
+    - 0.15
+    - 0.2
+    - 0.3
+    - 0.5
+    - 0.75
+    - 1.0
+    safety_violation_upper_bounds:
+    - 0.05
+    - 0.1
+    - 0.15
+    - 0.2
+    - 0.3
+    - 0.5
+    - 0.75
+    - 1.0
+    merge_viability_lower_bounds:
+    - 0.0
+    - 0.1
+    - 0.2
+    - 0.3
+    - 0.4
+    - 0.5
+    - 0.6
+    - 0.7
+  counterfactual:
+    collection_phase: formal
+    root_budget: 5000
+    roots_per_episode_limit: 3
+    workers: 2
+    pending_branch_jobs_per_worker: 4
+    shard_roots: 50
+    collection_id: null
+    collection_jobs:
+    - name: mixed_vnext_formal
+      collection_source: mixed
+      root_policy: mixed
+      root_filter: all
+      root_budget: 1000
+      roots_per_episode_limit: 3
+    - name: ppo_vnext_formal
+      collection_source: ppo
+      root_policy: ppo
+      root_filter: all
+      root_budget: 1000
+      roots_per_episode_limit: 3
+      root_policy_checkpoint: safe_rl_output/runs/safe_rl_comparison_schema9_validation_001/stage3/ppo_model.zip
+      config_overrides:
+        forecast_features:
+          enabled: false
+        rl:
+          use_wcdt_forecast_features: false
+    - name: merge_timing_vnext_formal
+      collection_source: merge_timing
+      root_policy: merge_timing
+      root_filter: all
+      root_budget: 1000
+      roots_per_episode_limit: 3
+      root_policy_checkpoint: safe_rl_output/runs/safe_rl_comparison_schema9_validation_001_forecast_wcdt_v3/stage3/ppo_model.zip
+      config_overrides:
+        forecast_features:
+          enabled: true
+          use_for_ppo_observation: true
+          source: wcdt_v3
+          checkpoint: safe_rl_output/runs/safe_rl_comparison_schema9_validation_001/stage2/wcdt_v3_predictor.pt
+          allow_heuristic_fallback: false
+        rl:
+          use_wcdt_forecast_features: true
+          reward_profile: merge_timing_forecast
+    - name: rule_vnext_formal
+      collection_source: rule
+      root_policy: rule
+      root_filter: all
+      root_budget: 1000
+      roots_per_episode_limit: 3
+    - name: deadline_hard_vnext_formal
+      collection_source: deadline_hard
+      root_policy: mixed
+      root_filter: activation_window
+      root_budget: 1000
+      roots_per_episode_limit: 3
+    root_policy: mixed
+    root_filter: all
+    episode_seeds: null
+    min_deadline_roots_per_seed: 1
+    cache_root: safe_rl_output/.cache/accvp_vnext_selector4_hybrid_formal
+    policy_checkpoints:
+      ppo: safe_rl_output/runs/safe_rl_comparison_schema9_validation_001/stage3/ppo_model.zip
+      merge_timing: safe_rl_output/runs/safe_rl_comparison_schema9_validation_001_forecast_wcdt_v3/stage3/ppo_model.zip
+    risk_checkpoint: safe_rl_output/runs/safe_rl_comparison_schema9_validation_001/stage2/risk_module.pt
+    output_name: accvp_vnext_selector4_hybrid_schema3_formal
+    incomplete_shard_policy: quarantine
+    required_pilot_report: safe_rl_output/runs/accvp_vnext_selector4_hybrid_pilot/pilot_report.json
+    required_latency_smoke_report: safe_rl_output/runs/accvp_vnext_selector4_hybrid_pilot_latency_smoke/feasibility_report.json
+  actor_relevance:
+    version: merge_conflict_relevance_v4_lane_aware
+    candidate_conflict_horizon_s: 3.0
+    candidate_conflict_surface_gap: 30.0
+    actor_longitudinal_accel_bound: 2.0
+    local_actor_distance: 45.0
+    critical_taper_distance: 120.0
+stage1:
+  episodes: 250
+  workers: 1
+  shard_episodes: 25
+  replay_mode: risk_or_failure
+  log_every_episodes: 20
+  action_sampling: mixed
+  sampling_probs:
+    random: 0.1
+    merge_heuristic: 0.6
+    risk_seek: 0.3
+  output_name: risk_probe_buffer
+  output_format: manifest_npy_v1
+  cleanup_worker_shards: true
+  audit_enabled: true
+  audit_gate:
+    enabled: true
+    smoke_skip_below_episodes: 20
+    min_candidate_samples: 100000
+    min_legal_boundary_samples: 10000
+    min_boundary_rate: 0.15
+  replay_enabled: true
+  curriculum:
+    enabled: true
+    profiles:
+      safe:
+        probability: 0.2
+        position_jitter: 4.0
+        speed_jitter: 1.0
+      boundary:
+        probability: 0.6
+        position_jitter: 10.0
+        speed_jitter: 2.0
+      hard:
+        probability: 0.2
+        position_jitter: 14.0
+        speed_jitter: 3.0
+stage2:
+  input_stage1: null
+  input_stage4: null
+stage3:
+  model_name: ppo_model.zip
+  tensorboard_log_name: ppo
+  eval_enabled: true
+  eval_freq: 10000
+  eval_seeds:
+  - 1
+  - 2
+  - 3
+  - 4
+  - 5
+  - 6
+  - 7
+  - 8
+  - 9
+  - 10
+  checkpoint_selection_workers: 1
+  checkpoint_selection_worker_torch_threads: 1
+  checkpoint_selection_start_method: spawn
+  checkpoint_selection_profile: safety
+  checkpoint_selection_weights:
+    reward: 1.0
+    min_distance_p1: 2.0
+    ttc_p1: 2.0
+    drac_p99_capped: -2.0
+    proxy_collision_rate: -50.0
+    safety_violation_rate: -30.0
+    completion_time_mean: 0.0
+    ego_speed_mean: 0.0
+stage4:
+  episodes: 100
+  mode: shadow
+  replay_enabled: true
+stage5:
+  paired_eval: true
+  same_seed: true
+  compare_shield_off_on: true
+  replay_enabled: true
+  episodes_per_group: 20
+  seeds:
+  - 1
+  - 2
+  - 3
+  - 4
+  - 5
+  - 6
+  - 7
+  - 8
+  - 9
+  - 10
+  - 11
+  - 12
+  - 13
+  - 14
+  - 15
+  - 16
+  - 17
+  - 18
+  - 19
+  - 20
+  task_quality:
+    timely_entry_distance_threshold_m: 80.0
+    late_merge_request_threshold_m: 60.0
+  acceptance:
+    mainline_reward_v2:
+      max_actual_replacement_rate: 0.05
+      reward_tolerance: 1.0e-06
+  groups:
+  - name: ppo
+    forecast_features: false
+    shield: false
+  - name: ppo_shield
+    forecast_features: false
+    shield: true
+evaluation_protocol:
+  strict: true
+  protocol_id: accvp-vnext-correctness-v4-selector4-hybrid
+  seed_ledger: safe_rl/config/accvp_vnext_selector4_hybrid_seed_ledger.json
+  revocation_manifest: safe_rl/config/artifact_revocation_manifest_selector4_hybrid.json
+  cohort_roles:
+    data_collection: data_collection
+    selector_diagnostic: selector_historical_development
+    selector_historical_development: selector_historical_development
+    selector_stress_development: selector_stress_development

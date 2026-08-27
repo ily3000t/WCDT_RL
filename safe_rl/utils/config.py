@@ -12,6 +12,7 @@ import yaml
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 DEFAULT_CONFIG_PATH = REPO_ROOT / "safe_rl" / "config" / "default_safe_rl.yaml"
+STANDALONE_CONFIG_KEY = "standalone_config"
 
 # These keys existed in the default file but were never consumed by runtime
 # code. Rejecting them in overlays is safer than silently pretending a no-op
@@ -133,13 +134,19 @@ def load_config(config_path: str | os.PathLike[str] | None = None) -> ConfigDict
     hundreds of unrelated defaults.
     """
 
-    with DEFAULT_CONFIG_PATH.open("r", encoding="utf-8") as file:
-        data = yaml.safe_load(file) or {}
-
+    override: dict[str, Any] = {}
     if config_path:
         path = Path(config_path)
         override = _resolve_extended_config(path)
-        data = _deep_merge(data, override)
+    standalone = override.pop(STANDALONE_CONFIG_KEY, False)
+    if standalone not in {False, True}:
+        raise ValueError(f"{STANDALONE_CONFIG_KEY} must be a boolean")
+    if standalone:
+        data: dict[str, Any] = {}
+    else:
+        with DEFAULT_CONFIG_PATH.open("r", encoding="utf-8") as file:
+            data = yaml.safe_load(file) or {}
+    data = _deep_merge(data, override)
 
     cfg = resolve_paths(_to_config_dict(data))
     return _apply_selector_capacity_lock(cfg)

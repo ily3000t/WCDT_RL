@@ -1,0 +1,90 @@
+{
+  "artifact_kind": "safe_rl_config_fix_bundle_v1",
+  "schema_version": 1,
+  "mode": "standalone_exact_snapshot",
+  "default_config": "safe_rl/config/default_safe_rl.yaml",
+  "default_config_sha256": "881a51a44cefbd6eddfe26e1f4e3f6cde37256ab0fba3b0872f4de4b7c573063",
+  "entries": [
+    {
+      "name": "selector_audit.yaml",
+      "source": "safe_rl/config/active/accvp_vnext_selector4/selector_audit.yaml",
+      "source_sha256": "60de0a937dfe98d4429675fd4e627121adffc5dcbf4560fefd78add42655a1ca",
+      "snapshot": "safe_rl/config/config_fix/accvp_vnext_selector4_hybrid_v4_frozen/selector_audit.yaml",
+      "snapshot_sha256": "1d89a293190520cc40b5ebec51bbab72ce79903dfa29d2823f9c5fdf7579eb18",
+      "resolved_config_sha256": "de1f77deeac542a21c17f41264880d86d7c946b0c382ec15d2c6f653cf336389"
+    },
+    {
+      "name": "pilot.yaml",
+      "source": "safe_rl/config/active/accvp_vnext_selector4/pilot.yaml",
+      "source_sha256": "1d9bacfa7ff07462a870ec7b6ab0769b4605c2f91f2bdde683add979a6d9f382",
+      "snapshot": "safe_rl/config/config_fix/accvp_vnext_selector4_hybrid_v4_frozen/pilot.yaml",
+      "snapshot_sha256": "fde9b69610add32b9491f3c37f19090cfc95ce0b7e393b46a62b60d461233fda",
+      "resolved_config_sha256": "eeac2c6cf8a3ec4c5f69ae2fe637b5bf944373a89b5b95515ae56371cb348129"
+    },
+    {
+      "name": "oracle_regression.yaml",
+      "source": "safe_rl/config/active/accvp_vnext_selector4/oracle_regression.yaml",
+      "source_sha256": "1ab579af7ba7bc98858d5e6a8419895d82934399c7ebc58b368c2b96fd758b42",
+      "snapshot": "safe_rl/config/config_fix/accvp_vnext_selector4_hybrid_v4_frozen/oracle_regression.yaml",
+      "snapshot_sha256": "e058f488f5c1859133afee714aa72dda9301156a35354a3083f051a130156a9a",
+      "resolved_config_sha256": "423df4179468bcc5fa134d5d930213c0b7ac94fe8a864e0a58328d0001c38482"
+    },
+    {
+      "name": "formal.yaml",
+      "source": "safe_rl/config/active/accvp_vnext_selector4/formal.yaml",
+      "source_sha256": "6780c3f472965aff7399cc839fe8fbe9a69dea15844c7bdec2f9832bf79270f4",
+      "snapshot": "safe_rl/config/config_fix/accvp_vnext_selector4_hybrid_v4_frozen/formal.yaml",
+      "snapshot_sha256": "c48ea4d0a2ca8f5629575e2ca600e76bffbe01373cdf525307da87f30d15a5d8",
+      "resolved_config_sha256": "cbf6c47125b86ec2122b7e466aa7db1f0a3b4e6017fa208582da5a40f745ae55"
+    },
+    {
+      "name": "train.yaml",
+      "source": "safe_rl/config/active/accvp_vnext_selector4/train.yaml",
+      "source_sha256": "2e8f066b7652d2833ea34109c15abad0696d01c0779aeb8749158fe8f76a2bf2",
+      "snapshot": "safe_rl/config/config_fix/accvp_vnext_selector4_hybrid_v4_frozen/train.yaml",
+      "snapshot_sha256": "4a0e497ea741295a034e4d6e06867c52078830f9efdff195a72e1c8a18a2502d",
+      "resolved_config_sha256": "6913daf9f495f76465f1b9a137df470893c58fc51bbea47342968081d6a39b7f"
+    },
+    {
+      "name": "pilot_latency_smoke_train.yaml",
+      "source": "safe_rl/config/active/accvp_vnext_selector4/pilot_latency_smoke_train.yaml",
+      "source_sha256": "b17f91f3382bd844287f421c34d3dc843543a5eb06d31e02c12bb0ffe7704518",
+      "snapshot": "safe_rl/config/config_fix/accvp_vnext_selector4_hybrid_v4_frozen/pilot_latency_smoke_train.yaml",
+      "snapshot_sha256": "0f4e0b6f74b08f51ffcb3ff656539920020cfa1bc338d464791e775fa565db3a",
+      "resolved_config_sha256": "9b560ab7e25a539be69e4f8a0672a201b3a6c0aefccb0d03a63373759ea040dc"
+    },
+    {
+      "name": "ppo_candidate_table_full.yaml",
+      "source": "safe_rl/config/active/accvp_vnext_selector4/ppo_candidate_table_full.yaml",
+      "source_sha256": "68b331b849364d9b701178c644386ca6b5f8643a4567d52d01c41df72a0349dc",
+      "snapshot": "safe_rl/config/config_fix/accvp_vnext_selector4_hybrid_v4_frozen/ppo_candidate_table_full.yaml",
+      "snapshot_sha256": "625f5068ea9c08b8dfdb4c025c04c38ca370a05203412e3db7acd29717405b88",
+      "resolved_config_sha256": "cc18f01784e187ffbb1163e0655e1573bb2d85f827825642d303510b7302c0ac"
+    },
+    {
+      "name": "pilot_latency_smoke_runtime.yaml",
+      "source": "safe_rl/config/active/accvp_vnext_selector4/pilot_latency_smoke_runtime.yaml",
+      "source_sha256": "915f142dc048cd7dab186576eeb412a582e873049181d063d61fd3b26dcf760b",
+      "snapshot": "safe_rl/config/config_fix/accvp_vnext_selector4_hybrid_v4_frozen/pilot_latency_smoke_runtime.yaml",
+      "snapshot_sha256": "73ab254703d48948c6017d93cc56ff6f748b5f6ef2ba350aa85a41c850a0826c",
+      "resolved_config_sha256": "a54cc0845410a895a5262dae29bebe4921386e7f660323f900dac0b3fd4c45e0"
+    },
+    {
+      "name": "baseline_ppo_wcdt_v3_reward_v2.yaml",
+      "source": "safe_rl/config/baselines/wcdt/ppo_wcdt_v3_reward_v2.yaml",
+      "source_sha256": "6322df1fe234c5924a428f5cd3729aea72459dc86423902168117d9a969d8a9a",
+      "snapshot": "safe_rl/config/config_fix/accvp_vnext_selector4_hybrid_v4_frozen/baseline_ppo_wcdt_v3_reward_v2.yaml",
+      "snapshot_sha256": "02360d4b6f9e071828f76f1136c92b9b0293a09aec971bf59bef9a57d11ddb43",
+      "resolved_config_sha256": "851730f26bc9cbe9434f2298e81fe80bf4e1a0db742a27532bd8be3d1d1fa9c9"
+    },
+    {
+      "name": "evaluation_protocol.yaml",
+      "source": "safe_rl/config/examples/vnext/evaluation_protocol_selector4_hybrid.example.yaml",
+      "source_sha256": "beacdc6504b823e43443a8f1f0e151a7f37789289150d94b20ed0cf476e583e9",
+      "snapshot": "safe_rl/config/config_fix/accvp_vnext_selector4_hybrid_v4_frozen/evaluation_protocol.yaml",
+      "snapshot_sha256": "d137fe8673c3368666834009fd6565b0637e9a82497e1db498992ab8a9f611c3",
+      "resolved_config_sha256": "c2bcda065e66e9e2ac920f93c4a75032272755d3eb0b100aa80c412943f2c116"
+    }
+  ],
+  "manifest_fingerprint": "ccf0be34c55f9ca1e0e688d1fd256cee8d1f3b6f5e1dc3c720311df0a39819c9"
+}
