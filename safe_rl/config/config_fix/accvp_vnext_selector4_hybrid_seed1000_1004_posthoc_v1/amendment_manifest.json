@@ -26,6 +26,12 @@
       1004
     ]
   },
+  "storage_path_fix": {
+    "classification": "non_semantic_windows_path_compatibility",
+    "legacy_incomplete_factorial_root": "safe_rl_output/runs/accvp_vnext_selector4_hybrid_posthoc_seed_amendment_v1_factorial",
+    "replacement_factorial_root": "safe_rl_output/runs/accvp_vnext_selector4_hybrid_posthoc_seed_amendment_v1_factorial_pathfix_v2",
+    "experiment_parameters_changed": false
+  },
   "unchanged_upstream_configs": [
     {
       "name": "selector_audit.yaml",
@@ -82,7 +88,7 @@
     },
     {
       "name": "workflow.yaml",
-      "sha256": "805ad0d4f55db28df0969d792750a3bfa86ec499d878b475cc7c18c94fbdd166"
+      "sha256": "6c3cafac933cdf180d3697970ef0a5824b62977afce1f29f0c2a2d5316e256c5"
     },
     {
       "name": "seed_ledger.json",
@@ -119,5 +125,5 @@
     "seed_ledger.cohorts.ppo_optimizer_replicates",
     "artifact revocation metadata"
   ],
-  "bundle_fingerprint": "5d013863d18561adcc05e6012e1c4b1463e7c094ee8069b6d2521e621ff182ca"
+  "bundle_fingerprint": "cdf3bb5478e38f62ce893f1137fbbac0b64d60a2b4bf6760d62ffe69faa8255b"
 }

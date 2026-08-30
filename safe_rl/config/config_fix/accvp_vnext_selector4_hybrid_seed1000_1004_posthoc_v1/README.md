@@ -21,6 +21,12 @@ The amended protocol is
 `accvp-vnext-correctness-v4-selector4-hybrid-posthoc-seed-amendment-v1`.
 It is not the original preregistered confirmatory protocol.
 
+The Candidate factorial output uses the `factorial_pathfix_v2` storage root.
+The earlier incomplete `..._factorial` plan is retained as diagnostic history;
+the v2 suffix prevents that pre-fix plan from being mistaken for a resumable
+short-filename plan. This changes storage identity only, not experiment
+parameters, seeds, run ids, or training semantics.
+
 ## Phase-to-config map
 
 | Pipeline phase | Configuration |

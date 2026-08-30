@@ -82,7 +82,12 @@ def build_replicate_plan(
             raise AssertionError("replicate construction changed the simulator seed")
         reward = validate_reward_semantics(resolved)
         observation = observation_contract(resolved, require_artifacts=require_artifacts)
-        config_file = generated_dir / f"{run_id}.yaml"
+        # The run id is already frozen inside the payload and replicate record.
+        # Repeating it in the generated-config basename can exceed the classic
+        # Windows MAX_PATH limit once a factorial output/method directory is
+        # included.  The method has its own output directory, so the optimizer
+        # seed is the shortest stable, unique name needed here.
+        config_file = generated_dir / f"optimizer_seed_{seed}.yaml"
         run_dir = run_output_root / run_id
         if run_dir.exists():
             raise FileExistsError(f"refusing to reuse PPO replicate run directory: {run_dir}")

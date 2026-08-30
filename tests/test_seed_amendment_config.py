@@ -40,6 +40,21 @@ def _json(path: Path) -> dict[str, Any]:
     return dict(payload)
 
 
+def _difference_paths(left: Any, right: Any, prefix: str = "") -> set[str]:
+    if type(left) is not type(right):
+        return {prefix}
+    if isinstance(left, Mapping):
+        result: set[str] = set()
+        for key in set(left) | set(right):
+            path = f"{prefix}.{key}" if prefix else str(key)
+            if key not in left or key not in right:
+                result.add(path)
+            else:
+                result.update(_difference_paths(left[key], right[key], path))
+        return result
+    return set() if left == right else {prefix}
+
+
 def test_posthoc_seed_amendment_is_isolated_from_frozen_config_tree() -> None:
     original_workflow = _yaml(
         REPO_ROOT / "safe_rl/config/active/accvp_vnext_selector4/workflow.yaml"
@@ -81,6 +96,43 @@ def test_posthoc_bundle_keeps_upstream_configs_byte_identical() -> None:
         assert file_sha256(AMENDED / name) == file_sha256(FROZEN / name)
     for path in AMENDED.glob("*.yaml"):
         assert "extends" not in _yaml(path)
+
+
+def test_posthoc_bundle_changes_only_declared_downstream_identity_fields() -> None:
+    expected = {
+        "ppo_candidate_table_full.yaml": {
+            "evaluation_protocol.protocol_id",
+            "evaluation_protocol.revocation_manifest",
+            "evaluation_protocol.seed_ledger",
+            "experiment.replicate_run_id_prefix",
+            "run.run_id",
+        },
+        "baseline_ppo_wcdt_v3_reward_v2.yaml": {
+            "evaluation_protocol.protocol_id",
+            "evaluation_protocol.revocation_manifest",
+            "evaluation_protocol.seed_ledger",
+            "experiment.note",
+            "run.run_id",
+        },
+        "evaluation_protocol.yaml": {
+            "evaluation_protocol.protocol_id",
+            "evaluation_protocol.revocation_manifest",
+            "evaluation_protocol.seed_ledger",
+        },
+        "ppo_ablation_matrix.yaml": {"protocol_id"},
+    }
+    for name, allowed in expected.items():
+        assert _difference_paths(_yaml(FROZEN / name), _yaml(AMENDED / name)) == allowed
+
+    frozen_workflow = _yaml(FROZEN / "workflow.yaml")
+    amended_workflow = _yaml(AMENDED / "workflow.yaml")
+    for payload in (frozen_workflow, amended_workflow):
+        payload.pop("protocol_id", None)
+        payload.pop("amendment", None)
+        payload.pop("paths", None)
+        payload["seeds"].pop("optimizer_replicates", None)
+        payload["factorial"].pop("baseline_replicate_run_id_prefix", None)
+    assert amended_workflow == frozen_workflow
 
 
 def test_posthoc_bundle_binds_revised_seed_ledger_and_new_outputs() -> None:
@@ -127,6 +179,7 @@ def test_posthoc_bundle_binds_revised_seed_ledger_and_new_outputs() -> None:
         "holdout_report",
     ):
         assert "posthoc_seed_amendment_v1" in str(workflow["paths"][key])
+    assert "factorial_pathfix_v2" in workflow["paths"]["factorial_manifest"]
 
     for name in (
         "ppo_candidate_table_full.yaml",

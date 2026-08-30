@@ -155,6 +155,14 @@ def test_replicate_plan_changes_only_optimizer_seed(tmp_path: Path):
     ]
     assert {config["run"]["seed"] for _path, config in configs} == {20001}
     assert len({config["run"]["run_id"] for _path, config in configs}) == 5
+    assert [path.name for path, _config in configs] == [
+        "optimizer_seed_1001.yaml",
+        "optimizer_seed_1002.yaml",
+        "optimizer_seed_1003.yaml",
+        "optimizer_seed_1004.yaml",
+        "optimizer_seed_1005.yaml",
+    ]
+    assert all(path.parent.name == "generated_configs" for path, _config in configs)
 
 
 def test_seed_ledger_values_alias_is_not_silently_empty():
