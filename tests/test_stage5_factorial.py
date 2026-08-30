@@ -160,6 +160,60 @@ def test_episode_cache_reuses_common_prefix_and_only_executes_extension(
     assert [row["seed"] for row in extended["episodes"]] == [80001, 80002, 80003]
 
 
+def test_episode_cache_allows_explicit_unshielded_method_effect_without_risk(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    model = tmp_path / "policy.zip"
+    model.write_bytes(b"policy")
+    identity = {
+        "method_id": "candidate_table_reward_v3_1_commitment",
+        "optimizer_seed": 1000,
+        "checkpoint_sha256": file_sha256(model),
+        "resolved_config": str(tmp_path / "resolved.yaml"),
+        "resolved_config_sha256": "a" * 64,
+        "reward_semantics_hash": "b" * 64,
+        "observation_contract_hash": "c" * 64,
+        "risk_checkpoint_sha256": "",
+        "group_execution_contract_sha256": "d" * 64,
+        "shield_enabled": False,
+        "policy_type": "sb3_ppo",
+    }
+    binding = {
+        "artifact_kind": "stage5_episode_cache_binding_v1",
+        "schema_version": 1,
+        "cache_dir": str(tmp_path / "cache"),
+        "execution_fingerprint": stable_hash(identity),
+        "identity": identity,
+    }
+
+    monkeypatch.setattr(
+        stage5_episode_cache,
+        "aggregate_episode_reports",
+        lambda reports, task_quality=None: {"episodes": len(reports)},
+    )
+    cfg = SimpleNamespace(stage5=_AttrDict(task_quality={}))
+
+    result = stage5_episode_cache.evaluate_policy_cached(
+        evaluator=lambda *_args, **_kwargs: {
+            "episodes": [{"seed": 80001, "episode_reward": 1.0}],
+            "model_observation_shape": [159],
+            "env_observation_shape": [159],
+            "policy_type": "sb3_ppo",
+        },
+        cfg=cfg,
+        model_path=model,
+        seeds=[80001],
+        shield_enabled=False,
+        risk_checkpoint=None,
+        group_name="accvp_final_method_effect",
+        policy_type="sb3_ppo",
+        binding=binding,
+    )
+
+    assert result["episode_cache"]["executed_episode_count"] == 1
+
+
 def _runtime_fixture(tmp_path: Path) -> tuple[Path, Path, dict]:
     factorial_path = _json(tmp_path / "factorial.json", {"frozen": True})
     methods = {}

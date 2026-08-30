@@ -259,7 +259,12 @@ class SumoHighwayMergeEnv(gym.Env):
         self._task_replacements: list[dict[str, Any]] = []
         self._forecast_ranking_replacements: list[dict[str, Any]] = []
         self._accvp_records: list[dict[str, Any]] = []
-        self.performance = PerformanceTracker()
+        runtime_profiling = dict(config.get("runtime_profiling", {}) or {})
+        self.performance = PerformanceTracker(
+            record_operation_samples=bool(
+                runtime_profiling.get("record_operation_samples", False)
+            )
+        )
         self._decision_context_cache: dict[str, Any] | None = None
         self._lane_count_cache: dict[str, int] = {}
         self._subscribed_vehicle_ids: set[str] = set()

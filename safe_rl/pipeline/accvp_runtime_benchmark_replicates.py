@@ -20,6 +20,14 @@ from safe_rl.utils.config import REPO_ROOT, load_config
 
 RUNTIME_REPLICATE_REPORT_KIND = "accvp_runtime_benchmark_replicates_v1"
 RUNTIME_REPLICATE_REPORT_SCHEMA_VERSION = 1
+SUPPORTED_REPLICATE_MANIFEST_KINDS = {
+    REPLICATE_MANIFEST_KIND,
+    # The main-method suite preserves the original training rows and their
+    # hashes in a protocol-specific manifest.  Accepting it here avoids
+    # manufacturing a second artifact that pretends the reused rows were
+    # retrained under the new protocol.
+    "main_method_ppo_method_manifest_v1",
+}
 
 
 def _resolve(path: str | Path) -> Path:
@@ -317,7 +325,7 @@ def run(
 ) -> Path:
     source = _resolve(replicate_manifest)
     manifest = read_json(source)
-    if str(manifest.get("artifact_kind", "")) != REPLICATE_MANIFEST_KIND:
+    if str(manifest.get("artifact_kind", "")) not in SUPPORTED_REPLICATE_MANIFEST_KINDS:
         raise ValueError("unsupported PPO replicate manifest")
     rows = list(manifest.get("records", []) or [])
     if manifest.get("status") != "complete" or len(rows) < MIN_FORMAL_OPTIMIZER_REPLICATES:

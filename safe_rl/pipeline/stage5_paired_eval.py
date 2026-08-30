@@ -27,6 +27,10 @@ from safe_rl.pipeline.stage5_episode_cache import evaluate_policy_cached
 from safe_rl.pipeline.stage5_lineage_compatibility import (
     validate_wcdt_parent_lineage_compatibility,
 )
+from safe_rl.pipeline.main_method_lineage_compatibility import (
+    COMPATIBILITY_KIND as MAIN_METHOD_COMPATIBILITY_KIND,
+    validate_compatibility as validate_main_method_parent_lineage_compatibility,
+)
 from safe_rl.ppo_replicates import observation_contract as ppo_observation_contract
 from safe_rl.rl.evaluation import evaluate_policy
 from safe_rl.sim.metrics import SAFETY_METRIC_VERSION
@@ -150,13 +154,26 @@ def _validate_stage5_model_lineage(
     except EvidenceProtocolError:
         if not parent_lineage_compatibility:
             raise
-        compatibility_validation = validate_wcdt_parent_lineage_compatibility(
-            parent_lineage_compatibility,
-            group_name=group_name,
-            model_path=model_path,
-            parent_lineage=parent,
-            stage5_lineage=stage5_lineage,
-        )
+        if str(parent_lineage_compatibility.get("artifact_kind", "")) == (
+            MAIN_METHOD_COMPATIBILITY_KIND
+        ):
+            compatibility_validation = (
+                validate_main_method_parent_lineage_compatibility(
+                    parent_lineage_compatibility,
+                    group_name=group_name,
+                    model_path=model_path,
+                    parent_lineage=parent,
+                    stage5_lineage=stage5_lineage,
+                )
+            )
+        else:
+            compatibility_validation = validate_wcdt_parent_lineage_compatibility(
+                parent_lineage_compatibility,
+                group_name=group_name,
+                model_path=model_path,
+                parent_lineage=parent,
+                stage5_lineage=stage5_lineage,
+            )
     else:
         if parent_lineage_compatibility:
             raise EvidenceProtocolError(
@@ -1262,7 +1279,25 @@ def run(cfg) -> Path:
                 "rule_gap_acceptance is an unshielded current-state baseline; "
                 "do not enable Shield or forecast features in this comparison group."
             )
-        if bool(group_cfg.accvp.get("enabled", False)) and not bool(group.shield):
+        main_method_unshielded_accvp = bool(
+            cfg.stage5.get(
+                "allow_accvp_observation_without_safety_shield",
+                False,
+            )
+            and str(cfg.evaluation_protocol.get("protocol_id", ""))
+            == "accvp-main-method-table-v1"
+            and bool(cfg.evaluation_protocol.get("strict", False))
+            and str(cfg.get("experiment", {}).get("mode", "")) == "method_effect"
+        )
+        accvp_observation_enabled = bool(
+            group_cfg.accvp.get("enabled", False)
+            or group_cfg.accvp.get("observation", {}).get("enabled", False)
+        )
+        if (
+            accvp_observation_enabled
+            and not bool(group.shield)
+            and not main_method_unshielded_accvp
+        ):
             raise ValueError(f"stage5 group '{group.name}' enables ACCVP but disables Safety Shield")
         model_path = group_model_paths.get(str(group.name))
         observation_contract = (

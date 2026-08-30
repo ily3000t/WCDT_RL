@@ -9,10 +9,12 @@ from typing import Any, Iterator
 class PerformanceTracker:
     """Low-overhead cumulative wall-clock timing for pipeline hot paths."""
 
-    def __init__(self) -> None:
+    def __init__(self, *, record_operation_samples: bool = False) -> None:
         self.started_at = time.perf_counter()
         self._seconds: dict[str, float] = defaultdict(float)
         self._counts: dict[str, int] = defaultdict(int)
+        self._record_operation_samples = bool(record_operation_samples)
+        self._samples: dict[str, list[float]] = defaultdict(list)
 
     @contextmanager
     def measure(self, name: str) -> Iterator[None]:
@@ -20,12 +22,24 @@ class PerformanceTracker:
         try:
             yield
         finally:
-            self._seconds[str(name)] += time.perf_counter() - started
-            self._counts[str(name)] += 1
+            elapsed = time.perf_counter() - started
+            key = str(name)
+            self._seconds[key] += elapsed
+            self._counts[key] += 1
+            if self._record_operation_samples:
+                self._samples[key].append(float(elapsed))
 
     def add_time(self, name: str, seconds: float, count: int = 1) -> None:
-        self._seconds[str(name)] += max(0.0, float(seconds))
-        self._counts[str(name)] += max(0, int(count))
+        key = str(name)
+        elapsed = max(0.0, float(seconds))
+        sample_count = max(0, int(count))
+        self._seconds[key] += elapsed
+        self._counts[key] += sample_count
+        if self._record_operation_samples and sample_count > 0:
+            # add_time normally represents one measured call.  A caller that
+            # supplies count > 1 has provided only an aggregate, so retain one
+            # aggregate sample instead of inventing per-call observations.
+            self._samples[key].append(elapsed)
 
     def increment(self, name: str, count: int = 1) -> None:
         self._counts[str(name)] += int(count)
@@ -43,6 +57,11 @@ class PerformanceTracker:
             **{name: float(value) for name, value in sorted(self._seconds.items())},
             "operation_counts": {name: int(value) for name, value in sorted(self._counts.items())},
         }
+        if self._record_operation_samples:
+            payload["operation_samples_s"] = {
+                name: [float(value) for value in values]
+                for name, values in sorted(self._samples.items())
+            }
         if steps is not None:
             payload["steps_per_second"] = float(steps / wall_time) if wall_time > 0.0 else 0.0
         if episodes is not None:

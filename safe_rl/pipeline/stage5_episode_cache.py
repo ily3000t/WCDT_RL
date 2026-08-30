@@ -65,14 +65,22 @@ def _validate_binding(
     if file_sha256(model_path) != expected_checkpoint:
         raise ValueError("Stage5 episode-cache checkpoint hash mismatch")
 
-    expected_risk = _normalise_sha256(
-        identity.get("risk_checkpoint_sha256"),
-        field="Stage5 episode-cache risk_checkpoint_sha256",
-    )
-    if risk_checkpoint is None or not Path(risk_checkpoint).is_file():
-        raise FileNotFoundError(risk_checkpoint or "")
-    if file_sha256(risk_checkpoint) != expected_risk:
-        raise ValueError("Stage5 episode-cache Risk checkpoint hash mismatch")
+    shield_enabled = bool(identity.get("shield_enabled", False))
+    if shield_enabled:
+        expected_risk = _normalise_sha256(
+            identity.get("risk_checkpoint_sha256"),
+            field="Stage5 episode-cache risk_checkpoint_sha256",
+        )
+        if risk_checkpoint is None or not Path(risk_checkpoint).is_file():
+            raise FileNotFoundError(risk_checkpoint or "")
+        if file_sha256(risk_checkpoint) != expected_risk:
+            raise ValueError("Stage5 episode-cache Risk checkpoint hash mismatch")
+    elif str(identity.get("risk_checkpoint_sha256", "")):
+        raise ValueError(
+            "unshielded Stage5 episode-cache identity must not bind a Risk checkpoint"
+        )
+    elif risk_checkpoint is not None:
+        raise ValueError("unshielded Stage5 episode cache received a Risk checkpoint")
     return cache_dir, identity, fingerprint
 
 
