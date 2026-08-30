@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from pathlib import Path
 
 import pytest
@@ -13,6 +14,8 @@ from safe_rl.main_method_protocol import (
 from safe_rl.pipeline import accvp_runtime_benchmark_replicates
 from safe_rl.pipeline.main_method_ppo_suite import _equivalence_authorization
 from safe_rl.pipeline.main_method_runtime import _generic_metrics, _runtime_seeds
+from safe_rl.pipeline.main_method_stage5 import aggregate as aggregate_main_method_stage5
+from safe_rl.accvp.contracts.schema import stable_hash
 from safe_rl.utils.performance import PerformanceTracker
 
 
@@ -139,3 +142,104 @@ def test_accvp_runtime_accepts_audited_main_method_manifest_kind() -> None:
         "main_method_ppo_method_manifest_v1"
         in accvp_runtime_benchmark_replicates.SUPPORTED_REPLICATE_MANIFEST_KINDS
     )
+
+
+def test_main_method_stage5_aggregate_promotes_crossed_pair_statistics(
+    tmp_path: Path,
+) -> None:
+    rows = []
+    for optimizer_seed in range(1000, 1005):
+        left_name = f"left_seed_{optimizer_seed}"
+        right_name = f"right_seed_{optimizer_seed}"
+        episodes_left = []
+        episodes_right = []
+        for simulator_seed in (80001, 80002):
+            common = {
+                "seed": simulator_seed,
+                "min_distance": 2.0,
+                "ttc_p1": 3.0,
+                "drac_p99": 1.0,
+                "completion_time": 10.0,
+                "ego_speed_mean": 20.0,
+                "hard_brake_rate": 0.0,
+                "proxy_collision": False,
+                "safety_violation": False,
+                "geometric_overlap": False,
+                "taper_miss": False,
+                "merge_success": True,
+                "timely_merge_success": True,
+            }
+            episodes_left.append({**common, "episode_reward": 1.0})
+            episodes_right.append({**common, "episode_reward": 2.0})
+        report = {
+            "configured_pairs": [
+                {
+                    "name": "left__vs__right",
+                    "left": left_name,
+                    "right": right_name,
+                }
+            ],
+            "acceptance": {
+                "left__vs__right": {"available": True, "regression": False}
+            },
+            "groups": {
+                left_name: {
+                    "comparative": {
+                        "method": "left",
+                        "training_seed": optimizer_seed,
+                        "checkpoint_sha256": f"{optimizer_seed - 999:064x}",
+                    },
+                    "episodes": episodes_left,
+                    "metrics": {"average_reward": 1.0},
+                },
+                right_name: {
+                    "comparative": {
+                        "method": "right",
+                        "training_seed": optimizer_seed,
+                        "checkpoint_sha256": f"{optimizer_seed - 899:064x}",
+                    },
+                    "episodes": episodes_right,
+                    "metrics": {"average_reward": 2.0},
+                },
+            },
+        }
+        report_path = tmp_path / f"stage5_{optimizer_seed}.json"
+        report_path.write_text(json.dumps(report), encoding="utf-8")
+        rows.append(
+            {
+                "scope": "secondary",
+                "optimizer_seed": optimizer_seed,
+                "stage5_report": str(report_path),
+                "method_ids": ["left", "right"],
+                "simulator_seed_count": 2,
+            }
+        )
+    request = {
+        "artifact_kind": "main_method_stage5_request_v1",
+        "schema_version": 1,
+        "status": "prepared",
+        "protocol_id": "accvp-main-method-table-v1",
+        "mode": "method_effect",
+        "conclusion_scope": "method_effect",
+        "optimizer_seeds": list(range(1000, 1005)),
+        "statistics": {
+            "confidence": 0.95,
+            "bootstrap_replicates": 50,
+            "bootstrap_seed": 42001,
+        },
+        "rows": rows,
+    }
+    request["request_fingerprint"] = stable_hash(request)
+    request_path = tmp_path / "method_effect_request.json"
+    request_path.write_text(json.dumps(request), encoding="utf-8")
+
+    output = aggregate_main_method_stage5(request_path)
+    aggregate = json.loads(output.read_text(encoding="utf-8"))
+
+    comparison = aggregate["comparisons"]["left__vs__right"]
+    assert comparison["statistics"]["training_seed_count"] == 5
+    assert comparison["statistics"]["simulator_seed_count"] == 2
+    assert comparison["statistics"]["continuous"]["episode_reward"][
+        "mean_delta"
+    ] == pytest.approx(1.0)
+    assert comparison["any_source_regression"] is False

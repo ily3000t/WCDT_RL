@@ -8,6 +8,7 @@ from typing import Any, Mapping
 import yaml
 
 from safe_rl.accvp.contracts.schema import file_sha256, read_json, stable_hash, write_json_atomic
+from safe_rl.analysis.paired_statistics import build_replicated_pair_statistics
 from safe_rl.main_method_protocol import (
     FINAL_METHOD_ID,
     RULE_METHOD_ID,
@@ -427,6 +428,7 @@ def prepare(
         "ppo_suite_manifest_sha256": file_sha256(suite_path),
         "optimizer_seeds": seeds,
         "risk_checkpoint": risk,
+        "statistics": plain(protocol["evaluation"]["statistics"]),
         "rows": request_rows,
     }
     request["request_fingerprint"] = stable_hash(request)
@@ -525,11 +527,45 @@ def aggregate(request_path: str | Path) -> Path:
     _validate_fingerprint(request, "request_fingerprint", "main-method Stage5 request")
     rows: list[dict[str, Any]] = []
     deterministic: dict[str, Any] | None = None
+    comparison_sources: dict[str, list[dict[str, Any]]] = {}
     for item in request.get("rows", []) or []:
         report_path = resolve_path(str(item["stage5_report"]))
         if not report_path.is_file():
             raise FileNotFoundError(report_path)
         report = read_json(report_path)
+        groups = dict(report.get("groups", {}) or {})
+        acceptance = dict(report.get("acceptance", {}) or {})
+        for pair in list(report.get("configured_pairs", []) or []):
+            comparison_id = str(pair.get("name", ""))
+            left_name = str(pair.get("left", ""))
+            right_name = str(pair.get("right", ""))
+            left = dict(groups.get(left_name, {}) or {})
+            right = dict(groups.get(right_name, {}) or {})
+            if not comparison_id or not left or not right:
+                raise ValueError(
+                    f"Stage5 report lacks configured comparison groups: {report_path}"
+                )
+            left_comparative = dict(left.get("comparative", {}) or {})
+            right_comparative = dict(right.get("comparative", {}) or {})
+            comparison_sources.setdefault(comparison_id, []).append(
+                {
+                    "scope": str(item["scope"]),
+                    "training_seed": int(item["optimizer_seed"]),
+                    "left_method_id": str(left_comparative.get("method", left_name)),
+                    "right_method_id": str(right_comparative.get("method", right_name)),
+                    "left_checkpoint_sha256": str(
+                        left_comparative.get("checkpoint_sha256", "")
+                    ),
+                    "right_checkpoint_sha256": str(
+                        right_comparative.get("checkpoint_sha256", "")
+                    ),
+                    "left_report": left,
+                    "right_report": right,
+                    "source_acceptance": plain(acceptance.get(comparison_id, {}) or {}),
+                    "source_report": str(report_path),
+                    "source_report_sha256": file_sha256(report_path),
+                }
+            )
         for group_name, group in (report.get("groups", {}) or {}).items():
             comparative = dict(group.get("comparative", {}) or {})
             method_id = str(comparative.get("method", group_name))
@@ -567,6 +603,60 @@ def aggregate(request_path: str | Path) -> Path:
             "main-method Stage5 aggregate lacks a complete learned-method grid: "
             f"missing={sorted(expected - observed)} extra={sorted(observed - expected)}"
         )
+    statistics_cfg = dict(
+        dict(request.get("statistics", {}) or {})
+        or {
+            "confidence": 0.95,
+            "bootstrap_replicates": 10_000,
+            "bootstrap_seed": 42_001,
+        }
+    )
+    comparisons: dict[str, Any] = {}
+    expected_optimizer_seeds = [int(seed) for seed in request["optimizer_seeds"]]
+    for offset, (comparison_id, sources) in enumerate(sorted(comparison_sources.items())):
+        ordered = sorted(sources, key=lambda value: int(value["training_seed"]))
+        training_seeds = [int(value["training_seed"]) for value in ordered]
+        if training_seeds != expected_optimizer_seeds:
+            raise ValueError(
+                f"comparison {comparison_id} lacks the complete optimizer-seed cohort"
+            )
+        left_methods = {str(value["left_method_id"]) for value in ordered}
+        right_methods = {str(value["right_method_id"]) for value in ordered}
+        scopes = {str(value["scope"]) for value in ordered}
+        if len(left_methods) != 1 or len(right_methods) != 1 or len(scopes) != 1:
+            raise ValueError(f"comparison {comparison_id} changes identity across replicates")
+        statistics_result = build_replicated_pair_statistics(
+            ordered,
+            confidence=float(statistics_cfg.get("confidence", 0.95)),
+            replicates=int(statistics_cfg.get("bootstrap_replicates", 10_000)),
+            seed=int(statistics_cfg.get("bootstrap_seed", 42_001)) + offset,
+            require_distinct_checkpoints=True,
+        )
+        source_acceptance = [
+            {
+                "training_seed": int(value["training_seed"]),
+                "acceptance": value["source_acceptance"],
+                "source_report": value["source_report"],
+                "source_report_sha256": value["source_report_sha256"],
+            }
+            for value in ordered
+        ]
+        comparisons[comparison_id] = {
+            "left_method_id": next(iter(left_methods)),
+            "right_method_id": next(iter(right_methods)),
+            "scope": next(iter(scopes)),
+            "delta_direction": "right_minus_left",
+            "statistics": statistics_result,
+            "source_acceptance": source_acceptance,
+            "all_source_acceptance_available": all(
+                bool(value["source_acceptance"].get("available", False))
+                for value in ordered
+            ),
+            "any_source_regression": any(
+                bool(value["source_acceptance"].get("regression", False))
+                for value in ordered
+            ),
+        }
     report: dict[str, Any] = {
         "artifact_kind": REPORT_KIND,
         "schema_version": 1,
@@ -579,6 +669,26 @@ def aggregate(request_path: str | Path) -> Path:
         "by_optimizer_seed": rows,
         "deterministic_rule": deterministic,
         "headline": _headline(rows),
+        "comparisons": comparisons,
+        "comparison_interpretation": {
+            "statistics": "crossed optimizer-seed by simulator-seed paired bootstrap",
+            "delta_direction": "right_minus_left",
+            "source_acceptance": (
+                "per-optimizer preregistered checks are reported, not used to suppress "
+                "the aggregate when a regression is observed"
+            ),
+        },
+        "multiplicity": {
+            "primary_family": str(statistics_cfg.get("primary_family", "")),
+            "secondary_family_correction": str(
+                statistics_cfg.get("secondary_family_correction", "holm")
+            ),
+            "status": "not_applied_no_explicit_valid_pvalues",
+            "reason": (
+                "crossed bootstrap confidence intervals do not create valid independent "
+                "p-values; no p-values are invented for Holm adjustment"
+            ),
+        },
         "runtime_gate_applied": False,
     }
     report["report_fingerprint"] = stable_hash(report)
