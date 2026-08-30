@@ -1,0 +1,133 @@
+schema_version: 1
+artifact_kind: accvp_main_method_experiment_v1
+protocol_id: accvp-main-method-table-v1
+evaluation_config: safe_rl/config/config_fix/accvp_main_method_table_v1/evaluation.yaml
+optimizer_seeds: [1000, 1001, 1002, 1003, 1004]
+
+ppo:
+  rollout_size: 1024
+  total_timesteps: 100000
+  preferred_executor:
+    ppo_num_envs: 4
+    n_steps: 256
+    checkpoint_selection_workers: 4
+  acceleration_benchmark:
+    optimizer_seed: 93001
+    total_timesteps: 10000
+    candidates:
+      - {ppo_num_envs: 1, n_steps: 1024, checkpoint_selection_workers: 1}
+      - {ppo_num_envs: 1, n_steps: 1024, checkpoint_selection_workers: 4}
+      - {ppo_num_envs: 2, n_steps: 512, checkpoint_selection_workers: 4}
+      - {ppo_num_envs: 4, n_steps: 256, checkpoint_selection_workers: 4}
+    require_exact_policy_state: true
+    require_exact_checkpoint_selection: true
+
+predictors:
+  wcdt_v1:
+    config: safe_rl/config/config_fix/accvp_main_method_table_v1/wcdt_v1_predictor.yaml
+    checkpoint: safe_rl_output/runs/accvp_main_method_table_v1_wcdt_v1_predictor/stage2/wcdt_predictor.pt
+    source_fidelity:
+      required: true
+      upstream: https://github.com/yangchen1997/WcDT
+      pinned_commit: 6baa2330fc3f620863d358b5d7f36323b4bfccae
+  wcdt_v3:
+    checkpoint: safe_rl_output/runs/safe_rl_comparison_schema9_validation_001/stage2/wcdt_v3_predictor.pt
+    relation_to_accvp: exact_warm_start_source_checkpoint
+
+methods:
+  rule_gap_acceptance_idm_style_v1:
+    role: deterministic_rule_baseline
+    label: Rule-based Gap Acceptance (IDM-style longitudinal control)
+    policy_type: rule_gap_acceptance
+    train: false
+    method_effect: true
+    system_effect: false
+  ppo_no_forecast_reward_v2:
+    role: no_prediction_control
+    label: PPO No-Forecast
+    policy_type: sb3_ppo
+    train: true
+    forecast_source: ''
+    config: safe_rl/config/config_fix/accvp_main_method_table_v1/ppo_no_forecast_reward_v2.yaml
+    manifest: safe_rl_output/runs/accvp_main_method_table_v1/ppo_suite/methods/ppo_no_forecast_reward_v2/main_method_replicate_manifest.json
+    run_id_prefix: ppo_main_table_v1_no_forecast_reward_v2
+    reuse_manifests: []
+  ppo_constant_velocity_reward_v2:
+    role: constant_velocity_prediction_control
+    label: PPO + Constant Velocity
+    policy_type: sb3_ppo
+    train: true
+    forecast_source: constant_velocity
+    config: safe_rl/config/config_fix/accvp_main_method_table_v1/ppo_constant_velocity_reward_v2.yaml
+    manifest: safe_rl_output/runs/accvp_main_method_table_v1/ppo_suite/methods/ppo_constant_velocity_reward_v2/main_method_replicate_manifest.json
+    run_id_prefix: ppo_main_table_v1_constant_velocity_reward_v2
+    reuse_manifests: []
+  ppo_wcdt_v1_adapted_reward_v2:
+    role: published_architecture_adapted_baseline
+    label: PPO + WcDT-v1 adapted
+    policy_type: sb3_ppo
+    train: true
+    forecast_source: wcdt
+    config: safe_rl/config/config_fix/accvp_main_method_table_v1/ppo_wcdt_v1_adapted_reward_v2.yaml
+    manifest: safe_rl_output/runs/accvp_main_method_table_v1/ppo_suite/methods/ppo_wcdt_v1_adapted_reward_v2/main_method_replicate_manifest.json
+    run_id_prefix: ppo_main_table_v1_wcdt_v1_adapted_reward_v2
+    reuse_manifests: []
+  wcdt_reward_v2:
+    role: matched_backbone_direct_baseline
+    label: PPO + WcDT-v3
+    policy_type: sb3_ppo
+    train: true
+    forecast_source: wcdt_v3
+    config: safe_rl/config/config_fix/accvp_main_method_table_v1/ppo_wcdt_v3_reward_v2.yaml
+    manifest: safe_rl_output/runs/accvp_main_method_table_v1/ppo_suite/methods/wcdt_reward_v2/main_method_replicate_manifest.json
+    run_id_prefix: ppo_main_table_v1_wcdt_v3_reward_v2
+    reuse_manifests:
+      - safe_rl_output/runs/wcdt_vnext_replicates/ppo_replicate_manifest.json
+    cross_executor_reuse_requires_equivalence: true
+  candidate_table_reward_v3_1_commitment:
+    role: final_complete_method
+    label: ACCVP final
+    policy_type: sb3_ppo
+    train: false
+    forecast_source: ''
+    config: safe_rl/config/config_fix/accvp_main_method_table_v1/ppo_accvp_final.yaml
+    manifest: safe_rl_output/runs/accvp_main_method_table_v1/ppo_suite/methods/candidate_table_reward_v3_1_commitment/main_method_replicate_manifest.json
+    reuse_manifests:
+      - safe_rl_output/runs/accvp_vnext_selector4_hybrid_posthoc_seed_amendment_v1_factorial_pathfix_v2/methods/candidate_table_reward_v3_1_commitment/ppo_replicate_manifest.json
+
+comparisons:
+  - {comparison_id: no_forecast__vs__constant_velocity, left: ppo_no_forecast_reward_v2, right: ppo_constant_velocity_reward_v2, family: forecast_attribution, role: simple_prediction_increment}
+  - {comparison_id: constant_velocity__vs__wcdt_v1, left: ppo_constant_velocity_reward_v2, right: ppo_wcdt_v1_adapted_reward_v2, family: forecast_attribution, role: learned_prediction_increment}
+  - {comparison_id: wcdt_v1__vs__wcdt_v3, left: ppo_wcdt_v1_adapted_reward_v2, right: wcdt_reward_v2, family: forecast_attribution, role: temporal_interaction_architecture}
+  - {comparison_id: wcdt_v3__vs__accvp_final, left: wcdt_reward_v2, right: candidate_table_reward_v3_1_commitment, family: final_method_confirmatory, role: primary_final}
+
+evaluation:
+  execution_contract: simulation_blocking_exact_v1
+  seed_role: stage5_confirmatory
+  secondary_simulator_seed_count: 100
+  primary_simulator_seed_count: 300
+  method_effect:
+    shield_enabled: false
+    conclusion_scope: method_effect
+  system_effect:
+    shield_enabled: true
+    conclusion_scope: system_effect
+  statistics:
+    confidence: 0.95
+    bootstrap_replicates: 10000
+    bootstrap_seed: 42001
+    primary_family: final_method_confirmatory
+    secondary_family_correction: holm
+
+deployment_runtime:
+  conclusion_scope: deployment_runtime_only
+  seed_role: runtime_confirmatory
+  simulator_seed_count: 60
+  shield_enabled: true
+  blocking_exact_results_must_not_gate_runtime: true
+  request: safe_rl_output/runs/accvp_main_method_table_v1/deployment_runtime/deployment_runtime_request.json
+  report: safe_rl_output/runs/accvp_main_method_table_v1/deployment_runtime/deployment_runtime_report.json
+  legacy_accvp_report:
+    path: safe_rl_output/runs/accvp_vnext_selector4_hybrid_deployment_runtime/factorial_runtime_report.json
+    optimizer_seeds: [1001, 1002, 1003, 1004, 1005]
+    reusable_for_current_cohort: false

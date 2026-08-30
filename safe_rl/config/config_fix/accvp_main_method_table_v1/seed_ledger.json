@@ -1,0 +1,13 @@
+{
+  "schema_version": 1,
+  "protocol_id": "accvp-main-method-table-v1",
+  "cohorts": {
+    "ppo_acceleration_development": {"values": [93001]},
+    "ppo_optimizer_replicates": {"values": [1000, 1001, 1002, 1003, 1004]},
+    "ppo_training": {"ranges": [{"start": 20001, "count": 10000}]},
+    "ppo_selection": {"ranges": [{"start": 40001, "count": 50}]},
+    "runtime_confirmatory": {"ranges": [{"start": 56001, "count": 60}]},
+    "natural_confirmatory": {"ranges": [{"start": 80001, "count": 300}]},
+    "targeted_confirmatory": {"ranges": [{"start": 70001, "count": 500}]}
+  }
+}

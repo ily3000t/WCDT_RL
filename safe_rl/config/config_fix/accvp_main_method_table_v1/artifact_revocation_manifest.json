@@ -1,0 +1,16 @@
+{
+  "schema_version": 1,
+  "artifact_kind": "safe_rl_artifact_revocation_manifest_v1",
+  "protocol_id": "accvp-main-method-table-v1",
+  "status": "active",
+  "deployable": false,
+  "allowed_usage": "main_method_comparison_only",
+  "reason": "Fresh main-method comparison namespace; legacy evidence is admitted only through an explicit hash-bound reuse audit.",
+  "path_base": "../../../..",
+  "artifacts": [],
+  "metadata": {
+    "deletion_required": false,
+    "formal_lineage_loading_allowed": true,
+    "legacy_reuse_requires_audit": true
+  }
+}
