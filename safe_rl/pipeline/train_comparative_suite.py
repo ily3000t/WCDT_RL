@@ -105,6 +105,10 @@ def _validate_existing_wcdt_v1_checkpoint(checkpoint: Path, cfg: Any) -> dict[st
     if not isinstance(payload, dict) or not isinstance(payload.get("model_state_dict"), dict):
         raise ValueError(f"Invalid WcDT v1 checkpoint payload: {checkpoint}")
     expected_hash = actor_selection_config_hash(cfg)
+    expected_early_stopping = stage2_train_prediction_risk._wcdt_v1_early_stopping_config(
+        cfg,
+        has_validation=int(payload.get("validation_sample_count", 0)) > 0,
+    )
     checks: dict[str, tuple[Any, Any]] = {
         "architecture_version": (
             payload.get("architecture_version"),
@@ -112,6 +116,11 @@ def _validate_existing_wcdt_v1_checkpoint(checkpoint: Path, cfg: Any) -> dict[st
         ),
         "actor_selection_config_hash": (payload.get("actor_selection_config_hash"), expected_hash),
         "max_actor_count": (int(payload.get("max_actor_count", 0)), int(cfg.prediction.wcdt_v1_max_agents)),
+        "wcdt_v1_batch_size": (
+            int(payload.get("wcdt_v1_batch_size", 0)),
+            stage2_train_prediction_risk._wcdt_v1_batch_size(cfg),
+        ),
+        "early_stopping_config": (payload.get("early_stopping_config"), expected_early_stopping),
     }
     mismatches = {key: value for key, value in checks.items() if value[0] != value[1]}
     if int(payload.get("stage1_buffer_schema_version", 0)) < STAGE1_BUFFER_SCHEMA_VERSION:
@@ -126,6 +135,11 @@ def _validate_existing_wcdt_v1_checkpoint(checkpoint: Path, cfg: Any) -> dict[st
     return {
         "best_epoch": payload.get("best_epoch"),
         "best_val_score": payload.get("best_val_score"),
+        "trained_epochs": payload.get("trained_epochs"),
+        "stopped_early": payload.get("stopped_early"),
+        "early_stopping_reason": payload.get("early_stopping_reason"),
+        "early_stopping_config": payload.get("early_stopping_config"),
+        "wcdt_v1_batch_size": payload.get("wcdt_v1_batch_size"),
     }
 
 

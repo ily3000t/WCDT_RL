@@ -55,6 +55,7 @@ from safe_rl.pipeline.stage2_train_prediction_risk import (
     _temperature_scaling_diagnostics,
     _target_lane_gap as stage2_target_lane_gap,
     _wcdt_v1_batch_size,
+    _wcdt_v1_early_stopping_config,
     _wcdt_v2_batch_size,
     _wcdt_v2_early_stopping_config,
     _wcdt_v2_early_stopping_step,
@@ -2073,6 +2074,30 @@ def test_wcdt_v2_early_stopping_and_validation_unavailable_behavior():
     assert improved
     assert stale == 0
     assert not should_stop
+
+
+def test_wcdt_v1_early_stopping_and_main_method_batch_contract():
+    config_path = (
+        Path(__file__).resolve().parents[1]
+        / "safe_rl"
+        / "config"
+        / "config_fix"
+        / "accvp_main_method_table_v1"
+        / "wcdt_v1_predictor.yaml"
+    )
+    cfg = load_config(config_path)
+    assert _wcdt_v1_batch_size(cfg) == 32
+    enabled = _wcdt_v1_early_stopping_config(cfg, has_validation=True)
+    assert enabled == {
+        "enabled": True,
+        "patience": 10,
+        "min_delta": 0.0001,
+        "warmup_epochs": 5,
+        "disabled_reason": None,
+    }
+    disabled = _wcdt_v1_early_stopping_config(cfg, has_validation=False)
+    assert not disabled["enabled"]
+    assert disabled["disabled_reason"] == "validation_unavailable"
 
 
 def test_wcdt_v3_early_stopping_disables_without_validation():

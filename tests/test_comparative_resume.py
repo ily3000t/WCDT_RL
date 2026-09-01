@@ -7,6 +7,8 @@ import pytest
 from safe_rl.pipeline.stage2_train_prediction_risk import (
     _reference_risk_report,
     _referenced_risk_checkpoint,
+    _wcdt_v1_batch_size,
+    _wcdt_v1_early_stopping_config,
 )
 from safe_rl.pipeline.train_comparative_suite import (
     _forecast_settings,
@@ -43,6 +45,7 @@ def test_comparative_resume_rejects_changed_input_provenance():
 def test_existing_wcdt_v1_checkpoint_validation_uses_top_level_payload(tmp_path: Path):
     torch = pytest.importorskip("torch")
     cfg = clone_with_overrides(load_config(), {"prediction": {"wcdt_v1_max_agents": 6}})
+    early_stopping = _wcdt_v1_early_stopping_config(cfg, has_validation=True)
     checkpoint = tmp_path / "wcdt_predictor.pt"
     torch.save(
         {
@@ -52,13 +55,27 @@ def test_existing_wcdt_v1_checkpoint_validation_uses_top_level_payload(tmp_path:
             "max_actor_count": 6,
             "stage1_buffer_schema_version": STAGE1_BUFFER_SCHEMA_VERSION,
             "trajectory_schema_version": 4,
+            "validation_sample_count": 10,
+            "wcdt_v1_batch_size": _wcdt_v1_batch_size(cfg),
+            "early_stopping_config": early_stopping,
             "best_epoch": 7,
             "best_val_score": 1.5,
+            "trained_epochs": 17,
+            "stopped_early": True,
+            "early_stopping_reason": "test patience exhausted",
         },
         checkpoint,
     )
     summary = _validate_existing_wcdt_v1_checkpoint(checkpoint, cfg)
-    assert summary == {"best_epoch": 7, "best_val_score": 1.5}
+    assert summary == {
+        "best_epoch": 7,
+        "best_val_score": 1.5,
+        "trained_epochs": 17,
+        "stopped_early": True,
+        "early_stopping_reason": "test patience exhausted",
+        "early_stopping_config": early_stopping,
+        "wcdt_v1_batch_size": _wcdt_v1_batch_size(cfg),
+    }
 
 
 def test_forecast_settings_uses_the_source_specific_checkpoint(tmp_path: Path):

@@ -1237,6 +1237,17 @@ def _wcdt_v3_batch_size(cfg: Any) -> int:
     return int(cfg.prediction.get("wcdt_v3_batch_size", cfg.prediction.batch_size))
 
 
+def _wcdt_v1_early_stopping_config(cfg: Any, *, has_validation: bool) -> dict[str, Any]:
+    configured = dict(cfg.prediction.get("wcdt_v1_early_stopping", {}) or {})
+    return {
+        "enabled": bool(configured.get("enabled", True)) and bool(has_validation),
+        "patience": max(1, int(configured.get("patience", 10))),
+        "min_delta": max(0.0, float(configured.get("min_delta", 0.0001))),
+        "warmup_epochs": max(0, int(configured.get("warmup_epochs", 5))),
+        "disabled_reason": None if has_validation else "validation_unavailable",
+    }
+
+
 def _wcdt_v2_early_stopping_config(cfg: Any, *, has_validation: bool) -> dict[str, Any]:
     configured = dict(cfg.prediction.get("wcdt_v2_early_stopping", {}) or {})
     return {
@@ -1629,6 +1640,11 @@ def _train_wcdt_predictor(
     best_payload: dict[str, Any] | None = None
     best_score: float | None = None
     best_epoch = 0
+    early_stopping = _wcdt_v1_early_stopping_config(cfg, has_validation=val_loader is not None)
+    early_stopping_best_score: float | None = None
+    stale_epochs = 0
+    stopped_early = False
+    early_stopping_reason: str | None = None
     checkpoint_metadata = _wcdt_v1_checkpoint_metadata(
         cfg,
         data,
@@ -1639,7 +1655,8 @@ def _train_wcdt_predictor(
     stage_log(
         "stage2",
         f"WcDT predictor train_samples={train_indices.shape[0]}, val_samples={val_indices.shape[0]}, "
-        f"batches={len(loader)}, batch_size={_wcdt_v1_batch_size(cfg)}, pin_memory={pin_memory}",
+        f"batches={len(loader)}, batch_size={_wcdt_v1_batch_size(cfg)}, pin_memory={pin_memory}, "
+        f"early_stopping={early_stopping}",
     )
     for epoch in progress_iter(range(int(cfg.prediction.epochs)), desc="Stage2 prediction epochs"):
         losses = []
@@ -1699,8 +1716,18 @@ def _train_wcdt_predictor(
                 "best_metric": "val_score" if val_loader is not None else "train_loss",
                 "train_sample_count": int(train_indices.shape[0]),
                 "validation_sample_count": int(val_indices.shape[0]),
+                "early_stopping_config": dict(early_stopping),
                 **checkpoint_metadata,
             }
+        improved_for_patience, stale_epochs, should_stop = _wcdt_v2_early_stopping_step(
+            best_score=early_stopping_best_score,
+            score=val_score,
+            epoch=epoch + 1,
+            stale_epochs=stale_epochs,
+            config=early_stopping,
+        )
+        if improved_for_patience:
+            early_stopping_best_score = float(val_score)
         if validation_metrics is not None:
             stage_log(
                 "stage2",
@@ -1711,6 +1738,18 @@ def _train_wcdt_predictor(
             )
         else:
             stage_log("stage2", f"prediction epoch={epoch + 1}/{cfg.prediction.epochs} loss={epoch_loss:.6f}")
+        if should_stop:
+            stopped_early = True
+            early_stopping_reason = (
+                f"no val_score improvement >= {early_stopping['min_delta']} "
+                f"for {early_stopping['patience']} epochs"
+            )
+            stage_log(
+                "stage2",
+                f"WcDT predictor early_stop epoch={epoch + 1} best_epoch={best_epoch} "
+                f"best_val_score={float(best_score):.6f}",
+            )
+            break
     checkpoint = stage_dir / "wcdt_predictor.pt"
     best_checkpoint = stage_dir / "wcdt_predictor_best.pt"
     if best_payload is None:
@@ -1724,8 +1763,20 @@ def _train_wcdt_predictor(
             "best_metric": "train_loss",
             "train_sample_count": int(train_indices.shape[0]),
             "validation_sample_count": int(val_indices.shape[0]),
+            "early_stopping_config": dict(early_stopping),
             **checkpoint_metadata,
         }
+    best_payload.update(
+        {
+            "loss_history": list(loss_history),
+            "val_loss_history": list(val_loss_history),
+            "validation_history": list(validation_history),
+            "trained_epochs": int(len(loss_history)),
+            "stopped_early": bool(stopped_early),
+            "early_stopping_reason": early_stopping_reason,
+            "early_stopping_config": dict(early_stopping),
+        }
+    )
     torch.save(best_payload, best_checkpoint)
     torch.save(best_payload, checkpoint)
     return {
@@ -1736,6 +1787,10 @@ def _train_wcdt_predictor(
         "prediction_validation_history": validation_history,
         "prediction_best_epoch": int(best_payload["best_epoch"]),
         "prediction_best_val_score": float(best_payload["best_val_score"]),
+        "prediction_trained_epochs": int(best_payload["trained_epochs"]),
+        "prediction_stopped_early": bool(best_payload["stopped_early"]),
+        "prediction_early_stopping_reason": best_payload["early_stopping_reason"],
+        "prediction_early_stopping_config": dict(best_payload["early_stopping_config"]),
         "prediction_architecture_version": checkpoint_metadata["architecture_version"],
         "prediction_loss_version": checkpoint_metadata["loss_version"],
         "prediction_safety_metric_version": checkpoint_metadata["safety_metric_version"],
@@ -2987,6 +3042,10 @@ def run(cfg) -> Path:
                 "prediction_loss_summary": _prediction_loss_summary(report.get("prediction_loss_history", [])),
                 "prediction_best_epoch": report.get("prediction_best_epoch"),
                 "prediction_best_val_score": report.get("prediction_best_val_score"),
+                "prediction_trained_epochs": report.get("prediction_trained_epochs"),
+                "prediction_stopped_early": report.get("prediction_stopped_early"),
+                "prediction_early_stopping_reason": report.get("prediction_early_stopping_reason"),
+                "prediction_early_stopping_config": report.get("prediction_early_stopping_config"),
                 "wcdt_v2_prediction_checkpoint": report.get("wcdt_v2_prediction_checkpoint"),
                 "wcdt_v2_prediction_best_checkpoint": report.get("wcdt_v2_prediction_best_checkpoint"),
                 "wcdt_v2_prediction_validation_history": report.get("wcdt_v2_prediction_validation_history", []),

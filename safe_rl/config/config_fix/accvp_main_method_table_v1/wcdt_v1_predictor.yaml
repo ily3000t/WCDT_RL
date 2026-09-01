@@ -102,13 +102,18 @@ prediction:
     version: per_actor_joint_world_v1
     joint_world_count: 32
   epochs: 50
-  batch_size: 16
-  wcdt_v1_batch_size: 16
+  batch_size: 32
+  wcdt_v1_batch_size: 32
   wcdt_v2_batch_size: 32
   learning_rate: 0.0001
   validation_split: 0.15
   target_lane_gap_metric_weight: 0.5
   future_min_distance_metric_weight: 0.5
+  wcdt_v1_early_stopping:
+    enabled: true
+    patience: 10
+    min_delta: 0.0001
+    warmup_epochs: 5
   wcdt_v2_train_enabled: false
   wcdt_v2_ensemble_size: 3
   wcdt_v2_epochs: 30
